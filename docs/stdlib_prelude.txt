@@ -1,0 +1,207 @@
+/*
+ * Standard Library Prelude
+ *
+ * These functions are automatically imported into every script.
+ * They are part of std.core but don't require explicit import.
+ *
+ * TYPE INTRINSICS:
+ *   is_X(v) - returns Bool          - "Is this a X?" (type check)
+ *   to_X(v) - returns Val or Missing - "Convert to X" (type conversion)
+ *
+ * TYPE PATTERNS (replace old as_X functions):
+ *   with UInt(x) = value;           - type-narrowing reference binding
+ *   if with UInt(x) = value { }     - conditional reference binding
+ *   let UInt(x) = value;            - type-checked value binding
+ *
+ * Use with the appropriate binding construct:
+ *   is_X()       -> boolean conditions: if is_uint(x) { }
+ *   Type(x)      -> type patterns: if with UInt(n) = x { n += 1; }
+ *   to_X()       -> type conversion: if let n = to_uint(x) { use(n); }
+ *
+ * NOTE: No ? needed in if let/if with - the implicit presence check IS the point
+ * NOTE: is_X() is compiler sugar for: if let Type(_) = x { true } else { false }
+ */
+
+// ============================================================================
+// Size/Length Functions
+// ============================================================================
+
+// Returns the length/size of a collection or string
+// - Array: number of elements
+// - Map: number of key-value pairs
+// - Text: number of characters (not bytes!)
+// - Bytes: number of bytes
+// Returns: UInt, or missing if x is not a collection type
+fn len(x) -> UInt;
+
+// ============================================================================
+// Type Checking Functions (is_X) - COMPILER SUGAR
+// ============================================================================
+//
+// These are pure syntactic sugar that the compiler lowers to pattern matching:
+//   is_uint(x) → if let UInt(_) = x { true } else { false }
+//
+// Kept for convenience; internally everything is pattern matching.
+
+// Check if value is present (not missing)
+// Returns: Bool (true if present, false if missing)
+// Useful for boolean conditions: is_some(x) && is_some(y)
+fn is_some(x) -> Bool;
+
+// Check if value is of specific CBOR type
+// All return Bool (true/false), never missing
+// These are sugar for type pattern matching
+fn is_uint(x) -> Bool;   // sugar for: if let UInt(_) = x { true } else { false }
+fn is_int(x) -> Bool;
+fn is_float(x) -> Bool;
+fn is_bool(x) -> Bool;
+fn is_text(x) -> Bool;
+fn is_bytes(x) -> Bool;
+fn is_array(x) -> Bool;
+fn is_map(x) -> Bool;
+
+// ============================================================================
+// Type Patterns (replaces as_X functions)
+// ============================================================================
+//
+// Type patterns provide type-narrowing bindings directly in pattern syntax:
+//
+//   with UInt(n) = value;              // n is reference if value is UInt
+//   if with UInt(n) = value { }        // conditional reference binding
+//   let UInt(n) = value;               // n is copy if value is UInt
+//   if let UInt(n) = value { }         // conditional value binding
+//   match value { UInt(n) => { }, _ => { } }  // in match arms
+//
+// This replaces the old as_X() functions with more explicit pattern syntax.
+// The binding mode (reference vs value) is controlled by with vs let.
+
+// ============================================================================
+// Type Conversion Functions (to_X) - Return Value, use with `if let`
+// ============================================================================
+
+// Convert to unsigned integer (returns a new VALUE)
+// Returns missing if:
+// - x is negative
+// - x is not numeric
+// - x cannot be represented as UInt
+// Otherwise converts:
+// - Int -> UInt (if positive)
+// - Float -> UInt (truncates)
+// - Bool -> UInt (false=0, true=1)
+// - Text -> missing (use std.parsing.parse_uint instead)
+// Use with `if let` for value binding (no ? needed):
+//   if let n = to_uint(val) { use(n); }  // n is a copy
+fn to_uint(x) -> UInt;
+
+// Convert to signed integer (returns a new VALUE)
+fn to_int(x) -> Int;
+
+// Convert to floating point (returns a new VALUE)
+fn to_float(x) -> Float;
+
+// Convert to text representation (returns a new VALUE)
+// Never returns missing - all values have text representation
+fn to_text(x) -> Text;
+
+// ============================================================================
+// Usage Examples
+// ============================================================================
+
+/*
+filter example(bundle) {
+    // -------------------------------------------------------------------------
+    // is_X(): Boolean type checks - use in if conditions
+    // -------------------------------------------------------------------------
+
+    // Length checking
+    if len(bundle.path) > 16 {
+        drop codes::HopLimitExceeded;
+    }
+
+    // Type checking with is_uint
+    if is_uint(bundle.priority) && bundle.priority > 10 {
+        bundle.priority = 10;
+    }
+
+    // Existence check with is_some
+    if is_some(bundle.security_blocks) {
+        increment_security_counter();
+    }
+
+    // Complex boolean conditions
+    if !is_some(bundle.destination) || !is_some(bundle.source) {
+        drop codes::BlockUnintelligible;
+    }
+
+    // -------------------------------------------------------------------------
+    // Type patterns: Type-narrowing REFERENCES - use with `if with`
+    // -------------------------------------------------------------------------
+
+    // Reference binding with UInt pattern - mutations flow back to bundle
+    if with UInt(priority) = bundle.priority {
+        // priority IS a reference to bundle.priority (if it's a UInt)
+        priority += 1;  // Directly mutates bundle.priority
+    }
+
+    // Reference binding to lvalue with type check
+    if with UInt(ttl) = bundle.ttl && ttl > 0 {
+        // ttl is a reference to bundle.ttl, known to be UInt
+        ttl -= 1;  // Directly mutates bundle.ttl
+    }
+
+    // Multiple reference bindings (chained with &&)
+    if with Text(source) = bundle.source && with Text(dest) = bundle.destination {
+        // Both are references, both known to be Text
+        if source != dest {
+            validate_route(source, dest);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // to_X(): Type CONVERSION - use with `if let` (no ? needed)
+    // -------------------------------------------------------------------------
+
+    // Value binding with to_uint - n is a COPY
+    if let n = to_uint(bundle.metadata.hops) {
+        // n is a copy of the converted value
+        bundle.total_hops = n + 1;  // Must explicitly assign back
+    } else {
+        bundle.total_hops = 1;
+    }
+
+    // Value binding with range check
+    if let hop_count = to_uint(bundle.hop_count) {
+        if hop_count < 16 && hop_count > 0 {
+            bundle.hop_count = hop_count + 1;  // Explicit write-back
+        }
+    }
+
+    // to_text always succeeds
+    let debug_info = to_text(bundle.flags);
+
+    // -------------------------------------------------------------------------
+    // Choosing between Type patterns and to_X
+    // -------------------------------------------------------------------------
+
+    // Use Type(x) pattern when:
+    // - You want to mutate the original value (with reference binding)
+    // - The value is already the right type (just needs type-narrowing)
+    if with UInt(count) = bundle.count {
+        count += 1;  // In-place mutation
+    }
+
+    // Use to_X when:
+    // - You need type conversion (Float -> UInt, etc.)
+    // - You want a copy to work with
+    // - You don't need to mutate the original
+    if let converted = to_uint(bundle.float_field) {
+        log("Converted: " + to_text(converted));
+    }
+
+    // Type pattern for value copy (no conversion):
+    if let UInt(n) = bundle.count {
+        // n is a copy of bundle.count (if it's a UInt)
+        use(n);  // Original unchanged
+    }
+}
+*/

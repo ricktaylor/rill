@@ -1,0 +1,620 @@
+; ABNF Grammar for Zircon
+; Augmented Backus-Naur Form specification
+
+; ============================================================================
+; Program Structure
+; ============================================================================
+
+; Imports, constants, and functions can appear in any order
+; The compiler will collect and organize them during AST construction
+program = *(import / constant / function)
+
+import = "import" import-path ["as" identifier] ";"
+
+; Constants: any expression that can be evaluated at compile-time
+; Compiler verifies the expression is const-evaluable and has a single type
+; Pattern match failure is a compile-time error (unlike let/with which produce missing)
+constant = "const" pattern "=" expression ";"
+
+import-path = stdlib-path / file-path
+
+stdlib-path = identifier *("." identifier)  ; std.bpsec, std.cbor.utils
+
+file-path = string-literal  ; "../common/bundle_age.flt"
+
+; ============================================================================
+; Attributes
+; ============================================================================
+
+; Rust-style attributes: #[name] or #[name(args)]
+; Args can be flags, literals, or key: value pairs
+attribute = "#[" identifier ["(" attr-arg-list ")"] "]"
+
+attr-arg-list = attr-arg *("," attr-arg)
+
+attr-arg = identifier ":" literal    ; Named: timeout: 5000
+         / identifier                ; Flag: export, required
+         / literal                   ; Positional: 5000, "text"
+
+; ============================================================================
+; Functions
+; ============================================================================
+
+; All functions use unified syntax with optional attributes
+; Driver selects entry points by signature/attributes, not syntax
+function = *attribute "fn" identifier "(" [param-list] ")" block
+
+; Function parameters: default is by-reference, `let` makes by-value
+; `with` is explicit by-reference (optional, for symmetry)
+; Rest parameter `..name` captures excess arguments as an Array
+param-list = [regular-params] ["," rest-param] / rest-param
+regular-params = function-param *("," function-param)
+
+function-param = ["let" / "with"] identifier   ; let = by-value, with/default = by-reference
+rest-param = ["let" / "with"] ".." identifier  ; Variadic: excess args become Array
+
+block = "{" *statement [expression] "}"
+
+; ============================================================================
+; Statements
+; ============================================================================
+
+statement = var-decl
+          / with-stmt
+          / assignment
+          / return-stmt
+          / break-stmt
+          / continue-stmt
+          / expression-stmt
+
+; Variable declaration with pattern destructuring
+; All bindings are by-value (copies)
+var-decl = "let" pattern "=" expression ";"
+
+; Reference binding with pattern: with x = expr; or with [a, b] = arr;
+; Creates references to matched locations; mutations affect the original
+; Pattern matching is total: if pattern doesn't match, all variables are missing
+; Use is_some() to check presence, or `if let`/`if with` for conditional binding
+; All bindings are by-reference (use `let` for by-value copies)
+with-stmt = "with" pattern "=" expression ";"
+
+assignment = expression assign-op expression ";"
+
+assign-op = "=" / "+=" / "-=" / "*=" / "/=" / "%="
+          / "&=" / "|=" / "^=" / "<<=" / ">>="
+
+return-stmt = "return" [expression] ";"
+
+break-stmt = "break" [expression] ";"
+
+continue-stmt = "continue" ";"
+
+expression-stmt = expression ";"
+
+; ============================================================================
+; Expressions
+; ============================================================================
+
+expression = match-expr
+           / if-expr
+           / while-expr
+           / loop-expr
+           / for-expr
+           / block-expr
+           / binary-expr
+
+; Precedence (lowest to highest):
+; 1. .. ..= (range)
+; 2. ||
+; 3. &&
+; 4. == !=
+; 5. < <= > >=
+; 6. |
+; 7. ^
+; 8. &
+; 9. << >>
+; 10. + -
+; 11. * / %
+; 12. Unary: ! - ~
+; 13. Postfix: . [] ()
+
+binary-expr = range-expr
+
+range-expr = or-expr [(".." / "..=") or-expr]  ; Range produces Array type
+
+or-expr = and-expr *("||" and-expr)
+
+and-expr = equality-expr *("&&" equality-expr)
+
+equality-expr = comparison-expr *(("==" / "!=") comparison-expr)
+
+comparison-expr = bitor-expr *(("<" / "<=" / ">" / ">=") bitor-expr)
+
+bitor-expr = bitxor-expr *("|" bitxor-expr)
+
+bitxor-expr = bitand-expr *("^" bitand-expr)
+
+bitand-expr = shift-expr *("&" shift-expr)
+
+shift-expr = additive-expr *(("<<" / ">>") additive-expr)
+
+additive-expr = multiplicative-expr *(("+"/"-") multiplicative-expr)
+
+multiplicative-expr = unary-expr *(("*" / "/" / "%") unary-expr)
+
+unary-expr = [("!" / "-" / "~")] postfix-expr
+
+postfix-expr = primary-expr *postfix-op
+
+postfix-op = "." (identifier / expression)          ; Member access
+           / "[" expression "]"                     ; Array access
+           / "(" [expr-list] ")"                    ; Function call
+
+primary-expr = literal
+             / identifier
+             / "(" expression ")"
+             / block-expr
+
+expr-list = expression *("," expression)
+
+; ============================================================================
+; Control Flow Expressions
+; ============================================================================
+
+match-expr = "match" expression "{" *match-arm "}"
+
+; Match arm with optional `let` for by-value bindings
+; Without keyword: pattern bindings are by-reference (default)
+; With `let`: pattern bindings are by-value (copies)
+; With `with`: explicit by-reference (same as default, for symmetry)
+match-arm = ["let" / "with"] pattern ["if" expression] "=>" "{" *statement "}" [","]
+
+; If expression with optional let bindings
+; Allows chaining boolean expressions and let bindings with &&
+; Examples:
+;   if condition { }
+;   if let x = expr { }
+;   if condition && let x = expr { }
+;   if let x = expr && x > 0 { }
+;   if let x = to_uint(a) && let y = to_uint(b) && x < y { }
+; All conditions are AND'ed - variables bound if ALL conditions succeed
+; Variables are in scope for later conditions AND the then-block
+; Pattern matching is strict unification: pattern must match value structure exactly
+; Body runs only if ALL pattern variables are present (not missing)
+; NOTE: No ? required - the implicit presence check IS the point of if let/if with
+if-expr = "if" if-condition *("&&" if-condition) block ["else" (if-expr / block)]
+
+if-condition = let-binding / with-binding / expression
+
+; Let binding in if: if let pattern = expr { }
+; Pattern matching with by-value binding (copies)
+; Body runs only if pattern matches (all variables present)
+let-binding = "let" pattern "=" expression
+
+; With binding in if: if with pattern = expr { }
+; Pattern matching with by-reference binding (mutations affect original)
+; Body runs only if pattern matches (all variables present)
+with-binding = "with" pattern "=" expression
+
+while-expr = "while" expression block
+
+loop-expr = "loop" block
+
+; Reference binding (default): for x in arr { } - x refers to each element
+; Value binding (explicit): for let x in arr { } - x is a copy of each element
+; Explicit reference: for with x in arr { } - same as default, for symmetry
+; Destructuring for maps: for [k, v] in map { }
+; Iterable can be any expression: Array, Map, or Range (0..10, 0..=10)
+for-expr = "for" ["let" / "with"] for-binding "in" expression block
+
+for-binding = identifier                              ; Single variable: for x in arr
+            / "[" identifier-list "]"                 ; Array destructure: for [k, v] in map
+
+identifier-list = identifier *("," identifier)
+
+block-expr = "{" *statement [expression] "}"
+
+; ============================================================================
+; Patterns
+; ============================================================================
+
+pattern = wildcard-pattern
+        / literal-pattern
+        / variable-pattern
+        / type-pattern
+        / array-pattern
+        / array-rest-pattern
+        / map-pattern
+
+wildcard-pattern = "_"
+
+literal-pattern = literal
+
+variable-pattern = identifier
+
+; Type pattern with optional binding
+; Type names must start with uppercase: UInt, Int, Float, Bool, Text, Bytes, Array, Map
+; Examples:
+;   UInt             - matches UInt type, no binding
+;   UInt(x)          - matches UInt type, binds x to the value
+;   Array([a, b])    - matches Array type, destructures into a, b
+type-pattern = type-name ["(" pattern ")"]
+
+type-name = "UInt" / "Int" / "Float" / "Bool" / "Text" / "Bytes" / "Array" / "Map"
+
+array-pattern = "[" [pattern-list] "]"
+
+; Rest pattern uses ".." optionally followed by identifier (whitespace permitted)
+; ".." without identifier ignores remaining elements without binding
+array-rest-pattern = "[" [pattern-list ","] ".." [identifier] ["," pattern-list] "]"
+
+pattern-list = pattern *("," pattern)
+
+map-pattern = "{" [map-pattern-entry *("," map-pattern-entry)] "}"
+
+map-pattern-entry = pattern ":" pattern
+
+; ============================================================================
+; Literals
+; ============================================================================
+
+literal = bool-literal
+        / uint-literal
+        / int-literal
+        / float-literal
+        / bytes-literal
+        / text-literal
+        / array-literal
+        / map-literal
+
+bool-literal = "true" / "false"
+
+uint-literal = 1*DIGIT
+
+int-literal = "-" 1*DIGIT
+
+float-literal = ["-"] 1*DIGIT "." 1*DIGIT [("e" / "E") ["-" / "+"] 1*DIGIT]
+
+bytes-literal = "bytes" "(" "[" [byte-list] "]" ")"
+
+byte-list = hex-byte *("," hex-byte)
+
+hex-byte = "0x" 2HEXDIG
+
+text-literal = string-literal
+
+string-literal = DQUOTE *char DQUOTE
+
+char = %x20-21 / %x23-5B / %x5D-10FFFF  ; Any char except " and \
+     / "\\" escape-sequence
+
+escape-sequence = DQUOTE / "\\" / "n" / "r" / "t"
+                / "u" 4HEXDIG
+                / "U" 8HEXDIG
+
+array-literal = "[" [expr-list] "]"
+
+map-literal = "{" [map-entry *("," map-entry)] "}"
+
+map-entry = expression ":" expression
+
+; ============================================================================
+; Identifiers and Keywords
+; ============================================================================
+
+identifier = (ALPHA / "_") *(ALPHA / DIGIT / "_")
+           ; but not a keyword or "_" by itself
+
+; Keywords (reserved words, cannot be used as identifiers):
+; fn, import, as, const, let, with, if, else, match, while
+; loop, for, in, return, break, continue, true, false, bytes
+
+; Note: Type names for patterns (UInt, Int, Float, Bool, Text, Bytes, Array, Map)
+; are identifiers, not keywords, so they can be shadowed
+
+; ============================================================================
+; Namespace Resolution
+; ============================================================================
+
+; Namespaced identifiers use :: separator
+; Examples: validation::check, cbor::decode
+; This is parsed as part of identifier/function call resolution
+; Not represented directly in ABNF as it's context-dependent
+
+; ============================================================================
+; Comments
+; ============================================================================
+
+comment = line-comment / block-comment
+
+line-comment = "//" *(%x00-09 / %x0B-0C / %x0E-10FFFF) LF
+
+block-comment = "/*" *(*comment-char / block-comment) "*/"
+
+comment-char = %x00-29 / %x2B-10FFFF  ; Any char except *
+             / "*" %x00-2E / "*" %x30-10FFFF  ; * not followed by /
+
+; Comments are treated as whitespace and can appear anywhere whitespace is allowed
+
+; ============================================================================
+; Whitespace
+; ============================================================================
+
+ws = *(WSP / LF / CR / comment)
+
+; ============================================================================
+; Core Rules (from RFC 5234)
+; ============================================================================
+
+ALPHA = %x41-5A / %x61-7A  ; A-Z / a-z
+DIGIT = %x30-39            ; 0-9
+HEXDIG = DIGIT / "A" / "B" / "C" / "D" / "E" / "F"
+       / "a" / "b" / "c" / "d" / "e" / "f"
+DQUOTE = %x22              ; "
+WSP = %x20 / %x09          ; Space / Tab
+LF = %x0A                  ; Line feed
+CR = %x0D                  ; Carriage return
+
+; ============================================================================
+; Notes
+; ============================================================================
+
+; 1. Member access can use any expression as key (CBOR maps)
+;    - obj.foo is sugar for obj[Text("foo")]
+;    - obj[42] accesses map with integer key
+;
+; 2. All member access (.) and array access ([]) return "missing" if the
+;    container is missing, field/key doesn't exist, or index is out of bounds
+;    - Missing propagates naturally through expressions: missing.field → missing
+;    - No explicit ? operator needed; use `if let` for presence checks
+;
+; 5. Conditions in if/while must be boolean expressions (strict boolean typing)
+;    - No truthiness: only boolean values allowed
+;
+; 6. Variable declarations require initialization (no "let x;")
+;
+; 7. "drop(reason)" is a builtin function that exits to the driver
+;    "return" returns a value to the caller
+;
+; 8. The "_" wildcard is valid in:
+;    - Pattern matching (match arms)
+;    - NOT as a variable identifier
+;
+; 9. Operator precedence follows standard C-like languages
+;
+; 10. Block expressions evaluate to the last expression (if no semicolon)
+;
+; 11. Import paths:
+;    - Unquoted dotted paths (std.bpsec) → standard library modules
+;    - Quoted strings ("../path/file.flt") → file system paths
+;    - Default alias: last component for stdlib (bpsec), filename for files
+;
+; 12. Declaration ordering:
+;    - Imports, constants, and functions can appear in any order
+;    - Multi-pass compilation resolves all references regardless of order
+;    - Convention: imports at top for readability, but not required
+;
+; 13. Constants:
+;    - Top-level only (const MaxAge = 86400;)
+;    - Takes a pattern (like let/with) for consistency
+;    - Pattern match failure is a compile-time error (not missing)
+;    - Can use any expression; compiler verifies const-evaluability
+;    - Const-evaluable: literals, other constants, pure operations, const fn calls
+;    - Must resolve to a single type (no union types)
+;    - Automatically exported from modules
+;    - Examples:
+;      const MaxAge = 86400;
+;      const Double = MaxAge * 2;
+;      const Flags = 0x01 | 0x02 | 0x04;
+;      const [A, B, C] = [1, 2, 3];           // destructuring
+;      const {x: X, y: Y} = {x: 10, y: 20};   // map destructuring
+;
+; 14. Standard Library Prelude:
+;    - Core functions automatically imported (len, is_*, to_*)
+;    - Type patterns replace old as_X functions
+;    - No explicit import needed
+;    - See stdlib_prelude.txt for complete documentation
+;
+; 15. Type intrinsics (is_, to_) and type patterns:
+;    - is_X(v): returns Bool - COMPILER SUGAR for pattern matching
+;      Lowered to: if let Type(_) = v { true } else { false }
+;      Kept for convenience; internally everything is pattern matching
+;    - to_X(v): returns Value or Missing - type conversion (creates new value)
+;    Examples:
+;    - is_uint(val) - sugar for: if let UInt(_) = val { true } else { false }
+;    - to_uint(val) - returns converted uint value, or missing if can't convert
+;    Type patterns (replace old as_X functions):
+;    - `with UInt(n) = val` - reference binding if val is UInt
+;    - `let UInt(n) = val` - value binding if val is UInt
+;    - `if let UInt(n) = val { }` - conditional value binding
+;    - `if with UInt(n) = val { }` - conditional reference binding
+;
+; 16. Value binding vs Reference binding:
+;    - `if let x = to_uint(val) { }` - VALUE binding (x is a copy)
+;    - `if cond && let x = expr { }` - chained conditions with value binding
+;    - `if with UInt(x) = val { }` - REFERENCE binding with type check
+;    - `with x = arr[0];` - simple REFERENCE binding (x refers to arr[0])
+;    - `with` as statement: simple binding without body (use `if with` for conditional)
+;    - No `?` needed in if let/if with: the implicit presence check IS the point
+;
+; 17. Variable semantics:
+;    - `let x = arr[0];` copies the value (x is independent of arr)
+;    - `with x = arr[0];` references the location (x.field = v mutates arr[0])
+;    - All filter parameters are mutable memory-backed values
+;    - Compiler tracks if parameters were mutated (filter vs rewriter)
+;
+; 18. For loop binding semantics:
+;    - `for x in arr { }` - REFERENCE binding (default)
+;      x refers to each element; mutations through x affect the original
+;    - `for let x in arr { }` - VALUE binding (explicit)
+;      x is a copy of each element; mutations don't affect the original
+;    - Reference is default because mutation is the common use case
+;    - Destructuring patterns for map iteration:
+;      for [k, v] in map { }       // k: value (immutable), v: reference
+;      for let [k, v] in map { }   // k: value (immutable), v: value
+;    - The key (first element) is ALWAYS by-value and immutable:
+;      - Mutating the key is a compile error (would break map semantics)
+;      - The `let` keyword only controls the value's (second element) binding mode
+;    - The syntax mirrors pattern matching for consistency:
+;      match x { [a, b] => { } }   // array pattern
+;    - Range iteration:
+;      for i in 0..10 { }          // reference binding with range
+;      for let i in 0..10 { }      // value binding with range
+;
+; 19. Range expressions (0..n, 0..=n):
+;    - Range is a first-class expression producing Array type
+;    - Lowest precedence: `1+2..3+4` parses as `(1+2)..(3+4)`
+;    - Can be used anywhere an expression is expected:
+;      let indices = 0..5;         // Range as value (Array type)
+;      let x = (0..10)[5];         // Indexing into range
+;      for i in 0..len(arr) { }    // Dynamic bounds supported
+;      let r = if cond { 0..5 } else { 10..15 };  // Range in conditionals
+;    - Inclusive vs exclusive:
+;      0..5   → [0, 1, 2, 3, 4]      (exclusive end)
+;      0..=5  → [0, 1, 2, 3, 4, 5]   (inclusive end)
+;
+; 20. Rest patterns in array matching:
+;    - Syntax: `..identifier` captures remaining elements as an array
+;    - Syntax: `..` alone ignores remaining elements without binding
+;    - Uses ".." (same token as range) - context distinguishes meaning
+;    - Whitespace around ".." is permitted: [a, .. rest] is valid
+;    - Rest can appear at start, middle, or end of pattern:
+;      [first, ..rest]           // first element + rest captured
+;      [first, ..]               // first element, rest ignored
+;      [..rest, last]            // rest + last element
+;      [first, ..middle, last]   // first + middle slice + last
+;    - Rest ALWAYS binds to a valid array (never missing):
+;      match [1, 2] { [a, ..m, z] => { } }  // m = [] (empty, not missing)
+;      match [1, 2, 3] { [a, ..m, z] => { } }  // m = [2]
+;    - Pattern fails to match if non-rest parts can't be satisfied:
+;      match [1] { [a, ..m, z] => { } }  // NO MATCH (need at least 2 elements)
+;    - Rest bindings are by-reference (slice of original data)
+;    - Zero captured elements → empty array, safe to iterate without checks
+;
+; 21. Pattern matching variable binding:
+;    - All pattern bindings are by-reference by default
+;    - Variables refer to the matched data, not copies
+;    - Mutations through pattern-bound variables affect the original
+;    - Rest captures (..rest) are references to slices of the original
+;
+; 22. Whitespace rules:
+;    - Generally permissive: whitespace allowed around most operators and tokens
+;    - Permissive cases (whitespace allowed):
+;      - .. rest patterns: both ..rest and .. rest are valid
+;      - . member access: both obj.field and obj . field are valid
+;      - Binary operators: 1+2, 1 + 2, 1+ 2 all valid
+;      - Range: 0..10 and 0 .. 10 both valid
+;
+; 24. Unified `let` vs `with` semantics:
+;    - `let` = by-value bindings via pattern (copies)
+;    - `with` = by-reference bindings via pattern (mutations affect original)
+;    - Both are simple statements with identical syntax:
+;      let x = expr;           // by-value
+;      let [a, b] = expr;      // by-value destructure
+;      with x = expr;          // by-reference
+;      with [a, b] = expr;     // by-reference destructure
+;    - Pattern matching is total (never fails):
+;      - If pattern doesn't match, all bound variables are `missing`
+;      - Use is_some(x) to check presence
+;      - Use `if let` / `if with` for conditional execution when values are present
+;    - Other contexts:
+;      Match arm:   [a, b] => { }        // by-reference (default)
+;                   let [a, b] => { }    // by-value
+;      For loop:    for x in arr { }     // by-reference (default)
+;                   for let x in arr { } // by-value
+;    - Teaching: "want a copy? use let" / "want a reference? use with"
+;
+; 25. Total pattern matching (unification semantics):
+;    - Patterns never fail - they always bind variables
+;    - If a pattern doesn't match, ALL variables are bound to `missing`
+;    - Matching is strict: pattern must exactly match value structure
+;    - Examples:
+;      let [a, b] = 0.01;       // a = missing, b = missing (not an array)
+;      let [a, b] = [1];        // a = missing, b = missing (need exactly 2)
+;      let [a, b] = [1, 2, 3];  // a = missing, b = missing (need exactly 2)
+;      let [a, b] = [1, 2];     // a = 1, b = 2 (exact match)
+;      let [a, b, ..] = [1,2,3];// a = 1, b = 2 (rest ignored)
+;      let [a, ..r] = [1,2,3];  // a = 1, r = [2, 3] (rest captured)
+;    - Rationale: [a, b] = [1] has no substitution making them equal
+;    - Use is_some() or `if let` to handle missing values:
+;      if is_some(a) && is_some(b) { ... }  // check presence
+;      if let [x, y] = [a, b] { sum = x + y; }  // conditional binding
+;
+; 26. Conditional pattern binding (if let / if with):
+;    - `if let pattern = expr { }` - by-value binding, conditional execution
+;    - `if with pattern = expr { }` - by-reference binding, conditional execution
+;    - Body runs only if pattern matches (ALL variables present)
+;    - No `?` required: the point of `if let`/`if with` IS the implicit presence check
+;    - Examples:
+;      if let [a, b] = arr { use(a, b); }     // body runs only if arr has exactly 2 elements
+;      if with [a, b] = arr { a += 1; }       // same, but mutations affect arr
+;      if let x = to_uint(val) { use(x); }    // body runs if conversion succeeds
+;    - Chaining with &&:
+;      if let x = to_uint(a) && let y = to_uint(b) && x < y { ... }
+;      // All conditions must succeed for body to run
+;    - This replaces the old `with x = expr { }` scoped block syntax
+;
+; 27. Type patterns with bindings:
+;    - Type patterns can optionally include a binding: `Type(pattern)`
+;    - Matches if value is that type AND binds the nested pattern
+;    - Type patterns replace the old as_X() functions:
+;      is_uint(x)        -> Bool              (type check, compiler sugar)
+;      to_uint(x)        -> Value or Missing  (type conversion)
+;      let UInt(v) = x   -> Value or Missing  (type-checked copy, no conversion)
+;      with UInt(v) = x  -> Ref or Missing    (type-checked reference)
+;    - Examples:
+;      let UInt(n) = arr[i];        // n is value if arr[i] is UInt, else missing
+;      with UInt(n) = arr[i];       // n is reference if arr[i] is UInt
+;      if let UInt(n) = value { }   // body runs if value is UInt
+;      if with UInt(n) = value { n += 1; }  // reference binding, mutates original
+;      match data {
+;          UInt(n) => { },          // n bound to the UInt value
+;          Text(s) => { },          // s bound to the Text value
+;          Array([a, b]) => { },    // Array with exactly 2 elements
+;          _ => { },
+;      }
+;    - Type names: UInt, Int, Float, Bool, Text, Bytes, Array, Map
+;
+; 28. Function attributes:
+;    - Rust-style syntax: #[name] or #[name(args)]
+;    - Placed before fn keyword, multiple allowed
+;    - Argument forms:
+;      #[export]                      // flag (no args)
+;      #[after(validate, encrypt)]    // identifier list
+;      #[priority(10)]                // literal value
+;      #[config(timeout: 5000)]       // named value (key: literal)
+;      #[param(x, required, type: "Bundle")]  // mixed
+;    - Standard attributes:
+;      #[export]           - marks function as externally callable
+;      #[after(fn1, fn2)]  - ordering dependencies
+;      #[pure]             - no side effects
+;    - Drivers can register custom attributes
+;    - Examples:
+;      #[export]
+;      #[after(validate)]
+;      fn check_ttl(bundle) {
+;          if bundle.age > MAX_TTL {
+;              drop(LIFETIME_EXPIRED);  // builtin, not keyword
+;          }
+;      }
+;
+; 29. Binding modes - symmetric `let` and `with` keywords:
+;    - Default is by-reference (mutations flow back to original)
+;    - `let` prefix makes binding by-value (copy, mutations are local)
+;    - `with` prefix is explicit by-reference (same as default, for clarity)
+;    - Both keywords are optional where context is unambiguous
+;    - Examples:
+;      fn process(bundle) { }           // by-reference (default)
+;      fn process(with bundle) { }      // by-reference (explicit)
+;      fn process(let bundle) { }       // by-value (copy)
+;      for x in arr { }                 // by-reference (default)
+;      for with x in arr { }            // by-reference (explicit)
+;      for let x in arr { }             // by-value (copy)
+;    - Binding mode table (consistent across language):
+;      | Context          | by-ref (explicit) | by-ref (implicit) | by-value        |
+;      |------------------|-------------------|-------------------|-----------------|
+;      | Statement        | with x = expr     | —                 | let x = expr    |
+;      | Conditional      | if with x = expr  | —                 | if let x = expr |
+;      | For loop         | for with x in arr | for x in arr      | for let x in arr|
+;      | Match arm        | with pat => { }   | pat => { }        | let pat => { }  |
+;      | Function param   | fn foo(with x)    | fn foo(x)         | fn foo(let x)   |

@@ -1,0 +1,37 @@
+/*
+ * Example Standard Library Module: std/status_report/codes
+ *
+ * This module exports Bundle Protocol status report reason codes
+ * as compile-time constants.
+ */
+
+// No imports needed - these are base constants
+
+// Bundle Protocol Status Report Reason Codes (RFC 9171)
+const NoAdditionalInformation = 0;
+const LifetimeExpired = 1;
+const ForwardedOverUnidirectionalLink = 2;
+const TransmissionCancelled = 3;
+const DepletedStorage = 4;
+const DestinationEndpointUnavailable = 5;
+const NoKnownRouteToDestination = 6;
+const NoTimelyContactWithNextNode = 7;
+const BlockUnintelligible = 8;
+const HopLimitExceeded = 9;
+const TrafficPared = 10;
+const BlockUnsupported = 11;
+
+// BPSec Security Reason Codes (RFC 9172)
+const FailedSecurityOperation = 12;
+const MisconfiguredSecurityOperation = 13;
+const UnknownSecurityOperation = 14;
+const UnexpectedSecurityOperation = 15;
+
+// Computed constants (examples)
+const MaxBundleProtocolCode = BlockUnsupported;
+const FirstBPSecCode = FailedSecurityOperation;
+const LastBPSecCode = UnexpectedSecurityOperation;
+const TotalReasonCodes = LastBPSecCode + 1;
+
+// All functions/constants are exported automatically
+// No explicit export syntax needed

@@ -1,0 +1,416 @@
+/*
+ * Sample Zircon Script
+ * Demonstrates the syntax for Zircon
+ */
+
+// Standard library imports (unquoted dotted paths)
+import std.bpsec;                               // Namespace: bpsec
+import std.cbor as cbor;                        // Namespace: cbor (explicit alias)
+import std.time;                                // Namespace: time
+import std.status_report.codes as codes;        // Bundle status report reason codes
+
+// Local file imports (quoted paths)
+import "../common/validation.flt";              // Namespace: validation
+import "./helpers/routing.flt" as routing;      // Namespace: routing (explicit alias)
+import "../../shared/utils.flt";                // Namespace: utils
+
+// Constants (compile-time values)
+const MaxAge = 86400;                           // 24 hours in seconds
+const DefaultPriority = 5;
+const UrgentPriority = DefaultPriority * 2;     // Can use expressions
+const MaxHops = 16;
+
+/* Filter: checks bundle age and drops if too old */
+filter check_age(bundle) after parser, validation::check_structure {
+    // Use imported function from validation module
+    if !validation::is_valid_timestamp(bundle.creation_time) {
+        drop codes::BlockUnintelligible;  // Using stdlib constant
+    }
+
+    // Use imported standard library function and module constant
+    let current = time::now();
+    if current - bundle.creation_time > MaxAge {
+        drop codes::LifetimeExpired;  // Reason code from stdlib
+    }
+
+    // Implicit Continue if we reach here
+}
+
+/*
+ * Filter: adds timestamp and modifies priority
+ *
+ * Demonstrates type intrinsics and type patterns:
+ * - is_X(): returns Bool - type check (compiler sugar for pattern match)
+ * - to_X(): returns Value - type conversion (use with `if let`)
+ * - Type patterns: UInt(x), Text(s) etc. for type-narrowing bindings
+ */
+filter add_metadata(bundle) after check_age {
+    // Simple assignment
+    bundle.timestamp = current_time();
+
+    /* Compound assignment */
+    bundle.hop_count += 1;
+
+    // Use prelude: len() to check hop limit
+    if bundle.path? && len(bundle.path) > MaxHops {
+        drop codes::HopLimitExceeded;
+    }
+
+    // Use prelude: type checking and coercion
+    if bundle.priority? && is_uint(bundle.priority) {
+        bundle.priority = 10;
+    } else {
+        // Type conversion with if let (no ? needed - presence check is implicit)
+        if let priority = to_uint(bundle.priority) {
+            bundle.priority = priority;
+        } else {
+            bundle.priority = DefaultPriority;
+        }
+    }
+
+    // Conditional rewriting
+    if bundle.destination.node == "earth" {
+        bundle.priority = UrgentPriority;
+    }
+}
+
+// Filter: validates BPSec signatures using standard library
+filter validate_security(bundle) after check_age {
+    // Use standard library BPSec module
+    if bundle.security_blocks? {
+        for block in bundle.security_blocks {
+            if !bpsec::validate_signature(block, bundle) {
+                drop codes::FailedSecurityOperation;  // RFC 9172 BPSec reason code
+            }
+        }
+    }
+}
+
+/*
+ * Filter: validates payload structure using pattern matching
+ *
+ * Demonstrates calling helpers that can drop - no need to check return values!
+ */
+filter validate_payload(bundle) {
+    // Helper can drop directly - no return value checking needed
+    validate_or_drop(bundle.payload);
+
+    match bundle.payload {
+        // Match map with specific keys
+        Map([("type", Text("data")), ("content", content)]) => {
+            if !is_valid_content(content) {
+                drop codes::BlockUnintelligible;
+            }
+        },
+
+        // Match array with pattern
+        Array([Text(header), ...rest]) => {
+            if header != "VALID" {
+                drop;  // No reason code (allowed)
+            }
+        },
+
+        // Type checking
+        Text(s) if len(s) > 0 => {
+            // Valid text payload - use imported function
+            cbor::validate_text_encoding(s);
+        },
+
+        // Catch-all
+        _ => {
+            drop codes::BlockUnintelligible;
+        }
+    }
+}
+
+/*
+ * Filter: processes array payloads
+ *
+ * Demonstrates the distinction between `if with` and `if let`:
+ * - `if with x = ref_expr { }` - REFERENCE binding - mutations flow back
+ * - `if let x = val_expr { }` - VALUE binding (to_X, functions) - x is a copy
+ * - Type patterns: `if with UInt(x) = val` for type-narrowing references
+ * - `is_some(x)` - existence check for boolean conditions
+ * NOTE: No ? needed in if let/if with - the implicit presence check IS the point
+ */
+filter process_bundles(bundle) {
+    /* Reference binding with `if with`: bind lvalue as reference */
+    if with dest = bundle.primary_block.destination.node {
+        // dest is a reference to the node field, mutations flow back
+        if dest == "mars" {
+            bundle.route = calculate_mars_route(bundle);
+        }
+    }
+
+    /* Reference binding with UInt pattern: type-narrowing reference */
+    if with UInt(priority) = bundle.priority {
+        // priority is a reference to bundle.priority (if it's a uint)
+        priority += 1;  // Mutates bundle.priority directly
+    }
+
+    /* Multiple reference bindings (chained with &&) */
+    if with source = bundle.source && with dest = bundle.destination {
+        // Both are references to the original fields
+        validate_route(source, dest);
+    }
+
+    /* Value binding with `if let`: to_X returns a converted VALUE */
+    if let converted = to_uint(bundle.metadata.priority) {
+        // converted is a COPY of the value (bundle unchanged)
+        if converted > 0 {
+            bundle.priority = converted;  // Explicit assignment back
+        }
+    } else {
+        bundle.priority = DefaultPriority;
+    }
+
+    /* Check existence without binding using is_some */
+    if is_some(bundle.security_blocks) && bundle.flags & FLAG_SECURITY_ENABLED {
+        // Security blocks exist AND flag is set
+        process_security(bundle);
+    }
+
+    /* Value binding with range checking */
+    if let hop_count = to_uint(bundle.hop_count) {
+        // hop_count is a copy - increment requires explicit write-back
+        if hop_count < MaxHops && hop_count > 0 {
+            bundle.hop_count = hop_count + 1;
+        }
+    }
+
+    /* Reference binding for in-place increment using type pattern */
+    if with UInt(hop_count) = bundle.hop_count {
+        // hop_count is a reference - increment mutates directly
+        if hop_count < MaxHops && hop_count > 0 {
+            hop_count += 1;  // Mutates bundle.hop_count in place
+        }
+    }
+}
+
+/*
+ * Helper function: validates content
+ *
+ * Note: Helpers can use "drop" to exit the entire filter chain,
+ * or "return" to return a value to the caller
+ */
+fn is_valid_content(content) {
+    match content {
+        Text(s) => {
+            let length = len(s);
+            length > 0 && length < 1024
+        },
+        UInt(n) => n > 0,
+        _ => false
+    }
+}
+
+// Helper function: validates and drops if invalid
+fn validate_or_drop(data) {
+    if !cbor::is_well_formed(data) {
+        drop codes::BlockUnintelligible;  // Unwinds to filter
+    }
+
+    // Otherwise continue - implicit success
+}
+
+// Helper function: validates required fields using is_some, type patterns, and if let
+fn validate_required_fields(bundle) {
+    // Use is_some for boolean logic
+    if !is_some(bundle.destination) || !is_some(bundle.source) {
+        drop codes::BlockUnintelligible;
+    }
+
+    // Multiple checks with && - type pattern checks both existence and type
+    if is_some(bundle.priority) && with UInt(ttl) = bundle.ttl {
+        // priority exists, ttl is a reference to bundle.ttl (if it's a UInt)
+        if ttl == 0 {
+            drop codes::LifetimeExpired;
+        }
+    }
+
+    return true;
+}
+
+// Helper function: demonstrates type coercion and debugging
+fn normalize_metadata(raw_data) {
+    // Type checking with prelude
+    if is_map(raw_data) {
+        return raw_data;  // Already correct type
+    }
+
+    // Try to convert to uint using if let (to_X returns a value, no ? needed)
+    if let uint_val = to_uint(raw_data) {
+        return {"value": uint_val};
+    }
+
+    // Convert anything to text for debugging/logging
+    let debug_str = to_text(raw_data);  // Always succeeds
+    return {"debug": debug_str, "type": "unknown"};
+}
+
+/*
+ * Helper function: calculates route with loops
+ *
+ * This demonstrates different loop types:
+ * - Range-based iteration
+ * - Array iteration
+ * - Map iteration with key-value pairs
+ */
+fn calculate_mars_route(bundle) {
+    let route = [];
+
+    /* Range-based for loop */
+    for i in 0..5 {
+        route[i] = get_hop(i);
+    }
+
+    // Iterator-based for loop over array
+    for hop in bundle.previous_hops {
+        if is_blocked(hop) {
+            continue;
+        }
+        route.push(hop);
+    }
+
+    // For loop with key-value pairs
+    for key, value in bundle.metadata {
+        if key == "priority" && value > 5 {
+            return route;
+        }
+    }
+
+    return route;
+}
+
+// Helper function: demonstrates while and loop
+fn find_valid_path(options) {
+    let index = 0;
+
+    // While loop
+    while index < len(options) {
+        if is_valid_path(options[index]) {
+            return options[index];
+        }
+        index += 1;
+    }
+
+    // Infinite loop with break
+    let result = loop {
+        let candidate = generate_path();
+        if is_valid_path(candidate) {
+            break candidate;  // Break with value
+        }
+    };
+
+    return result;
+}
+
+// Helper function: demonstrates block expressions
+fn compute_priority(bundle) {
+    // Block as expression
+    let base_priority = {
+        let urgency = bundle.flags & FLAG_URGENT;
+        let importance = bundle.importance;
+        urgency * 10 + importance
+    };
+
+    // If as expression
+    let adjusted = if bundle.age > 3600 {
+        base_priority * 2
+    } else {
+        base_priority
+    };
+
+    return adjusted;
+}
+
+/* Helper function: demonstrates operators */
+fn calculate_score(data) {
+    // Binary operators
+    let sum = data.a + data.b;
+    let product = data.c * data.d;
+    let comparison = sum > product;
+
+    // Unary operators
+    let negated = -sum;
+    let inverted = !comparison;
+    let bitwise = ~data.flags;
+
+    /*
+     * Alternative calculation (disabled for now)
+     * let alt_score = data.x * data.y + data.z;
+     * if alt_score > sum {
+     *     return alt_score;
+     * }
+     */
+
+    // Bitwise operations
+    let masked = data.flags & 0xFF;
+    let combined = data.flags | FLAG_PROCESSED;
+    let shifted = data.value << 2;
+
+    return if comparison { sum } else { product };
+}
+
+/*
+ * Helper function: demonstrates member access variants
+ * Shows both optional chaining (?.) and validity checks (?)
+ */
+fn extract_data(cbor_map) {
+    // String key (syntactic sugar)
+    let name = cbor_map.name;
+
+    // Integer key
+    let code = cbor_map[42];
+
+    // Variable key
+    let key = "dynamic";
+    let value = cbor_map[key];
+
+    // Nested access
+    let nested = cbor_map.outer.inner.value;
+
+    /* Optional chaining - returns invalid if any step fails */
+    let safe = cbor_map?.outer?.inner?.value;
+
+    /* Check if optional chain succeeded */
+    if safe? {
+        return safe;
+    }
+
+    /* Validity check in conditions */
+    if name? && code? {
+        return combine(name, code);
+    }
+
+    return default_value();
+}
+
+// Helper function: demonstrates CBOR literals
+fn create_bundle_data() {
+    // Boolean
+    let flag = true;
+
+    // Numbers
+    let count = 42;
+    let offset = -10;
+    let ratio = 3.14;
+
+    // Text
+    let name = "bundle_processor";
+
+    // Bytes
+    let data = bytes([0x01, 0x02, 0x03]);
+
+    // Array literal
+    let hops = ["earth", "moon", "mars"];
+
+    // Map literal
+    let metadata = {
+        "version": 1,
+        "timestamp": 1234567890,
+        "flags": 0x0F
+    };
+
+    return metadata;
+}

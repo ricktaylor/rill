@@ -1,0 +1,16 @@
+[package]
+name = "zircon"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+[features]
+default = []
+
+[dependencies]
+thiserror = "2.0.18"
+chumsky = "0.12"
+indexmap = "2.7"
