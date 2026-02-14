@@ -61,7 +61,6 @@ block = "{" *statement [expression] "}"
 
 statement = var-decl
           / with-stmt
-          / assignment
           / return-stmt
           / break-stmt
           / continue-stmt
@@ -69,6 +68,7 @@ statement = var-decl
 
 ; Variable declaration with pattern destructuring
 ; All bindings are by-value (copies)
+; Note: `let` is a declaration, not an expression
 var-decl = "let" pattern "=" expression ";"
 
 ; Reference binding with pattern: with x = expr; or with [a, b] = arr;
@@ -76,12 +76,8 @@ var-decl = "let" pattern "=" expression ";"
 ; Pattern matching is total: if pattern doesn't match, all variables are missing
 ; Use is_some() to check presence, or `if let`/`if with` for conditional binding
 ; All bindings are by-reference (use `let` for by-value copies)
+; Note: `with` is a declaration, not an expression
 with-stmt = "with" pattern "=" expression ";"
-
-assignment = expression assign-op expression ";"
-
-assign-op = "=" / "+=" / "-=" / "*=" / "/=" / "%="
-          / "&=" / "|=" / "^=" / "<<=" / ">>="
 
 return-stmt = "return" [expression] ";"
 
@@ -89,6 +85,8 @@ break-stmt = "break" [expression] ";"
 
 continue-stmt = "continue" ";"
 
+; Expression statement: evaluates expression, discards result
+; The semicolon discards the value; block evaluates to undefined
 expression-stmt = expression ";"
 
 ; ============================================================================
@@ -101,9 +99,10 @@ expression = match-expr
            / loop-expr
            / for-expr
            / block-expr
-           / binary-expr
+           / assign-expr
 
 ; Precedence (lowest to highest):
+; 0. = += -= *= /= %= &= |= ^= <<= >>= (assignment, right-associative)
 ; 1. .. ..= (range)
 ; 2. ||
 ; 3. &&
@@ -116,7 +115,16 @@ expression = match-expr
 ; 10. + -
 ; 11. * / %
 ; 12. Unary: ! - ~
-; 13. Postfix: . [] ()
+; 13. @ (bit test)
+; 14. Postfix: . [] ()
+
+; Assignment expression: returns the assigned value (or undefined if lvalue invalid)
+; Right-associative: a = b = c parses as a = (b = c)
+; Valid lvalues: identifier, array-access, member-access, bit-test
+assign-expr = range-expr [assign-op assign-expr]
+
+assign-op = "=" / "+=" / "-=" / "*=" / "/=" / "%="
+          / "&=" / "|=" / "^=" / "<<=" / ">>="
 
 binary-expr = range-expr
 
@@ -142,7 +150,9 @@ additive-expr = multiplicative-expr *(("+"/"-") multiplicative-expr)
 
 multiplicative-expr = unary-expr *(("*" / "/" / "%") unary-expr)
 
-unary-expr = [("!" / "-" / "~")] postfix-expr
+unary-expr = [("!" / "-" / "~")] bittest-expr
+
+bittest-expr = postfix-expr ["@" postfix-expr]  ; Bit test: X @ B returns true if bit B of UInt X is set
 
 postfix-expr = primary-expr *postfix-op
 
@@ -598,7 +608,50 @@ CR = %x0D                  ; Carriage return
 ;          }
 ;      }
 ;
-; 29. Binding modes - symmetric `let` and `with` keywords:
+; 29. Bit test/set operator (@):
+;    - Syntax: X @ B where X is a UInt and B is a UInt bit position
+;    - As rvalue: returns true if bit B is set in X, false if clear
+;    - As lvalue: sets bit B if assigned true, clears if assigned false
+;    - Returns undefined if X or B is not a UInt, or if B >= 64
+;    - Semantics match array access: out-of-range is undefined, not auto-extending
+;    - Whitespace is permitted around @: `flags @ 3` or `flags@3`
+;    - Examples:
+;      flags @ 3              // true if bit 3 is set
+;      x @ 0                  // true if x is odd (LSB test)
+;      value @ 63             // true if high bit is set (max valid bit)
+;      arr[i] @ b             // test bit b of arr[i]
+;      !flags @ 3             // negate the bit test result
+;      x @ 3 && y @ 4         // test multiple bits
+;      x @ (b + 1)            // bit position can be any expression
+;      flags @ 3 = true       // set bit 3
+;      flags @ 3 = false      // clear bit 3
+;      flags @ b ^= true      // toggle bit b
+;
+; 30. Assignment as expression:
+;    - Assignment is an expression, not just a statement
+;    - Evaluates to the assigned value (or undefined if lvalue is invalid)
+;    - Right-associative: `a = b = c` parses as `a = (b = c)`
+;    - Lowest precedence of all operators (below range)
+;    - Examples:
+;      let y = (x = 5);         // y is 5, x is 5
+;      let z = (arr[i] = v);    // z is v if succeeded, undefined if OOB
+;      a = b = c = 0;           // chained assignment, all get 0
+;      if is_some(x = v) { }    // check if assignment succeeded
+;    - Valid lvalues:
+;      - identifier: x
+;      - array-access: arr[i]
+;      - member-access: obj.field
+;      - bit-test: x @ b
+;    - Invalid lvalues (compile error):
+;      - arithmetic: x + 1
+;      - function call: foo()
+;      - literals: 5
+;    - Lvalue validity vs definedness:
+;      - Validity: compile-time check (is this syntactically an lvalue?)
+;      - Definedness: runtime check (does this location exist?)
+;      - Example: `arr[i] = v` is valid, but undefined if i >= len(arr)
+;
+; 31. Binding modes - symmetric `let` and `with` keywords:
 ;    - Default is by-reference (mutations flow back to original)
 ;    - `let` prefix makes binding by-value (copy, mutations are local)
 ;    - `with` prefix is explicit by-reference (same as default, for clarity)

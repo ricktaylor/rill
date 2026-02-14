@@ -103,6 +103,10 @@ impl<'a> Lowerer<'a> {
                 end,
                 inclusive,
             } => self.lower_range(start, end, *inclusive),
+
+            ast::Expression::Assignment { target, op, value } => {
+                self.lower_assignment(target, op, value)
+            }
         }
     }
 
@@ -278,6 +282,7 @@ impl<'a> Lowerer<'a> {
             ast::BinaryOperator::BitwiseXor => "core.bit_xor",
             ast::BinaryOperator::ShiftLeft => "core.shl",
             ast::BinaryOperator::ShiftRight => "core.shr",
+            ast::BinaryOperator::BitTest => "core.bit_test",
             ast::BinaryOperator::And | ast::BinaryOperator::Or => unreachable!(),
         };
 

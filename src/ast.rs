@@ -187,13 +187,6 @@ pub enum Statement {
         value: Expression,
     },
 
-    // Assignment: x = y + 1; or compound: x += 1;
-    Assignment {
-        target: Expression, // Could be variable or array access
-        op: AssignmentOp,
-        value: Expression,
-    },
-
     // Return statement: return; or return value;
     // Returns a value to the caller
     Return {
@@ -225,6 +218,17 @@ pub enum Expression {
         op: BinaryOperator,
         right: Box<Expression>,
     },
+
+    // Assignment expression: target = value or target op= value
+    // Returns the assigned value (or undefined if lvalue is invalid)
+    // Right-associative: a = b = c parses as a = (b = c)
+    // Valid lvalues: Variable, ArrayAccess, MemberAccess, BinaryOp(BitTest)
+    Assignment {
+        target: Box<Expression>,
+        op: AssignmentOp,
+        value: Box<Expression>,
+    },
+
     UnaryOp {
         op: UnaryOperator,
         operand: Box<Expression>,
@@ -446,6 +450,9 @@ pub enum BinaryOperator {
     BitwiseXor, // ^
     ShiftLeft,  // <<
     ShiftRight, // >>
+
+    // Bit test
+    BitTest, // @ - returns true if bit B is set in X (X @ B)
 }
 
 #[derive(Debug, Clone)]

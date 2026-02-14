@@ -258,7 +258,7 @@ short-circuit evaluation (control flow to skip the second operand).
 - Arithmetic: `core.add`, `core.sub`, `core.mul`, `core.div`, `core.mod`, `core.neg`
 - Comparison: `core.eq`, `core.lt`
 - Logical: `core.not`
-- Bitwise: `core.bit_and`, `core.bit_or`, `core.bit_xor`, `core.bit_not`, `core.shl`, `core.shr`
+- Bitwise: `core.bit_and`, `core.bit_or`, `core.bit_xor`, `core.bit_not`, `core.shl`, `core.shr`, `core.bit_test`, `core.bit_set`
 
 These const builtins enable compile-time folding: `1 + 2` lowers to `Call("core.add", [1, 2])`
 which the optimizer folds to `3` using the const evaluator.
@@ -346,6 +346,7 @@ All other operators are implemented as **core builtins** with `Purity::Const`:
 | Arithmetic | `+` `-` `*` `/` `%` `-x` | `core.add`, `core.sub`, `core.mul`, `core.div`, `core.mod`, `core.neg` |
 | Logical | `!` | `core.not` |
 | Bitwise | `&` `\|` `^` `~` `<<` `>>` | `core.bit_and`, `core.bit_or`, `core.bit_xor`, `core.bit_not`, `core.shl`, `core.shr` |
+| Bit access | `@` | `core.bit_test` (read), `core.bit_set` (write) |
 
 Other builtins with appropriate purity annotations:
 
@@ -540,6 +541,220 @@ Scoped bindings apply to:
 - `if with pattern = expr { }`
 - `for x in arr { }` / `for let x in arr { }`
 - `match expr { pattern => { } }`
+
+---
+
+## Expression Semantics
+
+### Expressions vs Statements
+
+Rill minimizes the distinction between expressions and statements. The key insight:
+**a statement is just an expression whose result is discarded**.
+
+| Construct | Type | Evaluates To |
+|-----------|------|--------------|
+| `x + 1` | Expression | Computed value |
+| `x = 5` | Expression | Assigned value (or undefined if lvalue invalid) |
+| `expr;` | Statement | Discards result, contributes undefined |
+| `{ stmts; expr }` | Block | Final expression value |
+| `{ stmts; }` | Block | Undefined (no final expression) |
+| `{ }` | Block | Undefined (empty) |
+
+### Assignment as Expression
+
+Assignment is an expression that returns the assigned value:
+
+```rust
+let y = (x = 5);        // y is 5, x is 5
+let z = (arr[i] = v);   // z is v if succeeded, undefined if lvalue invalid
+
+// Chained assignment (right-associative)
+a = b = c = 0;          // All set to 0, evaluates to 0
+```
+
+This enables **checked assignment** for potentially-undefined lvalues:
+
+```rust
+// Unchecked - value may vanish silently if arr[i] is undefined
+arr[i] = v;
+
+// Checked - capture result to detect failure
+if let result = (arr[i] = v) {
+    // Assignment succeeded
+} else {
+    // lvalue was undefined (out of bounds, etc.)
+}
+
+// Alternative - verify lvalue exists first
+if with slot = arr[i] {
+    slot = v;  // Guaranteed to succeed
+}
+```
+
+### Lvalue Validity
+
+Not all expressions are valid lvalues:
+
+| Expression | Valid Lvalue? | Notes |
+|------------|---------------|-------|
+| `x` | Yes | Simple variable |
+| `arr[i]` | Yes | Array index (may be undefined if OOB) |
+| `obj.field` | Yes | Member access (may be undefined) |
+| `x @ b` | Yes | Bit access (may be undefined if b >= 64) |
+| `x + 1` | No | Arithmetic result has no location |
+| `foo()` | No | Function result has no location |
+
+When an lvalue evaluates to undefined (e.g., out-of-bounds index), the assignment
+becomes a no-op and the expression evaluates to undefined.
+
+### Short-Circuit Evaluation
+
+Assignment to potentially-undefined lvalues uses **short-circuit evaluation**:
+the rhs is only evaluated if the lvalue is defined.
+
+```rust
+arr[100] = expensive();  // expensive() NOT called if arr[100] is OOB
+x @ 128 = compute();     // compute() NOT called if bit 128 is invalid
+```
+
+This is consistent with `&&` and `||` short-circuit behavior and avoids wasted
+computation when assigning to invalid locations. The generated IR uses Guard
+terminators to check lvalue validity before evaluating the rhs.
+
+### Semicolons and Blocks
+
+The semicolon `;` discards an expression's value:
+
+```rust
+{
+    5           // Block evaluates to 5
+}
+
+{
+    5;          // Semicolon discards, block evaluates to undefined
+}
+
+{
+    let x = 5;  // Binding declaration
+}               // No final expression, evaluates to undefined
+```
+
+**No Unit type needed** - undefined serves as "absence of meaningful value" uniformly.
+
+### Binding Declarations vs Expressions
+
+`let` and `with` are **binding declarations**, not expressions:
+
+- They introduce names into scope (a side effect on the environment)
+- They don't evaluate to a value themselves
+- `if let`/`if with` is special syntax, not `let` being used as an expression
+
+```rust
+let x = 5;              // Declaration - introduces x
+let y = (let z = 5);    // ERROR: let is not an expression
+
+if let x = maybe {      // Special syntax - conditional binding
+    use(x);
+}
+```
+
+This keeps the language simple: bindings affect scope, assignments compute values.
+
+---
+
+## Bit Test/Set Operator
+
+The `@` operator provides efficient bit-level access to unsigned integers:
+
+### Syntax
+
+```rust
+value @ bit           // Test: is bit set?
+value @ bit = bool    // Set: set or clear bit
+```
+
+### Semantics
+
+| Operation | Result |
+|-----------|--------|
+| `x @ b` (read) | `true` if bit b is set, `false` if clear |
+| `x @ b = true` | Sets bit b |
+| `x @ b = false` | Clears bit b |
+| `x @ b` where b >= 64 | `undefined` (out of range) |
+| `x @ b` where x or b not UInt | `undefined` (type error) |
+
+### Design Rationale
+
+The `@` operator is conceptually **syntactic sugar for bit-array access**:
+
+- Semantics match array indexing: out-of-range returns undefined
+- Valid as both rvalue (test) and lvalue (set/clear)
+- No auto-extension: you can't set bit 128 of a 64-bit integer
+
+### Examples
+
+```rust
+let flags = 0b1010;
+
+flags @ 1              // true (bit 1 is set)
+flags @ 0              // false (bit 0 is clear)
+
+flags @ 2 = true;      // Set bit 2: flags = 0b1110
+flags @ 3 = false;     // Clear bit 3: flags = 0b0110
+
+// Compound assignment for toggle
+flags @ 1 ^= true;     // Toggle bit 1
+
+// Checked bit access
+if let result = (flags @ b = true) {
+    // Bit set succeeded
+}
+
+// Out of range
+flags @ 100            // undefined
+flags @ 100 = true;    // No-op, assignment evaluates to undefined
+```
+
+### Implementation
+
+The `@` operator lowers to builtin calls:
+
+- Read: `core.bit_test(value, bit)` → Bool or undefined
+- Write: `core.bit_set(value, bit, bool)` → value or undefined
+
+---
+
+## Compiler Warnings
+
+### Unchecked Assignment Warning
+
+The compiler emits warnings for assignments to potentially-undefined lvalues
+when the result is not checked:
+
+```rust
+arr[i] = v;      // ⚠️ Warning: Unchecked assignment, destination may be undefined
+x @ b = true;    // ⚠️ Warning: Unchecked assignment, destination may be undefined
+```
+
+**Safe alternatives (no warning):**
+
+```rust
+// Check result
+if let _ = (arr[i] = v) { }
+if is_some(arr[i] = v) { }
+
+// Explicit discard
+let _ = arr[i] = v;
+
+// Verify lvalue first
+if with slot = arr[i] {
+    slot = v;
+}
+```
+
+**Rationale:** This catches "black holes" where data silently vanishes. The warning
+doesn't prevent the code from compiling - it's the programmer's choice to ignore
+or address it.
 
 ---
 

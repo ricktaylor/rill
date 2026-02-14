@@ -281,11 +281,17 @@ fn expression<'a>() -> BoxedParser<'a, Expression> {
         // Postfix operations
         let postfix = postfix_expr(expr_boxed.clone(), primary);
 
+        // Bit test operator (between postfix and unary)
+        let bittest = bittest_expr(postfix);
+
         // Unary prefix operators
-        let unary = unary_expr(postfix);
+        let unary = unary_expr(bittest);
 
         // Binary operators with precedence
-        binary_expr(unary)
+        let binary = binary_expr(unary);
+
+        // Assignment expression (lowest precedence, right-associative)
+        assign_expr(binary, expr_boxed)
     })
     .boxed()
 }
@@ -448,7 +454,26 @@ fn postfix_expr<'a>(
         .boxed()
 }
 
-fn unary_expr<'a>(postfix: BoxedParser<'a, Expression>) -> BoxedParser<'a, Expression> {
+fn bittest_expr<'a>(postfix: BoxedParser<'a, Expression>) -> BoxedParser<'a, Expression> {
+    // Bit test operator: X @ B - returns true if bit B is set in X
+    let bittest_op = just('@')
+        .to(BinaryOperator::BitTest)
+        .padded_by(whitespace())
+        .boxed();
+
+    postfix
+        .clone()
+        .foldl(bittest_op.then(postfix).repeated(), |l, (op, r)| {
+            Expression::BinaryOp {
+                left: Box::new(l),
+                op,
+                right: Box::new(r),
+            }
+        })
+        .boxed()
+}
+
+fn unary_expr<'a>(bittest: BoxedParser<'a, Expression>) -> BoxedParser<'a, Expression> {
     let unary_op = choice((
         just('!').to(UnaryOperator::Not),
         just('-').to(UnaryOperator::Negate),
@@ -459,7 +484,7 @@ fn unary_expr<'a>(postfix: BoxedParser<'a, Expression>) -> BoxedParser<'a, Expre
 
     unary_op
         .repeated()
-        .foldr(postfix, |op, rhs| Expression::UnaryOp {
+        .foldr(bittest, |op, rhs| Expression::UnaryOp {
             op,
             operand: Box::new(rhs),
         })
@@ -670,6 +695,30 @@ fn binary_expr<'a>(unary: BoxedParser<'a, Expression>) -> BoxedParser<'a, Expres
                 inclusive: inclusive.is_some(),
             },
             None => start,
+        })
+        .boxed()
+}
+
+/// Assignment expression parser
+/// Assignment has lowest precedence and is right-associative
+/// a = b = c parses as a = (b = c)
+fn assign_expr<'a>(
+    binary: BoxedParser<'a, Expression>,
+    expr: BoxedParser<'a, Expression>,
+) -> BoxedParser<'a, Expression> {
+    // Right-associative: use foldr pattern
+    // First, parse the left operand (binary expression)
+    // Then optionally parse assign-op followed by another assign-expr
+    binary
+        .clone()
+        .then(assign_op().then(expr).or_not())
+        .map(|(target, rest)| match rest {
+            Some((op, value)) => Expression::Assignment {
+                target: Box::new(target),
+                op,
+                value: Box::new(value),
+            },
+            None => target,
         })
         .boxed()
 }
@@ -1126,14 +1175,8 @@ fn statement_inner<'a>(expr: BoxedParser<'a, Expression>) -> BoxedParser<'a, Sta
         .to(Statement::Continue)
         .boxed();
 
-    let assignment = expr
-        .clone()
-        .padded_by(whitespace())
-        .then(assign_op())
-        .then(expr.clone().padded_by(whitespace()))
-        .then_ignore(just(';').padded_by(whitespace()))
-        .map(|((target, op), value)| Statement::Assignment { target, op, value })
-        .boxed();
+    // Note: Assignment is now an expression, not a separate statement form
+    // x = y; is parsed as expression-stmt where the expression is an assignment
 
     // Control flow expressions can be statements without trailing semicolon
     // This includes: if, while, loop, for, match, and block expressions
@@ -1162,7 +1205,6 @@ fn statement_inner<'a>(expr: BoxedParser<'a, Expression>) -> BoxedParser<'a, Sta
         return_stmt,
         break_stmt,
         continue_stmt,
-        assignment,
         control_flow_stmt,
         expression_stmt,
     ))

@@ -83,7 +83,7 @@ impl<'a> Lowerer<'a> {
                 self.const_index(&obj, &key)
             }
 
-            // Control flow is not allowed in const expressions
+            // Control flow and assignment are not allowed in const expressions
             // TODO: Could support if/match/block by evaluating at compile time,
             // but loops would need termination analysis. Keep it simple for now.
             ast::Expression::Block { .. }
@@ -94,6 +94,12 @@ impl<'a> Lowerer<'a> {
             | ast::Expression::Match { .. }
             | ast::Expression::Range { .. } => Err(LowerError::SemanticError {
                 message: "control flow not allowed in constant expression".to_string(),
+                span: dummy_span(),
+            }),
+
+            // Assignment has side effects - not allowed in const expressions
+            ast::Expression::Assignment { .. } => Err(LowerError::SemanticError {
+                message: "assignment not allowed in constant expression".to_string(),
                 span: dummy_span(),
             }),
         }
@@ -170,6 +176,7 @@ impl<'a> Lowerer<'a> {
             ast::BinaryOperator::BitwiseXor => "core.bit_xor",
             ast::BinaryOperator::ShiftLeft => "core.shl",
             ast::BinaryOperator::ShiftRight => "core.shr",
+            ast::BinaryOperator::BitTest => "core.bit_test",
             ast::BinaryOperator::And | ast::BinaryOperator::Or => unreachable!(),
         };
 
