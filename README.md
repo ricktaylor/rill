@@ -1,20 +1,20 @@
-# Zircon
+# Rill
 
 > A memory-safe, embeddable scripting language.
 
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
 
-**Zircon** is a general-purpose scripting language designed for high-reliability environments where script failures cannot compromise the host process. Think of it as a duck-typed subset of Rust with the embeddability of Lua and the safety guarantees of its Rust heritage.
+**Rill** is a general-purpose scripting language designed for high-reliability environments where script failures cannot compromise the host process. Think of it as a duck-typed subset of Rust with the embeddability of Lua and the safety guarantees of its Rust heritage.
 
 ## Origin Story
 
-Zircon emerged from work on [Hardy](https://github.com/rick_taylor/hardy), a Delay-Tolerant Networking (RFC 9171) agent for satellite communications. When you're managing traffic policies during 40-minute light-speed delays, you need a scripting engine that won't crash your agent or leak memory while waiting for Mars to respond.
+Rill emerged from work on [Hardy](https://github.com/rick_taylor/hardy), a Delay-Tolerant Networking (RFC 9171) agent for satellite communications. When you're managing traffic policies during 40-minute light-speed delays, you need a scripting engine that won't crash your agent or leak memory while waiting for Mars to respond.
 
-Unable to find a scripting language that felt truly "at home" in a high-reliability Rust environment, Zircon was created to fill that gap.
+Unable to find a scripting language that felt truly "at home" in a high-reliability Rust environment, Rill was created to fill that gap.
 
-## Why "Zircon"?
+## Why "Rill"?
 
-Zircons are the oldest minerals on Earth—chemically inert, heat-resistant, and fundamentally hardy. They survive geological time scales and extreme conditions. A fitting name for a language designed to survive the vacuum of space.
+Rills are the oldest minerals on Earth—chemically inert, heat-resistant, and fundamentally hardy. They survive geological time scales and extreme conditions. A fitting name for a language designed to survive the vacuum of space.
 
 ## Key Features
 
@@ -84,7 +84,7 @@ Source Code
 
 ### CBOR-First Design
 
-Zircon has native support for the CBOR data model:
+Rill has native support for the CBOR data model:
 
 ```rust
 let data = {
@@ -143,10 +143,10 @@ if let value = potentially_undefined {
 }
 ```
 
-## Embedding Zircon
+## Embedding Rill
 
 ```rust
-use zircon::{VM, BuiltinRegistry, Value};
+use rill::{VM, BuiltinRegistry, Value};
 
 // Register custom builtins
 let mut registry = BuiltinRegistry::new();
@@ -158,8 +158,8 @@ registry.register(
 );
 
 // Compile and execute
-let program = zircon::parse(source)?;
-let compiled = zircon::compile(program, &registry)?;
+let program = rill::parse(source)?;
+let compiled = rill::compile(program, &registry)?;
 let mut vm = VM::new(compiled);
 
 match vm.call_function("main", &[]) {
@@ -170,7 +170,7 @@ match vm.call_function("main", &[]) {
 
 ## Current Status
 
-⚠️ **Early Development** - Zircon is functional but not yet production-ready.
+⚠️ **Early Development** - Rill is functional but not yet production-ready.
 
 **Complete:**
 
@@ -202,7 +202,7 @@ match vm.call_function("main", &[]) {
 
 ## Use Cases
 
-While born in the Deep Space Network, Zircon is a general-purpose language suitable for:
+While born in the Deep Space Network, Rill is a general-purpose language suitable for:
 
 - **CBOR document validation and transformation**: Native CBOR support for policy enforcement
 - **Embedded scripting**: Safe sandboxing for untrusted scripts in Rust applications
@@ -219,7 +219,7 @@ cargo test
 
 ## Safety Guarantees
 
-Zircon scripts run in a controlled sandbox with hard limits:
+Rill scripts run in a controlled sandbox with hard limits:
 
 - **Stack limit**: 65,536 slots (catches deep recursion)
 - **Heap limit**: 16MB default (configurable per-VM)
@@ -235,7 +235,7 @@ Scripts cannot:
 
 ## Contributing
 
-Zircon is in early development and feedback is greatly appreciated! Areas of particular interest:
+Rill is in early development and feedback is greatly appreciated! Areas of particular interest:
 
 - **IR lowering completion**: Help finish the AST → IR transformation
 - **Standard library**: Implementing core modules (time, encoding, parsing)

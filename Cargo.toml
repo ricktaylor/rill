@@ -1,5 +1,5 @@
 [package]
-name = "zircon"
+name = "rill"
 version = "0.1.0"
 edition = "2024"
 

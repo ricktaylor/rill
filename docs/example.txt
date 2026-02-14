@@ -1,6 +1,6 @@
 /*
- * Sample Zircon Script
- * Demonstrates the syntax for Zircon
+ * Sample Rill Script
+ * Demonstrates the syntax for Rill
  */
 
 // Standard library imports (unquoted dotted paths)

@@ -1,10 +1,10 @@
-# Zircon Language Design Document
+# Rill Language Design Document
 
-This document captures the design of the Zircon language.
+This document captures the design of the Rill language.
 
 ## Overview
 
-Zircon is a general-purpose embeddable scripting language with first-class
+Rill is a general-purpose embeddable scripting language with first-class
 support for CBOR data. While originally created for DTN bundle processing, it is
 a standalone language suitable for any domain requiring CBOR manipulation, data
 transformation, or policy enforcement.
@@ -254,6 +254,7 @@ vm.set_local(x_offset, new_val);  // mutates arr[0]
 short-circuit evaluation (control flow to skip the second operand).
 
 **Core builtins** (`core.*`) implement all other operators with `Purity::Const`:
+
 - Arithmetic: `core.add`, `core.sub`, `core.mul`, `core.div`, `core.mod`, `core.neg`
 - Comparison: `core.eq`, `core.lt`
 - Logical: `core.not`
@@ -263,11 +264,13 @@ These const builtins enable compile-time folding: `1 + 2` lowers to `Call("core.
 which the optimizer folds to `3` using the const evaluator.
 
 **Other functions** include user-defined, prelude, and host-provided:
+
 - *Prelude*: `len()`, `concat()`, `to_uint()`, `is_uint()`, `is_some()`, etc.
 - *Host*: `drop()`, `decode()`, `validate()`
 
 Functions may be inlined by the optimizer. Some prelude functions always inline
 because the expansion is simpler than a call:
+
 - `is_uint(x)` → `Match(x, [(Type(UInt), BB_t)], BB_f)` + Phi → Bool
 - `is_some(x)` → `Guard(x, BB_t, BB_f)` + Phi → Bool
 
@@ -345,6 +348,7 @@ All other operators are implemented as **core builtins** with `Purity::Const`:
 | Bitwise | `&` `\|` `^` `~` `<<` `>>` | `core.bit_and`, `core.bit_or`, `core.bit_xor`, `core.bit_not`, `core.shl`, `core.shr` |
 
 Other builtins with appropriate purity annotations:
+
 - Collection: `len()`, `concat()`, `push()`, `insert()`, `slice()`
 - Ranges: `range()`, `range_inclusive()`
 - Type conversion: `to_uint()`, `to_int()`, `to_float()`, `to_text()`
@@ -526,10 +530,12 @@ BB_continue:
 ```
 
 The `Drop` instruction serves two purposes:
+
 1. **Slot reclamation**: The slot allocator can reuse these slots for later variables
 2. **Scope enforcement**: Accessing dropped variables is a compile error
 
 Scoped bindings apply to:
+
 - `if let pattern = expr { }`
 - `if with pattern = expr { }`
 - `for x in arr { }` / `for let x in arr { }`
@@ -553,6 +559,7 @@ The `with` keyword can be used explicitly for by-reference (same as default) for
 | Function param | `fn foo(with x)` | `fn foo(x)` | `fn foo(let x)` |
 
 **Semantics:**
+
 - **By-reference** (`with` or default): Variable refers to original location; mutations flow back
 - **By-value** (`let`): Variable is a copy; mutations are local only
 
@@ -578,6 +585,7 @@ printf("hello %s %d", name, age);   // args = [name, age]
 ```
 
 Rest parameters follow the same binding mode rules:
+
 - `..args` - by-reference (default)
 - `let ..args` - by-value (copy)
 - `with ..args` - explicit by-reference
@@ -786,10 +794,12 @@ len(arr)                        // Prelude (no namespace)
 ### Prelude (Auto-imported)
 
 **Always inlined:**
+
 - `is_uint(x)`, `is_int(x)`, ... - Type checks (→ Match + Phi)
 - `is_some(x)` - Existence check (→ Guard + Phi)
 
 **Regular functions:**
+
 - `to_uint(x)`, `to_int(x)`, ... - Type conversions
 - `len(x)` - Collection length
 - `concat(a, b)` - Concatenate collections
@@ -1048,8 +1058,8 @@ Tag(0xF1700) Module {
 
 ## Example Use Case: DTN Bundle Filtering
 
-While Zircon is a general-purpose embeddable scripting language, it was originally
-designed for DTN bundle processing. This section demonstrates how Zircon can be used
+While Rill is a general-purpose embeddable scripting language, it was originally
+designed for DTN bundle processing. This section demonstrates how Rill can be used
 in that context as an example of embedding the language in a domain-specific application.
 
 ### Filter Functions
@@ -1206,6 +1216,7 @@ Frame allocations are bounded by stack depth (already limited), tiny (16 bytes),
 ### Why four control flow primitives (If, Match, Guard, Jump)?
 
 Each does exactly one thing:
+
 - **If**: Boolean logic (true/false)
 - **Match**: Type dispatch (BaseType)
 - **Guard**: Presence check (Defined/Undefined)
@@ -1229,6 +1240,7 @@ A function either returns to its caller or exits to the driver - never both. An 
 
 The language is general-purpose. Making all functions uniform and using metadata
 for driver binding enables:
+
 - Multiple use cases (filtering, transforms, validation, etc.)
 - Driver flexibility (select by signature, not syntax)
 - Cleaner language (fewer keywords, uniform semantics)
@@ -1237,6 +1249,7 @@ for driver binding enables:
 ### Why Rust-style attributes with `:` for named values?
 
 Attributes provide extensible metadata without language keywords:
+
 - Rust-style `#[attr]` is familiar and visually distinct from code
 - Using `:` instead of `=` for named values avoids confusion with assignment
 - Consistent with map literal syntax (`{key: value}`)
@@ -1247,6 +1260,7 @@ Attributes provide extensible metadata without language keywords:
 
 The language has first-class CBOR support, so using CBOR for the compiled format
 is natural:
+
 - Same tooling for inspection
 - Natural representation of constants (already CBOR values)
 - Extensible via custom tags

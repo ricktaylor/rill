@@ -1,4 +1,4 @@
-// Parser for Zircon using chumsky 0.12
+// Parser for Rill using chumsky 0.12
 //
 // This parser directly produces AST nodes from the source text.
 // It follows the grammar defined in docs/grammar.abnf.
@@ -1397,7 +1397,7 @@ fn program<'a>() -> BoxedParser<'a, Program> {
 // Public API
 // ============================================================================
 
-/// Parse a Zircon source file into an AST
+/// Parse a Rill source file into an AST
 pub fn parse(input: &str) -> Result<Program, Vec<Rich<'_, char, Span>>> {
     program().parse(input).into_result()
 }

@@ -1,6 +1,6 @@
 // Core type definitions shared by IR and execution
 //
-// This module defines the fundamental types of the Zircon language.
+// This module defines the fundamental types of the Rill language.
 // Both compile-time (IR) and runtime (exec) modules use these definitions.
 
 /// The base types that a value can have at runtime.
