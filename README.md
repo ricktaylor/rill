@@ -8,13 +8,13 @@
 
 ## Origin Story
 
-Rill emerged from work on [Hardy](https://github.com/rick_taylor/hardy), a Delay-Tolerant Networking (RFC 9171) agent for satellite communications. When you're managing traffic policies during 40-minute light-speed delays, you need a scripting engine that won't crash your agent or leak memory while waiting for Mars to respond.
+Rill emerged from work on [Hardy](https://github.com/ricktaylor/hardy), a Delay-Tolerant Networking (RFC 9171) agent for satellite communications. When you're managing traffic policies during 40-minute light-speed delays, you need a scripting engine that won't crash your agent or leak memory while waiting for Mars to respond.
 
 Unable to find a scripting language that felt truly "at home" in a high-reliability Rust environment, Rill was created to fill that gap.
 
 ## Why "Rill"?
 
-Rills are the oldest minerals on Earth—chemically inert, heat-resistant, and fundamentally hardy. They survive geological time scales and extreme conditions. A fitting name for a language designed to survive the vacuum of space.
+A *rill* is a small stream—a modest channel through which water flows. In lunar geology, *rilles* are the sinuous channels carved across the Moon's surface, remnants of ancient lava flows. Like these channels, Rill is designed to be a conduit: small, efficient pathways for data to flow through your systems. A fitting name for a language born in deep space communications.
 
 ## Key Features
 
@@ -262,4 +262,4 @@ at your option.
 
 ---
 
-*"The oldest minerals on Earth, chemically inert and fundamentally hardy—built to last."*
+*"Small streams carve deep channels—in rock, in regolith, in code."*
