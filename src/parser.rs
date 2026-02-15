@@ -10,6 +10,7 @@
 use super::*;
 use ast::*;
 use chumsky::prelude::*;
+use diagnostics::{Diagnostic, DiagnosticCode, Diagnostics};
 
 // ============================================================================
 // Type Aliases
@@ -1436,69 +1437,181 @@ fn program<'a>() -> BoxedParser<'a, Program> {
 }
 
 // ============================================================================
+// Error Conversion
+// ============================================================================
+
+/// Convert a chumsky Rich error to a Diagnostic
+fn rich_to_diagnostic(error: &Rich<'_, char, Span>) -> Diagnostic {
+    let span = *error.span();
+    let message = format_rich_error(error);
+
+    // Determine the appropriate error code based on the error
+    let code = categorize_parse_error(error);
+
+    let mut diag = Diagnostic::at(code, span, message);
+
+    // Add context from the error's context stack
+    // Note: contexts() returns (RichPattern, &str) - we include the label but not the pattern span
+    for (_pattern, label) in error.contexts() {
+        diag.help(format!("in {}", label));
+    }
+
+    diag
+}
+
+/// Format a Rich error into a human-readable message
+fn format_rich_error(error: &Rich<'_, char, Span>) -> String {
+    use chumsky::error::RichReason;
+
+    match error.reason() {
+        RichReason::ExpectedFound { expected, found } => {
+            let expected_str = if expected.is_empty() {
+                "something else".to_string()
+            } else {
+                let items: Vec<_> = expected.iter().map(|e| format!("{}", e)).collect();
+                if items.len() == 1 {
+                    items[0].clone()
+                } else {
+                    format!(
+                        "{} or {}",
+                        items[..items.len() - 1].join(", "),
+                        items.last().unwrap()
+                    )
+                }
+            };
+
+            match found {
+                Some(c) => format!("expected {}, found {:?}", expected_str, c),
+                None => format!("expected {}, found end of input", expected_str),
+            }
+        }
+        RichReason::Custom(msg) => msg.to_string(),
+    }
+}
+
+/// Categorize a parse error to determine the diagnostic code
+fn categorize_parse_error(error: &Rich<'_, char, Span>) -> DiagnosticCode {
+    use chumsky::error::RichReason;
+
+    match error.reason() {
+        RichReason::Custom(msg) => {
+            if msg.contains("unclosed") || msg.contains("delimiter") {
+                DiagnosticCode::E002_UnclosedDelimiter
+            } else if msg.contains("escape") {
+                DiagnosticCode::E004_InvalidEscape
+            } else if msg.contains("literal") || msg.contains("number") {
+                DiagnosticCode::E003_InvalidLiteral
+            } else {
+                DiagnosticCode::E001_UnexpectedToken
+            }
+        }
+        _ => DiagnosticCode::E001_UnexpectedToken,
+    }
+}
+
+/// Convert multiple Rich errors to Diagnostics
+fn convert_parse_errors(errors: Vec<Rich<'_, char, Span>>, diags: &mut Diagnostics) {
+    for error in &errors {
+        diags.emit(rich_to_diagnostic(error));
+    }
+}
+
+// ============================================================================
 // Public API
 // ============================================================================
 
-/// Parse a Rill source file into an AST
-pub fn parse(input: &str) -> Result<Program, Vec<Rich<'_, char, Span>>> {
-    program().parse(input).into_result()
+/// Parse a Rill source file, emitting diagnostics on error
+///
+/// Returns `Some(Program)` if parsing succeeded, `None` if there were errors.
+/// Errors are emitted to the provided diagnostics accumulator.
+pub fn parse(input: &str, diags: &mut Diagnostics) -> Option<Program> {
+    match program().parse(input).into_result() {
+        Ok(program) => Some(program),
+        Err(errors) => {
+            convert_parse_errors(errors, diags);
+            None
+        }
+    }
 }
 
 /// Parse a single expression (useful for REPL or testing)
-pub fn parse_expression(input: &str) -> Result<Expression, Vec<Rich<'_, char, Span>>> {
-    whitespace()
+///
+/// Returns `Some(Expression)` if parsing succeeded, `None` if there were errors.
+/// Errors are emitted to the provided diagnostics accumulator.
+pub fn parse_expression(input: &str, diags: &mut Diagnostics) -> Option<Expression> {
+    let result = whitespace()
         .ignore_then(expression())
         .then_ignore(whitespace())
         .then_ignore(end())
         .parse(input)
-        .into_result()
+        .into_result();
+
+    match result {
+        Ok(expr) => Some(expr),
+        Err(errors) => {
+            convert_parse_errors(errors, diags);
+            None
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // Test helper: parse expression and return Result for easy assertion
+    fn try_parse_expr(input: &str) -> Result<Expression, ()> {
+        let mut diags = Diagnostics::new();
+        parse_expression(input, &mut diags).ok_or(())
+    }
+
+    // Test helper: parse program and return Result for easy assertion
+    fn try_parse(input: &str) -> Result<Program, ()> {
+        let mut diags = Diagnostics::new();
+        parse(input, &mut diags).ok_or(())
+    }
+
     #[test]
     fn test_parse_literals() {
-        assert!(parse_expression("42").is_ok());
-        assert!(parse_expression("-123").is_ok());
-        assert!(parse_expression("3.14").is_ok());
-        assert!(parse_expression("true").is_ok());
-        assert!(parse_expression("false").is_ok());
-        assert!(parse_expression("\"hello\"").is_ok());
-        assert!(parse_expression("[1, 2, 3]").is_ok());
-        assert!(parse_expression("{1: \"a\", 2: \"b\"}").is_ok());
+        assert!(try_parse_expr("42").is_ok());
+        assert!(try_parse_expr("-123").is_ok());
+        assert!(try_parse_expr("3.14").is_ok());
+        assert!(try_parse_expr("true").is_ok());
+        assert!(try_parse_expr("false").is_ok());
+        assert!(try_parse_expr("\"hello\"").is_ok());
+        assert!(try_parse_expr("[1, 2, 3]").is_ok());
+        assert!(try_parse_expr("{1: \"a\", 2: \"b\"}").is_ok());
     }
 
     #[test]
     fn test_parse_operators() {
-        assert!(parse_expression("1 + 2").is_ok());
-        assert!(parse_expression("1 + 2 * 3").is_ok());
-        assert!(parse_expression("(1 + 2) * 3").is_ok());
-        assert!(parse_expression("a && b || c").is_ok());
-        assert!(parse_expression("a == b").is_ok());
-        assert!(parse_expression("!x").is_ok());
-        assert!(parse_expression("-x").is_ok());
+        assert!(try_parse_expr("1 + 2").is_ok());
+        assert!(try_parse_expr("1 + 2 * 3").is_ok());
+        assert!(try_parse_expr("(1 + 2) * 3").is_ok());
+        assert!(try_parse_expr("a && b || c").is_ok());
+        assert!(try_parse_expr("a == b").is_ok());
+        assert!(try_parse_expr("!x").is_ok());
+        assert!(try_parse_expr("-x").is_ok());
     }
 
     #[test]
     fn test_parse_postfix() {
-        assert!(parse_expression("arr[0]").is_ok());
-        assert!(parse_expression("obj.field").is_ok());
-        assert!(parse_expression("func()").is_ok());
-        assert!(parse_expression("func(a, b)").is_ok());
-        assert!(parse_expression("arr[0].field").is_ok());
+        assert!(try_parse_expr("arr[0]").is_ok());
+        assert!(try_parse_expr("obj.field").is_ok());
+        assert!(try_parse_expr("func()").is_ok());
+        assert!(try_parse_expr("func(a, b)").is_ok());
+        assert!(try_parse_expr("arr[0].field").is_ok());
     }
 
     #[test]
     fn test_parse_namespaced_calls() {
         // Namespaced function calls use :: separator
-        assert!(parse_expression("bpsec::validate()").is_ok());
-        assert!(parse_expression("bpsec::validate(bundle)").is_ok());
-        assert!(parse_expression("cbor::decode(data, schema)").is_ok());
+        assert!(try_parse_expr("bpsec::validate()").is_ok());
+        assert!(try_parse_expr("bpsec::validate(bundle)").is_ok());
+        assert!(try_parse_expr("cbor::decode(data, schema)").is_ok());
 
         // Verify it produces the right AST structure
-        let result = parse_expression("bpsec::validate(bundle)").unwrap();
+        let result = try_parse_expr("bpsec::validate(bundle)").unwrap();
         match result {
             Expression::FunctionCall {
                 namespace,
@@ -1513,7 +1626,7 @@ mod tests {
         }
 
         // Simple call should have no namespace
-        let result = parse_expression("foo()").unwrap();
+        let result = try_parse_expr("foo()").unwrap();
         match result {
             Expression::FunctionCall { namespace, .. } => {
                 assert_eq!(namespace, None);
@@ -1522,7 +1635,7 @@ mod tests {
         }
 
         // Qualified name as expression (for constants)
-        let result = parse_expression("bpsec::MAX_TTL").unwrap();
+        let result = try_parse_expr("bpsec::MAX_TTL").unwrap();
         match result {
             Expression::QualifiedName { namespace, name } => {
                 assert_eq!(namespace, Identifier("bpsec".to_string()));
@@ -1540,61 +1653,61 @@ mod tests {
             }
         "#;
         assert!(
-            parse(program).is_err(),
+            try_parse(program).is_err(),
             "obj.field() should be a parse error - cannot call field access result"
         );
 
         // But obj.field (without call) is fine
-        assert!(parse_expression("obj.field").is_ok());
+        assert!(try_parse_expr("obj.field").is_ok());
 
         // And func().field is fine (accessing field on function result)
-        assert!(parse_expression("func().field").is_ok());
+        assert!(try_parse_expr("func().field").is_ok());
     }
 
     #[test]
     fn test_parse_if() {
-        assert!(parse_expression("if x { 1 }").is_ok());
-        assert!(parse_expression("if x { 1 } else { 2 }").is_ok());
+        assert!(try_parse_expr("if x { 1 }").is_ok());
+        assert!(try_parse_expr("if x { 1 } else { 2 }").is_ok());
         // Note: No ? needed in if let - the implicit presence check IS the point
-        assert!(parse_expression("if let y = x { y }").is_ok());
-        assert!(parse_expression("if x && let y = z { y }").is_ok());
+        assert!(try_parse_expr("if let y = x { y }").is_ok());
+        assert!(try_parse_expr("if x && let y = z { y }").is_ok());
     }
 
     #[test]
     fn test_parse_loops() {
-        assert!(parse_expression("while x { }").is_ok());
-        assert!(parse_expression("loop { }").is_ok());
-        assert!(parse_expression("for i in 0..10 { }").is_ok());
+        assert!(try_parse_expr("while x { }").is_ok());
+        assert!(try_parse_expr("loop { }").is_ok());
+        assert!(try_parse_expr("for i in 0..10 { }").is_ok());
         // Reference binding (default)
-        assert!(parse_expression("for item in array { }").is_ok());
+        assert!(try_parse_expr("for item in array { }").is_ok());
         // Value binding (explicit let)
-        assert!(parse_expression("for let item in array { }").is_ok());
-        assert!(parse_expression("for let i in 0..10 { }").is_ok());
+        assert!(try_parse_expr("for let item in array { }").is_ok());
+        assert!(try_parse_expr("for let i in 0..10 { }").is_ok());
         // Array destructuring for maps
-        assert!(parse_expression("for [k, v] in map { }").is_ok());
-        assert!(parse_expression("for let [k, v] in map { }").is_ok());
+        assert!(try_parse_expr("for [k, v] in map { }").is_ok());
+        assert!(try_parse_expr("for let [k, v] in map { }").is_ok());
         // Single element destructuring
-        assert!(parse_expression("for [x] in nested { }").is_ok());
+        assert!(try_parse_expr("for [x] in nested { }").is_ok());
     }
 
     #[test]
     fn test_parse_range_expressions() {
         // Basic range expressions
-        assert!(parse_expression("0..10").is_ok());
-        assert!(parse_expression("0..=10").is_ok());
-        assert!(parse_expression("a..b").is_ok());
+        assert!(try_parse_expr("0..10").is_ok());
+        assert!(try_parse_expr("0..=10").is_ok());
+        assert!(try_parse_expr("a..b").is_ok());
 
         // Range has lowest precedence: 1+2..3+4 is (1+2)..(3+4)
-        assert!(parse_expression("1 + 2 .. 3 + 4").is_ok());
-        assert!(parse_expression("n - 1 .. n + 1").is_ok());
+        assert!(try_parse_expr("1 + 2 .. 3 + 4").is_ok());
+        assert!(try_parse_expr("n - 1 .. n + 1").is_ok());
 
         // Range as first-class expression
-        assert!(parse_expression("(0..10)[5]").is_ok());
-        assert!(parse_expression("len(0..10)").is_ok());
+        assert!(try_parse_expr("(0..10)[5]").is_ok());
+        assert!(try_parse_expr("len(0..10)").is_ok());
 
         // Range with function calls
-        assert!(parse_expression("0..len(arr)").is_ok());
-        assert!(parse_expression("start()..end()").is_ok());
+        assert!(try_parse_expr("0..len(arr)").is_ok());
+        assert!(try_parse_expr("start()..end()").is_ok());
 
         // Range in various contexts
         let input = r#"
@@ -1604,7 +1717,7 @@ mod tests {
                 for i in 0..len(arr) { }
             }
         "#;
-        assert!(parse(input).is_ok());
+        assert!(try_parse(input).is_ok());
     }
 
     #[test]
@@ -1613,7 +1726,7 @@ mod tests {
             1 => { },
             _ => { },
         }"#;
-        assert!(parse_expression(input).is_ok());
+        assert!(try_parse_expr(input).is_ok());
 
         // Array patterns
         let input = r#"match x {
@@ -1622,7 +1735,7 @@ mod tests {
             [] => { },
             _ => { },
         }"#;
-        assert!(parse_expression(input).is_ok());
+        assert!(try_parse_expr(input).is_ok());
 
         // Mixed patterns
         let input = r#"match x {
@@ -1630,7 +1743,7 @@ mod tests {
             {key: value} => { },
             _ => { },
         }"#;
-        assert!(parse_expression(input).is_ok());
+        assert!(try_parse_expr(input).is_ok());
 
         // Rest patterns with ..
         let input = r#"match x {
@@ -1640,7 +1753,7 @@ mod tests {
             [..all] => { },
             _ => { },
         }"#;
-        assert!(parse_expression(input).is_ok());
+        assert!(try_parse_expr(input).is_ok());
 
         // Rest patterns with whitespace (permissive)
         let input = r#"match x {
@@ -1648,7 +1761,7 @@ mod tests {
             [first,  ..  middle  , last] => { },
             _ => { },
         }"#;
-        assert!(parse_expression(input).is_ok());
+        assert!(try_parse_expr(input).is_ok());
     }
 
     #[test]
@@ -1669,8 +1782,8 @@ mod tests {
                 return x + 1;
             }
         "#;
-        let result = parse(input);
-        assert!(result.is_ok(), "Parse error: {:?}", result.err());
+        let result = try_parse(input);
+        assert!(result.is_ok(), "Parse error");
         let program = result.unwrap();
         assert_eq!(program.imports.len(), 2);
         assert_eq!(program.constants.len(), 1);
@@ -1688,7 +1801,7 @@ mod tests {
                 }
             }
         "#;
-        assert!(parse(input).is_ok());
+        assert!(try_parse(input).is_ok());
 
         // Array destructuring
         let input = r#"
@@ -1700,7 +1813,7 @@ mod tests {
                 }
             }
         "#;
-        assert!(parse(input).is_ok());
+        assert!(try_parse(input).is_ok());
 
         // Rest patterns
         let input = r#"
@@ -1711,7 +1824,7 @@ mod tests {
                 }
             }
         "#;
-        assert!(parse(input).is_ok());
+        assert!(try_parse(input).is_ok());
 
         // Nested patterns
         let input = r#"
@@ -1723,7 +1836,7 @@ mod tests {
                 }
             }
         "#;
-        assert!(parse(input).is_ok());
+        assert!(try_parse(input).is_ok());
 
         // Type narrowing with type patterns (replaces as_X)
         let input = r#"
@@ -1735,7 +1848,7 @@ mod tests {
                 }
             }
         "#;
-        assert!(parse(input).is_ok());
+        assert!(try_parse(input).is_ok());
     }
 
     #[test]
@@ -1747,7 +1860,7 @@ mod tests {
                 let name = "hello";
             }
         "#;
-        assert!(parse(input).is_ok());
+        assert!(try_parse(input).is_ok());
 
         // Array destructuring
         let input = r#"
@@ -1757,7 +1870,7 @@ mod tests {
                 let [x] = single;
             }
         "#;
-        assert!(parse(input).is_ok());
+        assert!(try_parse(input).is_ok());
 
         // Rest patterns in let
         let input = r#"
@@ -1766,7 +1879,7 @@ mod tests {
                 let [head, ..middle, last] = arr;
             }
         "#;
-        assert!(parse(input).is_ok());
+        assert!(try_parse(input).is_ok());
 
         // Nested patterns
         let input = r#"
@@ -1774,50 +1887,50 @@ mod tests {
                 let [a, [b, c]] = nested;
             }
         "#;
-        assert!(parse(input).is_ok());
+        assert!(try_parse(input).is_ok());
     }
 
     #[test]
     fn test_parse_if_let_patterns() {
         // if let with single variable
-        assert!(parse_expression("if let x = expr { }").is_ok());
-        assert!(parse_expression("if let x = to_uint(y) { }").is_ok());
+        assert!(try_parse_expr("if let x = expr { }").is_ok());
+        assert!(try_parse_expr("if let x = to_uint(y) { }").is_ok());
 
         // if let with array pattern
-        assert!(parse_expression("if let [a, b] = arr { }").is_ok());
-        assert!(parse_expression("if let [first, second, third] = arr { }").is_ok());
+        assert!(try_parse_expr("if let [a, b] = arr { }").is_ok());
+        assert!(try_parse_expr("if let [first, second, third] = arr { }").is_ok());
 
         // if let with rest pattern
-        assert!(parse_expression("if let [first, ..rest] = arr { }").is_ok());
+        assert!(try_parse_expr("if let [first, ..rest] = arr { }").is_ok());
 
         // if let with nested patterns
-        assert!(parse_expression("if let [a, [b, c]] = nested { }").is_ok());
+        assert!(try_parse_expr("if let [a, [b, c]] = nested { }").is_ok());
 
         // if let chained with &&
-        assert!(parse_expression("if let [a, b] = arr && a > 0 { }").is_ok());
-        assert!(parse_expression("if cond && let [a, b] = arr { }").is_ok());
-        assert!(parse_expression("if let x = a && let y = b && x < y { }").is_ok());
+        assert!(try_parse_expr("if let [a, b] = arr && a > 0 { }").is_ok());
+        assert!(try_parse_expr("if cond && let [a, b] = arr { }").is_ok());
+        assert!(try_parse_expr("if let x = a && let y = b && x < y { }").is_ok());
 
         // if let with else
-        assert!(parse_expression("if let [a, b] = arr { } else { }").is_ok());
+        assert!(try_parse_expr("if let [a, b] = arr { } else { }").is_ok());
     }
 
     #[test]
     fn test_parse_if_with() {
         // if with - by-reference bindings in conditional
-        assert!(parse_expression("if with x = arr[0] { }").is_ok());
-        assert!(parse_expression("if with [a, b] = arr { }").is_ok());
+        assert!(try_parse_expr("if with x = arr[0] { }").is_ok());
+        assert!(try_parse_expr("if with [a, b] = arr { }").is_ok());
 
         // if with with rest pattern
-        assert!(parse_expression("if with [first, ..rest] = arr { }").is_ok());
+        assert!(try_parse_expr("if with [first, ..rest] = arr { }").is_ok());
 
         // if with chained with &&
-        assert!(parse_expression("if with x = arr[0] && x > 0 { }").is_ok());
-        assert!(parse_expression("if cond && with x = arr[0] { }").is_ok());
-        assert!(parse_expression("if with x = a && with y = b { }").is_ok());
+        assert!(try_parse_expr("if with x = arr[0] && x > 0 { }").is_ok());
+        assert!(try_parse_expr("if cond && with x = arr[0] { }").is_ok());
+        assert!(try_parse_expr("if with x = a && with y = b { }").is_ok());
 
         // Mixed if let and if with
-        assert!(parse_expression("if let x = to_uint(a) && with y = arr[0] { }").is_ok());
+        assert!(try_parse_expr("if let x = to_uint(a) && with y = arr[0] { }").is_ok());
 
         // if with in program context
         let input = r#"
@@ -1830,15 +1943,15 @@ mod tests {
                 }
             }
         "#;
-        assert!(parse(input).is_ok());
+        assert!(try_parse(input).is_ok());
     }
 
     #[test]
     fn test_parse_ignore_rest_pattern() {
         // .. without identifier (ignore rest)
-        assert!(parse_expression("match x { [a, ..] => { }, _ => { } }").is_ok());
-        assert!(parse_expression("match x { [.., last] => { }, _ => { } }").is_ok());
-        assert!(parse_expression("match x { [first, .., last] => { }, _ => { } }").is_ok());
+        assert!(try_parse_expr("match x { [a, ..] => { }, _ => { } }").is_ok());
+        assert!(try_parse_expr("match x { [.., last] => { }, _ => { } }").is_ok());
+        assert!(try_parse_expr("match x { [first, .., last] => { }, _ => { } }").is_ok());
 
         // in let statements
         let input = r#"
@@ -1847,7 +1960,7 @@ mod tests {
                 let [head, .., tail] = arr;
             }
         "#;
-        assert!(parse(input).is_ok());
+        assert!(try_parse(input).is_ok());
 
         // in with statements
         let input = r#"
@@ -1855,11 +1968,11 @@ mod tests {
                 with [first, ..] = arr;
             }
         "#;
-        assert!(parse(input).is_ok());
+        assert!(try_parse(input).is_ok());
 
         // in if let / if with
-        assert!(parse_expression("if let [a, b, ..] = arr { }").is_ok());
-        assert!(parse_expression("if with [first, ..] = arr { }").is_ok());
+        assert!(try_parse_expr("if let [a, b, ..] = arr { }").is_ok());
+        assert!(try_parse_expr("if with [first, ..] = arr { }").is_ok());
 
         // Mixed with captured rest
         let input = r#"match x {
@@ -1869,7 +1982,7 @@ mod tests {
             [a, ..middle, z] => { },
             _ => { },
         }"#;
-        assert!(parse_expression(input).is_ok());
+        assert!(try_parse_expr(input).is_ok());
     }
 
     #[test]
@@ -1879,7 +1992,7 @@ mod tests {
             [a, b] => { },
             _ => { },
         }"#;
-        assert!(parse_expression(input).is_ok());
+        assert!(try_parse_expr(input).is_ok());
 
         // Match with let prefix (by-value)
         let input = r#"match x {
@@ -1887,7 +2000,7 @@ mod tests {
             let y => { },
             _ => { },
         }"#;
-        assert!(parse_expression(input).is_ok());
+        assert!(try_parse_expr(input).is_ok());
 
         // Mixed let and non-let arms
         let input = r#"match x {
@@ -1895,7 +2008,7 @@ mod tests {
             let [c, d] => { },
             _ => { },
         }"#;
-        assert!(parse_expression(input).is_ok());
+        assert!(try_parse_expr(input).is_ok());
 
         // Let with guards
         let input = r#"match x {
@@ -1903,14 +2016,14 @@ mod tests {
             let y if y < 10 => { },
             _ => { },
         }"#;
-        assert!(parse_expression(input).is_ok());
+        assert!(try_parse_expr(input).is_ok());
 
         // Let with rest patterns
         let input = r#"match x {
             let [first, ..rest] => { },
             _ => { },
         }"#;
-        assert!(parse_expression(input).is_ok());
+        assert!(try_parse_expr(input).is_ok());
     }
 
     #[test]
@@ -1922,7 +2035,7 @@ mod tests {
             Array => { },
             _ => { },
         }"#;
-        assert!(parse_expression(input).is_ok());
+        assert!(try_parse_expr(input).is_ok());
 
         // Type pattern with simple binding
         let input = r#"match x {
@@ -1931,7 +2044,7 @@ mod tests {
             Bool(b) => { },
             _ => { },
         }"#;
-        assert!(parse_expression(input).is_ok());
+        assert!(try_parse_expr(input).is_ok());
 
         // Type pattern with nested destructuring
         let input = r#"match x {
@@ -1940,7 +2053,7 @@ mod tests {
             Map({key: value}) => { },
             _ => { },
         }"#;
-        assert!(parse_expression(input).is_ok());
+        assert!(try_parse_expr(input).is_ok());
 
         // Type pattern in let statement
         let input = r#"
@@ -1950,7 +2063,7 @@ mod tests {
                 let Array([first, second]) = data;
             }
         "#;
-        assert!(parse(input).is_ok());
+        assert!(try_parse(input).is_ok());
 
         // Type pattern in with statement
         let input = r#"
@@ -1961,14 +2074,14 @@ mod tests {
                 }
             }
         "#;
-        assert!(parse(input).is_ok());
+        assert!(try_parse(input).is_ok());
 
         // Type pattern in if let
-        assert!(parse_expression("if let UInt(n) = value { }").is_ok());
-        assert!(parse_expression("if let Text(s) = value && len(s) > 0 { }").is_ok());
+        assert!(try_parse_expr("if let UInt(n) = value { }").is_ok());
+        assert!(try_parse_expr("if let Text(s) = value && len(s) > 0 { }").is_ok());
 
         // Type pattern in if with
-        assert!(parse_expression("if with UInt(n) = value { n += 1; }").is_ok());
+        assert!(try_parse_expr("if with UInt(n) = value { n += 1; }").is_ok());
 
         // Type pattern with wildcard
         let input = r#"match x {
@@ -1976,7 +2089,7 @@ mod tests {
             Text(_) => { },
             _ => { },
         }"#;
-        assert!(parse_expression(input).is_ok());
+        assert!(try_parse_expr(input).is_ok());
 
         // All type names
         let input = r#"match x {
@@ -1990,6 +2103,46 @@ mod tests {
             Map(h) => { },
             _ => { },
         }"#;
-        assert!(parse_expression(input).is_ok());
+        assert!(try_parse_expr(input).is_ok());
+    }
+
+    #[test]
+    fn test_parse_diagnostics() {
+        // Test that parse errors are converted to diagnostics
+        let mut diags = Diagnostics::new();
+
+        // Valid input should succeed
+        let result = parse("fn test() { }", &mut diags);
+        assert!(result.is_some());
+        assert!(!diags.has_errors());
+
+        // Invalid input should fail and emit diagnostics
+        let mut diags = Diagnostics::new();
+        let result = parse("fn { }", &mut diags);
+        assert!(result.is_none());
+        assert!(diags.has_errors());
+        assert!(diags.error_count() >= 1);
+
+        // Check the diagnostic has appropriate code and span
+        let errors: Vec<_> = diags.errors().collect();
+        assert!(!errors.is_empty());
+        assert!(errors[0].span.is_some());
+    }
+
+    #[test]
+    fn test_parse_expr_diagnostics() {
+        // Test expression parsing with diagnostics
+        let mut diags = Diagnostics::new();
+
+        // Valid expression
+        let result = parse_expression("1 + 2", &mut diags);
+        assert!(result.is_some());
+        assert!(!diags.has_errors());
+
+        // Invalid expression
+        let mut diags = Diagnostics::new();
+        let result = parse_expression("1 +", &mut diags);
+        assert!(result.is_none());
+        assert!(diags.has_errors());
     }
 }

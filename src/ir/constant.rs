@@ -5,19 +5,35 @@
 //! - Compile-time evaluation of pure expressions with literal arguments
 //!
 //! Const evaluation delegates to builtin const evaluators registered in
-//! the BuiltinRegistry.
+//! the BuiltinRegistry. Shared const evaluation utilities are in the
+//! `const_eval` module.
 
 use super::*;
+use crate::ir::const_eval;
+
+/// Internal result type for const evaluation
+type ConstResult<T> = std::result::Result<T, String>;
 
 impl<'a> Lowerer<'a> {
     /// Lower a constant declaration
-    pub(super) fn lower_constant(&mut self, constant: &ast::Constant) -> Result<Vec<ConstBinding>> {
+    ///
+    /// Returns `Some(bindings)` on success, `None` on error (with diagnostic emitted).
+    pub fn lower_constant(&mut self, constant: &ast::Constant) -> Option<Vec<ConstBinding>> {
         // Evaluate the initializer expression at compile time
-        let value = self.const_eval_expr(&constant.value)?;
+        let value = match self.const_eval_expr(&constant.value) {
+            Ok(v) => v,
+            Err(msg) => {
+                self.error_const_eval(&msg, dummy_span());
+                return None;
+            }
+        };
 
         // Match the pattern and create bindings
         let mut bindings = Vec::new();
-        self.const_match_pattern(&constant.pattern.node, &value, &mut bindings)?;
+        if let Err(msg) = self.const_match_pattern(&constant.pattern.node, &value, &mut bindings) {
+            self.error_const_eval(&msg, dummy_span());
+            return None;
+        }
 
         // Add all bindings to const_bindings for future reference
         for binding in &bindings {
@@ -25,7 +41,7 @@ impl<'a> Lowerer<'a> {
                 .insert(binding.name.0.clone(), binding.value.clone());
         }
 
-        Ok(bindings)
+        Some(bindings)
     }
 
     // ========================================================================
@@ -33,30 +49,23 @@ impl<'a> Lowerer<'a> {
     // ========================================================================
 
     /// Evaluate an expression at compile time, returning a ConstValue
-    fn const_eval_expr(&self, expr: &ast::Expression) -> Result<ConstValue> {
+    fn const_eval_expr(&self, expr: &ast::Expression) -> ConstResult<ConstValue> {
         match expr {
             ast::Expression::Literal(lit) => self.const_eval_literal(lit),
 
             ast::Expression::Variable(name) => {
                 // Look up in const bindings
-                self.const_bindings
-                    .get(&name.0)
-                    .cloned()
-                    .ok_or_else(|| LowerError::SemanticError {
-                        message: format!("cannot use variable '{}' in constant expression", name.0),
-                        span: dummy_span(),
-                    })
+                self.const_bindings.get(&name.0).cloned().ok_or_else(|| {
+                    format!("cannot use variable '{}' in constant expression", name.0)
+                })
             }
 
             ast::Expression::QualifiedName { namespace, name } => {
                 // TODO: Look up in imported module's constants
-                Err(LowerError::SemanticError {
-                    message: format!(
-                        "namespaced constant '{}::{}' not yet supported",
-                        namespace.0, name.0
-                    ),
-                    span: dummy_span(),
-                })
+                Err(format!(
+                    "namespaced constant '{}::{}' not yet supported",
+                    namespace.0, name.0
+                ))
             }
 
             ast::Expression::BinaryOp { left, op, right } => {
@@ -74,39 +83,35 @@ impl<'a> Lowerer<'a> {
             ast::Expression::ArrayAccess { array, index } => {
                 let arr = self.const_eval_expr(array)?;
                 let idx = self.const_eval_expr(index)?;
-                self.const_index(&arr, &idx)
+                self.const_index_expr(&arr, &idx)
             }
 
             ast::Expression::MemberAccess { object, member } => {
                 let obj = self.const_eval_expr(object)?;
                 let key = self.const_eval_expr(member)?;
-                self.const_index(&obj, &key)
+                self.const_index_expr(&obj, &key)
             }
 
             // Control flow and assignment are not allowed in const expressions
-            // TODO: Could support if/match/block by evaluating at compile time,
-            // but loops would need termination analysis. Keep it simple for now.
             ast::Expression::Block { .. }
             | ast::Expression::If { .. }
             | ast::Expression::While { .. }
             | ast::Expression::Loop { .. }
             | ast::Expression::For { .. }
             | ast::Expression::Match { .. }
-            | ast::Expression::Range { .. } => Err(LowerError::SemanticError {
-                message: "control flow not allowed in constant expression".to_string(),
-                span: dummy_span(),
-            }),
+            | ast::Expression::Range { .. } => {
+                Err("control flow not allowed in constant expression".to_string())
+            }
 
             // Assignment has side effects - not allowed in const expressions
-            ast::Expression::Assignment { .. } => Err(LowerError::SemanticError {
-                message: "assignment not allowed in constant expression".to_string(),
-                span: dummy_span(),
-            }),
+            ast::Expression::Assignment { .. } => {
+                Err("assignment not allowed in constant expression".to_string())
+            }
         }
     }
 
     /// Convert a literal to a ConstValue
-    fn const_eval_literal(&self, lit: &ast::Literal) -> Result<ConstValue> {
+    fn const_eval_literal(&self, lit: &ast::Literal) -> ConstResult<ConstValue> {
         match lit {
             ast::Literal::Bool(b) => Ok(ConstValue::Bool(*b)),
             ast::Literal::UInt(n) => Ok(ConstValue::UInt(*n)),
@@ -115,12 +120,12 @@ impl<'a> Lowerer<'a> {
             ast::Literal::Text(s) => Ok(ConstValue::Text(s.clone())),
             ast::Literal::Bytes(b) => Ok(ConstValue::Bytes(b.clone())),
             ast::Literal::Array(elements) => {
-                let values: Result<Vec<_>> =
+                let values: ConstResult<Vec<_>> =
                     elements.iter().map(|e| self.const_eval_expr(e)).collect();
                 Ok(ConstValue::Array(values?))
             }
             ast::Literal::Map(entries) => {
-                let pairs: Result<Vec<_>> = entries
+                let pairs: ConstResult<Vec<_>> = entries
                     .iter()
                     .map(|(k, v)| Ok((self.const_eval_expr(k)?, self.const_eval_expr(v)?)))
                     .collect();
@@ -135,7 +140,7 @@ impl<'a> Lowerer<'a> {
         left: &ast::Expression,
         op: &ast::BinaryOperator,
         right: &ast::Expression,
-    ) -> Result<ConstValue> {
+    ) -> ConstResult<ConstValue> {
         // Short-circuit evaluation for && and ||
         match op {
             ast::BinaryOperator::And => {
@@ -158,26 +163,52 @@ impl<'a> Lowerer<'a> {
         let lhs = self.const_eval_expr(left)?;
         let rhs = self.const_eval_expr(right)?;
 
-        // Map operator to builtin name
+        // Reflexive comparison operators expand to combinations of eq/lt/not
+        match op {
+            // a != b  →  not(eq(a, b))
+            ast::BinaryOperator::NotEqual => {
+                let eq_result = self.call_const_builtin("core::eq", &[lhs, rhs])?;
+                return self.call_const_builtin("core::not", &[eq_result]);
+            }
+            // a > b  →  lt(b, a)  (swap operands)
+            ast::BinaryOperator::Greater => {
+                return self.call_const_builtin("core::lt", &[rhs, lhs]);
+            }
+            // a <= b  →  not(lt(b, a))
+            ast::BinaryOperator::LessEqual => {
+                let lt_result = self.call_const_builtin("core::lt", &[rhs, lhs])?;
+                return self.call_const_builtin("core::not", &[lt_result]);
+            }
+            // a >= b  →  not(lt(a, b))
+            ast::BinaryOperator::GreaterEqual => {
+                let lt_result = self.call_const_builtin("core::lt", &[lhs, rhs])?;
+                return self.call_const_builtin("core::not", &[lt_result]);
+            }
+            _ => {}
+        }
+
+        // Direct builtin mapping for remaining operators
         let builtin_name = match op {
-            ast::BinaryOperator::Add => "core.add",
-            ast::BinaryOperator::Subtract => "core.sub",
-            ast::BinaryOperator::Multiply => "core.mul",
-            ast::BinaryOperator::Divide => "core.div",
-            ast::BinaryOperator::Modulo => "core.mod",
-            ast::BinaryOperator::Equal => "core.eq",
-            ast::BinaryOperator::NotEqual => "core.neq",
-            ast::BinaryOperator::Less => "core.lt",
-            ast::BinaryOperator::LessEqual => "core.le",
-            ast::BinaryOperator::Greater => "core.gt",
-            ast::BinaryOperator::GreaterEqual => "core.ge",
-            ast::BinaryOperator::BitwiseAnd => "core.bit_and",
-            ast::BinaryOperator::BitwiseOr => "core.bit_or",
-            ast::BinaryOperator::BitwiseXor => "core.bit_xor",
-            ast::BinaryOperator::ShiftLeft => "core.shl",
-            ast::BinaryOperator::ShiftRight => "core.shr",
-            ast::BinaryOperator::BitTest => "core.bit_test",
-            ast::BinaryOperator::And | ast::BinaryOperator::Or => unreachable!(),
+            ast::BinaryOperator::Add => "core::add",
+            ast::BinaryOperator::Subtract => "core::sub",
+            ast::BinaryOperator::Multiply => "core::mul",
+            ast::BinaryOperator::Divide => "core::div",
+            ast::BinaryOperator::Modulo => "core::mod",
+            ast::BinaryOperator::Equal => "core::eq",
+            ast::BinaryOperator::Less => "core::lt",
+            ast::BinaryOperator::BitwiseAnd => "core::bit_and",
+            ast::BinaryOperator::BitwiseOr => "core::bit_or",
+            ast::BinaryOperator::BitwiseXor => "core::bit_xor",
+            ast::BinaryOperator::ShiftLeft => "core::shl",
+            ast::BinaryOperator::ShiftRight => "core::shr",
+            ast::BinaryOperator::BitTest => "core::bit_test",
+            // Already handled above
+            ast::BinaryOperator::NotEqual
+            | ast::BinaryOperator::Greater
+            | ast::BinaryOperator::LessEqual
+            | ast::BinaryOperator::GreaterEqual
+            | ast::BinaryOperator::And
+            | ast::BinaryOperator::Or => unreachable!(),
         };
 
         self.call_const_builtin(builtin_name, &[lhs, rhs])
@@ -188,13 +219,13 @@ impl<'a> Lowerer<'a> {
         &self,
         op: &ast::UnaryOperator,
         operand: &ast::Expression,
-    ) -> Result<ConstValue> {
+    ) -> ConstResult<ConstValue> {
         let arg = self.const_eval_expr(operand)?;
 
         let builtin_name = match op {
-            ast::UnaryOperator::Negate => "core.neg",
-            ast::UnaryOperator::Not => "core.not",
-            ast::UnaryOperator::BitwiseNot => "core.bit_not",
+            ast::UnaryOperator::Negate => "core::neg",
+            ast::UnaryOperator::Not => "core::not",
+            ast::UnaryOperator::BitwiseNot => "core::bit_not",
         };
 
         self.call_const_builtin(builtin_name, &[arg])
@@ -206,9 +237,9 @@ impl<'a> Lowerer<'a> {
         namespace: Option<&ast::Identifier>,
         name: &ast::Identifier,
         arguments: &[ast::Expression],
-    ) -> Result<ConstValue> {
+    ) -> ConstResult<ConstValue> {
         // Evaluate all arguments first
-        let args: Result<Vec<_>> = arguments.iter().map(|e| self.const_eval_expr(e)).collect();
+        let args: ConstResult<Vec<_>> = arguments.iter().map(|e| self.const_eval_expr(e)).collect();
         let args = args?;
 
         // Build the full function name
@@ -221,60 +252,27 @@ impl<'a> Lowerer<'a> {
     }
 
     /// Call a builtin's const evaluator
-    fn call_const_builtin(&self, name: &str, args: &[ConstValue]) -> Result<ConstValue> {
+    fn call_const_builtin(&self, name: &str, args: &[ConstValue]) -> ConstResult<ConstValue> {
         // Look up the builtin
         let builtin = self
             .builtins
             .get(name)
-            .ok_or_else(|| LowerError::SemanticError {
-                message: format!("unknown function '{}' in constant expression", name),
-                span: dummy_span(),
-            })?;
+            .ok_or_else(|| format!("unknown function '{}' in constant expression", name))?;
 
         // Check if it's a const function
         let const_eval =
-            builtin
-                .meta
-                .purity
-                .const_eval()
-                .ok_or_else(|| LowerError::SemanticError {
-                    message: format!("function '{}' cannot be used in constant expression", name),
-                    span: dummy_span(),
-                })?;
+            builtin.meta.purity.const_eval().ok_or_else(|| {
+                format!("function '{}' cannot be used in constant expression", name)
+            })?;
 
         // Call the const evaluator
-        const_eval(args).ok_or_else(|| LowerError::SemanticError {
-            message: format!("constant evaluation of '{}' failed", name),
-            span: dummy_span(),
-        })
+        const_eval(args).ok_or_else(|| format!("constant evaluation of '{}' failed", name))
     }
 
     /// Index into a const array or map
-    fn const_index(&self, base: &ConstValue, key: &ConstValue) -> Result<ConstValue> {
-        match (base, key) {
-            (ConstValue::Array(arr), ConstValue::UInt(idx)) => arr
-                .get(*idx as usize)
-                .cloned()
-                .ok_or_else(|| LowerError::SemanticError {
-                    message: format!("array index {} out of bounds", idx),
-                    span: dummy_span(),
-                }),
-            (ConstValue::Map(entries), key) => {
-                for (k, v) in entries {
-                    if k == key {
-                        return Ok(v.clone());
-                    }
-                }
-                Err(LowerError::SemanticError {
-                    message: "key not found in map".to_string(),
-                    span: dummy_span(),
-                })
-            }
-            _ => Err(LowerError::SemanticError {
-                message: "invalid indexing in constant expression".to_string(),
-                span: dummy_span(),
-            }),
-        }
+    fn const_index_expr(&self, base: &ConstValue, key: &ConstValue) -> ConstResult<ConstValue> {
+        const_eval::const_index(base, key)
+            .ok_or_else(|| "indexing failed in constant expression".to_string())
     }
 
     /// Match a pattern against a const value and produce bindings
@@ -283,7 +281,7 @@ impl<'a> Lowerer<'a> {
         pattern: &ast::Pattern,
         value: &ConstValue,
         bindings: &mut Vec<ConstBinding>,
-    ) -> Result<()> {
+    ) -> ConstResult<()> {
         match pattern {
             ast::Pattern::Wildcard => {
                 // Ignore the value
@@ -304,34 +302,25 @@ impl<'a> Lowerer<'a> {
                 if value == &expected {
                     Ok(())
                 } else {
-                    Err(LowerError::SemanticError {
-                        message: "constant pattern match failed".to_string(),
-                        span: dummy_span(),
-                    })
+                    Err("constant pattern match failed".to_string())
                 }
             }
 
             ast::Pattern::Array(patterns) => {
                 if let ConstValue::Array(elements) = value {
                     if elements.len() != patterns.len() {
-                        return Err(LowerError::SemanticError {
-                            message: format!(
-                                "array pattern has {} elements but value has {}",
-                                patterns.len(),
-                                elements.len()
-                            ),
-                            span: dummy_span(),
-                        });
+                        return Err(format!(
+                            "array pattern has {} elements but value has {}",
+                            patterns.len(),
+                            elements.len()
+                        ));
                     }
                     for (pat, val) in patterns.iter().zip(elements.iter()) {
                         self.const_match_pattern(&pat.node, val, bindings)?;
                     }
                     Ok(())
                 } else {
-                    Err(LowerError::SemanticError {
-                        message: "expected array in constant pattern".to_string(),
-                        span: dummy_span(),
-                    })
+                    Err("expected array in constant pattern".to_string())
                 }
             }
 
@@ -343,14 +332,11 @@ impl<'a> Lowerer<'a> {
                 if let ConstValue::Array(elements) = value {
                     let min_len = before.len() + after.len();
                     if elements.len() < min_len {
-                        return Err(LowerError::SemanticError {
-                            message: format!(
-                                "array pattern requires at least {} elements but value has {}",
-                                min_len,
-                                elements.len()
-                            ),
-                            span: dummy_span(),
-                        });
+                        return Err(format!(
+                            "array pattern requires at least {} elements but value has {}",
+                            min_len,
+                            elements.len()
+                        ));
                     }
 
                     // Match before patterns
@@ -375,10 +361,7 @@ impl<'a> Lowerer<'a> {
 
                     Ok(())
                 } else {
-                    Err(LowerError::SemanticError {
-                        message: "expected array in constant pattern".to_string(),
-                        span: dummy_span(),
-                    })
+                    Err("expected array in constant pattern".to_string())
                 }
             }
 
@@ -389,10 +372,7 @@ impl<'a> Lowerer<'a> {
                         let key = match &key_pat.node {
                             ast::Pattern::Literal(lit) => self.const_eval_literal(lit)?,
                             _ => {
-                                return Err(LowerError::SemanticError {
-                                    message: "map pattern key must be a literal".to_string(),
-                                    span: dummy_span(),
-                                });
+                                return Err("map pattern key must be a literal".to_string());
                             }
                         };
 
@@ -401,19 +381,13 @@ impl<'a> Lowerer<'a> {
                             .iter()
                             .find(|(k, _)| k == &key)
                             .map(|(_, v)| v)
-                            .ok_or_else(|| LowerError::SemanticError {
-                                message: "key not found in map constant".to_string(),
-                                span: dummy_span(),
-                            })?;
+                            .ok_or_else(|| "key not found in map constant".to_string())?;
 
                         self.const_match_pattern(&val_pat.node, map_value, bindings)?;
                     }
                     Ok(())
                 } else {
-                    Err(LowerError::SemanticError {
-                        message: "expected map in constant pattern".to_string(),
-                        span: dummy_span(),
-                    })
+                    Err("expected map in constant pattern".to_string())
                 }
             }
 
@@ -432,10 +406,10 @@ impl<'a> Lowerer<'a> {
                 );
 
                 if !type_matches {
-                    return Err(LowerError::SemanticError {
-                        message: format!("type pattern '{}' does not match value", type_name.0),
-                        span: dummy_span(),
-                    });
+                    return Err(format!(
+                        "type pattern '{}' does not match value",
+                        type_name.0
+                    ));
                 }
 
                 // Match inner binding if present

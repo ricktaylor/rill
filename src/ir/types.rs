@@ -12,10 +12,9 @@
 //!   variables are stack slots, mutations go through captured base+key
 
 use super::*;
-use std::collections::BTreeSet;
 
-// Re-export BaseType so submodules can access it via types::BaseType
-pub use crate::types::BaseType;
+// Re-export types from the shared types module
+pub use crate::types::{BaseType, TypeSet};
 
 // ============================================================================
 // Builtin Operations
@@ -36,102 +35,6 @@ pub enum IntrinsicOp {
 
     /// Logical OR with short-circuit evaluation
     Or,
-}
-
-/// Set of possible types for an SSA value
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TypeSet {
-    pub types: BTreeSet<BaseType>,
-    pub maybe_undefined: bool,
-}
-
-impl TypeSet {
-    /// Create a type set containing only one type (not undefined)
-    pub fn single(ty: BaseType) -> Self {
-        let mut types = BTreeSet::new();
-        types.insert(ty);
-        TypeSet {
-            types,
-            maybe_undefined: false,
-        }
-    }
-
-    /// Create a type set that is just "undefined" (no concrete types)
-    pub fn undefined() -> Self {
-        TypeSet {
-            types: BTreeSet::new(),
-            maybe_undefined: true,
-        }
-    }
-
-    /// Create a type set from multiple types (not undefined)
-    pub fn from_types(types: impl IntoIterator<Item = BaseType>) -> Self {
-        TypeSet {
-            types: types.into_iter().collect(),
-            maybe_undefined: false,
-        }
-    }
-
-    /// Union of two type sets (for phi nodes)
-    pub fn union(&self, other: &TypeSet) -> TypeSet {
-        TypeSet {
-            types: self.types.union(&other.types).copied().collect(),
-            maybe_undefined: self.maybe_undefined || other.maybe_undefined,
-        }
-    }
-
-    /// Intersection of two type sets
-    pub fn intersection(&self, other: &TypeSet) -> TypeSet {
-        TypeSet {
-            types: self.types.intersection(&other.types).copied().collect(),
-            maybe_undefined: self.maybe_undefined && other.maybe_undefined,
-        }
-    }
-
-    /// Type after successful presence check - guarantees value is defined
-    pub fn unwrapped(&self) -> TypeSet {
-        TypeSet {
-            types: self.types.clone(),
-            maybe_undefined: false,
-        }
-    }
-
-    /// Make this type optional (might be undefined)
-    pub fn as_optional(&self) -> TypeSet {
-        TypeSet {
-            types: self.types.clone(),
-            maybe_undefined: true,
-        }
-    }
-
-    /// Check if type set includes a specific type
-    pub fn contains(&self, ty: BaseType) -> bool {
-        self.types.contains(&ty)
-    }
-
-    /// Check if type set is empty (unreachable code)
-    pub fn is_empty(&self) -> bool {
-        self.types.is_empty() && !self.maybe_undefined
-    }
-
-    /// Check if this type set can be used in a boolean context
-    pub fn is_boolean(&self) -> bool {
-        self.types.len() == 1 && self.types.contains(&BaseType::Bool) && !self.maybe_undefined
-    }
-
-    /// Check if this type set contains only numeric types
-    pub fn is_numeric(&self) -> bool {
-        !self.types.is_empty()
-            && self
-                .types
-                .iter()
-                .all(|t| matches!(t, BaseType::UInt | BaseType::Int | BaseType::Float))
-    }
-
-    /// Check if this value might be undefined
-    pub fn is_optional(&self) -> bool {
-        self.maybe_undefined
-    }
 }
 
 // ============================================================================
@@ -191,14 +94,6 @@ pub enum Instruction {
         value: VarId,
     },
 
-    /// Conditional select: dest = cond ? then_val : else_val
-    Select {
-        dest: VarId,
-        cond: VarId,
-        then_val: VarId,
-        else_val: VarId,
-    },
-
     /// Intrinsic operation (pure, can be optimized)
     Intrinsic {
         dest: VarId,
@@ -231,6 +126,19 @@ pub struct FunctionRef {
     pub name: ast::Identifier,
 }
 
+impl FunctionRef {
+    /// Get the fully qualified name using `::` as separator
+    ///
+    /// This matches the naming convention used by the builtin registry.
+    /// Examples: "core::add", "str::len", "my_function"
+    pub fn qualified_name(&self) -> String {
+        match &self.namespace {
+            Some(ns) => format!("{}::{}", ns.0, self.name.0),
+            None => self.name.0.clone(),
+        }
+    }
+}
+
 /// Argument to a function call with binding mode
 #[derive(Debug, Clone)]
 pub struct CallArg {
@@ -242,7 +150,7 @@ pub struct CallArg {
 // Literals
 // ============================================================================
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Literal {
     Bool(bool),
     UInt(u64),
@@ -260,11 +168,14 @@ pub enum Literal {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BlockId(pub u32);
 
+/// A spanned instruction for source location tracking
+pub type SpannedInst = crate::ast::Spanned<Instruction>;
+
 /// Basic block in SSA form
 #[derive(Debug, Clone)]
 pub struct BasicBlock {
     pub id: BlockId,
-    pub instructions: Vec<Instruction>,
+    pub instructions: Vec<SpannedInst>,
     pub terminator: Terminator,
 }
 
@@ -279,6 +190,7 @@ pub enum Terminator {
         condition: VarId,
         then_target: BlockId,
         else_target: BlockId,
+        span: crate::ast::Span,
     },
 
     /// Dispatch on type (for type patterns)
@@ -286,6 +198,7 @@ pub enum Terminator {
         value: VarId,
         arms: Vec<(MatchPattern, BlockId)>,
         default: BlockId,
+        span: crate::ast::Span,
     },
 
     /// Branch on presence (for if let/if with, is_some checks)
@@ -293,6 +206,7 @@ pub enum Terminator {
         value: VarId,
         defined: BlockId,
         undefined: BlockId,
+        span: crate::ast::Span,
     },
 
     /// Return from function
@@ -300,6 +214,34 @@ pub enum Terminator {
 
     /// Hard exit to driver (from diverging builtins like drop())
     Exit { value: VarId },
+
+    /// Unreachable code (placeholder after merging)
+    Unreachable,
+}
+
+impl Terminator {
+    /// Returns all successor block IDs for this terminator
+    pub fn successors(&self) -> Vec<BlockId> {
+        match self {
+            Terminator::Jump { target } => vec![*target],
+            Terminator::If {
+                then_target,
+                else_target,
+                ..
+            } => vec![*then_target, *else_target],
+            Terminator::Match { arms, default, .. } => {
+                let mut succs: Vec<BlockId> = arms.iter().map(|(_, b)| *b).collect();
+                succs.push(*default);
+                succs
+            }
+            Terminator::Guard {
+                defined, undefined, ..
+            } => vec![*defined, *undefined],
+            Terminator::Return { .. } | Terminator::Exit { .. } | Terminator::Unreachable => {
+                vec![]
+            }
+        }
+    }
 }
 
 /// Pattern for Match terminator arms

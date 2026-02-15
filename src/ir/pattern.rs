@@ -10,12 +10,14 @@ impl<'a> Lowerer<'a> {
     // ========================================================================
 
     /// Lower a pattern binding (for let/with statements)
-    pub(super) fn lower_pattern_binding(
+    ///
+    /// Emits diagnostics on error and continues processing.
+    pub fn lower_pattern_binding(
         &mut self,
         pattern: &ast::Pattern,
         value: VarId,
         mode: BindingMode,
-    ) -> Result<()> {
+    ) {
         match pattern {
             ast::Pattern::Wildcard => {
                 // Ignore the value
@@ -51,14 +53,14 @@ impl<'a> Lowerer<'a> {
                         value: Literal::UInt(i as u64),
                     });
 
-                    let elem = self.new_temp(TypeSet::from_types(all_types()).as_optional());
+                    let elem = self.new_temp(TypeSet::all());
                     self.emit(Instruction::Index {
                         dest: elem,
                         base: value,
                         key: idx,
                     });
 
-                    self.lower_pattern_binding(&pat.node, elem, mode)?;
+                    self.lower_pattern_binding(&pat.node, elem, mode);
                 }
             }
 
@@ -76,14 +78,14 @@ impl<'a> Lowerer<'a> {
                         value: Literal::UInt(i as u64),
                     });
 
-                    let elem = self.new_temp(TypeSet::from_types(all_types()).as_optional());
+                    let elem = self.new_temp(TypeSet::all());
                     self.emit(Instruction::Index {
                         dest: elem,
                         base: value,
                         key: idx,
                     });
 
-                    self.lower_pattern_binding(&pat.node, elem, mode)?;
+                    self.lower_pattern_binding(&pat.node, elem, mode);
                 }
 
                 if let Some(rest_name) = rest {
@@ -110,11 +112,10 @@ impl<'a> Lowerer<'a> {
                 // TODO: Type patterns need Match terminator
                 // For now, just bind if there's a binding pattern
                 if let Some(inner) = binding {
-                    self.lower_pattern_binding(&inner.node, value, mode)?;
+                    self.lower_pattern_binding(&inner.node, value, mode);
                 }
                 let _ = type_name;
             }
         }
-        Ok(())
     }
 }

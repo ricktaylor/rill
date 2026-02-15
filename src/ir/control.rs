@@ -10,14 +10,14 @@ impl<'a> Lowerer<'a> {
     // ========================================================================
 
     /// Lower an if expression
-    pub(super) fn lower_if(
+    pub fn lower_if(
         &mut self,
         conditions: &[ast::IfCondition],
         then_block: &[ast::Stmt],
         then_expr: &Option<Box<ast::Expression>>,
         else_block: &Option<Vec<ast::Stmt>>,
         else_expr: &Option<Box<ast::Expression>>,
-    ) -> Result<VarId> {
+    ) -> VarId {
         let else_bb = self.fresh_block();
         let join_bb = self.fresh_block();
 
@@ -30,12 +30,13 @@ impl<'a> Lowerer<'a> {
             match condition {
                 ast::IfCondition::Bool(expr) => {
                     // Lower boolean expression and branch
-                    let cond_var = self.lower_expression(expr)?;
+                    let cond_var = self.lower_expression(expr);
                     let next_bb = self.fresh_block();
                     self.finish_block(Terminator::If {
                         condition: cond_var,
                         then_target: next_bb,
                         else_target: else_bb,
+                        span: dummy_span(),
                     });
                     self.current_block = next_bb;
                     self.current_instructions = Vec::new();
@@ -43,26 +44,26 @@ impl<'a> Lowerer<'a> {
 
                 ast::IfCondition::Let { pattern, value } => {
                     // Lower value and check if pattern matches
-                    let value_var = self.lower_expression(value)?;
-                    self.lower_if_pattern(pattern, value_var, BindingMode::Value, else_bb)?;
+                    let value_var = self.lower_expression(value);
+                    self.lower_if_pattern(pattern, value_var, BindingMode::Value, else_bb);
                 }
 
                 ast::IfCondition::With { pattern, value } => {
                     // Lower value and check if pattern matches (by-reference)
-                    let value_var = self.lower_expression(value)?;
-                    self.lower_if_pattern(pattern, value_var, BindingMode::Reference, else_bb)?;
+                    let value_var = self.lower_expression(value);
+                    self.lower_if_pattern(pattern, value_var, BindingMode::Reference, else_bb);
                 }
             }
         }
 
         // All conditions passed - execute then-block
         for stmt in then_block {
-            self.lower_statement(&stmt.node)?;
+            self.lower_statement(&stmt.node);
         }
         let then_value = if let Some(expr) = then_expr {
-            self.lower_expression(expr)?
+            self.lower_expression(expr)
         } else {
-            let dest = self.new_temp(TypeSet::undefined());
+            let dest = self.new_temp(TypeSet::empty());
             self.emit(Instruction::Undefined { dest });
             dest
         };
@@ -77,13 +78,13 @@ impl<'a> Lowerer<'a> {
 
         if let Some(stmts) = else_block {
             for stmt in stmts {
-                self.lower_statement(&stmt.node)?;
+                self.lower_statement(&stmt.node);
             }
         }
         let else_value = if let Some(expr) = else_expr {
-            self.lower_expression(expr)?
+            self.lower_expression(expr)
         } else {
-            let dest = self.new_temp(TypeSet::undefined());
+            let dest = self.new_temp(TypeSet::empty());
             self.emit(Instruction::Undefined { dest });
             dest
         };
@@ -95,13 +96,13 @@ impl<'a> Lowerer<'a> {
         self.current_block = join_bb;
         self.current_instructions = Vec::new();
 
-        let result = self.new_temp(TypeSet::from_types(all_types()).as_optional());
+        let result = self.new_temp(TypeSet::all());
         self.emit(Instruction::Phi {
             dest: result,
             sources: vec![(then_exit_block, then_value), (else_exit_block, else_value)],
         });
 
-        Ok(result)
+        result
     }
 
     /// Lower a pattern match for if-let/if-with conditions
@@ -117,7 +118,7 @@ impl<'a> Lowerer<'a> {
         value: VarId,
         mode: BindingMode,
         else_bb: BlockId,
-    ) -> Result<()> {
+    ) {
         match &pattern.node {
             ast::Pattern::Wildcard => {
                 // Always matches, binds nothing
@@ -152,14 +153,14 @@ impl<'a> Lowerer<'a> {
                         dest: idx,
                         value: Literal::UInt(i as u64),
                     });
-                    let elem = self.new_temp(TypeSet::from_types(all_types()).as_optional());
+                    let elem = self.new_temp(TypeSet::all());
                     self.emit(Instruction::Index {
                         dest: elem,
                         base: value,
                         key: idx,
                     });
                     // Recursively match element pattern
-                    self.lower_if_pattern(elem_pat, elem, mode, else_bb)?;
+                    self.lower_if_pattern(elem_pat, elem, mode, else_bb);
                 }
             }
 
@@ -171,12 +172,20 @@ impl<'a> Lowerer<'a> {
 
             ast::Pattern::Type { type_name, binding } => {
                 // Match checks type AND rejects undefined (no Guard needed)
-                let base_type = self.type_name_to_base_type(type_name)?;
-                self.emit_match(value, MatchPattern::Type(base_type), else_bb);
+                if let Some(base_type) = self.type_name_to_base_type(type_name) {
+                    self.emit_match(value, MatchPattern::Type(base_type), else_bb);
+                } else {
+                    // Unknown type - always fail to else
+                    self.finish_block(Terminator::Jump { target: else_bb });
+                    let unreachable_bb = self.fresh_block();
+                    self.current_block = unreachable_bb;
+                    self.current_instructions = Vec::new();
+                    return;
+                }
 
                 // If there's a nested binding, process it
                 if let Some(inner_pat) = binding {
-                    self.lower_if_pattern(inner_pat.as_ref(), value, mode, else_bb)?;
+                    self.lower_if_pattern(inner_pat.as_ref(), value, mode, else_bb);
                 }
             }
 
@@ -196,13 +205,13 @@ impl<'a> Lowerer<'a> {
                         dest: idx,
                         value: Literal::UInt(i as u64),
                     });
-                    let elem = self.new_temp(TypeSet::from_types(all_types()).as_optional());
+                    let elem = self.new_temp(TypeSet::all());
                     self.emit(Instruction::Index {
                         dest: elem,
                         base: value,
                         key: idx,
                     });
-                    self.lower_if_pattern(pat, elem, mode, else_bb)?;
+                    self.lower_if_pattern(pat, elem, mode, else_bb);
                 }
 
                 // Bind rest if present (requires slice builtin - TODO)
@@ -224,7 +233,6 @@ impl<'a> Lowerer<'a> {
                 self.emit_match(value, MatchPattern::Type(types::BaseType::Map), else_bb);
             }
         }
-        Ok(())
     }
 
     /// Emit Guard terminator: check value is defined
@@ -236,6 +244,7 @@ impl<'a> Lowerer<'a> {
             value,
             defined: ok_bb,
             undefined: fail_bb,
+            span: dummy_span(),
         });
         self.current_block = ok_bb;
         self.current_instructions = Vec::new();
@@ -251,6 +260,7 @@ impl<'a> Lowerer<'a> {
             value,
             arms: vec![(pattern, ok_bb)],
             default: fail_bb,
+            span: dummy_span(),
         });
         self.current_block = ok_bb;
         self.current_instructions = Vec::new();
@@ -271,30 +281,31 @@ impl<'a> Lowerer<'a> {
     }
 
     /// Convert type name to BaseType
-    fn type_name_to_base_type(&self, name: &ast::Identifier) -> Result<types::BaseType> {
+    /// Returns None and emits diagnostic for unknown types
+    fn type_name_to_base_type(&mut self, name: &ast::Identifier) -> Option<types::BaseType> {
         match name.0.as_str() {
-            "Bool" => Ok(types::BaseType::Bool),
-            "UInt" => Ok(types::BaseType::UInt),
-            "Int" => Ok(types::BaseType::Int),
-            "Float" => Ok(types::BaseType::Float),
-            "Text" => Ok(types::BaseType::Text),
-            "Bytes" => Ok(types::BaseType::Bytes),
-            "Array" => Ok(types::BaseType::Array),
-            "Map" => Ok(types::BaseType::Map),
-            _ => Err(LowerError::SemanticError {
-                message: format!("unknown type '{}'", name.0),
-                span: dummy_span(),
-            }),
+            "Bool" => Some(types::BaseType::Bool),
+            "UInt" => Some(types::BaseType::UInt),
+            "Int" => Some(types::BaseType::Int),
+            "Float" => Some(types::BaseType::Float),
+            "Text" => Some(types::BaseType::Text),
+            "Bytes" => Some(types::BaseType::Bytes),
+            "Array" => Some(types::BaseType::Array),
+            "Map" => Some(types::BaseType::Map),
+            _ => {
+                self.error_invalid_pattern(&format!("unknown type '{}'", name.0), dummy_span());
+                None
+            }
         }
     }
 
     /// Lower a while loop
-    pub(super) fn lower_while(
+    pub fn lower_while(
         &mut self,
         condition: &ast::Expression,
         body: &[ast::Stmt],
         body_expr: &Option<Box<ast::Expression>>,
-    ) -> Result<VarId> {
+    ) -> VarId {
         let header_bb = self.fresh_block();
         let body_bb = self.fresh_block();
         let exit_bb = self.fresh_block();
@@ -305,11 +316,12 @@ impl<'a> Lowerer<'a> {
         // Header: evaluate condition
         self.current_block = header_bb;
         self.current_instructions = Vec::new();
-        let cond = self.lower_expression(condition)?;
+        let cond = self.lower_expression(condition);
         self.finish_block(Terminator::If {
             condition: cond,
             then_target: body_bb,
             else_target: exit_bb,
+            span: dummy_span(),
         });
 
         // Body
@@ -324,10 +336,10 @@ impl<'a> Lowerer<'a> {
         });
 
         for stmt in body {
-            self.lower_statement(&stmt.node)?;
+            self.lower_statement(&stmt.node);
         }
         if let Some(expr) = body_expr {
-            self.lower_expression(expr)?;
+            self.lower_expression(expr);
         }
 
         self.loop_stack.pop();
@@ -340,17 +352,17 @@ impl<'a> Lowerer<'a> {
         self.current_instructions = Vec::new();
 
         // While loops produce undefined (unless break with value)
-        let result = self.new_temp(TypeSet::undefined());
+        let result = self.new_temp(TypeSet::empty());
         self.emit(Instruction::Undefined { dest: result });
-        Ok(result)
+        result
     }
 
     /// Lower an infinite loop
-    pub(super) fn lower_loop(
+    pub fn lower_loop(
         &mut self,
         body: &[ast::Stmt],
         body_expr: &Option<Box<ast::Expression>>,
-    ) -> Result<VarId> {
+    ) -> VarId {
         let body_bb = self.fresh_block();
         let exit_bb = self.fresh_block();
 
@@ -368,10 +380,10 @@ impl<'a> Lowerer<'a> {
         });
 
         for stmt in body {
-            self.lower_statement(&stmt.node)?;
+            self.lower_statement(&stmt.node);
         }
         if let Some(expr) = body_expr {
-            self.lower_expression(expr)?;
+            self.lower_expression(expr);
         }
 
         self.loop_stack.pop();
@@ -383,25 +395,25 @@ impl<'a> Lowerer<'a> {
         self.current_block = exit_bb;
         self.current_instructions = Vec::new();
 
-        let result = self.new_temp(TypeSet::from_types(all_types()).as_optional());
+        let result = self.new_temp(TypeSet::all());
         // TODO: Phi from break values
         self.emit(Instruction::Undefined { dest: result });
-        Ok(result)
+        result
     }
 
     /// Lower a for loop
-    pub(super) fn lower_for(
+    pub fn lower_for(
         &mut self,
         _binding_is_value: bool,
         binding: &ast::ForBinding,
         iterable: &ast::Expression,
         body: &[ast::Stmt],
         body_expr: &Option<Box<ast::Expression>>,
-    ) -> Result<VarId> {
+    ) -> VarId {
         // TODO: Proper iterator protocol
         // For now, just a placeholder that evaluates the iterable
 
-        let _iter = self.lower_expression(iterable)?;
+        let _iter = self.lower_expression(iterable);
 
         let header_bb = self.fresh_block();
         let body_bb = self.fresh_block();
@@ -422,6 +434,7 @@ impl<'a> Lowerer<'a> {
             condition: has_more,
             then_target: body_bb,
             else_target: exit_bb,
+            span: dummy_span(),
         });
 
         // Body
@@ -432,13 +445,13 @@ impl<'a> Lowerer<'a> {
         // Bind loop variable
         match binding {
             ast::ForBinding::Variable(name) => {
-                let var = self.new_temp(TypeSet::from_types(all_types()).as_optional());
+                let var = self.new_temp(TypeSet::all());
                 self.emit(Instruction::Undefined { dest: var });
                 self.bind(&name.0, var);
             }
             ast::ForBinding::Array(names) => {
                 for name in names {
-                    let var = self.new_temp(TypeSet::from_types(all_types()).as_optional());
+                    let var = self.new_temp(TypeSet::all());
                     self.emit(Instruction::Undefined { dest: var });
                     self.bind(&name.0, var);
                 }
@@ -452,10 +465,10 @@ impl<'a> Lowerer<'a> {
         });
 
         for stmt in body {
-            self.lower_statement(&stmt.node)?;
+            self.lower_statement(&stmt.node);
         }
         if let Some(expr) = body_expr {
-            self.lower_expression(expr)?;
+            self.lower_expression(expr);
         }
 
         self.loop_stack.pop();
@@ -467,18 +480,14 @@ impl<'a> Lowerer<'a> {
         self.current_block = exit_bb;
         self.current_instructions = Vec::new();
 
-        let result = self.new_temp(TypeSet::undefined());
+        let result = self.new_temp(TypeSet::empty());
         self.emit(Instruction::Undefined { dest: result });
-        Ok(result)
+        result
     }
 
     /// Lower a match expression
-    pub(super) fn lower_match(
-        &mut self,
-        value: &ast::Expression,
-        arms: &[ast::MatchArm],
-    ) -> Result<VarId> {
-        let _scrutinee = self.lower_expression(value)?;
+    pub fn lower_match(&mut self, value: &ast::Expression, arms: &[ast::MatchArm]) -> VarId {
+        let _scrutinee = self.lower_expression(value);
         let exit_bb = self.fresh_block();
 
         // TODO: Proper match compilation with decision trees
@@ -503,12 +512,13 @@ impl<'a> Lowerer<'a> {
 
             // Check guard if present
             if let Some(ref guard) = arm.guard {
-                let guard_val = self.lower_expression(guard)?;
+                let guard_val = self.lower_expression(guard);
                 let guard_pass_bb = self.fresh_block();
                 self.finish_block(Terminator::If {
                     condition: guard_val,
                     then_target: guard_pass_bb,
                     else_target: next_bb,
+                    span: dummy_span(),
                 });
 
                 self.current_block = guard_pass_bb;
@@ -516,12 +526,12 @@ impl<'a> Lowerer<'a> {
             }
 
             for stmt in &arm.body {
-                self.lower_statement(&stmt.node)?;
+                self.lower_statement(&stmt.node);
             }
             let arm_value = if let Some(ref expr) = arm.body_expr {
-                self.lower_expression(expr)?
+                self.lower_expression(expr)
             } else {
-                let dest = self.new_temp(TypeSet::undefined());
+                let dest = self.new_temp(TypeSet::empty());
                 self.emit(Instruction::Undefined { dest });
                 dest
             };
@@ -535,7 +545,7 @@ impl<'a> Lowerer<'a> {
         }
 
         // Final fallthrough (should be unreachable if patterns are exhaustive)
-        let fallback = self.new_temp(TypeSet::undefined());
+        let fallback = self.new_temp(TypeSet::empty());
         self.emit(Instruction::Undefined { dest: fallback });
         arm_results.push((self.current_block, fallback));
         self.finish_block(Terminator::Jump { target: exit_bb });
@@ -544,28 +554,28 @@ impl<'a> Lowerer<'a> {
         self.current_block = exit_bb;
         self.current_instructions = Vec::new();
 
-        let result = self.new_temp(TypeSet::from_types(all_types()).as_optional());
+        let result = self.new_temp(TypeSet::all());
         self.emit(Instruction::Phi {
             dest: result,
             sources: arm_results,
         });
-        Ok(result)
+        result
     }
 
     /// Lower a range expression
-    pub(super) fn lower_range(
+    pub fn lower_range(
         &mut self,
         start: &ast::Expression,
         end: &ast::Expression,
         _inclusive: bool,
-    ) -> Result<VarId> {
+    ) -> VarId {
         // TODO: Ranges should produce lazy iterators or arrays
         // For now, just evaluate bounds and return undefined
-        let _start = self.lower_expression(start)?;
-        let _end = self.lower_expression(end)?;
+        let _start = self.lower_expression(start);
+        let _end = self.lower_expression(end);
 
         let result = self.new_temp(TypeSet::single(types::BaseType::Array));
         self.emit(Instruction::Undefined { dest: result });
-        Ok(result)
+        result
     }
 }

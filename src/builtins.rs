@@ -3,6 +3,15 @@
 //! Provides a Lua-style registry for builtin functions with metadata that
 //! drives compiler lowering decisions.
 //!
+//! # Purity and Fallibility
+//!
+//! Each builtin has a purity level that determines optimization potential
+//! and whether it may return undefined:
+//!
+//! - `Impure`: Has side effects, always fallible (may return undefined)
+//! - `Pure { fallible }`: No side effects, fallible if domain errors possible
+//! - `Const { eval, fallible }`: Can be evaluated at compile time
+//!
 //! # Example
 //!
 //! ```ignore
@@ -10,123 +19,31 @@
 //!
 //! registry.register(
 //!     BuiltinDef::new("len", builtins::len)
-//!         .param("v", TypeSig::Collection)
-//!         .returns(TypeSig::uint())
-//!         .purity(Purity::Const(const_eval_len))  // Const with evaluator
+//!         .param("v", TypeSet::collection())
+//!         .returns(TypeSet::uint())
+//!         .const_eval(const_eval_len)  // Const, fallible by default
+//! );
+//!
+//! registry.register(
+//!     BuiltinDef::new("core::make_array", builtins::make_array)
+//!         .returns(TypeSet::single(BaseType::Array))
+//!         .const_eval_infallible(const_eval_make_array)  // Never fails
 //! );
 //!
 //! registry.register(
 //!     BuiltinDef::new("drop", builtins::drop)
-//!         .param_optional("reason", TypeSig::UInt)
-//!         .exits(TypeSig::uint())
-//!         .purity(Purity::Impure)
+//!         .param_optional("reason", TypeSet::uint())
+//!         .exits(TypeSet::uint())  // Diverges, implicitly Impure
 //! );
 //! ```
 
 use super::*;
 use exec::{ExecError, Float, HeapVal, VM, Value};
 use indexmap::IndexMap;
-use ir::ConstValue;
+use ir::{ConstValue, FunctionRef};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use types::BaseType;
-
-// ============================================================================
-// Type Signatures
-// ============================================================================
-
-/// Type signature for builtin parameters and return types
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TypeSig {
-    /// Allowed base types
-    pub types: Vec<BaseType>,
-    /// Whether the value may be missing
-    pub maybe_missing: bool,
-}
-
-impl TypeSig {
-    /// Any single type, not missing
-    pub fn of(ty: BaseType) -> Self {
-        TypeSig {
-            types: vec![ty],
-            maybe_missing: false,
-        }
-    }
-
-    /// UInt type
-    pub fn uint() -> Self {
-        Self::of(BaseType::UInt)
-    }
-
-    /// Int type
-    pub fn int() -> Self {
-        Self::of(BaseType::Int)
-    }
-
-    /// Float type
-    pub fn float() -> Self {
-        Self::of(BaseType::Float)
-    }
-
-    /// Bool type
-    pub fn bool() -> Self {
-        Self::of(BaseType::Bool)
-    }
-
-    /// Text type
-    pub fn text() -> Self {
-        Self::of(BaseType::Text)
-    }
-
-    /// Bytes type
-    pub fn bytes() -> Self {
-        Self::of(BaseType::Bytes)
-    }
-
-    /// Any numeric type (UInt, Int, Float)
-    pub fn numeric() -> Self {
-        TypeSig {
-            types: vec![BaseType::UInt, BaseType::Int, BaseType::Float],
-            maybe_missing: false,
-        }
-    }
-
-    /// Any collection type (Array, Map, Text, Bytes)
-    pub fn collection() -> Self {
-        TypeSig {
-            types: vec![
-                BaseType::Array,
-                BaseType::Map,
-                BaseType::Text,
-                BaseType::Bytes,
-            ],
-            maybe_missing: false,
-        }
-    }
-
-    /// Any type
-    pub fn any() -> Self {
-        TypeSig {
-            types: vec![
-                BaseType::Bool,
-                BaseType::UInt,
-                BaseType::Int,
-                BaseType::Float,
-                BaseType::Text,
-                BaseType::Bytes,
-                BaseType::Array,
-                BaseType::Map,
-            ],
-            maybe_missing: false,
-        }
-    }
-
-    /// Make this type optional (may be missing)
-    pub fn optional(mut self) -> Self {
-        self.maybe_missing = true;
-        self
-    }
-}
+use types::{BaseType, TypeSet};
 
 // ============================================================================
 // Return Behavior
@@ -136,13 +53,13 @@ impl TypeSig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReturnBehavior {
     /// Returns a value of this type to the caller
-    /// The type may have maybe_missing = true
-    Returns(TypeSig),
+    /// Whether the return may be undefined is determined by Purity::may_return_undefined()
+    Returns(TypeSet),
 
     /// Never returns to caller - exits to driver with typed value
     /// Lowers to Terminator::Exit
-    Exits(TypeSig),
-    // Future: Yields(TypeSig) for generators/async
+    Exits(TypeSet),
+    // Future: Yields(TypeSet) for generators/async
 }
 
 impl ReturnBehavior {
@@ -152,7 +69,7 @@ impl ReturnBehavior {
     }
 
     /// Get the type signature (for either Returns or Exits)
-    pub fn type_sig(&self) -> &TypeSig {
+    pub fn type_sig(&self) -> &TypeSet {
         match self {
             ReturnBehavior::Returns(sig) => sig,
             ReturnBehavior::Exits(sig) => sig,
@@ -175,33 +92,69 @@ pub type ConstEvalFn = fn(&[ConstValue]) -> Option<ConstValue>;
 pub enum Purity {
     /// Has side effects or depends on external state
     /// Cannot be reordered, eliminated, or CSE'd
+    /// Implicitly fallible - may return undefined due to external factors
     Impure,
 
     /// No side effects, deterministic given same inputs
     /// Can be reordered, eliminated if unused, and CSE'd
     /// But cannot be evaluated at compile time (may use runtime values)
-    Pure,
+    /// The bool indicates whether the operation is fallible (can return undefined
+    /// for domain reasons like overflow, out-of-bounds, type mismatch)
+    Pure { fallible: bool },
 
     /// Can be evaluated at compile time with the provided evaluator
     /// Valid in const initializers
     /// Implies Pure
-    Const(ConstEvalFn),
+    /// The bool indicates whether the operation is fallible (can return undefined
+    /// for domain reasons like overflow, out-of-bounds, type mismatch)
+    Const { eval: ConstEvalFn, fallible: bool },
+}
+
+impl Purity {
+    /// Check if this operation may return undefined
+    /// - Impure: always true (external factors)
+    /// - Pure/Const: depends on the fallible flag
+    pub fn may_return_undefined(&self) -> bool {
+        match self {
+            Purity::Impure => true,
+            Purity::Pure { fallible } => *fallible,
+            Purity::Const { fallible, .. } => *fallible,
+        }
+    }
+
+    /// Get the const evaluator if this is a Const purity
+    pub fn const_eval(&self) -> Option<ConstEvalFn> {
+        match self {
+            Purity::Const { eval, .. } => Some(*eval),
+            _ => None,
+        }
+    }
+
+    /// Try to evaluate at compile time
+    pub fn try_const_eval(&self, args: &[ConstValue]) -> Option<ConstValue> {
+        self.const_eval().and_then(|f| f(args))
+    }
 }
 
 impl std::fmt::Debug for Purity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Purity::Impure => write!(f, "Impure"),
-            Purity::Pure => write!(f, "Pure"),
-            Purity::Const(_) => write!(f, "Const(fn)"),
+            Purity::Pure { fallible } => write!(f, "Pure {{ fallible: {} }}", fallible),
+            Purity::Const { fallible, .. } => write!(f, "Const {{ fallible: {} }}", fallible),
         }
     }
 }
 
 impl PartialEq for Purity {
     fn eq(&self, other: &Self) -> bool {
-        // Compare by variant, ignoring the function pointer for Const
-        std::mem::discriminant(self) == std::mem::discriminant(other)
+        // Compare by variant and fallible flag, ignoring the function pointer for Const
+        match (self, other) {
+            (Purity::Impure, Purity::Impure) => true,
+            (Purity::Pure { fallible: a }, Purity::Pure { fallible: b }) => a == b,
+            (Purity::Const { fallible: a, .. }, Purity::Const { fallible: b, .. }) => a == b,
+            _ => false,
+        }
     }
 }
 
@@ -219,8 +172,8 @@ impl Ord for Purity {
         fn rank(p: &Purity) -> u8 {
             match p {
                 Purity::Impure => 0,
-                Purity::Pure => 1,
-                Purity::Const(_) => 2,
+                Purity::Pure { .. } => 1,
+                Purity::Const { .. } => 2,
             }
         }
         rank(self).cmp(&rank(other))
@@ -237,26 +190,12 @@ impl Hash for Purity {
 impl Purity {
     /// Check if this purity level allows compile-time evaluation
     pub fn is_const(&self) -> bool {
-        matches!(self, Purity::Const(_))
+        matches!(self, Purity::Const { .. })
     }
 
     /// Check if this purity level allows optimization (reorder, CSE, eliminate)
     pub fn is_pure(&self) -> bool {
-        matches!(self, Purity::Pure | Purity::Const(_))
-    }
-
-    /// Get the const evaluator function, if this is a Const purity
-    pub fn const_eval(&self) -> Option<ConstEvalFn> {
-        match self {
-            Purity::Const(f) => Some(*f),
-            _ => None,
-        }
-    }
-
-    /// Evaluate this function at compile time with the given arguments
-    /// Returns None if not const or if evaluation fails
-    pub fn try_const_eval(&self, args: &[ConstValue]) -> Option<ConstValue> {
-        self.const_eval().and_then(|f| f(args))
+        matches!(self, Purity::Pure { .. } | Purity::Const { .. })
     }
 }
 
@@ -270,7 +209,7 @@ pub struct ParamSpec {
     /// Parameter name (for documentation and error messages)
     pub name: String,
     /// Expected type
-    pub type_sig: TypeSig,
+    pub type_sig: TypeSet,
     /// Whether this parameter is optional
     pub optional: bool,
     /// Whether this parameter is passed by reference
@@ -279,7 +218,7 @@ pub struct ParamSpec {
 
 impl ParamSpec {
     /// Required parameter
-    pub fn required(name: impl Into<String>, type_sig: TypeSig) -> Self {
+    pub fn required(name: impl Into<String>, type_sig: TypeSet) -> Self {
         ParamSpec {
             name: name.into(),
             type_sig,
@@ -289,7 +228,7 @@ impl ParamSpec {
     }
 
     /// Optional parameter
-    pub fn optional(name: impl Into<String>, type_sig: TypeSig) -> Self {
+    pub fn optional(name: impl Into<String>, type_sig: TypeSet) -> Self {
         ParamSpec {
             name: name.into(),
             type_sig,
@@ -322,16 +261,17 @@ pub struct BuiltinMeta {
 
 impl BuiltinMeta {
     /// Create metadata for a function that returns a value
-    pub fn returning(type_sig: TypeSig) -> Self {
+    /// Default purity is Pure { fallible: true } (conservative)
+    pub fn returning(type_sig: TypeSet) -> Self {
         BuiltinMeta {
             params: Vec::new(),
             returns: ReturnBehavior::Returns(type_sig),
-            purity: Purity::Pure,
+            purity: Purity::Pure { fallible: true },
         }
     }
 
     /// Create metadata for a function that exits to driver
-    pub fn exiting(type_sig: TypeSig) -> Self {
+    pub fn exiting(type_sig: TypeSet) -> Self {
         BuiltinMeta {
             params: Vec::new(),
             returns: ReturnBehavior::Exits(type_sig),
@@ -440,22 +380,24 @@ impl std::fmt::Debug for BuiltinDef {
 
 impl BuiltinDef {
     /// Create a new builtin definition with a native function
+    /// Default: returns any type, pure but fallible
     pub fn new(name: impl Into<String>, f: BuiltinFn) -> Self {
         BuiltinDef {
             name: name.into(),
-            meta: BuiltinMeta::returning(TypeSig::any().optional()),
+            meta: BuiltinMeta::returning(TypeSet::all()),
             implementation: BuiltinImpl::Native(f),
         }
     }
 
     /// Create a new builtin definition with a closure
+    /// Default: returns any type, pure but fallible
     pub fn with_closure<F>(name: impl Into<String>, f: F) -> Self
     where
         F: Fn(&mut VM, &[Value]) -> Result<ExecResult, ExecError> + Send + Sync + 'static,
     {
         BuiltinDef {
             name: name.into(),
-            meta: BuiltinMeta::returning(TypeSig::any().optional()),
+            meta: BuiltinMeta::returning(TypeSet::all()),
             implementation: BuiltinImpl::Closure(Box::new(f)),
         }
     }
@@ -463,19 +405,19 @@ impl BuiltinDef {
     // Builder methods
 
     /// Add a required parameter
-    pub fn param(mut self, name: impl Into<String>, type_sig: TypeSig) -> Self {
+    pub fn param(mut self, name: impl Into<String>, type_sig: TypeSet) -> Self {
         self.meta.params.push(ParamSpec::required(name, type_sig));
         self
     }
 
     /// Add an optional parameter
-    pub fn param_optional(mut self, name: impl Into<String>, type_sig: TypeSig) -> Self {
+    pub fn param_optional(mut self, name: impl Into<String>, type_sig: TypeSet) -> Self {
         self.meta.params.push(ParamSpec::optional(name, type_sig));
         self
     }
 
     /// Add a by-reference parameter
-    pub fn param_ref(mut self, name: impl Into<String>, type_sig: TypeSig) -> Self {
+    pub fn param_ref(mut self, name: impl Into<String>, type_sig: TypeSet) -> Self {
         self.meta
             .params
             .push(ParamSpec::required(name, type_sig).by_ref());
@@ -483,19 +425,58 @@ impl BuiltinDef {
     }
 
     /// Set return type (normal return to caller)
-    pub fn returns(mut self, type_sig: TypeSig) -> Self {
+    pub fn returns(mut self, type_sig: TypeSet) -> Self {
         self.meta.returns = ReturnBehavior::Returns(type_sig);
         self
     }
 
     /// Set exit type (diverges, exits to driver)
-    pub fn exits(mut self, type_sig: TypeSig) -> Self {
+    pub fn exits(mut self, type_sig: TypeSet) -> Self {
         self.meta.returns = ReturnBehavior::Exits(type_sig);
         self.meta.purity = Purity::Impure; // Exiting is a side effect
         self
     }
 
-    /// Set purity level
+    /// Set purity to Const with a const evaluator
+    /// Default fallible = true (conservative, can fail for domain reasons)
+    pub fn const_eval(mut self, eval: ConstEvalFn) -> Self {
+        self.meta.purity = Purity::Const {
+            eval,
+            fallible: true,
+        };
+        self
+    }
+
+    /// Set purity to Const with infallible operation (never returns undefined)
+    /// Use for operations that always succeed: array construction, etc.
+    pub fn const_eval_infallible(mut self, eval: ConstEvalFn) -> Self {
+        self.meta.purity = Purity::Const {
+            eval,
+            fallible: false,
+        };
+        self
+    }
+
+    /// Set purity to Pure (no side effects, but can't const eval)
+    /// Default fallible = true
+    pub fn pure(mut self) -> Self {
+        self.meta.purity = Purity::Pure { fallible: true };
+        self
+    }
+
+    /// Set purity to Pure and infallible
+    pub fn pure_infallible(mut self) -> Self {
+        self.meta.purity = Purity::Pure { fallible: false };
+        self
+    }
+
+    /// Set purity to Impure (has side effects, implicitly fallible)
+    pub fn impure(mut self) -> Self {
+        self.meta.purity = Purity::Impure;
+        self
+    }
+
+    /// Set purity level (low-level, prefer const_eval/pure/impure helpers)
     pub fn purity(mut self, purity: Purity) -> Self {
         self.meta.purity = purity;
         self
@@ -532,6 +513,13 @@ impl BuiltinRegistry {
         self.builtins.get(name)
     }
 
+    /// Look up a builtin by function reference
+    ///
+    /// Uses the qualified name (e.g., "core::add") for lookup.
+    pub fn lookup(&self, func: &FunctionRef) -> Option<&BuiltinDef> {
+        self.builtins.get(&func.qualified_name())
+    }
+
     /// Check if a name is a registered builtin
     pub fn contains(&self, name: &str) -> bool {
         self.builtins.contains_key(name)
@@ -562,123 +550,141 @@ impl BuiltinRegistry {
 pub fn register_core_builtins(registry: &mut BuiltinRegistry) {
     // --- Comparison ---
     registry.register(
-        BuiltinDef::new("core.eq", builtin_eq)
-            .param("a", TypeSig::any())
-            .param("b", TypeSig::any())
-            .returns(TypeSig::bool().optional())
-            .purity(Purity::Const(const_eval_eq)),
+        BuiltinDef::new("core::eq", builtin_eq)
+            .param("a", TypeSet::all())
+            .param("b", TypeSet::all())
+            .returns(TypeSet::bool())
+            .const_eval(const_eval_eq),
     );
 
     registry.register(
-        BuiltinDef::new("core.lt", builtin_lt)
-            .param("a", TypeSig::numeric())
-            .param("b", TypeSig::numeric())
-            .returns(TypeSig::bool().optional())
-            .purity(Purity::Const(const_eval_lt)),
+        BuiltinDef::new("core::lt", builtin_lt)
+            .param("a", TypeSet::numeric())
+            .param("b", TypeSet::numeric())
+            .returns(TypeSet::bool())
+            .const_eval(const_eval_lt),
     );
 
     // --- Arithmetic ---
+    // Note: These are fallible (overflow possible), which is the default
     registry.register(
-        BuiltinDef::new("core.add", builtin_add)
-            .param("a", TypeSig::numeric())
-            .param("b", TypeSig::numeric())
-            .returns(TypeSig::numeric().optional())
-            .purity(Purity::Const(const_eval_add)),
+        BuiltinDef::new("core::add", builtin_add)
+            .param("a", TypeSet::numeric())
+            .param("b", TypeSet::numeric())
+            .returns(TypeSet::numeric())
+            .const_eval(const_eval_add),
     );
 
     registry.register(
-        BuiltinDef::new("core.sub", builtin_sub)
-            .param("a", TypeSig::numeric())
-            .param("b", TypeSig::numeric())
-            .returns(TypeSig::numeric().optional())
-            .purity(Purity::Const(const_eval_sub)),
+        BuiltinDef::new("core::sub", builtin_sub)
+            .param("a", TypeSet::numeric())
+            .param("b", TypeSet::numeric())
+            .returns(TypeSet::numeric())
+            .const_eval(const_eval_sub),
     );
 
     registry.register(
-        BuiltinDef::new("core.mul", builtin_mul)
-            .param("a", TypeSig::numeric())
-            .param("b", TypeSig::numeric())
-            .returns(TypeSig::numeric().optional())
-            .purity(Purity::Const(const_eval_mul)),
+        BuiltinDef::new("core::mul", builtin_mul)
+            .param("a", TypeSet::numeric())
+            .param("b", TypeSet::numeric())
+            .returns(TypeSet::numeric())
+            .const_eval(const_eval_mul),
     );
 
     registry.register(
-        BuiltinDef::new("core.div", builtin_div)
-            .param("a", TypeSig::numeric())
-            .param("b", TypeSig::numeric())
-            .returns(TypeSig::numeric().optional())
-            .purity(Purity::Const(const_eval_div)),
+        BuiltinDef::new("core::div", builtin_div)
+            .param("a", TypeSet::numeric())
+            .param("b", TypeSet::numeric())
+            .returns(TypeSet::numeric())
+            .const_eval(const_eval_div),
     );
 
     registry.register(
-        BuiltinDef::new("core.mod", builtin_mod)
-            .param("a", TypeSig::numeric())
-            .param("b", TypeSig::numeric())
-            .returns(TypeSig::numeric().optional())
-            .purity(Purity::Const(const_eval_mod)),
+        BuiltinDef::new("core::mod", builtin_mod)
+            .param("a", TypeSet::numeric())
+            .param("b", TypeSet::numeric())
+            .returns(TypeSet::numeric())
+            .const_eval(const_eval_mod),
     );
 
     registry.register(
-        BuiltinDef::new("core.neg", builtin_neg)
-            .param("a", TypeSig::numeric())
-            .returns(TypeSig::numeric().optional())
-            .purity(Purity::Const(const_eval_neg)),
+        BuiltinDef::new("core::neg", builtin_neg)
+            .param("a", TypeSet::numeric())
+            .returns(TypeSet::numeric())
+            .const_eval(const_eval_neg),
     );
 
     // --- Logical (non-short-circuit) ---
     registry.register(
-        BuiltinDef::new("core.not", builtin_not)
-            .param("a", TypeSig::bool())
-            .returns(TypeSig::bool().optional())
-            .purity(Purity::Const(const_eval_not)),
+        BuiltinDef::new("core::not", builtin_not)
+            .param("a", TypeSet::bool())
+            .returns(TypeSet::bool())
+            .const_eval(const_eval_not),
     );
 
     // --- Bitwise ---
     registry.register(
-        BuiltinDef::new("core.bit_and", builtin_bit_and)
-            .param("a", TypeSig::uint())
-            .param("b", TypeSig::uint())
-            .returns(TypeSig::uint().optional())
-            .purity(Purity::Const(const_eval_bit_and)),
+        BuiltinDef::new("core::bit_and", builtin_bit_and)
+            .param("a", TypeSet::uint())
+            .param("b", TypeSet::uint())
+            .returns(TypeSet::uint())
+            .const_eval(const_eval_bit_and),
     );
 
     registry.register(
-        BuiltinDef::new("core.bit_or", builtin_bit_or)
-            .param("a", TypeSig::uint())
-            .param("b", TypeSig::uint())
-            .returns(TypeSig::uint().optional())
-            .purity(Purity::Const(const_eval_bit_or)),
+        BuiltinDef::new("core::bit_or", builtin_bit_or)
+            .param("a", TypeSet::uint())
+            .param("b", TypeSet::uint())
+            .returns(TypeSet::uint())
+            .const_eval(const_eval_bit_or),
     );
 
     registry.register(
-        BuiltinDef::new("core.bit_xor", builtin_bit_xor)
-            .param("a", TypeSig::uint())
-            .param("b", TypeSig::uint())
-            .returns(TypeSig::uint().optional())
-            .purity(Purity::Const(const_eval_bit_xor)),
+        BuiltinDef::new("core::bit_xor", builtin_bit_xor)
+            .param("a", TypeSet::uint())
+            .param("b", TypeSet::uint())
+            .returns(TypeSet::uint())
+            .const_eval(const_eval_bit_xor),
     );
 
     registry.register(
-        BuiltinDef::new("core.bit_not", builtin_bit_not)
-            .param("a", TypeSig::uint())
-            .returns(TypeSig::uint().optional())
-            .purity(Purity::Const(const_eval_bit_not)),
+        BuiltinDef::new("core::bit_not", builtin_bit_not)
+            .param("a", TypeSet::uint())
+            .returns(TypeSet::uint())
+            .const_eval(const_eval_bit_not),
     );
 
     registry.register(
-        BuiltinDef::new("core.shl", builtin_shl)
-            .param("a", TypeSig::uint())
-            .param("b", TypeSig::uint())
-            .returns(TypeSig::uint().optional())
-            .purity(Purity::Const(const_eval_shl)),
+        BuiltinDef::new("core::shl", builtin_shl)
+            .param("a", TypeSet::uint())
+            .param("b", TypeSet::uint())
+            .returns(TypeSet::uint())
+            .const_eval(const_eval_shl),
     );
 
     registry.register(
-        BuiltinDef::new("core.shr", builtin_shr)
-            .param("a", TypeSig::uint())
-            .param("b", TypeSig::uint())
-            .returns(TypeSig::uint().optional())
-            .purity(Purity::Const(const_eval_shr)),
+        BuiltinDef::new("core::shr", builtin_shr)
+            .param("a", TypeSet::uint())
+            .param("b", TypeSet::uint())
+            .returns(TypeSet::uint())
+            .const_eval(const_eval_shr),
+    );
+
+    registry.register(
+        BuiltinDef::new("core::bit_test", builtin_bit_test)
+            .param("x", TypeSet::uint())
+            .param("b", TypeSet::uint())
+            .returns(TypeSet::bool())
+            .const_eval(const_eval_bit_test),
+    );
+
+    registry.register(
+        BuiltinDef::new("core::bit_set", builtin_bit_set)
+            .param("x", TypeSet::uint())
+            .param("b", TypeSet::uint())
+            .param("v", TypeSet::bool())
+            .returns(TypeSet::uint())
+            .const_eval(const_eval_bit_set),
     );
 }
 
@@ -696,33 +702,35 @@ pub fn standard_builtins() -> BuiltinRegistry {
     // Exit/control flow
     registry.register(
         BuiltinDef::new("drop", builtin_drop)
-            .param_optional("reason", TypeSig::uint())
-            .exits(TypeSig::uint())
-            .purity(Purity::Impure),
+            .param_optional("reason", TypeSet::uint())
+            .exits(TypeSet::uint()),
+        // Note: exits() already sets Impure
     );
 
     registry.register(
         BuiltinDef::new("len", builtin_len)
-            .param("value", TypeSig::collection())
-            .returns(TypeSig::uint().optional())
-            .purity(Purity::Const(const_eval_len)),
+            .param("value", TypeSet::collection())
+            .returns(TypeSet::uint())
+            .const_eval(const_eval_len),
     );
 
     // --- Collection Construction ---
     // These accept any number of arguments (variadic)
 
     registry.register(
-        BuiltinDef::new("core.make_array", builtin_make_array)
+        BuiltinDef::new("core::make_array", builtin_make_array)
             // No fixed params - accepts variadic elements
-            .returns(TypeSig::of(BaseType::Array))
-            .purity(Purity::Const(const_eval_make_array)),
+            .returns(TypeSet::single(BaseType::Array))
+            // Array construction always succeeds - infallible
+            .const_eval_infallible(const_eval_make_array),
     );
 
     registry.register(
-        BuiltinDef::new("core.make_map", builtin_make_map)
+        BuiltinDef::new("core::make_map", builtin_make_map)
             // No fixed params - accepts variadic key-value pairs (must be even count)
-            .returns(TypeSig::of(BaseType::Map).optional()) // Optional: fails if odd arg count
-            .purity(Purity::Const(const_eval_make_map)),
+            .returns(TypeSet::single(BaseType::Map))
+            // Map construction can fail with odd arg count - fallible (default)
+            .const_eval(const_eval_make_map),
     );
 
     registry
@@ -1014,6 +1022,38 @@ fn builtin_shr(_vm: &mut VM, args: &[Value]) -> Result<ExecResult, ExecError> {
     Ok(ExecResult::Return(result))
 }
 
+fn builtin_bit_test(_vm: &mut VM, args: &[Value]) -> Result<ExecResult, ExecError> {
+    let result = if let (Some(Value::UInt(x)), Some(Value::UInt(b))) = (args.first(), args.get(1)) {
+        // Return undefined if bit position is out of bounds (>= 64)
+        if *b >= 64 {
+            None
+        } else {
+            Some(Value::Bool((x >> b) & 1 == 1))
+        }
+    } else {
+        None
+    };
+    Ok(ExecResult::Return(result))
+}
+
+fn builtin_bit_set(_vm: &mut VM, args: &[Value]) -> Result<ExecResult, ExecError> {
+    let result = if let (Some(Value::UInt(x)), Some(Value::UInt(b)), Some(Value::Bool(v))) =
+        (args.first(), args.get(1), args.get(2))
+    {
+        // Return undefined if bit position is out of bounds (>= 64)
+        if *b >= 64 {
+            None
+        } else if *v {
+            Some(Value::UInt(x | (1 << b)))
+        } else {
+            Some(Value::UInt(x & !(1 << b)))
+        }
+    } else {
+        None
+    };
+    Ok(ExecResult::Return(result))
+}
+
 // ============================================================================
 // Const Evaluators (compile-time evaluation)
 // ============================================================================
@@ -1232,6 +1272,36 @@ fn const_eval_shr(args: &[ConstValue]) -> Option<ConstValue> {
     }
 }
 
+fn const_eval_bit_test(args: &[ConstValue]) -> Option<ConstValue> {
+    if let (Some(ConstValue::UInt(x)), Some(ConstValue::UInt(b))) = (args.first(), args.get(1)) {
+        // Return None (undefined) if bit position is out of bounds (>= 64)
+        if *b >= 64 {
+            None
+        } else {
+            Some(ConstValue::Bool((x >> b) & 1 == 1))
+        }
+    } else {
+        None
+    }
+}
+
+fn const_eval_bit_set(args: &[ConstValue]) -> Option<ConstValue> {
+    if let (Some(ConstValue::UInt(x)), Some(ConstValue::UInt(b)), Some(ConstValue::Bool(v))) =
+        (args.first(), args.get(1), args.get(2))
+    {
+        // Return None (undefined) if bit position is out of bounds (>= 64)
+        if *b >= 64 {
+            None
+        } else if *v {
+            Some(ConstValue::UInt(x | (1 << b)))
+        } else {
+            Some(ConstValue::UInt(x & !(1 << b)))
+        }
+    } else {
+        None
+    }
+}
+
 // --- Collection Construction ---
 
 fn builtin_make_array(vm: &mut VM, args: &[Value]) -> Result<ExecResult, ExecError> {
@@ -1279,27 +1349,52 @@ mod tests {
 
     #[test]
     fn test_purity_ordering() {
-        assert!(Purity::Impure < Purity::Pure);
-        assert!(Purity::Pure < Purity::Const(dummy_const_eval));
+        assert!(Purity::Impure < Purity::Pure { fallible: true });
+        assert!(
+            Purity::Pure { fallible: true }
+                < Purity::Const {
+                    eval: dummy_const_eval,
+                    fallible: true
+                }
+        );
     }
 
     #[test]
     fn test_purity_methods() {
         assert!(!Purity::Impure.is_pure());
         assert!(!Purity::Impure.is_const());
+        assert!(Purity::Impure.may_return_undefined()); // Impure is always fallible
 
-        assert!(Purity::Pure.is_pure());
-        assert!(!Purity::Pure.is_const());
+        let pure = Purity::Pure { fallible: true };
+        assert!(pure.is_pure());
+        assert!(!pure.is_const());
+        assert!(pure.may_return_undefined());
 
-        let const_purity = Purity::Const(dummy_const_eval);
+        let pure_infallible = Purity::Pure { fallible: false };
+        assert!(!pure_infallible.may_return_undefined());
+
+        let const_purity = Purity::Const {
+            eval: dummy_const_eval,
+            fallible: true,
+        };
         assert!(const_purity.is_pure());
         assert!(const_purity.is_const());
+        assert!(const_purity.may_return_undefined());
+
+        let const_infallible = Purity::Const {
+            eval: dummy_const_eval,
+            fallible: false,
+        };
+        assert!(!const_infallible.may_return_undefined());
     }
 
     #[test]
     fn test_const_eval() {
         // Test that const evaluator is callable
-        let const_purity = Purity::Const(const_eval_len);
+        let const_purity = Purity::Const {
+            eval: const_eval_len,
+            fallible: true,
+        };
         assert!(const_purity.const_eval().is_some());
 
         // Test evaluation with a Text value
@@ -1308,16 +1403,16 @@ mod tests {
         assert_eq!(result, Some(ConstValue::UInt(5)));
 
         // Test that non-const purity returns None
-        assert!(Purity::Pure.const_eval().is_none());
+        assert!(Purity::Pure { fallible: true }.const_eval().is_none());
         assert!(Purity::Impure.const_eval().is_none());
     }
 
     #[test]
     fn test_return_behavior() {
-        let returns = ReturnBehavior::Returns(TypeSig::uint());
+        let returns = ReturnBehavior::Returns(TypeSet::uint());
         assert!(!returns.diverges());
 
-        let exits = ReturnBehavior::Exits(TypeSig::uint());
+        let exits = ReturnBehavior::Exits(TypeSet::uint());
         assert!(exits.diverges());
     }
 
@@ -1328,10 +1423,10 @@ mod tests {
         }
 
         let def = BuiltinDef::new("test", dummy)
-            .param("x", TypeSig::uint())
-            .param_optional("y", TypeSig::int())
-            .returns(TypeSig::bool())
-            .purity(Purity::Const(dummy_const_eval));
+            .param("x", TypeSet::uint())
+            .param_optional("y", TypeSet::int())
+            .returns(TypeSet::bool())
+            .const_eval(dummy_const_eval);
 
         assert_eq!(def.name, "test");
         assert_eq!(def.meta.params.len(), 2);

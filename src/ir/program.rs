@@ -8,28 +8,41 @@ impl<'a> Lowerer<'a> {
     // ========================================================================
 
     /// Lower an entire program
-    pub fn lower_program(&mut self, program: &ast::Program) -> Result<Program> {
+    ///
+    /// Returns `Some(Program)` if lowering succeeded, `None` if there were errors.
+    /// Errors are emitted to the diagnostics accumulator.
+    pub fn lower_program(&mut self, program: &ast::Program) -> Option<Program> {
         let mut functions = Vec::new();
         let mut constants = Vec::new();
         let mut imports = Vec::new();
 
-        // Lower imports
+        let errors_before = self.diagnostics.error_count();
+
+        // Lower imports (imports can't fail currently)
         for import in &program.imports {
-            imports.push(self.lower_import(&import.node)?);
+            imports.push(self.lower_import(&import.node));
         }
 
-        // Lower constants
+        // Lower constants (may emit errors but we continue)
         for constant in &program.constants {
-            let bindings = self.lower_constant(&constant.node)?;
-            constants.extend(bindings);
+            if let Some(bindings) = self.lower_constant(&constant.node) {
+                constants.extend(bindings);
+            }
         }
 
-        // Lower functions
+        // Lower functions (may emit errors but we continue)
         for function in &program.functions {
-            functions.push(self.lower_function(&function.node)?);
+            if let Some(func) = self.lower_function(&function.node) {
+                functions.push(func);
+            }
         }
 
-        Ok(Program {
+        // If any errors were emitted, return None
+        if self.diagnostics.error_count() > errors_before {
+            return None;
+        }
+
+        Some(Program {
             functions,
             constants,
             imports,
@@ -37,7 +50,7 @@ impl<'a> Lowerer<'a> {
     }
 
     /// Lower an import declaration
-    fn lower_import(&mut self, import: &ast::Import) -> Result<Import> {
+    fn lower_import(&mut self, import: &ast::Import) -> Import {
         let namespace = match &import.alias {
             Some(alias) => alias.clone(),
             None => match &import.path {
@@ -55,10 +68,10 @@ impl<'a> Lowerer<'a> {
             },
         };
 
-        Ok(Import {
+        Import {
             namespace,
             path: import.path.clone(),
-        })
+        }
     }
 
     // ========================================================================
@@ -66,7 +79,11 @@ impl<'a> Lowerer<'a> {
     // ========================================================================
 
     /// Lower a function definition
-    pub(super) fn lower_function(&mut self, func: &ast::Function) -> Result<Function> {
+    ///
+    /// Returns `Some(Function)` if lowering succeeded, `None` if there were errors.
+    pub fn lower_function(&mut self, func: &ast::Function) -> Option<Function> {
+        let errors_before = self.diagnostics.error_count();
+
         // Reset per-function state
         self.vars.clear();
         self.blocks.clear();
@@ -103,17 +120,16 @@ impl<'a> Lowerer<'a> {
             None
         };
 
-        // Lower statements
+        // Lower statements (continue even on errors to report multiple issues)
         for stmt in &func.statements {
-            self.lower_statement(&stmt.node)?;
+            self.lower_statement(&stmt.node);
         }
 
         // Lower final expression if present
-        let final_value = if let Some(ref expr) = func.final_expr {
-            Some(self.lower_expression(expr)?)
-        } else {
-            None
-        };
+        let final_value = func
+            .final_expr
+            .as_ref()
+            .map(|expr| self.lower_expression(expr));
 
         // Terminate with return
         self.finish_block(Terminator::Return { value: final_value });
@@ -121,11 +137,16 @@ impl<'a> Lowerer<'a> {
         // Pop function scope
         self.pop_scope();
 
+        // If any errors were emitted, return None
+        if self.diagnostics.error_count() > errors_before {
+            return None;
+        }
+
         // Extract attributes
         let attributes: Vec<ast::Attribute> =
             func.attributes.iter().map(|a| a.node.clone()).collect();
 
-        Ok(Function {
+        Some(Function {
             name: func.name.clone(),
             attributes,
             params,
