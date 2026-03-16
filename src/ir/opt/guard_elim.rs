@@ -6,7 +6,7 @@
 //! 2. Simplify the resulting CFG by merging blocks and removing unreachable code
 
 use super::definedness::{Definedness, DefinednessAnalysis, analyze_definedness};
-use super::{BlockId, Function, Terminator};
+use super::{BlockId, Function, Instruction, Terminator};
 use crate::builtins::BuiltinRegistry;
 use std::collections::{HashMap, HashSet};
 
@@ -102,6 +102,15 @@ fn remove_unreachable_blocks(function: &mut Function) {
 
     // Remove unreachable blocks
     function.blocks.retain(|b| reachable.contains(&b.id));
+
+    // Clean up phi sources that reference removed blocks
+    for block in &mut function.blocks {
+        for inst in &mut block.instructions {
+            if let Instruction::Phi { sources, .. } = &mut inst.node {
+                sources.retain(|(block_id, _)| reachable.contains(block_id));
+            }
+        }
+    }
 }
 
 /// Merge chains of blocks where one has a single successor and the other
@@ -183,6 +192,19 @@ fn merge_block_chains(function: &mut Function) {
                     for p in succ_preds.iter_mut() {
                         if *p == block_id {
                             *p = pred_id;
+                        }
+                    }
+                }
+            }
+
+            // Update phi sources in ALL blocks: replace block_id with pred_id
+            for block in function.blocks.iter_mut() {
+                for inst in &mut block.instructions {
+                    if let Instruction::Phi { sources, .. } = &mut inst.node {
+                        for (src_block, _) in sources.iter_mut() {
+                            if *src_block == block_id {
+                                *src_block = pred_id;
+                            }
                         }
                     }
                 }

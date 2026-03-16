@@ -259,6 +259,194 @@ vm.set_local(x_offset, new_val);  // mutates arr[0]
 
 ---
 
+## Execution Model: Closure-Threaded Code
+
+### Overview
+
+Rill uses a **closure-threaded** execution model. The IR is compiled into Rust
+closures at load time — each IR instruction becomes a closure that captures its
+resolved operands. At runtime, there is no interpreter dispatch switch; closures
+ARE the instructions.
+
+```
+Source → Parse → AST → Lower → IR → Optimize → Compile → Closures
+                                                              │
+                                                              ▼
+                                                         Execute loop
+```
+
+### Why Closures?
+
+| Approach | Dispatch cost | Operand cost | Portability |
+|----------|--------------|--------------|-------------|
+| Switch interpreter | Per-instruction match | Per-instruction decode | High |
+| Bytecode VM | Per-instruction dispatch | Register/stack decode | High |
+| Closure-threaded | None (closure IS the op) | None (captured at compile) | High |
+| Machine code JIT | None | None | Low (arch-specific) |
+
+Closures give near-JIT performance characteristics (no dispatch, no operand decode)
+while remaining fully portable Rust. The Rust compiler can inline small closures.
+
+### Compiled Representation
+
+```rust
+struct CompiledProgram {
+    functions: Vec<CompiledFunction>,
+    func_index: HashMap<String, usize>,  // name → index
+}
+
+struct CompiledFunction {
+    steps: Vec<Step>,           // all closures, flattened contiguously
+    block_starts: Vec<usize>,   // block i starts at steps[block_starts[i]]
+    entry: usize,               // index into block_starts
+    frame_size: usize,          // VM slots to reserve (1 + locals)
+}
+
+type Step = Box<dyn Fn(&mut VM, &CompiledProgram) -> Result<Action, ExecError>>;
+
+enum Action {
+    Continue,                   // advance pc by 1
+    NextBlock(usize),           // jump to block_starts[idx]
+    Return(Option<Value>),      // return from function
+    Exit(Value),                // hard exit to driver
+}
+```
+
+Every closure — instructions AND control flow — is a `Step`. There is no
+separate terminator type. The last step of each block returns `NextBlock`,
+`Return`, or `Exit` instead of `Continue`.
+
+### Compilation Pipeline
+
+```
+IR blocks (SSA with phis)
+    │
+    ├─ 1. Compile each IR instruction to a Step closure
+    │     (VarIds → slot offsets, builtins → fn pointers)
+    │
+    ├─ 2. Compile each terminator to a Step closure
+    │     (If/Match/Guard → NextBlock closures)
+    │
+    ├─ 3. Resolve phis: insert Copy steps into predecessor blocks
+    │     (eliminates ALL phi nodes — no runtime prev_block tracking)
+    │
+    ├─ 4. [Future] Peephole optimize each block
+    │     (copy elimination, dead stores, const+use fusion)
+    │
+    └─ 5. Flatten all blocks into a single contiguous Vec<Step>
+          with block_starts offsets
+```
+
+**Phi elimination** (step 3) works by moving the copy to each predecessor:
+
+```
+// Before (SSA phi in join block):
+then_block: ..., Jump(join)
+else_block: ..., Jump(join)
+join: phi(dest=5, [(then, slot_3), (else, slot_7)])
+
+// After (copies in predecessors, no phi):
+then_block: ..., Copy(slot_5 <- slot_3), Jump(join)
+else_block: ..., Copy(slot_5 <- slot_7), Jump(join)
+join: // nothing — value already in slot_5
+```
+
+Identity phis (all sources are the same slot as dest) are dropped entirely.
+
+### What Closures Capture
+
+| IR concept | Compile-time resolution |
+|------------|------------------------|
+| `VarId(n)` | Stack slot offset `n + 1` |
+| `FunctionRef("core::add")` | Native function pointer (Copy) |
+| `Literal::UInt(42)` | Cloned into the closure |
+| `BlockId` | Index into `block_starts` |
+
+### Execution Loop
+
+The executor is a single flat loop with a program counter:
+
+```rust
+fn execute_function(program, vm, func_idx, args) -> Action {
+    let func = &program.functions[func_idx];
+    vm.call(func.frame_size, None)?;
+    bind_params(vm, args);
+
+    let mut pc = func.block_starts[func.entry];
+
+    loop {
+        match (func.steps[pc])(vm, program)? {
+            Action::Continue    => pc += 1,
+            Action::NextBlock(i) => pc = func.block_starts[i],
+            Action::Return(val) => { vm.ret(); return Return(val); }
+            Action::Exit(val)   => { vm.ret(); return Exit(val); }
+        }
+    }
+}
+```
+
+**Key properties:**
+
+- **One loop, one match**: No nested loops, no separate terminator dispatch.
+  The branch predictor sees one site where ~95% of outcomes are `Continue`
+  (`pc += 1`).
+- **Contiguous step array**: All closures for a function are in a single `Vec`.
+  Step pointers (fat pointers, 16 bytes each) are cache-friendly.
+- **No phi overhead at runtime**: All phis resolved to copies in predecessors
+  during compilation. No `prev_block` tracking.
+- **No Rust stack growth for loops**: Back-edges set `pc` to an earlier offset.
+- **User function calls are recursive**: `execute_function` calls itself, bounded
+  by the VM's `MAX_STACK_SIZE` (65K slots, ~3000-6000 call levels).
+- **Linear blocks are merged**: CFG simplification (runs twice in optimizer)
+  concatenates chains of single-predecessor/single-successor blocks. The
+  closure compiler only emits `NextBlock` for genuine runtime branches.
+
+### Future: Peephole Optimization
+
+After phi resolution but before flattening, each block is a `Vec<Step>` that
+can be inspected and optimized. This requires a tagged intermediate form:
+
+```rust
+enum StepKind {
+    Copy { dest: usize, src: usize },
+    Const { dest: usize, value: Value },
+    Call { dest: usize, func: BuiltinFn, args: Vec<usize> },
+    // ...
+}
+// Optimize StepKind sequences, then convert to closures
+```
+
+Candidates: copy-to-self elimination, dead store removal, constant + immediate
+use fusion, jump threading.
+
+### Future: Tail-Call Optimization
+
+When a function's last action is calling another function (tail position), the
+current frame can be reused instead of pushing a new one. This is an IR-level
+transform:
+
+```
+// Before TCO:
+fn factorial(n, acc) {
+    if n == 0 { return acc; }
+    return factorial(n - 1, acc * n);  // pushes new VM frame
+}
+
+// After TCO (IR transform):
+fn factorial(n, acc) {
+    if n == 0 { return acc; }
+    n = n - 1;          // rewrite params in current frame
+    acc = acc * n;
+    jump to entry;      // pc = block_starts[entry], no new frame
+}
+```
+
+The flat pc-based architecture supports this naturally — TCO just rewrites
+params and sets `pc` to the entry offset instead of recursing through
+`execute_function`.
+
+---
+
 ## Intermediate Representation
 
 ### Design Philosophy
@@ -273,7 +461,7 @@ vm.set_local(x_offset, new_val);  // mutates arr[0]
 | Category | Description | Examples |
 |----------|-------------|----------|
 | **Intrinsic** | Short-circuit operators (require control flow) | `And`, `Or` |
-| **Function** | Everything else (may be inlined or called) | `core::add`, `len()`, `drop()` |
+| **Function** | Everything else (may be inlined or called) | `core::add`, `len()`, `exit()` |
 
 **Intrinsics** are minimal - only `And` (`&&`) and `Or` (`||`) which require
 short-circuit evaluation (control flow to skip the second operand).
@@ -291,7 +479,7 @@ which the optimizer folds to `3` using the const evaluator.
 **Other functions** include user-defined, prelude, and host-provided:
 
 - *Prelude*: `len()`, `concat()`, `to_uint()`, `is_uint()`, `is_some()`, etc.
-- *Host*: `drop()`, `decode()`, `validate()`
+- *Host*: `exit()`, `decode()`, `validate()`
 
 Functions may be inlined by the optimizer. Some prelude functions always inline
 because the expansion is simpler than a call:
@@ -1345,7 +1533,7 @@ attrs.register("priority", |args| {
 #[config(timeout: 5000, retries: 3)]
 fn process_bundle(bundle) {
     if bundle.age > MAX_TTL {
-        drop(LIFETIME_EXPIRED);
+        exit(LIFETIME_EXPIRED);
     }
 }
 ```
@@ -1493,7 +1681,7 @@ prelude is implicit - no configuration needed.
 **Builtins** (registered in `standard_builtins()`):
 ```rill
 len(arr)        // → core::len (runtime call)
-drop()          // → core::drop (runtime call, exits)
+exit()          // → core::exit (runtime call, exits)
 ```
 
 **Intrinsics** (compiler-recognized, expand to IR):
@@ -1955,26 +2143,26 @@ in that context as an example of embedding the language in a domain-specific app
 ### Filter Functions
 
 A bundle filter is a function that takes a `Bundle` parameter (by reference)
-and uses the `drop()` builtin to reject bundles:
+and uses the `exit()` builtin to reject bundles:
 
 ```
 fn check_lifetime(bundle) {
     if bundle.age > MAX_TTL {
-        drop(LIFETIME_EXPIRED);
+        exit(LIFETIME_EXPIRED);
     }
-    // Implicit: bundle continues if drop() not called
+    // Implicit: bundle continues if exit() not called
 }
 
 fn validate_destination(bundle) {
     if !is_valid_eid(bundle.destination) {
-        drop(INVALID_DESTINATION);
+        exit(INVALID_DESTINATION);
     }
 }
 ```
 
-### The `drop()` Builtin
+### The `exit()` Builtin
 
-The `drop(reason)` builtin is a diverging function that exits the script
+The `exit(code)` builtin is a diverging function that exits the script
 and returns a disposition to the host driver:
 
 ```rust
@@ -1998,7 +2186,7 @@ fn builtin_drop(_vm: &mut VM, args: &[Value]) -> Result<ExecResult, ExecError> {
 The host driver runs filters as a chain:
 
 ```rust
-// Find filter functions (accept Bundle, may call drop())
+// Find filter functions (accept Bundle, may call exit())
 let filters: Vec<_> = compiled.functions
     .iter()
     .filter(|f| f.params.get(0).map(|p| p.type_sig == TypeSig::Bundle).unwrap_or(false))
@@ -2012,7 +2200,7 @@ for filter in ordered {
     match vm.call(filter, &mut bundle) {
         Ok(_) => continue,  // Filter passed, continue chain
         Err(ExitValue(reason)) => {
-            // Filter called drop()
+            // Filter called exit()
             return FilterResult::Drop(reason);
         }
     }
@@ -2109,7 +2297,7 @@ Avoids copying return values. Caller specifies where to write; callee writes dir
 
 ### Why embed HeapRef inside Tracked<T>?
 
-Drop::drop() takes no arguments, so deallocation tracking requires storing the heap reference somewhere accessible. By embedding HeapRef in the Rc'd allocation (Tracked<T>), HeapVal remains 8 bytes (one pointer). The cost is 8 extra bytes per allocation, not per HeapVal clone. This keeps Value at 16 bytes for better cache locality across the 65K-slot stack—a bigger win than saving 8 bytes per allocation.
+Drop::exit() takes no arguments, so deallocation tracking requires storing the heap reference somewhere accessible. By embedding HeapRef in the Rc'd allocation (Tracked<T>), HeapVal remains 8 bytes (one pointer). The cost is 8 extra bytes per allocation, not per HeapVal clone. This keeps Value at 16 bytes for better cache locality across the 65K-slot stack—a bigger win than saving 8 bytes per allocation.
 
 ### Why Box<FrameInfo> instead of inline?
 
@@ -2150,7 +2338,7 @@ for driver binding enables:
 - Multiple use cases (filtering, transforms, validation, etc.)
 - Driver flexibility (select by signature, not syntax)
 - Cleaner language (fewer keywords, uniform semantics)
-- `drop()` as a builtin rather than special syntax
+- `exit()` as a builtin rather than special syntax
 
 ### Why Rust-style attributes with `:` for named values?
 

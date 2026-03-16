@@ -18,6 +18,24 @@ impl<'a> Lowerer<'a> {
             ast::Expression::Variable(name) => {
                 if let Some(var) = self.lookup(name) {
                     var
+                } else if let Some(cv) = self.const_bindings.get(name).cloned() {
+                    // Constant binding — emit inline literal
+                    let lit = match &cv {
+                        ConstValue::Bool(b) => Some(Literal::Bool(*b)),
+                        ConstValue::UInt(n) => Some(Literal::UInt(*n)),
+                        ConstValue::Int(n) => Some(Literal::Int(*n)),
+                        ConstValue::Float(f) => Some(Literal::Float(*f)),
+                        ConstValue::Text(s) => Some(Literal::Text(s.clone())),
+                        ConstValue::Bytes(b) => Some(Literal::Bytes(b.clone())),
+                        _ => None, // Array/Map constants can't be inlined as literals
+                    };
+                    if let Some(lit) = lit {
+                        let dest = self.new_temp(TypeSet::all());
+                        self.emit(Instruction::Const { dest, value: lit });
+                        dest
+                    } else {
+                        self.error_placeholder()
+                    }
                 } else {
                     self.error_undefined_var(None, name, self.current_span);
                     self.error_placeholder()
@@ -446,14 +464,6 @@ impl<'a> Lowerer<'a> {
         // Check if the function exists in the registry
         let builtin_def = self.builtins.get(&full_name);
 
-        // If function not found in builtins and not in core namespace,
-        // check if it might be a user-defined function (future: function table lookup)
-        // For now, require all functions to be in the builtins registry
-        if builtin_def.is_none() {
-            self.error_undefined_fn(namespace.map(|ns| &**ns), name, self.current_span);
-            return self.error_placeholder();
-        }
-
         let param_specs = builtin_def.map(|b| &b.meta.params);
 
         let args: Vec<CallArg> = arguments
@@ -471,9 +481,15 @@ impl<'a> Lowerer<'a> {
             })
             .collect();
 
-        // Emit the call with the resolved namespace
-        let resolved_namespace = if is_core_namespace || namespace.is_none() {
-            Some(ast::Identifier("core".to_string()))
+        // Emit the call with the resolved namespace.
+        // If found in builtins, use core:: prefix. Otherwise keep the original
+        // namespace (None for unqualified user-defined function calls).
+        let resolved_namespace = if builtin_def.is_some() {
+            if is_core_namespace || namespace.is_none() {
+                Some(ast::Identifier("core".to_string()))
+            } else {
+                namespace.cloned()
+            }
         } else {
             namespace.cloned()
         };

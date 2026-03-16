@@ -427,6 +427,83 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// Snapshot all variable bindings in the current scope stack.
+    /// Returns (name, VarId) pairs for all visible variables.
+    fn snapshot_scope(&self) -> Vec<(ast::Identifier, VarId)> {
+        let mut seen = std::collections::HashSet::new();
+        let mut result = Vec::new();
+        // Walk scopes from innermost to outermost (same as lookup order)
+        for scope in self.scopes.iter().rev() {
+            for (name, &var) in scope {
+                if seen.insert(name.clone()) {
+                    result.push((name.clone(), var));
+                }
+            }
+        }
+        result
+    }
+
+    /// Construct loop-carried phi nodes for a while/loop.
+    ///
+    /// Before the header: create a phi for each in-scope variable, bind the
+    /// variable to the phi result. After the body: patch each phi with the
+    /// post-body VarId. Variables not modified in the body get identity phis
+    /// (same VarId for both sources) which the closure compiler eliminates.
+    ///
+    /// Returns the list of (phi_var, pre_loop_var, variable_name) for patching.
+    fn create_loop_phis(
+        &mut self,
+        pre_header_bb: BlockId,
+        scope_snapshot: &[(ast::Identifier, VarId)],
+    ) -> Vec<(VarId, VarId, ast::Identifier)> {
+        let mut phis = Vec::new();
+        for (name, pre_loop_var) in scope_snapshot {
+            let phi_var = self.new_temp(TypeSet::all());
+            // Placeholder phi — body source added later
+            self.emit(Instruction::Phi {
+                dest: phi_var,
+                sources: vec![(pre_header_bb, *pre_loop_var)],
+            });
+            // Rebind variable to phi result — header uses this VarId
+            self.bind(name, phi_var);
+            phis.push((phi_var, *pre_loop_var, name.clone()));
+        }
+        phis
+    }
+
+    /// Patch loop-carried phis after the body is lowered.
+    /// Adds the post-body VarId as a second source for each phi.
+    fn patch_loop_phis(
+        &mut self,
+        header_bb: BlockId,
+        body_exit_bb: BlockId,
+        phis: &[(VarId, VarId, ast::Identifier)],
+    ) {
+        // For each phi, find the current VarId for the variable (post-body)
+        // and add it as a source from the body exit block
+        let post_body_vars: Vec<(VarId, VarId)> = phis
+            .iter()
+            .map(|(phi_var, _pre_var, name)| {
+                let post_var = self.lookup(name).unwrap_or(*phi_var);
+                (*phi_var, post_var)
+            })
+            .collect();
+
+        // Find the header block and patch each phi
+        if let Some(header_block) = self.blocks.iter_mut().find(|b| b.id == header_bb) {
+            for inst in &mut header_block.instructions {
+                if let Instruction::Phi { dest, sources } = &mut inst.node {
+                    for (phi_var, post_var) in &post_body_vars {
+                        if *dest == *phi_var {
+                            sources.push((body_exit_bb, *post_var));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Lower a while loop
     pub fn lower_while(
         &mut self,
@@ -438,12 +515,16 @@ impl<'a> Lowerer<'a> {
         let body_bb = self.fresh_block();
         let exit_bb = self.fresh_block();
 
-        // Jump to header
+        // Snapshot scope and jump to header
+        let scope_snapshot = self.snapshot_scope();
+        let pre_header_bb = self.current_block;
         self.finish_block(Terminator::Jump { target: header_bb });
 
-        // Header: evaluate condition
+        // Header: create loop-carried phis, then evaluate condition
         self.current_block = header_bb;
         self.current_instructions = Vec::new();
+        let loop_phis = self.create_loop_phis(pre_header_bb, &scope_snapshot);
+
         let cond = self.lower_expression(condition);
         self.finish_block(Terminator::If {
             condition: cond,
@@ -471,6 +552,11 @@ impl<'a> Lowerer<'a> {
         }
 
         let break_values = self.loop_stack.pop().unwrap().break_values;
+
+        // Patch phis with post-body variable values
+        let body_exit_bb = self.current_block;
+        self.patch_loop_phis(header_bb, body_exit_bb, &loop_phis);
+
         self.pop_scope();
 
         self.finish_block(Terminator::Jump { target: header_bb });
@@ -504,11 +590,16 @@ impl<'a> Lowerer<'a> {
         let body_bb = self.fresh_block();
         let exit_bb = self.fresh_block();
 
+        // Snapshot scope and jump to body (which acts as the header for loop)
+        let scope_snapshot = self.snapshot_scope();
+        let pre_header_bb = self.current_block;
         self.finish_block(Terminator::Jump { target: body_bb });
 
-        // Body
+        // Body: create loop-carried phis, then execute body
         self.current_block = body_bb;
         self.current_instructions = Vec::new();
+        let loop_phis = self.create_loop_phis(pre_header_bb, &scope_snapshot);
+
         self.push_scope();
 
         self.loop_stack.push(LoopContext {
@@ -525,6 +616,11 @@ impl<'a> Lowerer<'a> {
         }
 
         let break_values = self.loop_stack.pop().unwrap().break_values;
+
+        // Patch phis with post-body variable values
+        let body_exit_bb = self.current_block;
+        self.patch_loop_phis(body_bb, body_exit_bb, &loop_phis);
+
         self.pop_scope();
 
         self.finish_block(Terminator::Jump { target: body_bb });

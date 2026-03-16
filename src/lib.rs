@@ -1,5 +1,6 @@
 mod ast;
 pub mod builtins;
+mod compile;
 pub mod diagnostics;
 pub mod exec;
 mod ir;
@@ -19,12 +20,68 @@ pub use types::{BaseType, TypeSet};
 /// structure. A future serialization format will allow saving/loading
 /// compiled programs without re-compilation.
 pub struct Program {
-    ir: ir::IrProgram,
+    compiled: compile::CompiledProgram,
+}
+
+impl Program {
+    /// Resolve a function by name, returning a handle for repeated calls.
+    ///
+    /// Performs the name lookup once. The returned [`Function`] can be called
+    /// many times without further lookup overhead — critical for hot-path
+    /// embedding where the same program processes many inputs.
+    ///
+    /// ```ignore
+    /// let process = program.function("process").expect("function exists");
+    /// for input in inputs {
+    ///     let result = process.call(&program, &mut vm, &[input])?;
+    /// }
+    /// ```
+    pub fn function(&self, name: &str) -> Option<FunctionHandle<'_>> {
+        self.compiled
+            .func_index
+            .get(name)
+            .map(|&idx| FunctionHandle {
+                program: &self.compiled,
+                func_idx: idx,
+            })
+    }
+
+    /// Call a named function (convenience method — does a name lookup each time).
+    ///
+    /// For repeated calls to the same function, use [`function()`] to resolve
+    /// the name once and then call the returned handle.
+    pub fn call(
+        &self,
+        vm: &mut VM,
+        func_name: &str,
+        args: &[Value],
+    ) -> Result<Option<Value>, ExecError> {
+        compile::execute(&self.compiled, vm, func_name, args)
+    }
+}
+
+/// A resolved function handle — no name lookup on each call.
+///
+/// Obtained from [`Program::function()`]. Holds a reference to the program
+/// and the resolved function index. Use this for hot-path execution where
+/// the same function is called repeatedly with different data.
+pub struct FunctionHandle<'a> {
+    program: &'a compile::CompiledProgram,
+    func_idx: usize,
+}
+
+impl<'a> FunctionHandle<'a> {
+    /// Execute this function with the given arguments.
+    ///
+    /// No name lookup — the function was resolved when the handle was created.
+    pub fn call(&self, vm: &mut VM, args: &[Value]) -> Result<Option<Value>, ExecError> {
+        compile::execute_by_index(self.program, vm, self.func_idx, args)
+    }
 }
 
 /// Compile source code into an executable program.
 ///
-/// Runs the full pipeline: parse → lower → optimize.
+/// Runs the full pipeline: parse → lower → optimize → compile to closures.
 ///
 /// Returns `Ok((program, diagnostics))` on success (diagnostics may contain
 /// warnings), or `Err(diagnostics)` if there were compilation errors.
@@ -46,7 +103,19 @@ pub fn compile(
 
     ir::opt::optimize(&mut ir_program, builtins, &mut diagnostics);
 
-    Ok((Program { ir: ir_program }, diagnostics))
+    // Compile IR to closure-threaded code (includes link phase)
+    let mut compiled = match compile::compile_program(&ir_program, builtins) {
+        Ok(compiled) => compiled,
+        Err(link_errors) => {
+            diagnostics.merge(link_errors);
+            return Err(diagnostics);
+        }
+    };
+
+    // Merge any link-phase warnings (unused functions, etc.)
+    diagnostics.merge(std::mem::take(&mut compiled.warnings));
+
+    Ok((Program { compiled }, diagnostics))
 }
 
 /// Create a builtin registry with all standard builtins registered.

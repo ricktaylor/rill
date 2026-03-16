@@ -726,9 +726,10 @@ impl VM {
 
         // Write return value directly to caller's slot (must happen before truncate)
         if let Some(slot) = return_slot
-            && let Some(s) = self.stack.get_mut(slot) {
-                *s = Slot::Val(value);
-            }
+            && let Some(s) = self.stack.get_mut(slot)
+        {
+            *s = Slot::Val(value);
+        }
 
         self.stack.truncate(self.bp);
         self.bp = saved_bp;
@@ -803,6 +804,14 @@ impl VM {
     /// Set value at local offset
     pub fn set_local(&mut self, offset: usize, value: Value) {
         self.set(self.bp + offset, value);
+    }
+
+    /// Set a local slot to uninitialized (represents undefined)
+    pub fn set_local_uninit(&mut self, offset: usize) {
+        let idx = self.bp + offset;
+        if let Some(slot) = self.stack.get_mut(idx) {
+            *slot = Slot::Uninit;
+        }
     }
 
     /// Set a slot to be a reference to another slot

@@ -34,7 +34,7 @@ import std.status_report.codes as codes;
 
 fn check_lifetime(bundle) {
     if bundle.age > MAX_TTL {
-        drop(codes::LifetimeExpired);
+        exit(codes::LifetimeExpired);
     }
 }
 
@@ -43,7 +43,7 @@ fn validate_payload(bundle) {
         Bytes(data) if len(data) > 0 => {
             // Process valid payload
         },
-        _ => drop(codes::BlockUnintelligible)
+        _ => exit(codes::BlockUnintelligible)
     }
 }
 

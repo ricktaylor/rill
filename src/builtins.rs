@@ -31,8 +31,8 @@
 //! );
 //!
 //! registry.register(
-//!     BuiltinDef::new("drop", builtins::drop)
-//!         .param_optional("reason", TypeSet::uint())
+//!     BuiltinDef::new("core::exit", builtins::exit)
+//!         .param_optional("code", TypeSet::uint())
 //!         .exits(TypeSet::uint())  // Diverges, implicitly Impure
 //! );
 //! ```
@@ -307,12 +307,12 @@ pub enum ExecResult {
     Return(Option<Value>),
 
     /// Hard exit - value goes to driver, never returns to caller
-    /// Used by diverging builtins like drop()
+    /// Used by diverging builtins like exit()
     Exit(Value),
 }
 
 impl ExecResult {
-    /// Create an exit result (for diverging builtins like drop())
+    /// Create an exit result (for diverging builtins like exit())
     pub fn exit(value: Value) -> Self {
         ExecResult::Exit(value)
     }
@@ -699,16 +699,8 @@ pub fn standard_builtins() -> BuiltinRegistry {
     // Register core operator builtins
     register_core_builtins(&mut registry);
 
-    // Exit/control flow
     registry.register(
-        BuiltinDef::new("drop", builtin_drop)
-            .param_optional("reason", TypeSet::uint())
-            .exits(TypeSet::uint()),
-        // Note: exits() already sets Impure
-    );
-
-    registry.register(
-        BuiltinDef::new("len", builtin_len)
+        BuiltinDef::new("core::len", builtin_len)
             .param("value", TypeSet::collection())
             .returns(TypeSet::uint())
             .const_eval(const_eval_len),
@@ -739,11 +731,6 @@ pub fn standard_builtins() -> BuiltinRegistry {
 // ============================================================================
 // Builtin Implementations
 // ============================================================================
-
-fn builtin_drop(_vm: &mut VM, args: &[Value]) -> Result<ExecResult, ExecError> {
-    let reason = args.first().cloned().unwrap_or(Value::UInt(0));
-    Ok(ExecResult::exit(reason))
-}
 
 fn builtin_len(_vm: &mut VM, args: &[Value]) -> Result<ExecResult, ExecError> {
     let result = if let Some(value) = args.first() {

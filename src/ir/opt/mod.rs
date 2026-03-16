@@ -72,6 +72,12 @@ pub fn optimize_function(
     // Fold constants exposed by guard elimination and CFG simplification
     fold_constants(function, builtins, diagnostics);
 
+    // Pass 5.5: Final CFG simplification
+    // Cleanup fold may create new Jumps (from folded If/Guard with constant
+    // conditions). Merge any new linear chains so the closure compiler sees
+    // minimal blocks with no unnecessary NextBlock transitions.
+    let _blocks_removed2 = simplify_cfg(function);
+
     // Pass 6: Dead code elimination (TODO)
     // eliminate_dead_code(function);
 }

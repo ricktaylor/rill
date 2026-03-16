@@ -55,8 +55,8 @@ Bundle Protocol and BPSec status report reason codes (RFC 9171, RFC 9172)
 ```rust
 import std.status_report.codes as codes;
 
-drop codes::LifetimeExpired;
-drop codes::FailedSecurityOperation;
+exit codes::LifetimeExpired;
+exit codes::FailedSecurityOperation;
 ```
 
 See `stdlib_example.txt` for all constants.
@@ -68,7 +68,7 @@ BPSec signature and encryption validation
 import std.bpsec;
 
 if !bpsec::validate_signature(block, bundle) {
-    drop codes::FailedSecurityOperation;
+    exit codes::FailedSecurityOperation;
 }
 ```
 
@@ -92,7 +92,7 @@ CBOR encoding/decoding utilities
 import std.cbor;
 
 if !cbor::is_well_formed(data) {
-    drop codes::BlockUnintelligible;
+    exit codes::BlockUnintelligible;
 }
 ```
 

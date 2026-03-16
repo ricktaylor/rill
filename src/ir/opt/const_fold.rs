@@ -37,8 +37,9 @@ pub fn fold_constants(
 ) {
     let mut constants: ConstantMap = HashMap::new();
 
-    // First pass: collect all constant values
-    // We iterate until no new constants are discovered (fixpoint)
+    // Collect constant values, iterating to fixpoint.
+    // With proper SSA, each VarId is assigned exactly once, so this
+    // converges in 1-2 iterations.
     loop {
         let prev_count = constants.len();
         collect_constants(function, &mut constants, builtins);
@@ -64,31 +65,27 @@ pub fn fold_constants(
     }
 }
 
-/// Collect constant values from instructions
+/// Collect constant values from instructions (SSA: each VarId assigned once)
 fn collect_constants(function: &Function, constants: &mut ConstantMap, builtins: &BuiltinRegistry) {
     for block in &function.blocks {
         for spanned_inst in &block.instructions {
             match &spanned_inst.node {
-                // Const instructions directly provide constant values
                 Instruction::Const { dest, value } => {
                     constants.insert(*dest, literal_to_const(value));
                 }
 
-                // Copy propagates constants
                 Instruction::Copy { dest, src } => {
                     if let Some(cv) = constants.get(src) {
                         constants.insert(*dest, cv.clone());
                     }
                 }
 
-                // Phi with all constant sources of the same value
                 Instruction::Phi { dest, sources } => {
                     if let Some(cv) = try_fold_phi(sources, constants) {
                         constants.insert(*dest, cv);
                     }
                 }
 
-                // Builtin calls with Purity::Const
                 Instruction::Call {
                     dest,
                     function: func_ref,
@@ -99,21 +96,18 @@ fn collect_constants(function: &Function, constants: &mut ConstantMap, builtins:
                     }
                 }
 
-                // Intrinsic operations (And, Or)
                 Instruction::Intrinsic { dest, op, args } => {
                     if let Some(cv) = try_fold_intrinsic(*op, args, constants) {
                         constants.insert(*dest, cv);
                     }
                 }
 
-                // Index with constant base and key
                 Instruction::Index { dest, base, key } => {
                     if let Some(cv) = try_fold_index(*base, *key, constants) {
                         constants.insert(*dest, cv);
                     }
                 }
 
-                // Other instructions don't produce constants
                 _ => {}
             }
         }

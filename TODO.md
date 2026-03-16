@@ -185,25 +185,33 @@ Issues identified during code review, ordered by priority.
 ## Task Backlog
 
 ### P0 — Critical Path (needed for end-to-end execution)
-- [ ] Bridge IR to VM execution (IR interpreter or bytecode emission)
-- [ ] Verify all expression types lower correctly (binary ops, unary ops, calls, indexing, field access, bit access `@`)
-- [ ] Verify all statement types lower correctly (let, with, assign, augmented assign, return, for, while, loop, break, continue)
-- [ ] Verify match/pattern lowering completeness (type patterns, destructuring, guards, rest patterns)
-- [ ] End-to-end test: parse -> lower -> optimize -> execute
+- [x] Bridge IR to VM execution — closure-threaded compiler in `src/compile.rs`
+- [x] End-to-end test: 21 tests covering constants, arithmetic, variables,
+      if/else, while, loop/break, recursion, short-circuit logic, builtins
+- [ ] Parser: support final expressions (implicit return without semicolon)
+- [ ] Verify match/pattern execution correctness
+- [ ] Verify for-loop execution correctness
 
 ### P1 — Core Functionality
+- [ ] Register missing builtins: `core::make_seq`, `core::seq_next`, `core::array_seq`, `core::collect`
+- [ ] For-loop type dispatch (Match on iterable type for unknown types)
+- [ ] For-loop sequence path (seq_next-based loop for Sequence type)
+- [ ] Host sequence support (`SeqState::Host` variant, defer trait design to embedder API)
 - [ ] Module/import resolution system
 - [ ] Standard library: `std.cbor` (encode/decode)
 - [ ] Standard library: `std.time` (now, format)
 - [ ] Standard library: `std.encoding` (hex, base64)
 - [ ] Standard library: `std.parsing` (parse_int, etc.)
-- [ ] Error reporting with source spans through full pipeline
-- [ ] Public API surface (`src/lib.rs` currently only declares modules, no re-exports)
 
 ### P2 — Optimization & Quality
-- [ ] Dead code elimination pass
+- [ ] Dead code elimination pass (IR level)
+- [ ] Peephole optimization pass (closure compiler level, between phi resolution and flattening)
+  - Requires tagged `StepKind` intermediate form before conversion to closures
+  - Copy-to-self elimination, dead store removal, const+use fusion, jump threading
+- [ ] Tail-call optimization (IR level: detect tail calls, rewrite to param overwrite + jump to entry)
 - [ ] Additional const folding cases
 - [ ] Type narrowing through control flow
+- [ ] Dead-store warnings for non-ref-backed loop variable mutations
 - [ ] Integration test suite
 - [ ] Fuzz testing for parser
 - [ ] Documentation: API docs, embedding guide
@@ -218,7 +226,8 @@ Issues identified during code review, ordered by priority.
 
 ```
 src/
-  lib.rs              — Crate root (module declarations only)
+  lib.rs              — Public API: compile(), Program::call(), re-exports
+  compile.rs          — IR-to-closure compilation, phi elimination, flat executor
   ast.rs              — AST node types, Span, Spanned
   types.rs            — BaseType, TypeSet
   parser.rs           — Chumsky-based parser -> AST

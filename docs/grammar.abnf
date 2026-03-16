@@ -388,7 +388,7 @@ CR = %x0D                  ; Carriage return
 ;
 ; 6. Variable declarations require initialization (no "let x;")
 ;
-; 7. "drop(reason)" is a builtin function that exits to the driver
+; 7. "exit(code)" is a builtin function that exits to the driver
 ;    "return" returns a value to the caller
 ;
 ; 8. The "_" wildcard is valid in:
@@ -613,7 +613,7 @@ CR = %x0D                  ; Carriage return
 ;      #[after(validate)]
 ;      fn check_ttl(bundle) {
 ;          if bundle.age > MAX_TTL {
-;              drop(LIFETIME_EXPIRED);  // builtin, not keyword
+;              exit(LIFETIME_EXPIRED);  // builtin, not keyword
 ;          }
 ;      }
 ;

@@ -99,6 +99,9 @@ impl<'a> Lowerer<'a> {
                     }
                 };
 
+                // SSA: create a new VarId for each assignment, rebind the name.
+                // Loop-carried variables are handled by phi nodes constructed
+                // in the while/loop lowering.
                 let dest = self.new_temp(TypeSet::from_types(all_types()));
                 self.emit(Instruction::Copy {
                     dest,

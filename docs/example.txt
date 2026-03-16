@@ -24,13 +24,13 @@ const MaxHops = 16;
 filter check_age(bundle) after parser, validation::check_structure {
     // Use imported function from validation module
     if !validation::is_valid_timestamp(bundle.creation_time) {
-        drop codes::BlockUnintelligible;  // Using stdlib constant
+        exit codes::BlockUnintelligible;  // Using stdlib constant
     }
 
     // Use imported standard library function and module constant
     let current = time::now();
     if current - bundle.creation_time > MaxAge {
-        drop codes::LifetimeExpired;  // Reason code from stdlib
+        exit codes::LifetimeExpired;  // Reason code from stdlib
     }
 
     // Implicit Continue if we reach here
@@ -53,7 +53,7 @@ filter add_metadata(bundle) after check_age {
 
     // Use prelude: len() to check hop limit
     if bundle.path? && len(bundle.path) > MaxHops {
-        drop codes::HopLimitExceeded;
+        exit codes::HopLimitExceeded;
     }
 
     // Use prelude: type checking and coercion
@@ -80,7 +80,7 @@ filter validate_security(bundle) after check_age {
     if bundle.security_blocks? {
         for block in bundle.security_blocks {
             if !bpsec::validate_signature(block, bundle) {
-                drop codes::FailedSecurityOperation;  // RFC 9172 BPSec reason code
+                exit codes::FailedSecurityOperation;  // RFC 9172 BPSec reason code
             }
         }
     }
@@ -89,24 +89,24 @@ filter validate_security(bundle) after check_age {
 /*
  * Filter: validates payload structure using pattern matching
  *
- * Demonstrates calling helpers that can drop - no need to check return values!
+ * Demonstrates calling helpers that can exit - no need to check return values!
  */
 filter validate_payload(bundle) {
-    // Helper can drop directly - no return value checking needed
+    // Helper can exit directly - no return value checking needed
     validate_or_drop(bundle.payload);
 
     match bundle.payload {
         // Match map with specific keys
         Map([("type", Text("data")), ("content", content)]) => {
             if !is_valid_content(content) {
-                drop codes::BlockUnintelligible;
+                exit codes::BlockUnintelligible;
             }
         },
 
         // Match array with pattern
         Array([Text(header), ...rest]) => {
             if header != "VALID" {
-                drop;  // No reason code (allowed)
+                exit;  // No exit code (allowed)
             }
         },
 
@@ -118,7 +118,7 @@ filter validate_payload(bundle) {
 
         // Catch-all
         _ => {
-            drop codes::BlockUnintelligible;
+            exit codes::BlockUnintelligible;
         }
     }
 }
@@ -190,7 +190,7 @@ filter process_bundles(bundle) {
 /*
  * Helper function: validates content
  *
- * Note: Helpers can use "drop" to exit the entire filter chain,
+ * Note: Helpers can use "exit" to exit the entire filter chain,
  * or "return" to return a value to the caller
  */
 fn is_valid_content(content) {
@@ -207,7 +207,7 @@ fn is_valid_content(content) {
 // Helper function: validates and drops if invalid
 fn validate_or_drop(data) {
     if !cbor::is_well_formed(data) {
-        drop codes::BlockUnintelligible;  // Unwinds to filter
+        exit codes::BlockUnintelligible;  // Unwinds to filter
     }
 
     // Otherwise continue - implicit success
@@ -217,14 +217,14 @@ fn validate_or_drop(data) {
 fn validate_required_fields(bundle) {
     // Use is_some for boolean logic
     if !is_some(bundle.destination) || !is_some(bundle.source) {
-        drop codes::BlockUnintelligible;
+        exit codes::BlockUnintelligible;
     }
 
     // Multiple checks with && - type pattern checks both existence and type
     if is_some(bundle.priority) && with UInt(ttl) = bundle.ttl {
         // priority exists, ttl is a reference to bundle.ttl (if it's a UInt)
         if ttl == 0 {
-            drop codes::LifetimeExpired;
+            exit codes::LifetimeExpired;
         }
     }
 
