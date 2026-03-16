@@ -3,8 +3,6 @@
 //! This module defines the fundamental types of the Rill language.
 //! Both compile-time (IR) and runtime (exec) modules use these definitions.
 
-use std::collections::BTreeSet;
-
 /// The base types that a value can have at runtime.
 ///
 /// These correspond to CBOR major types plus our language-specific distinctions:
@@ -24,6 +22,7 @@ pub enum BaseType {
     Bytes,
     Array,
     Map,
+    Sequence,
 }
 
 impl BaseType {
@@ -38,6 +37,7 @@ impl BaseType {
             BaseType::Bytes => "Bytes",
             BaseType::Array => "Array",
             BaseType::Map => "Map",
+            BaseType::Sequence => "Sequence",
         }
     }
 
@@ -46,7 +46,7 @@ impl BaseType {
         matches!(self, BaseType::UInt | BaseType::Int | BaseType::Float)
     }
 
-    /// Check if this is a collection type
+    /// Check if this is a collection type (indexable)
     pub fn is_collection(&self) -> bool {
         matches!(
             self,
@@ -54,204 +54,241 @@ impl BaseType {
         )
     }
 
+    /// Check if this type can be iterated with `for`
+    pub fn is_iterable(&self) -> bool {
+        matches!(
+            self,
+            BaseType::Array | BaseType::Map | BaseType::Text | BaseType::Bytes | BaseType::Sequence
+        )
+    }
+
     /// Check if this is an integer type
     pub fn is_integer(&self) -> bool {
         matches!(self, BaseType::UInt | BaseType::Int)
     }
+
+    /// Bit position for this type in a TypeSet bitfield
+    const fn bit(self) -> u16 {
+        1 << (self as u16)
+    }
+
+    /// All base type variants, for iteration
+    const ALL: [BaseType; 9] = [
+        BaseType::Bool,
+        BaseType::UInt,
+        BaseType::Int,
+        BaseType::Float,
+        BaseType::Text,
+        BaseType::Bytes,
+        BaseType::Array,
+        BaseType::Map,
+        BaseType::Sequence,
+    ];
 }
 
 // ============================================================================
 // TypeSet - Set of possible types
 // ============================================================================
 
-/// A set of possible types for a value.
+/// A set of possible types for a value, stored as a compact bitfield.
 ///
 /// Used throughout the compiler for:
 /// - Builtin parameter and return type signatures
 /// - IR type analysis and refinement
 /// - Type checking and inference
 ///
+/// Internally uses a `u16` with one bit per `BaseType` (9 types = 9 bits).
+/// All operations are O(1) with no heap allocation.
+///
 /// Note: Definedness (whether a value might be undefined/missing) is tracked
 /// orthogonally via the Definedness lattice, not in TypeSet.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct TypeSet {
-    types: BTreeSet<BaseType>,
+    bits: u16,
+}
+
+impl std::fmt::Debug for TypeSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let types: Vec<&str> = BaseType::ALL
+            .iter()
+            .filter(|t| self.contains(**t))
+            .map(|t| t.name())
+            .collect();
+        write!(f, "TypeSet{{{}}}", types.join(", "))
+    }
 }
 
 impl TypeSet {
     /// Create an empty type set (represents unreachable/bottom)
-    pub fn empty() -> Self {
-        TypeSet {
-            types: BTreeSet::new(),
-        }
+    pub const fn empty() -> Self {
+        TypeSet { bits: 0 }
     }
 
     /// Create a type set containing a single type
-    pub fn single(ty: BaseType) -> Self {
-        let mut types = BTreeSet::new();
-        types.insert(ty);
-        TypeSet { types }
+    pub const fn single(ty: BaseType) -> Self {
+        TypeSet { bits: ty.bit() }
     }
 
     /// Create a type set from multiple types
     pub fn from_types(types: impl IntoIterator<Item = BaseType>) -> Self {
-        TypeSet {
-            types: types.into_iter().collect(),
+        let mut bits = 0u16;
+        for ty in types {
+            bits |= ty.bit();
         }
+        TypeSet { bits }
     }
 
     /// Create a type set containing all types
-    pub fn all() -> Self {
-        TypeSet::from_types([
-            BaseType::Bool,
-            BaseType::UInt,
-            BaseType::Int,
-            BaseType::Float,
-            BaseType::Text,
-            BaseType::Bytes,
-            BaseType::Array,
-            BaseType::Map,
-        ])
+    pub const fn all() -> Self {
+        TypeSet {
+            bits: BaseType::Bool.bit()
+                | BaseType::UInt.bit()
+                | BaseType::Int.bit()
+                | BaseType::Float.bit()
+                | BaseType::Text.bit()
+                | BaseType::Bytes.bit()
+                | BaseType::Array.bit()
+                | BaseType::Map.bit()
+                | BaseType::Sequence.bit(),
+        }
     }
 
-    // Convenience constructors matching common signatures
+    // Convenience constructors
 
-    /// Bool type
-    pub fn bool() -> Self {
+    pub const fn bool() -> Self {
         Self::single(BaseType::Bool)
     }
-
-    /// UInt type
-    pub fn uint() -> Self {
+    pub const fn uint() -> Self {
         Self::single(BaseType::UInt)
     }
-
-    /// Int type
-    pub fn int() -> Self {
+    pub const fn int() -> Self {
         Self::single(BaseType::Int)
     }
-
-    /// Float type
-    pub fn float() -> Self {
+    pub const fn float() -> Self {
         Self::single(BaseType::Float)
     }
-
-    /// Text type
-    pub fn text() -> Self {
+    pub const fn text() -> Self {
         Self::single(BaseType::Text)
     }
-
-    /// Bytes type
-    pub fn bytes() -> Self {
+    pub const fn bytes() -> Self {
         Self::single(BaseType::Bytes)
     }
-
-    /// Array type
-    pub fn array() -> Self {
+    pub const fn array() -> Self {
         Self::single(BaseType::Array)
     }
-
-    /// Map type
-    pub fn map() -> Self {
+    pub const fn map() -> Self {
         Self::single(BaseType::Map)
     }
-
-    /// Any numeric type (UInt, Int, Float)
-    pub fn numeric() -> Self {
-        TypeSet::from_types([BaseType::UInt, BaseType::Int, BaseType::Float])
+    pub const fn sequence() -> Self {
+        Self::single(BaseType::Sequence)
     }
 
-    /// Any integer type (UInt, Int)
-    pub fn integer() -> Self {
-        TypeSet::from_types([BaseType::UInt, BaseType::Int])
+    pub const fn numeric() -> Self {
+        TypeSet {
+            bits: BaseType::UInt.bit() | BaseType::Int.bit() | BaseType::Float.bit(),
+        }
     }
 
-    /// Any collection type (Array, Map, Text, Bytes)
-    pub fn collection() -> Self {
-        TypeSet::from_types([
-            BaseType::Array,
-            BaseType::Map,
-            BaseType::Text,
-            BaseType::Bytes,
-        ])
+    pub const fn integer() -> Self {
+        TypeSet {
+            bits: BaseType::UInt.bit() | BaseType::Int.bit(),
+        }
+    }
+
+    pub const fn collection() -> Self {
+        TypeSet {
+            bits: BaseType::Array.bit()
+                | BaseType::Map.bit()
+                | BaseType::Text.bit()
+                | BaseType::Bytes.bit(),
+        }
+    }
+
+    pub const fn iterable() -> Self {
+        TypeSet {
+            bits: BaseType::Array.bit()
+                | BaseType::Map.bit()
+                | BaseType::Text.bit()
+                | BaseType::Bytes.bit()
+                | BaseType::Sequence.bit(),
+        }
     }
 
     // Set operations
 
     /// Union of two type sets (for phi nodes, joins)
-    pub fn union(&self, other: &TypeSet) -> TypeSet {
+    pub const fn union(&self, other: &TypeSet) -> TypeSet {
         TypeSet {
-            types: self.types.union(&other.types).copied().collect(),
+            bits: self.bits | other.bits,
         }
     }
 
     /// Intersection of two type sets (for refinement)
-    pub fn intersection(&self, other: &TypeSet) -> TypeSet {
+    pub const fn intersection(&self, other: &TypeSet) -> TypeSet {
         TypeSet {
-            types: self.types.intersection(&other.types).copied().collect(),
+            bits: self.bits & other.bits,
         }
     }
 
     /// Difference: types in self but not in other
-    pub fn difference(&self, other: &TypeSet) -> TypeSet {
+    pub const fn difference(&self, other: &TypeSet) -> TypeSet {
         TypeSet {
-            types: self.types.difference(&other.types).copied().collect(),
+            bits: self.bits & !other.bits,
         }
     }
 
     // Queries
 
     /// Check if type set contains a specific type
-    pub fn contains(&self, ty: BaseType) -> bool {
-        self.types.contains(&ty)
+    pub const fn contains(&self, ty: BaseType) -> bool {
+        self.bits & ty.bit() != 0
     }
 
     /// Check if type set is empty (unreachable/bottom)
-    pub fn is_empty(&self) -> bool {
-        self.types.is_empty()
+    pub const fn is_empty(&self) -> bool {
+        self.bits == 0
     }
 
     /// Check if type set contains exactly one type
-    pub fn is_single(&self) -> bool {
-        self.types.len() == 1
+    pub const fn is_single(&self) -> bool {
+        self.bits != 0 && (self.bits & (self.bits - 1)) == 0
     }
 
     /// Get the single type if this set contains exactly one
     pub fn as_single(&self) -> Option<BaseType> {
-        if self.types.len() == 1 {
-            self.types.iter().next().copied()
-        } else {
-            None
+        if !self.is_single() {
+            return None;
         }
+        BaseType::ALL.iter().find(|t| self.contains(**t)).copied()
     }
 
     /// Check if this is a boolean type (exactly Bool)
-    pub fn is_bool(&self) -> bool {
-        self.types.len() == 1 && self.types.contains(&BaseType::Bool)
+    pub const fn is_bool(&self) -> bool {
+        self.bits == BaseType::Bool.bit()
     }
 
     /// Check if all types are numeric
-    pub fn is_numeric(&self) -> bool {
-        !self.types.is_empty() && self.types.iter().all(|t| t.is_numeric())
+    pub const fn is_numeric(&self) -> bool {
+        self.bits != 0 && self.bits & !Self::numeric().bits == 0
     }
 
     /// Check if all types are integers
-    pub fn is_integer(&self) -> bool {
-        !self.types.is_empty() && self.types.iter().all(|t| t.is_integer())
+    pub const fn is_integer(&self) -> bool {
+        self.bits != 0 && self.bits & !Self::integer().bits == 0
     }
 
     /// Check if all types are collections
-    pub fn is_collection(&self) -> bool {
-        !self.types.is_empty() && self.types.iter().all(|t| t.is_collection())
+    pub const fn is_collection(&self) -> bool {
+        self.bits != 0 && self.bits & !Self::collection().bits == 0
     }
 
     /// Iterate over the types in this set
     pub fn iter(&self) -> impl Iterator<Item = BaseType> + '_ {
-        self.types.iter().copied()
+        BaseType::ALL.iter().filter(|t| self.contains(**t)).copied()
     }
 
     /// Number of types in this set
-    pub fn len(&self) -> usize {
-        self.types.len()
+    pub const fn len(&self) -> usize {
+        self.bits.count_ones() as usize
     }
 }

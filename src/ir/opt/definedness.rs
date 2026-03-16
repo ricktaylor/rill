@@ -552,7 +552,7 @@ pub struct FunctionReturnInfo {
 }
 
 /// Map from function name to return info
-pub type FunctionReturnMap = HashMap<String, FunctionReturnInfo>;
+pub type FunctionReturnMap = HashMap<crate::ast::Identifier, FunctionReturnInfo>;
 
 /// Analyze the return definedness of a function
 ///
@@ -593,14 +593,14 @@ pub fn analyze_return_definedness(
 /// Analyze return definedness for all functions in a program
 pub fn analyze_all_returns(
     functions: &[Function],
-    analyses: &HashMap<String, DefinednessAnalysis>,
+    analyses: &HashMap<crate::ast::Identifier, DefinednessAnalysis>,
 ) -> FunctionReturnMap {
     let mut map = FunctionReturnMap::new();
 
     for function in functions {
-        if let Some(analysis) = analyses.get(&function.name.0) {
+        if let Some(analysis) = analyses.get(&function.name) {
             let info = analyze_return_definedness(function, analysis);
-            map.insert(function.name.0.clone(), info);
+            map.insert(function.name.clone(), info);
         }
     }
 
@@ -651,7 +651,7 @@ pub fn check_definedness(
             check_instruction_uses(
                 &spanned_inst.node,
                 &state,
-                &function.name.0,
+                &function.name,
                 &analysis.provenance,
                 spanned_inst.span,
                 diagnostics,
@@ -669,7 +669,7 @@ pub fn check_definedness(
         check_terminator_uses(
             &block.terminator,
             &state,
-            &function.name.0,
+            &function.name,
             &analysis.provenance,
             diagnostics,
         );

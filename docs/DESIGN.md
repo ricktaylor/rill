@@ -76,6 +76,13 @@ Source Code
 | `Bytes` | `HeapVal<Vec<u8>>` | 2 |
 | `Array` | `HeapVal<Vec<Value>>` | 4 |
 | `Map` | `HeapVal<IndexMap<Value, Value>>` | 5 |
+| `Sequence` | `HeapVal<SeqState>` | — (internal) |
+
+**Note on Sequence:** Sequence is a 9th internal type for lazy, single-pass values
+(e.g., `0..10` creates a Sequence, not an Array). It is not user-visible as a type
+name — users cannot pattern match on it. They interact with sequences through `for`
+loops and `collect()`. The `..` operator is described as creating "a sequence", not
+"a range object."
 
 ### Undefined Values
 
@@ -114,7 +121,25 @@ Value::Text(HeapVal<String>)
 Value::Bytes(HeapVal<Vec<u8>>)
 Value::Array(HeapVal<Vec<Value>>)
 Value::Map(HeapVal<IndexMap<Value, Value>>)
+Value::Sequence(HeapVal<SeqState>)
 ```
+
+### SeqState
+
+Internal state for lazy sequences:
+
+```rust
+pub enum SeqState {
+    RangeUInt { current: u64, end: u64, inclusive: bool },
+    RangeInt { current: i64, end: i64, inclusive: bool },
+    ArraySlice { source: HeapVal<Vec<Value>>, start: usize, end: usize, mutable: bool },
+}
+```
+
+- **RangeUInt/RangeInt**: Created by `0..10` / `0..=10`. O(1) memory.
+- **ArraySlice**: Created by `..rest` patterns. Zero-copy reference to source array.
+  The `mutable` flag follows the binding mode: `let` = false, `with` = true.
+  Mutable slices allow for-loop write-back to the source array.
 
 ### HeapVal<T>
 
@@ -351,8 +376,8 @@ All other operators are implemented as **core builtins** with `Purity::Const`:
 
 Other builtins with appropriate purity annotations:
 
-- Collection: `len()`, `concat()`, `push()`, `insert()`, `slice()`
-- Ranges: `range()`, `range_inclusive()`
+- Collection: `len()`, `concat()`, `push()`, `insert()`, `sub_slice()`, `collect()`
+- Sequences: created by `..` operator; `core::make_seq`, `core::seq_next`, `core::array_seq`
 - Type conversion: `to_uint()`, `to_int()`, `to_float()`, `to_text()`
 - Type checking: `is_uint()`, `is_some()`, etc.
 
@@ -1101,9 +1126,30 @@ The `with` keyword can be used explicitly for by-reference (same as default) for
 |---------|-------------------|-------------------|----------|
 | Statement | `with x = expr` | — | `let x = expr` |
 | Conditional | `if with x = expr { }` | — | `if let x = expr { }` |
-| For loop | `for with x in arr { }` | `for x in arr { }` | `for let x in arr { }` |
+| For loop (single) | `for with x in arr { }` | `for x in arr { }` | `for let x in arr { }` |
+| For loop (pair) | `for with k, v in map { }` | `for k, v in map { }` | `for let k, v in map { }` |
 | Match arm | `with pat => { }` | `pat => { }` | `let pat => { }` |
 | Function param | `fn foo(with x)` | `fn foo(x)` | `fn foo(let x)` |
+
+**For-loop pair binding:**
+
+```rust
+for k, v in map { }         // k = key (always by-val), v refs value
+for i, x in arr { }         // i = index (always by-val), x refs element
+for let k, v in map { }     // both by-value
+```
+
+The first variable (key/index) is always by-value. The `let`/`with` keyword
+controls the second variable's binding mode.
+
+**For-loop and Sequences:**
+
+Collections (Array, Map, Bytes) support by-ref iteration — mutations through the
+loop variable write back to the source. Sequences (from `..` operator) are always
+by-value — there is no backing store to write back to. Text iteration yields
+characters by-value (characters aren't individually mutable slots).
+
+The compiler warns on mutations to non-ref-backed loop variables (dead stores).
 
 **Semantics:**
 
@@ -1171,11 +1217,10 @@ Auto-imported functions available without qualification.
 | Function | Returns | Purpose |
 |----------|---------|---------|
 | `to_uint(v)`, `to_int(v)`, ... | Value or Undefined | Type conversion |
-| `len(v)` | `UInt` or Undefined | Collection length |
+| `len(v)` | `UInt` or Undefined | Collection/sequence length |
 | `concat(a, b)` | Collection or Undefined | Concatenate arrays, text, bytes |
-| `slice(coll, start, end)` | Collection | Extract sub-collection [start, end) |
-| `range(start, end)` | Array | Create range [start, end) |
-| `range_inclusive(start, end)` | Array | Create range [start, end] |
+| `collect(seq)` | Array | Materialize a sequence into an Array |
+| `sub_slice(coll, start, end)` | Collection | Extract sub-collection [start, end) |
 
 **Internal functions** (compiler-generated for lowering literals):
 
@@ -1189,21 +1234,42 @@ Auto-imported functions available without qualification.
 ### Rest Patterns
 
 ```rust
-let [first, ..rest] = arr;      // rest = remaining elements
+let [first, ..rest] = arr;      // rest = Sequence (immutable, by-value iteration)
+with [first, ..rest] = arr;     // first = ref, rest = Sequence (mutable, write-back)
 let [head, .., tail] = arr;     // ignore middle
-let [a, ..middle, z] = arr;     // capture middle
+let [a, ..middle, z] = arr;     // capture middle as Sequence
 let [first, ..] = arr;          // ignore rest (no binding)
 ```
 
-### Ranges
+The `..rest` variable is always a Sequence (zero-copy view of the source array),
+never a copied Array. Mutability follows the binding mode:
+
+- `let [a, ..rest] = arr` → rest is an immutable Sequence; iteration is by-value
+- `with [a, ..rest] = arr` → rest is a mutable Sequence; for-loop write-back works
+
+Use `collect(rest)` to materialize a Sequence into a concrete Array if random
+access is needed.
+
+### Sequences (the `..` operator)
+
+The `..` and `..=` operators create lazy sequences with O(1) memory:
 
 ```rust
-0..10     // Exclusive: [0, 1, ..., 9]
-0..=10    // Inclusive: [0, 1, ..., 10]
+0..10     // Exclusive: yields 0, 1, ..., 9
+0..=10    // Inclusive: yields 0, 1, ..., 10
 
 for i in 0..len(arr) { }        // Dynamic bounds
-let indices = 0..5;             // Range as value
+let s = 0..5;                   // Store a sequence
+for x in s { }                  // Consume it
+let arr = collect(0..10);       // Materialize to Array
 ```
+
+Sequences are an internal type — not user-visible for pattern matching. Users
+never write "Sequence" in their code. They write `0..10`, use `for` loops,
+and call `collect()`.
+
+Host builtins can return sequences for lazy data streams (e.g., iterating over
+DTN bundle blocks without materializing them all into an Array).
 
 ---
 
@@ -1977,10 +2043,11 @@ The driver topologically sorts filters to honor these dependencies.
 - [x] AST types
 - [x] Parser (chumsky)
 - [x] IR types and structures
-- [x] IR lowering (AST → IR)
+- [x] IR lowering (AST → IR) — all expression, statement, and pattern types
 - [x] VM core (stack, frames, slots)
-- [x] Heap tracking with HeapVal
+- [x] Heap tracking with HeapVal (uses capacity() for accuracy)
 - [x] Value types with Hash/Eq
+- [x] Sequence type (SeqState: RangeUInt, RangeInt, ArraySlice with mutable flag)
 - [x] Call convention with return slots
 - [x] Reference binding via Slot::Ref
 - [x] Builtin registry and metadata system
@@ -1991,14 +2058,25 @@ The driver topologically sorts filters to honor these dependencies.
   - [x] Guard elimination
   - [x] CFG simplification
   - [x] Type refinement
+- [x] Public API: opaque `Program`, `compile()`, `standard_builtins()`
+- [x] Source location utilities: `span_to_line_col()`, `LineCol`
+- [x] For-loop pair binding: `for k, v in map { }`
+- [x] Pattern lowering: Type, Map, ArrayRest with after patterns
+- [x] TypeSet as u16 bitfield (Copy, const, zero heap)
 
 ### Pending
 
-- [ ] Instruction execution (VM codegen)
-- [ ] Builtin implementations (runtime)
-- [ ] Standard library modules
+- [ ] Instruction execution (IR interpreter or VM codegen)
+- [ ] Builtin implementations: `core::make_seq`, `core::seq_next`,
+      `core::array_seq`, `core::collect`
+- [ ] For-loop type dispatch (Match on iterable type for unknown types)
+- [ ] For-loop sequence path (seq_next-based loop for Sequence type)
+- [ ] Dead-store warnings for non-ref-backed loop variable mutations
+- [ ] Host sequence support (`SeqState::Host` variant)
+- [ ] Standard library modules (std.time, std.cbor, std.encoding, std.parsing)
+- [ ] Module/import resolution system
 - [ ] CBOR encode/decode integration
-- [ ] CBOR binary output format
+- [ ] Compiled binary format
 - [ ] Dead code elimination pass
 
 ---

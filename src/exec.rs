@@ -19,6 +19,9 @@ pub const MAX_STACK_SIZE: usize = 65536;
 /// Default heap limit (bytes, approximate)
 pub const DEFAULT_HEAP_LIMIT: usize = 16 * 1024 * 1024; // 16 MB
 
+/// Maximum Ref indirection depth (guards against circular refs)
+const MAX_REF_DEPTH: usize = 64;
+
 // ============================================================================
 // Heap tracking
 // ============================================================================
@@ -76,26 +79,31 @@ pub trait HeapSize {
 
 impl HeapSize for Vec<u8> {
     fn heap_size(&self) -> usize {
-        self.len()
+        self.capacity()
     }
 }
 
 impl HeapSize for String {
     fn heap_size(&self) -> usize {
-        self.len()
+        self.capacity()
     }
 }
 
-// Note: These impls will use the new 16-byte Value size after this change
 impl HeapSize for Vec<Value> {
     fn heap_size(&self) -> usize {
-        self.len() * std::mem::size_of::<Value>()
+        self.capacity() * std::mem::size_of::<Value>()
+    }
+}
+
+impl HeapSize for SeqState {
+    fn heap_size(&self) -> usize {
+        std::mem::size_of::<Self>()
     }
 }
 
 impl HeapSize for IndexMap<Value, Value> {
     fn heap_size(&self) -> usize {
-        self.len() * std::mem::size_of::<(Value, Value)>()
+        self.capacity() * std::mem::size_of::<(Value, Value)>()
     }
 }
 
@@ -282,6 +290,223 @@ impl Slot {
 }
 
 // ============================================================================
+// Sequence State
+// ============================================================================
+
+/// Internal state for a Sequence value.
+///
+/// Sequences are single-pass lazy values. Advancing a sequence is a mutation
+/// on the shared HeapVal — all references to the same sequence see the
+/// same position.
+#[derive(Debug, Clone)]
+pub enum SeqState {
+    /// Range over unsigned integers
+    RangeUInt {
+        current: u64,
+        end: u64,
+        inclusive: bool,
+    },
+    /// Range over signed integers
+    RangeInt {
+        current: i64,
+        end: i64,
+        inclusive: bool,
+    },
+    /// Zero-copy slice of an array (e.g., from `..rest` patterns).
+    ///
+    /// Holds a refcounted reference to the source array — no element copying.
+    ///
+    /// Mutability is controlled by `mutable`:
+    /// - `false` (`let` binding): elements yielded by-value, no write-back
+    /// - `true` (`with` binding): for-loop uses source-relative MakeRef,
+    ///   mutations through the loop variable write back to the source array
+    ///
+    /// ```text
+    /// let [first, ..rest] = arr;   // rest.mutable = false
+    /// with [first, ..rest] = arr;  // rest.mutable = true, first is also by-ref
+    /// ```
+    ArraySlice {
+        source: HeapVal<Vec<Value>>,
+        start: usize,
+        end: usize,
+        mutable: bool,
+    },
+}
+
+impl SeqState {
+    /// Advance the sequence and return the next value, or None if exhausted.
+    pub fn next(&mut self) -> Option<Value> {
+        match self {
+            SeqState::RangeUInt {
+                current,
+                end,
+                inclusive,
+            } => {
+                let done = if *inclusive {
+                    *current > *end
+                } else {
+                    *current >= *end
+                };
+                if done {
+                    return None;
+                }
+                let val = Value::UInt(*current);
+                *current = current.saturating_add(1);
+                Some(val)
+            }
+            SeqState::RangeInt {
+                current,
+                end,
+                inclusive,
+            } => {
+                let done = if *inclusive {
+                    *current > *end
+                } else {
+                    *current >= *end
+                };
+                if done {
+                    return None;
+                }
+                let val = Value::Int(*current);
+                *current = current.saturating_add(1);
+                Some(val)
+            }
+            SeqState::ArraySlice {
+                source, start, end, ..
+            } => {
+                if *start >= *end {
+                    return None;
+                }
+                let val = source.get(*start).cloned();
+                *start += 1;
+                val
+            }
+        }
+    }
+
+    /// Remaining length, if known.
+    pub fn remaining(&self) -> Option<usize> {
+        match self {
+            SeqState::RangeUInt {
+                current,
+                end,
+                inclusive,
+            } => {
+                let end_val = if *inclusive {
+                    end.saturating_add(1)
+                } else {
+                    *end
+                };
+                Some(end_val.saturating_sub(*current) as usize)
+            }
+            SeqState::RangeInt {
+                current,
+                end,
+                inclusive,
+            } => {
+                let end_val = if *inclusive {
+                    end.saturating_add(1)
+                } else {
+                    *end
+                };
+                if end_val <= *current {
+                    Some(0)
+                } else {
+                    Some((end_val - *current) as usize)
+                }
+            }
+            SeqState::ArraySlice { start, end, .. } => Some(end.saturating_sub(*start)),
+        }
+    }
+}
+
+impl PartialEq for SeqState {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                SeqState::RangeUInt {
+                    current: a,
+                    end: b,
+                    inclusive: c,
+                },
+                SeqState::RangeUInt {
+                    current: d,
+                    end: e,
+                    inclusive: f,
+                },
+            ) => a == d && b == e && c == f,
+            (
+                SeqState::RangeInt {
+                    current: a,
+                    end: b,
+                    inclusive: c,
+                },
+                SeqState::RangeInt {
+                    current: d,
+                    end: e,
+                    inclusive: f,
+                },
+            ) => a == d && b == e && c == f,
+            (
+                SeqState::ArraySlice {
+                    source: a,
+                    start: b,
+                    end: c,
+                    mutable: m1,
+                },
+                SeqState::ArraySlice {
+                    source: d,
+                    start: e,
+                    end: f,
+                    mutable: m2,
+                },
+            ) => a == d && b == e && c == f && m1 == m2,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for SeqState {}
+
+impl Hash for SeqState {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            SeqState::RangeUInt {
+                current,
+                end,
+                inclusive,
+            } => {
+                current.hash(state);
+                end.hash(state);
+                inclusive.hash(state);
+            }
+            SeqState::RangeInt {
+                current,
+                end,
+                inclusive,
+            } => {
+                current.hash(state);
+                end.hash(state);
+                inclusive.hash(state);
+            }
+            SeqState::ArraySlice {
+                source,
+                start,
+                end,
+                mutable,
+            } => {
+                mutable.hash(state);
+                // Hash the visible slice contents for value equality
+                for val in source.iter().skip(*start).take(*end - *start) {
+                    val.hash(state);
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
 // Values (scalars inline, collections heap-allocated)
 // ============================================================================
 
@@ -307,6 +532,9 @@ pub enum Value {
     Array(HeapVal<Vec<Value>>),
     /// Map: any value can be a key (CBOR compliant)
     Map(HeapVal<IndexMap<Value, Value>>),
+
+    // --- Sequence type (single-pass lazy values, e.g. ranges) ---
+    Sequence(HeapVal<SeqState>),
 }
 
 impl Value {
@@ -320,6 +548,7 @@ impl Value {
             Value::Text(_) => BaseType::Text,
             Value::Array(_) => BaseType::Array,
             Value::Map(_) => BaseType::Map,
+            Value::Sequence(_) => BaseType::Sequence,
         }
     }
 
@@ -329,12 +558,18 @@ impl Value {
             Value::Text(s) => Some(s.chars().count()),
             Value::Array(a) => Some(a.len()),
             Value::Map(m) => Some(m.len()),
+            Value::Sequence(it) => it.remaining(),
             _ => None,
         }
     }
 
+    /// Check if the value is empty. Only meaningful for collections and iterators.
+    /// Returns false for scalar types (scalars are not "empty").
     pub fn is_empty(&self) -> bool {
-        self.len().is_none_or(|n| n == 0)
+        match self.len() {
+            Some(n) => n == 0,
+            None => false, // scalars are not empty
+        }
     }
 }
 
@@ -358,6 +593,7 @@ impl Hash for Value {
                     v.hash(state);
                 }
             }
+            Value::Sequence(it) => it.hash(state),
         }
     }
 }
@@ -513,12 +749,19 @@ impl VM {
     // Slot access
     // ========================================================================
 
-    /// Resolve a slot index, following Ref indirection
+    /// Resolve a slot index, following Ref indirection.
+    /// Uses an iteration limit to prevent infinite loops on circular refs.
     pub fn resolve(&self, idx: usize) -> usize {
-        match self.stack.get(idx) {
-            Some(Slot::Ref(target)) => self.resolve(*target),
-            _ => idx,
+        let mut current = idx;
+        // Ref chains should be short (typically 1 hop). A limit prevents
+        // infinite loops if circular refs are ever constructed by a bug.
+        for _ in 0..MAX_REF_DEPTH {
+            match self.stack.get(current) {
+                Some(Slot::Ref(target)) => current = *target,
+                _ => return current,
+            }
         }
+        current
     }
 
     /// Get value at absolute index, following refs
@@ -701,10 +944,12 @@ impl Default for VM {
 // ============================================================================
 
 /// Execution error
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ExecError {
     /// Stack overflow (value or recursion)
+    #[error("stack overflow (limit: {MAX_STACK_SIZE} slots)")]
     StackOverflow,
     /// Heap allocation limit exceeded
+    #[error("heap allocation limit exceeded")]
     HeapOverflow,
 }

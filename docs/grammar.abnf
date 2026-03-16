@@ -128,7 +128,7 @@ assign-op = "=" / "+=" / "-=" / "*=" / "/=" / "%="
 
 binary-expr = range-expr
 
-range-expr = or-expr [(".." / "..=") or-expr]  ; Range produces Array type
+range-expr = or-expr [(".." / "..=") or-expr]  ; .. produces a lazy Sequence
 
 or-expr = and-expr *("||" and-expr)
 
@@ -213,14 +213,12 @@ loop-expr = "loop" block
 ; Reference binding (default): for x in arr { } - x refers to each element
 ; Value binding (explicit): for let x in arr { } - x is a copy of each element
 ; Explicit reference: for with x in arr { } - same as default, for symmetry
-; Destructuring for maps: for [k, v] in map { }
-; Iterable can be any expression: Array, Map, or Range (0..10, 0..=10)
+; Pair binding for maps: for k, v in map { }
+; Iterable can be any expression: Array, Map, Sequence (0..10), etc.
 for-expr = "for" ["let" / "with"] for-binding "in" expression block
 
-for-binding = identifier                              ; Single variable: for x in arr
-            / "[" identifier-list "]"                 ; Array destructure: for [k, v] in map
-
-identifier-list = identifier *("," identifier)
+for-binding = identifier "," identifier                ; Pair: for k, v in map / for i, x in arr
+            / identifier                              ; Single: for x in arr
 
 block-expr = "{" *statement [expression] "}"
 
@@ -256,6 +254,13 @@ array-pattern = "[" [pattern-list] "]"
 
 ; Rest pattern uses ".." optionally followed by identifier (whitespace permitted)
 ; ".." without identifier ignores remaining elements without binding
+; The rest variable is bound as a Sequence (zero-copy view of the source array).
+; Mutability follows the binding mode — no hidden surprises:
+;   let [first, ..rest] = arr;    // first=copy, rest=immutable Sequence (by-value iteration)
+;   with [first, ..rest] = arr;   // first=ref, rest=mutable Sequence (write-back to arr)
+;   with [a, ..rest, z] = arr;    // a,z=ref, rest=mutable Sequence
+; For mutable sequences, `for x in rest { x += 1; }` writes back to the
+; source array. For immutable sequences, mutations are dead stores (warned).
 array-rest-pattern = "[" [pattern-list ","] ".." [identifier] ["," pattern-list] "]"
 
 pattern-list = pattern *("," pattern)
@@ -454,34 +459,38 @@ CR = %x0D                  ; Carriage return
 ;    - Compiler tracks if parameters were mutated (filter vs rewriter)
 ;
 ; 18. For loop binding semantics:
-;    - `for x in arr { }` - REFERENCE binding (default)
-;      x refers to each element; mutations through x affect the original
-;    - `for let x in arr { }` - VALUE binding (explicit)
-;      x is a copy of each element; mutations don't affect the original
-;    - Reference is default because mutation is the common use case
-;    - Destructuring patterns for map iteration:
-;      for [k, v] in map { }       // k: value (immutable), v: reference
-;      for let [k, v] in map { }   // k: value (immutable), v: value
-;    - The key (first element) is ALWAYS by-value and immutable:
-;      - Mutating the key is a compile error (would break map semantics)
-;      - The `let` keyword only controls the value's (second element) binding mode
-;    - The syntax mirrors pattern matching for consistency:
-;      match x { [a, b] => { } }   // array pattern
-;    - Range iteration:
-;      for i in 0..10 { }          // reference binding with range
-;      for let i in 0..10 { }      // value binding with range
+;    - Single variable:
+;      for x in arr { }            // x refs each element (default = by-ref)
+;      for let x in arr { }        // x copies each element (by-value)
+;      for with x in arr { }       // explicit by-ref (same as default)
+;    - Pair binding (key/index + value):
+;      for k, v in map { }         // k = key (always by-val), v refs value
+;      for let k, v in map { }     // k = key (always by-val), v copies value
+;      for i, x in arr { }         // i = index (always by-val), x refs element
+;      for let i, x in arr { }     // i = index (always by-val), x copies element
+;    - The first variable (key/index) is ALWAYS by-value:
+;      Mutating a key would break map semantics; indices are computed values
+;    - The `let`/`with` keyword controls the second variable's binding mode
+;    - By-ref on sequences degrades to by-value (no backing store):
+;      for x in 0..10 { x += 1; }  // x is by-value; mutation is a dead store
+;      The compiler warns on mutations to non-ref-backed loop variables
 ;
-; 19. Range expressions (0..n, 0..=n):
-;    - Range is a first-class expression producing Array type
-;    - Lowest precedence: `1+2..3+4` parses as `(1+2)..(3+4)`
-;    - Can be used anywhere an expression is expected:
-;      let indices = 0..5;         // Range as value (Array type)
-;      let x = (0..10)[5];         // Indexing into range
-;      for i in 0..len(arr) { }    // Dynamic bounds supported
-;      let r = if cond { 0..5 } else { 10..15 };  // Range in conditionals
+; 19. Sequences and the `..` operator:
+;    - The `..` and `..=` operators create lazy sequences, O(1) memory:
+;      for i in 0..1000000 { }     // no array allocation
+;    - Sequences can be stored and passed:
+;      let s = 0..10;              // s is a lazy sequence
+;      for x in s { }              // consumes the sequence
+;    - collect() materializes a sequence into an Array
+;    - Host builtins can return sequences for lazy data streams
+;    - Sequences are not user-visible as a type name (no pattern matching)
+;    - The for loop handles both collections and sequences:
+;      - Array, Map, Bytes: index-based iteration (supports by-ref)
+;      - Text: character iteration (always by-value)
+;      - Sequence: next-based consumption (always by-value)
 ;    - Inclusive vs exclusive:
-;      0..5   → [0, 1, 2, 3, 4]      (exclusive end)
-;      0..=5  → [0, 1, 2, 3, 4, 5]   (inclusive end)
+;      0..5   → yields 0, 1, 2, 3, 4      (exclusive end)
+;      0..=5  → yields 0, 1, 2, 3, 4, 5   (inclusive end)
 ;
 ; 20. Rest patterns in array matching:
 ;    - Syntax: `..identifier` captures remaining elements as an array
@@ -513,7 +522,7 @@ CR = %x0D                  ; Carriage return
 ;      - .. rest patterns: both ..rest and .. rest are valid
 ;      - . member access: both obj.field and obj . field are valid
 ;      - Binary operators: 1+2, 1 + 2, 1+ 2 all valid
-;      - Range: 0..10 and 0 .. 10 both valid
+;      - Sequence: 0..10 and 0 .. 10 both valid
 ;
 ; 24. Unified `let` vs `with` semantics:
 ;    - `let` = by-value bindings via pattern (copies)

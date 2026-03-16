@@ -16,10 +16,10 @@ impl<'a> Lowerer<'a> {
             ast::Expression::Literal(lit) => self.lower_literal(lit),
 
             ast::Expression::Variable(name) => {
-                if let Some(var) = self.lookup(&name.0) {
+                if let Some(var) = self.lookup(name) {
                     var
                 } else {
-                    self.error_undefined_var(None, &name.0, dummy_span());
+                    self.error_undefined_var(None, name, self.current_span);
                     self.error_placeholder()
                 }
             }
@@ -27,7 +27,7 @@ impl<'a> Lowerer<'a> {
             ast::Expression::QualifiedName { namespace, name } => {
                 // QualifiedName is for accessing constants like `math::PI`
                 // Currently not supported - emit error
-                self.error_undefined_var(Some(&namespace.0), &name.0, dummy_span());
+                self.error_undefined_var(Some(namespace), name, self.current_span);
                 self.error_placeholder()
             }
 
@@ -63,7 +63,7 @@ impl<'a> Lowerer<'a> {
             } => {
                 self.push_scope();
                 for stmt in statements {
-                    self.lower_statement(&stmt.node);
+                    self.lower_stmt(stmt);
                 }
                 let result = if let Some(expr) = final_expr {
                     self.lower_expression(expr)
@@ -203,10 +203,7 @@ impl<'a> Lowerer<'a> {
 
         self.emit(Instruction::Call {
             dest,
-            function: FunctionRef {
-                namespace: None,
-                name: ast::Identifier("core::make_array".to_string()),
-            },
+            function: FunctionRef::core("make_array"),
             args,
         });
 
@@ -238,10 +235,7 @@ impl<'a> Lowerer<'a> {
 
         self.emit(Instruction::Call {
             dest,
-            function: FunctionRef {
-                namespace: None,
-                name: ast::Identifier("core::make_map".to_string()),
-            },
+            function: FunctionRef::core("make_map"),
             args,
         });
 
@@ -269,57 +263,40 @@ impl<'a> Lowerer<'a> {
         match op {
             // a != b  →  not(eq(a, b))
             ast::BinaryOperator::NotEqual => {
-                let eq_result = self.emit_binary_call("core::eq", lhs, rhs);
-                return self.emit_unary_call("core::not", eq_result);
+                let eq_result = self.emit_binary_call("eq", lhs, rhs);
+                return self.emit_unary_call("not", eq_result);
             }
             // a > b  →  lt(b, a)  (swap operands)
             ast::BinaryOperator::Greater => {
-                return self.emit_binary_call("core::lt", rhs, lhs);
+                return self.emit_binary_call("lt", rhs, lhs);
             }
             // a <= b  →  not(lt(b, a))
             ast::BinaryOperator::LessEqual => {
-                let lt_result = self.emit_binary_call("core::lt", rhs, lhs);
-                return self.emit_unary_call("core::not", lt_result);
+                let lt_result = self.emit_binary_call("lt", rhs, lhs);
+                return self.emit_unary_call("not", lt_result);
             }
             // a >= b  →  not(lt(a, b))
             ast::BinaryOperator::GreaterEqual => {
-                let lt_result = self.emit_binary_call("core::lt", lhs, rhs);
-                return self.emit_unary_call("core::not", lt_result);
+                let lt_result = self.emit_binary_call("lt", lhs, rhs);
+                return self.emit_unary_call("not", lt_result);
             }
             _ => {}
         }
 
         // Direct builtin mapping for remaining operators
-        let builtin = match op {
-            ast::BinaryOperator::Add => "core::add",
-            ast::BinaryOperator::Subtract => "core::sub",
-            ast::BinaryOperator::Multiply => "core::mul",
-            ast::BinaryOperator::Divide => "core::div",
-            ast::BinaryOperator::Modulo => "core::mod",
-            ast::BinaryOperator::Equal => "core::eq",
-            ast::BinaryOperator::Less => "core::lt",
-            ast::BinaryOperator::BitwiseAnd => "core::bit_and",
-            ast::BinaryOperator::BitwiseOr => "core::bit_or",
-            ast::BinaryOperator::BitwiseXor => "core::bit_xor",
-            ast::BinaryOperator::ShiftLeft => "core::shl",
-            ast::BinaryOperator::ShiftRight => "core::shr",
-            ast::BinaryOperator::BitTest => "core::bit_test",
-            // Already handled above
-            ast::BinaryOperator::NotEqual
-            | ast::BinaryOperator::Greater
-            | ast::BinaryOperator::LessEqual
-            | ast::BinaryOperator::GreaterEqual
-            | ast::BinaryOperator::And
-            | ast::BinaryOperator::Or => unreachable!(),
-        };
+        let builtin = op
+            .builtin_name()
+            .expect("reflexive/short-circuit ops handled above");
+        self.emit_binary_call(builtin, lhs, rhs)
+    }
 
+    /// Helper to emit a binary core builtin call.
+    /// `builtin` is the short name (e.g., "add"), not the qualified name.
+    pub(crate) fn emit_binary_call(&mut self, builtin: &str, lhs: VarId, rhs: VarId) -> VarId {
         let dest = self.new_temp(TypeSet::all());
         self.emit(Instruction::Call {
             dest,
-            function: FunctionRef {
-                namespace: None,
-                name: ast::Identifier(builtin.to_string()),
-            },
+            function: FunctionRef::core(builtin),
             args: vec![
                 CallArg {
                     value: lhs,
@@ -334,38 +311,13 @@ impl<'a> Lowerer<'a> {
         dest
     }
 
-    /// Helper to emit a binary builtin call
-    fn emit_binary_call(&mut self, builtin: &str, lhs: VarId, rhs: VarId) -> VarId {
+    /// Helper to emit a unary core builtin call.
+    /// `builtin` is the short name (e.g., "not"), not the qualified name.
+    pub(crate) fn emit_unary_call(&mut self, builtin: &str, arg: VarId) -> VarId {
         let dest = self.new_temp(TypeSet::all());
         self.emit(Instruction::Call {
             dest,
-            function: FunctionRef {
-                namespace: None,
-                name: ast::Identifier(builtin.to_string()),
-            },
-            args: vec![
-                CallArg {
-                    value: lhs,
-                    by_ref: false,
-                },
-                CallArg {
-                    value: rhs,
-                    by_ref: false,
-                },
-            ],
-        });
-        dest
-    }
-
-    /// Helper to emit a unary builtin call
-    fn emit_unary_call(&mut self, builtin: &str, arg: VarId) -> VarId {
-        let dest = self.new_temp(TypeSet::all());
-        self.emit(Instruction::Call {
-            dest,
-            function: FunctionRef {
-                namespace: None,
-                name: ast::Identifier(builtin.to_string()),
-            },
+            function: FunctionRef::core(builtin),
             args: vec![CallArg {
                 value: arg,
                 by_ref: false,
@@ -384,11 +336,12 @@ impl<'a> Lowerer<'a> {
         let right_block = self.fresh_block();
         let join_block = self.fresh_block();
 
+        let from_left = self.current_block;
         self.finish_block(Terminator::If {
             condition: lhs,
             then_target: right_block,
             else_target: join_block,
-            span: dummy_span(),
+            span: self.current_span,
         });
 
         self.current_block = right_block;
@@ -409,10 +362,7 @@ impl<'a> Lowerer<'a> {
         let result = self.new_temp(TypeSet::single(types::BaseType::Bool));
         self.emit(Instruction::Phi {
             dest: result,
-            sources: vec![
-                (BlockId(right_block.0.wrapping_sub(1)), false_var),
-                (from_right, rhs),
-            ],
+            sources: vec![(from_left, false_var), (from_right, rhs)],
         });
 
         result
@@ -424,11 +374,12 @@ impl<'a> Lowerer<'a> {
         let right_block = self.fresh_block();
         let join_block = self.fresh_block();
 
+        let from_left = self.current_block;
         self.finish_block(Terminator::If {
             condition: lhs,
             then_target: join_block,
             else_target: right_block,
-            span: dummy_span(),
+            span: self.current_span,
         });
 
         self.current_block = right_block;
@@ -449,10 +400,7 @@ impl<'a> Lowerer<'a> {
         let result = self.new_temp(TypeSet::single(types::BaseType::Bool));
         self.emit(Instruction::Phi {
             dest: result,
-            sources: vec![
-                (BlockId(right_block.0.wrapping_sub(1)), true_var),
-                (from_right, rhs),
-            ],
+            sources: vec![(from_left, true_var), (from_right, rhs)],
         });
 
         result
@@ -460,26 +408,9 @@ impl<'a> Lowerer<'a> {
 
     fn lower_unary_op(&mut self, op: &ast::UnaryOperator, operand: &ast::Expression) -> VarId {
         let arg = self.lower_expression(operand);
+        let builtin = op.builtin_name();
 
-        let builtin = match op {
-            ast::UnaryOperator::Negate => "core::neg",
-            ast::UnaryOperator::Not => "core::not",
-            ast::UnaryOperator::BitwiseNot => "core::bit_not",
-        };
-
-        let dest = self.new_temp(TypeSet::all());
-        self.emit(Instruction::Call {
-            dest,
-            function: FunctionRef {
-                namespace: None,
-                name: ast::Identifier(builtin.to_string()),
-            },
-            args: vec![CallArg {
-                value: arg,
-                by_ref: false,
-            }],
-        });
-        dest
+        self.emit_unary_call(builtin, arg)
     }
 
     pub fn lower_function_call(
@@ -489,12 +420,12 @@ impl<'a> Lowerer<'a> {
         arguments: &[ast::Expression],
     ) -> VarId {
         // Determine the effective namespace and check for intrinsics
-        let is_core_namespace = namespace.as_ref().map(|ns| ns.0 == "core").unwrap_or(false);
+        let is_core_namespace = namespace.as_ref().map(|ns| *ns == "core").unwrap_or(false);
 
         // For qualified core:: calls or unqualified calls, check intrinsics first
         // (Unqualified calls implicitly look in core:: after local/imported)
         if (is_core_namespace || namespace.is_none())
-            && let Some(result) = self.try_lower_intrinsic(&name.0, arguments)
+            && let Some(result) = self.try_lower_intrinsic(name, arguments)
         {
             return result;
         }
@@ -502,14 +433,14 @@ impl<'a> Lowerer<'a> {
         // Resolve the full name for builtin lookup
         let full_name = if is_core_namespace {
             // Explicit core:: qualification
-            format!("core::{}", name.0)
+            format!("core::{name}")
         } else if namespace.is_some() {
             // Other namespace qualification
-            format!("{}::{}", namespace.as_ref().unwrap().0, name.0)
+            format!("{}::{name}", namespace.as_ref().unwrap())
         } else {
             // Unqualified: try core:: prefix for builtin lookup
             // (In future: check local/imported functions first)
-            format!("core::{}", name.0)
+            format!("core::{name}")
         };
 
         // Check if the function exists in the registry
@@ -519,7 +450,7 @@ impl<'a> Lowerer<'a> {
         // check if it might be a user-defined function (future: function table lookup)
         // For now, require all functions to be in the builtins registry
         if builtin_def.is_none() {
-            self.error_undefined_fn(namespace.map(|ns| ns.0.as_str()), &name.0, dummy_span());
+            self.error_undefined_fn(namespace.map(|ns| &**ns), name, self.current_span);
             return self.error_placeholder();
         }
 
@@ -595,7 +526,7 @@ impl<'a> Lowerer<'a> {
             value,
             defined: defined_block,
             undefined: undefined_block,
-            span: dummy_span(),
+            span: self.current_span,
         });
 
         // Defined path: result = true
@@ -653,7 +584,7 @@ impl<'a> Lowerer<'a> {
             value,
             arms: vec![(MatchPattern::Type(expected_type), match_block)],
             default: default_block,
-            span: dummy_span(),
+            span: self.current_span,
         });
 
         // Match path: result = true

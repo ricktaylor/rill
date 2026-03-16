@@ -57,6 +57,43 @@ impl<T: std::hash::Hash> std::hash::Hash for Spanned<T> {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Identifier(pub String);
 
+impl std::ops::Deref for Identifier {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for Identifier {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::borrow::Borrow<str> for Identifier {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for Identifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl PartialEq<str> for Identifier {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for Identifier {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
 // ============================================================================
 // Spanned Type Aliases
 // ============================================================================
@@ -74,7 +111,7 @@ pub type Pat = Spanned<Pattern>;
 // Program Structure
 // ============================================================================
 
-pub struct Program {
+pub struct AstProgram {
     pub imports: Vec<Spanned<Import>>,
     pub constants: Vec<Spanned<Constant>>,
     pub functions: Vec<Spanned<Function>>,
@@ -309,8 +346,8 @@ pub enum Expression {
         arms: Vec<MatchArm>,
     },
 
-    // Range expression: 0..10 or 0..=10
-    // Produces an Array, evaluated lazily during iteration
+    // Sequence expression: 0..10 or 0..=10
+    // Produces a lazy Sequence value, O(1) memory
     // Can be used anywhere an expression is expected
     Range {
         start: Box<Expression>,
@@ -338,17 +375,18 @@ pub enum IfCondition {
     With { pattern: Pat, value: Expression },
 }
 
-// Binding in for loops - either a single variable or destructuring pattern
+// Binding in for loops - single variable or key/value pair
 #[derive(Debug, Clone)]
 pub enum ForBinding {
     // Single variable: for x in arr { }
     // Binding mode (ref/value) controlled by presence of `let`
-    Variable(Identifier),
+    Single(Identifier),
 
-    // Array destructuring: for [k, v] in map { }
-    // Key (first element) is ALWAYS by-value and immutable (mutation is compile error)
-    // Value (second element) binding mode controlled by presence of `let`
-    Array(Vec<Identifier>),
+    // Key-value pair: for k, v in map { }
+    // Also used for index-element: for i, x in arr { }
+    // First variable (key/index) is ALWAYS by-value
+    // Second variable (value/element) binding mode controlled by presence of `let`
+    Pair(Identifier, Identifier),
 }
 
 #[derive(Debug, Clone)]
@@ -423,6 +461,17 @@ pub enum UnaryOperator {
     BitwiseNot, // ~x (bitwise complement)
 }
 
+impl UnaryOperator {
+    /// Core builtin name for this operator (short name, e.g. "neg")
+    pub fn builtin_name(&self) -> &'static str {
+        match self {
+            UnaryOperator::Negate => "neg",
+            UnaryOperator::Not => "not",
+            UnaryOperator::BitwiseNot => "bit_not",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum BinaryOperator {
     // Arithmetic
@@ -455,6 +504,36 @@ pub enum BinaryOperator {
     BitTest, // @ - returns true if bit B is set in X (X @ B)
 }
 
+impl BinaryOperator {
+    /// Core builtin name for operators that map directly to a single builtin.
+    /// Returns None for reflexive operators (!=, >, <=, >=) and short-circuit
+    /// operators (&&, ||) which require special lowering.
+    pub fn builtin_name(&self) -> Option<&'static str> {
+        match self {
+            BinaryOperator::Add => Some("add"),
+            BinaryOperator::Subtract => Some("sub"),
+            BinaryOperator::Multiply => Some("mul"),
+            BinaryOperator::Divide => Some("div"),
+            BinaryOperator::Modulo => Some("mod"),
+            BinaryOperator::Equal => Some("eq"),
+            BinaryOperator::Less => Some("lt"),
+            BinaryOperator::BitwiseAnd => Some("bit_and"),
+            BinaryOperator::BitwiseOr => Some("bit_or"),
+            BinaryOperator::BitwiseXor => Some("bit_xor"),
+            BinaryOperator::ShiftLeft => Some("shl"),
+            BinaryOperator::ShiftRight => Some("shr"),
+            BinaryOperator::BitTest => Some("bit_test"),
+            // These require special lowering (reflexive expansion or short-circuit)
+            BinaryOperator::NotEqual
+            | BinaryOperator::Greater
+            | BinaryOperator::LessEqual
+            | BinaryOperator::GreaterEqual
+            | BinaryOperator::And
+            | BinaryOperator::Or => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum AssignmentOp {
     Assign,    // =
@@ -468,4 +547,24 @@ pub enum AssignmentOp {
     XorAssign, // ^=
     ShlAssign, // <<=
     ShrAssign, // >>=
+}
+
+impl AssignmentOp {
+    /// Core builtin name for the underlying operation.
+    /// Returns None for plain Assign (=) which doesn't use a builtin.
+    pub fn builtin_name(&self) -> Option<&'static str> {
+        match self {
+            AssignmentOp::Assign => None,
+            AssignmentOp::AddAssign => Some("add"),
+            AssignmentOp::SubAssign => Some("sub"),
+            AssignmentOp::MulAssign => Some("mul"),
+            AssignmentOp::DivAssign => Some("div"),
+            AssignmentOp::ModAssign => Some("mod"),
+            AssignmentOp::AndAssign => Some("bit_and"),
+            AssignmentOp::OrAssign => Some("bit_or"),
+            AssignmentOp::XorAssign => Some("bit_xor"),
+            AssignmentOp::ShlAssign => Some("shl"),
+            AssignmentOp::ShrAssign => Some("shr"),
+        }
+    }
 }

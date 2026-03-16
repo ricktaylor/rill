@@ -252,19 +252,19 @@ fn normalize_metadata(raw_data) {
  * Helper function: calculates route with loops
  *
  * This demonstrates different loop types:
- * - Range-based iteration
+ * - Sequence iteration (0..5)
  * - Array iteration
  * - Map iteration with key-value pairs
  */
 fn calculate_mars_route(bundle) {
     let route = [];
 
-    /* Range-based for loop */
+    /* Sequence-based for loop */
     for i in 0..5 {
         route[i] = get_hop(i);
     }
 
-    // Iterator-based for loop over array
+    // For loop over array
     for hop in bundle.previous_hops {
         if is_blocked(hop) {
             continue;

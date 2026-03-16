@@ -23,14 +23,18 @@ pub use guard_elim::{eliminate_guards, simplify_cfg};
 pub use type_refinement::analyze_types;
 
 // Import IR types from parent module
-use super::{BlockId, CallArg, Function, FunctionRef, Instruction, Program, Terminator, VarId};
+use super::{BlockId, CallArg, Function, FunctionRef, Instruction, IrProgram, Terminator, VarId};
 
 // Import builtins for metadata lookup
 use crate::builtins::BuiltinRegistry;
 use crate::diagnostics::Diagnostics;
 
 /// Run all optimization passes on a program
-pub fn optimize(program: &mut Program, builtins: &BuiltinRegistry, diagnostics: &mut Diagnostics) {
+pub fn optimize(
+    program: &mut IrProgram,
+    builtins: &BuiltinRegistry,
+    diagnostics: &mut Diagnostics,
+) {
     for function in &mut program.functions {
         optimize_function(function, builtins, diagnostics);
     }

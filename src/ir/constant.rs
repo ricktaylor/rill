@@ -23,7 +23,7 @@ impl<'a> Lowerer<'a> {
         let value = match self.const_eval_expr(&constant.value) {
             Ok(v) => v,
             Err(msg) => {
-                self.error_const_eval(&msg, dummy_span());
+                self.error_const_eval(&msg, self.current_span);
                 return None;
             }
         };
@@ -31,14 +31,14 @@ impl<'a> Lowerer<'a> {
         // Match the pattern and create bindings
         let mut bindings = Vec::new();
         if let Err(msg) = self.const_match_pattern(&constant.pattern.node, &value, &mut bindings) {
-            self.error_const_eval(&msg, dummy_span());
+            self.error_const_eval(&msg, self.current_span);
             return None;
         }
 
         // Add all bindings to const_bindings for future reference
         for binding in &bindings {
             self.const_bindings
-                .insert(binding.name.0.clone(), binding.value.clone());
+                .insert(binding.name.clone(), binding.value.clone());
         }
 
         Some(bindings)
@@ -55,16 +55,17 @@ impl<'a> Lowerer<'a> {
 
             ast::Expression::Variable(name) => {
                 // Look up in const bindings
-                self.const_bindings.get(&name.0).cloned().ok_or_else(|| {
-                    format!("cannot use variable '{}' in constant expression", name.0)
-                })
+                self.const_bindings
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| format!("cannot use variable '{}' in constant expression", name))
             }
 
             ast::Expression::QualifiedName { namespace, name } => {
                 // TODO: Look up in imported module's constants
                 Err(format!(
                     "namespaced constant '{}::{}' not yet supported",
-                    namespace.0, name.0
+                    namespace, name
                 ))
             }
 
@@ -188,30 +189,11 @@ impl<'a> Lowerer<'a> {
         }
 
         // Direct builtin mapping for remaining operators
-        let builtin_name = match op {
-            ast::BinaryOperator::Add => "core::add",
-            ast::BinaryOperator::Subtract => "core::sub",
-            ast::BinaryOperator::Multiply => "core::mul",
-            ast::BinaryOperator::Divide => "core::div",
-            ast::BinaryOperator::Modulo => "core::mod",
-            ast::BinaryOperator::Equal => "core::eq",
-            ast::BinaryOperator::Less => "core::lt",
-            ast::BinaryOperator::BitwiseAnd => "core::bit_and",
-            ast::BinaryOperator::BitwiseOr => "core::bit_or",
-            ast::BinaryOperator::BitwiseXor => "core::bit_xor",
-            ast::BinaryOperator::ShiftLeft => "core::shl",
-            ast::BinaryOperator::ShiftRight => "core::shr",
-            ast::BinaryOperator::BitTest => "core::bit_test",
-            // Already handled above
-            ast::BinaryOperator::NotEqual
-            | ast::BinaryOperator::Greater
-            | ast::BinaryOperator::LessEqual
-            | ast::BinaryOperator::GreaterEqual
-            | ast::BinaryOperator::And
-            | ast::BinaryOperator::Or => unreachable!(),
-        };
-
-        self.call_const_builtin(builtin_name, &[lhs, rhs])
+        let short_name = op
+            .builtin_name()
+            .expect("reflexive/short-circuit ops handled above");
+        let full_name = format!("core::{}", short_name);
+        self.call_const_builtin(&full_name, &[lhs, rhs])
     }
 
     /// Evaluate a unary operation at compile time
@@ -222,13 +204,8 @@ impl<'a> Lowerer<'a> {
     ) -> ConstResult<ConstValue> {
         let arg = self.const_eval_expr(operand)?;
 
-        let builtin_name = match op {
-            ast::UnaryOperator::Negate => "core::neg",
-            ast::UnaryOperator::Not => "core::not",
-            ast::UnaryOperator::BitwiseNot => "core::bit_not",
-        };
-
-        self.call_const_builtin(builtin_name, &[arg])
+        let full_name = format!("core::{}", op.builtin_name());
+        self.call_const_builtin(&full_name, &[arg])
     }
 
     /// Evaluate a function call at compile time
@@ -242,10 +219,12 @@ impl<'a> Lowerer<'a> {
         let args: ConstResult<Vec<_>> = arguments.iter().map(|e| self.const_eval_expr(e)).collect();
         let args = args?;
 
-        // Build the full function name
+        // Build the qualified name for builtin lookup, matching lower_function_call logic:
+        // - Explicit namespace: "ns::name"
+        // - Unqualified: try "core::name" (builtins live in core namespace)
         let full_name = match namespace {
-            Some(ns) => format!("{}.{}", ns.0, name.0),
-            None => name.0.clone(),
+            Some(ns) => format!("{}::{}", ns, name),
+            None => format!("core::{}", name),
         };
 
         self.call_const_builtin(&full_name, &args)
@@ -394,7 +373,7 @@ impl<'a> Lowerer<'a> {
             ast::Pattern::Type { type_name, binding } => {
                 // Check type matches
                 let type_matches = matches!(
-                    (type_name.0.as_str(), value),
+                    (type_name.as_ref(), value),
                     ("Bool", ConstValue::Bool(_))
                         | ("UInt", ConstValue::UInt(_))
                         | ("Int", ConstValue::Int(_))
@@ -406,10 +385,7 @@ impl<'a> Lowerer<'a> {
                 );
 
                 if !type_matches {
-                    return Err(format!(
-                        "type pattern '{}' does not match value",
-                        type_name.0
-                    ));
+                    return Err(format!("type pattern '{}' does not match value", type_name));
                 }
 
                 // Match inner binding if present

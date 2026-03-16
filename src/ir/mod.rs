@@ -76,14 +76,14 @@ pub struct Lowerer<'a> {
     pub diagnostics: &'a mut Diagnostics,
 
     /// Evaluated constant values (for referencing in other constants)
-    pub const_bindings: HashMap<String, ConstValue>,
+    pub const_bindings: HashMap<ast::Identifier, ConstValue>,
 
     // ID generation
     pub next_var_id: u32,
     pub next_block_id: u32,
 
     /// Stack of scopes for variable name resolution
-    pub scopes: Vec<HashMap<String, VarId>>,
+    pub scopes: Vec<HashMap<ast::Identifier, VarId>>,
 
     /// All variables declared in the current function
     pub vars: Vec<Var>,
@@ -224,13 +224,13 @@ impl<'a> Lowerer<'a> {
         self.scopes.pop();
     }
 
-    pub fn bind(&mut self, name: &str, var: VarId) {
+    pub fn bind(&mut self, name: &ast::Identifier, var: VarId) {
         if let Some(scope) = self.scopes.last_mut() {
-            scope.insert(name.to_string(), var);
+            scope.insert(name.clone(), var);
         }
     }
 
-    pub fn lookup(&self, name: &str) -> Option<VarId> {
+    pub fn lookup(&self, name: &ast::Identifier) -> Option<VarId> {
         for scope in self.scopes.iter().rev() {
             if let Some(&var) = scope.get(name) {
                 return Some(var);
@@ -268,6 +268,18 @@ impl<'a> Lowerer<'a> {
     pub fn set_span(&mut self, span: ast::Span) {
         self.current_span = span;
     }
+
+    /// Lower a spanned statement, setting the current span first
+    pub fn lower_stmt(&mut self, stmt: &ast::Stmt) {
+        self.set_span(stmt.span);
+        self.lower_statement(&stmt.node);
+    }
+
+    /// Lower a spanned expression, setting the current span first
+    pub fn lower_expr(&mut self, expr: &ast::Expr) -> VarId {
+        self.set_span(expr.span);
+        self.lower_expression(&expr.node)
+    }
 }
 
 // ============================================================================
@@ -286,6 +298,7 @@ pub fn all_types() -> impl Iterator<Item = types::BaseType> {
         BaseType::Bytes,
         BaseType::Array,
         BaseType::Map,
+        BaseType::Sequence,
     ]
     .into_iter()
 }
@@ -296,13 +309,13 @@ pub fn all_types() -> impl Iterator<Item = types::BaseType> {
 
 /// Lower an AST program to IR with the given builtin registry
 ///
-/// Errors are emitted to the diagnostics accumulator. Returns `Some(Program)` if
+/// Errors are emitted to the diagnostics accumulator. Returns `Some(IrProgram)` if
 /// lowering succeeded (possibly with warnings), `None` if there were errors.
 pub fn lower(
-    program: &ast::Program,
+    program: &ast::AstProgram,
     builtins: &builtins::BuiltinRegistry,
     diagnostics: &mut Diagnostics,
-) -> Option<Program> {
+) -> Option<IrProgram> {
     let mut lowerer = Lowerer::new(builtins, diagnostics);
     lowerer.lower_program(program)
 }
@@ -318,12 +331,12 @@ mod tests {
         registry
     }
 
-    fn try_parse(source: &str) -> ast::Program {
+    fn try_parse(source: &str) -> ast::AstProgram {
         let mut diags = Diagnostics::new();
         parser::parse(source, &mut diags).expect("parse failed")
     }
 
-    fn try_lower(ast: &ast::Program, registry: &builtins::BuiltinRegistry) -> Program {
+    fn try_lower(ast: &ast::AstProgram, registry: &builtins::BuiltinRegistry) -> IrProgram {
         let mut diags = Diagnostics::new();
         lower(ast, registry, &mut diags).expect("lower failed")
     }
@@ -342,7 +355,7 @@ mod tests {
         let ir = try_lower(&ast, &registry);
 
         assert_eq!(ir.functions.len(), 1);
-        assert_eq!(ir.functions[0].name.0, "test");
+        assert_eq!(ir.functions[0].name.as_ref(), "test");
         assert_eq!(ir.functions[0].params.len(), 1);
     }
 
@@ -391,9 +404,9 @@ mod tests {
         let ir = try_lower(&ast, &registry);
 
         assert_eq!(ir.constants.len(), 2);
-        assert_eq!(ir.constants[0].name.0, "MAX_TTL");
+        assert_eq!(ir.constants[0].name.as_ref(), "MAX_TTL");
         assert_eq!(ir.constants[0].value, ConstValue::UInt(86400));
-        assert_eq!(ir.constants[1].name.0, "DOUBLE");
+        assert_eq!(ir.constants[1].name.as_ref(), "DOUBLE");
         assert_eq!(ir.constants[1].value, ConstValue::UInt(172800));
     }
 
@@ -409,11 +422,11 @@ mod tests {
         let ir = try_lower(&ast, &registry);
 
         assert_eq!(ir.constants.len(), 3);
-        assert_eq!(ir.constants[0].name.0, "A");
+        assert_eq!(ir.constants[0].name.as_ref(), "A");
         assert_eq!(ir.constants[0].value, ConstValue::UInt(1));
-        assert_eq!(ir.constants[1].name.0, "B");
+        assert_eq!(ir.constants[1].name.as_ref(), "B");
         assert_eq!(ir.constants[1].value, ConstValue::UInt(2));
-        assert_eq!(ir.constants[2].name.0, "C");
+        assert_eq!(ir.constants[2].name.as_ref(), "C");
         assert_eq!(ir.constants[2].value, ConstValue::UInt(3));
     }
 }

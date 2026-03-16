@@ -847,23 +847,18 @@ fn for_expr<'a>(expr: BoxedParser<'a, Expression>) -> BoxedParser<'a, Expression
     .map(|opt| opt.unwrap_or(false)) // default = by-reference
     .boxed();
 
-    // Single variable binding: for x in arr { }
-    let single_var = ident().map(ForBinding::Variable).boxed();
-
-    // Array destructuring: for [k, v] in map { }
-    let array_binding = ident()
-        .padded_by(whitespace())
-        .separated_by(just(',').padded_by(whitespace()))
-        .at_least(1)
-        .collect::<Vec<_>>()
-        .delimited_by(
-            just('[').padded_by(whitespace()),
-            just(']').padded_by(whitespace()),
-        )
-        .map(ForBinding::Array)
+    // Pair binding: for k, v in map { }
+    // Must try pair first (ident "," ident) before single
+    let pair_binding = ident()
+        .then_ignore(just(',').padded_by(whitespace()))
+        .then(ident())
+        .map(|(first, second)| ForBinding::Pair(first, second))
         .boxed();
 
-    let binding = choice((array_binding, single_var)).boxed();
+    // Single variable binding: for x in arr { }
+    let single_var = ident().map(ForBinding::Single).boxed();
+
+    let binding = choice((pair_binding, single_var)).boxed();
 
     // Iterable is any expression (Array, Map, or Range)
     // Range expressions (0..10, 0..=10) are parsed as regular expressions
@@ -1403,7 +1398,7 @@ enum TopLevel {
     Function(ast::Spanned<Function>),
 }
 
-fn program<'a>() -> BoxedParser<'a, Program> {
+fn program<'a>() -> BoxedParser<'a, AstProgram> {
     let top_level = choice((
         import().map(TopLevel::Import),
         constant().map(TopLevel::Constant),
@@ -1427,7 +1422,7 @@ fn program<'a>() -> BoxedParser<'a, Program> {
                 }
             }
 
-            Program {
+            AstProgram {
                 imports,
                 constants,
                 functions,
@@ -1522,9 +1517,9 @@ fn convert_parse_errors(errors: Vec<Rich<'_, char, Span>>, diags: &mut Diagnosti
 
 /// Parse a Rill source file, emitting diagnostics on error
 ///
-/// Returns `Some(Program)` if parsing succeeded, `None` if there were errors.
+/// Returns `Some(AstProgram)` if parsing succeeded, `None` if there were errors.
 /// Errors are emitted to the provided diagnostics accumulator.
-pub fn parse(input: &str, diags: &mut Diagnostics) -> Option<Program> {
+pub fn parse(input: &str, diags: &mut Diagnostics) -> Option<AstProgram> {
     match program().parse(input).into_result() {
         Ok(program) => Some(program),
         Err(errors) => {
@@ -1566,7 +1561,7 @@ mod tests {
     }
 
     // Test helper: parse program and return Result for easy assertion
-    fn try_parse(input: &str) -> Result<Program, ()> {
+    fn try_parse(input: &str) -> Result<AstProgram, ()> {
         let mut diags = Diagnostics::new();
         parse(input, &mut diags).ok_or(())
     }
@@ -1683,11 +1678,11 @@ mod tests {
         // Value binding (explicit let)
         assert!(try_parse_expr("for let item in array { }").is_ok());
         assert!(try_parse_expr("for let i in 0..10 { }").is_ok());
-        // Array destructuring for maps
-        assert!(try_parse_expr("for [k, v] in map { }").is_ok());
-        assert!(try_parse_expr("for let [k, v] in map { }").is_ok());
-        // Single element destructuring
-        assert!(try_parse_expr("for [x] in nested { }").is_ok());
+        // Pair binding for maps
+        assert!(try_parse_expr("for k, v in map { }").is_ok());
+        assert!(try_parse_expr("for let k, v in map { }").is_ok());
+        // Pair binding for arrays (index, element)
+        assert!(try_parse_expr("for i, x in arr { }").is_ok());
     }
 
     #[test]

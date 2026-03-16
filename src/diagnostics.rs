@@ -520,12 +520,15 @@ impl Diagnostics {
         self.items.extend(other.items);
     }
 
-    /// Convert to a Result - Ok if no errors, Err with all diagnostics if any errors
-    pub fn into_result<T>(self, value: T) -> Result<T, Diagnostics> {
+    /// Convert to a Result, preserving warnings on success.
+    ///
+    /// - Ok: no errors — returns value and any warnings
+    /// - Err: has errors — returns all diagnostics (errors + warnings)
+    pub fn into_result<T>(self, value: T) -> Result<(T, Diagnostics), Diagnostics> {
         if self.has_errors() {
             Err(self)
         } else {
-            Ok(value)
+            Ok((value, self))
         }
     }
 
@@ -576,6 +579,56 @@ impl fmt::Display for Diagnostics {
         }
         Ok(())
     }
+}
+
+// ============================================================================
+// Source Location Utilities
+// ============================================================================
+
+/// A line:column location in source text (both 1-based)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineCol {
+    pub line: usize,
+    pub col: usize,
+}
+
+impl fmt::Display for LineCol {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.line, self.col)
+    }
+}
+
+/// Convert a byte offset to a line:column position in source text.
+///
+/// Both line and column are 1-based. If the offset is past the end of
+/// the source, returns the position at the end.
+///
+/// Note: when multi-file support is added, the caller will need to
+/// resolve which source file a span refers to before calling this.
+pub fn offset_to_line_col(source: &str, offset: usize) -> LineCol {
+    let offset = offset.min(source.len());
+    let mut line = 1;
+    let mut line_start = 0;
+
+    for (i, ch) in source[..offset].char_indices() {
+        if ch == '\n' {
+            line += 1;
+            line_start = i + 1;
+        }
+    }
+
+    LineCol {
+        line,
+        col: offset - line_start + 1,
+    }
+}
+
+/// Convert a span to start and end line:column positions.
+pub fn span_to_line_col(source: &str, span: Span) -> (LineCol, LineCol) {
+    (
+        offset_to_line_col(source, span.start),
+        offset_to_line_col(source, span.end),
+    )
 }
 
 // ============================================================================
@@ -669,15 +722,29 @@ mod tests {
 
     #[test]
     fn test_into_result() {
-        let mut diags = Diagnostics::new();
+        let diags = Diagnostics::new();
         let result = diags.into_result(42);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), 42);
+        let (value, warnings) = result.unwrap();
+        assert_eq!(value, 42);
+        assert!(!warnings.has_warnings());
 
         let mut diags = Diagnostics::new();
         diags.error_no_span(DiagnosticCode::E100_UndefinedVariable, "error");
         let result = diags.into_result(42);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_into_result_preserves_warnings() {
+        let mut diags = Diagnostics::new();
+        diags.warning_no_span(DiagnosticCode::W001_UnusedVariable, "unused x");
+        let result = diags.into_result(42);
+        assert!(result.is_ok());
+        let (value, warnings) = result.unwrap();
+        assert_eq!(value, 42);
+        assert!(warnings.has_warnings());
+        assert_eq!(warnings.warning_count(), 1);
     }
 
     #[test]
@@ -719,5 +786,51 @@ mod tests {
 
         let spans: Vec<_> = diags.iter().map(|d| d.span.unwrap().start).collect();
         assert_eq!(spans, vec![10, 30, 50]);
+    }
+
+    // ========================================================================
+    // Source Location Tests
+    // ========================================================================
+
+    #[test]
+    fn test_offset_to_line_col_single_line() {
+        let src = "let x = 42;";
+        assert_eq!(offset_to_line_col(src, 0), LineCol { line: 1, col: 1 });
+        assert_eq!(offset_to_line_col(src, 4), LineCol { line: 1, col: 5 });
+        assert_eq!(offset_to_line_col(src, 10), LineCol { line: 1, col: 11 });
+    }
+
+    #[test]
+    fn test_offset_to_line_col_multi_line() {
+        let src = "fn test() {\n    let x = 1;\n    return x;\n}";
+        // "fn test() {\n" = 12 chars, line 1
+        // "    let x = 1;\n" = 14 chars, line 2
+        // "    return x;\n" = 14 chars, line 3
+        // "}" = 1 char, line 4
+        assert_eq!(offset_to_line_col(src, 0), LineCol { line: 1, col: 1 });
+        assert_eq!(offset_to_line_col(src, 11), LineCol { line: 1, col: 12 }); // '{'
+        assert_eq!(offset_to_line_col(src, 12), LineCol { line: 2, col: 1 }); // after \n
+        assert_eq!(offset_to_line_col(src, 16), LineCol { line: 2, col: 5 }); // 'l' in let
+    }
+
+    #[test]
+    fn test_offset_to_line_col_past_end() {
+        let src = "hi";
+        assert_eq!(offset_to_line_col(src, 100), LineCol { line: 1, col: 3 });
+    }
+
+    #[test]
+    fn test_span_to_line_col() {
+        let src = "let x = 42;\nlet y = x + 1;";
+        let span = test_span(16, 17); // 'x' on line 2
+        let (start, end) = span_to_line_col(src, span);
+        assert_eq!(start, LineCol { line: 2, col: 5 });
+        assert_eq!(end, LineCol { line: 2, col: 6 });
+    }
+
+    #[test]
+    fn test_line_col_display() {
+        let lc = LineCol { line: 3, col: 12 };
+        assert_eq!(lc.to_string(), "3:12");
     }
 }

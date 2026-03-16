@@ -226,7 +226,7 @@ fn try_simplify_terminator(
                     *span,
                     format!(
                         "in function `{}`: guard on value that is always defined",
-                        func_name.0
+                        func_name
                     ),
                 );
                 Some(Terminator::Jump { target: *defined })
@@ -269,7 +269,7 @@ fn try_simplify_terminator(
                         *span,
                         format!(
                             "in function `{}`: match has {} unreachable arm(s)",
-                            func_name.0, unreachable_count
+                            func_name, unreachable_count
                         ),
                     );
                 }

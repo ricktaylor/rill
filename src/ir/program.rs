@@ -9,9 +9,9 @@ impl<'a> Lowerer<'a> {
 
     /// Lower an entire program
     ///
-    /// Returns `Some(Program)` if lowering succeeded, `None` if there were errors.
+    /// Returns `Some(IrProgram)` if lowering succeeded, `None` if there were errors.
     /// Errors are emitted to the diagnostics accumulator.
-    pub fn lower_program(&mut self, program: &ast::Program) -> Option<Program> {
+    pub fn lower_program(&mut self, program: &ast::AstProgram) -> Option<IrProgram> {
         let mut functions = Vec::new();
         let mut constants = Vec::new();
         let mut imports = Vec::new();
@@ -25,6 +25,7 @@ impl<'a> Lowerer<'a> {
 
         // Lower constants (may emit errors but we continue)
         for constant in &program.constants {
+            self.set_span(constant.span);
             if let Some(bindings) = self.lower_constant(&constant.node) {
                 constants.extend(bindings);
             }
@@ -32,6 +33,7 @@ impl<'a> Lowerer<'a> {
 
         // Lower functions (may emit errors but we continue)
         for function in &program.functions {
+            self.set_span(function.span);
             if let Some(func) = self.lower_function(&function.node) {
                 functions.push(func);
             }
@@ -42,7 +44,7 @@ impl<'a> Lowerer<'a> {
             return None;
         }
 
-        Some(Program {
+        Some(IrProgram {
             functions,
             constants,
             imports,
@@ -101,7 +103,7 @@ impl<'a> Lowerer<'a> {
         let mut params = Vec::new();
         for param in &func.params {
             let var = self.new_var(param.name.clone(), TypeSet::from_types(all_types()));
-            self.bind(&param.name.0, var);
+            self.bind(&param.name, var);
             params.push(Param {
                 var,
                 by_ref: !param.is_value,
@@ -111,7 +113,7 @@ impl<'a> Lowerer<'a> {
         // Lower rest parameter if present
         let rest_param = if let Some(ref rest) = func.rest_param {
             let var = self.new_var(rest.name.clone(), TypeSet::single(types::BaseType::Array));
-            self.bind(&rest.name.0, var);
+            self.bind(&rest.name, var);
             Some(Param {
                 var,
                 by_ref: !rest.is_value,
@@ -122,7 +124,7 @@ impl<'a> Lowerer<'a> {
 
         // Lower statements (continue even on errors to report multiple issues)
         for stmt in &func.statements {
-            self.lower_statement(&stmt.node);
+            self.lower_stmt(stmt);
         }
 
         // Lower final expression if present

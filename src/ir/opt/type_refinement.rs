@@ -59,27 +59,6 @@ fn build_block_index_map(function: &Function) -> HashMap<BlockId, usize> {
         .collect()
 }
 
-/// Get successor block IDs for a terminator
-fn terminator_successors(terminator: &Terminator) -> Vec<BlockId> {
-    match terminator {
-        Terminator::Jump { target } => vec![*target],
-        Terminator::If {
-            then_target,
-            else_target,
-            ..
-        } => vec![*then_target, *else_target],
-        Terminator::Match { arms, default, .. } => {
-            let mut succs: Vec<_> = arms.iter().map(|(_, target)| *target).collect();
-            succs.push(*default);
-            succs
-        }
-        Terminator::Guard {
-            defined, undefined, ..
-        } => vec![*defined, *undefined],
-        Terminator::Return { .. } | Terminator::Exit { .. } | Terminator::Unreachable => vec![],
-    }
-}
-
 // ============================================================================
 // Transfer Functions
 // ============================================================================
@@ -112,7 +91,7 @@ fn transfer_instruction(
         // Copy inherits the type of the source
         Instruction::Copy { dest, src } => {
             if let Some(src_type) = state.get(src) {
-                state.insert(*dest, src_type.clone());
+                state.insert(*dest, *src_type);
             } else {
                 // Unknown source - use all types as optional
                 state.insert(*dest, all_types());
@@ -216,7 +195,7 @@ fn type_sig_to_type_set(sig: &TypeSet) -> TypeSet {
         // Empty types means any type
         all_types()
     } else {
-        sig.clone()
+        *sig
     }
 }
 
@@ -265,7 +244,7 @@ fn apply_match_refinement(
 
         // For default arm, exclude the matched types
         let mut default_state = state.clone();
-        let mut remaining = current_type.clone();
+        let mut remaining = current_type;
         for (pattern, _) in arms {
             match pattern {
                 crate::ir::MatchPattern::Type(ty) => {
@@ -383,7 +362,7 @@ pub fn analyze_types(function: &Function, builtins: Option<&BuiltinRegistry>) ->
             let guard_refined = apply_guard_refinement(&block.terminator, &state);
 
             // Propagate to successors
-            for succ_id in terminator_successors(&block.terminator) {
+            for succ_id in block.terminator.successors() {
                 // Compute new entry state for successor
                 let new_entry = match_refined
                     .get(&succ_id)
@@ -399,7 +378,7 @@ pub fn analyze_types(function: &Function, builtins: Option<&BuiltinRegistry>) ->
                     let existing = entry.get(var);
                     let merged = match existing {
                         Some(existing_type) => existing_type.union(new_type),
-                        None => new_type.clone(),
+                        None => *new_type,
                     };
                     if existing != Some(&merged) {
                         entry.insert(*var, merged);

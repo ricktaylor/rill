@@ -127,14 +127,22 @@ pub struct FunctionRef {
 }
 
 impl FunctionRef {
+    /// Create a FunctionRef for a core builtin (e.g., "add" -> core::add)
+    pub fn core(name: &str) -> Self {
+        FunctionRef {
+            namespace: Some(ast::Identifier("core".to_string())),
+            name: ast::Identifier(name.to_string()),
+        }
+    }
+
     /// Get the fully qualified name using `::` as separator
     ///
     /// This matches the naming convention used by the builtin registry.
     /// Examples: "core::add", "str::len", "my_function"
     pub fn qualified_name(&self) -> String {
         match &self.namespace {
-            Some(ns) => format!("{}::{}", ns.0, self.name.0),
-            None => self.name.0.clone(),
+            Some(ns) => format!("{}::{}", ns, self.name),
+            None => self.name.to_string(),
         }
     }
 }
@@ -285,7 +293,7 @@ pub struct Param {
 
 /// Complete IR program
 #[derive(Debug, Clone)]
-pub struct Program {
+pub struct IrProgram {
     pub functions: Vec<Function>,
     pub constants: Vec<ConstBinding>,
     pub imports: Vec<Import>,
