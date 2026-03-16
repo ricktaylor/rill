@@ -40,7 +40,15 @@ impl<'a> Lowerer<'a> {
             ast::Statement::Break { value } => {
                 if let Some(loop_ctx) = self.loop_stack.last() {
                     let break_target = loop_ctx.break_target;
-                    let _break_value = value.as_ref().map(|e| self.lower_expression(e));
+                    let break_value = value.as_ref().map(|e| self.lower_expression(e));
+                    if let Some(val) = break_value {
+                        let from_block = self.current_block;
+                        self.loop_stack
+                            .last_mut()
+                            .unwrap()
+                            .break_values
+                            .push((from_block, val));
+                    }
                     self.finish_block(Terminator::Jump {
                         target: break_target,
                     });

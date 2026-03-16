@@ -679,7 +679,10 @@ impl VM {
     ///
     /// IR local offsets are 1-based (slot 0 is Frame info).
     pub fn call(&mut self, frame_size: usize, return_slot: Option<usize>) -> Result<(), ExecError> {
-        debug_assert!(frame_size >= 1, "frame_size must include Frame slot");
+        // frame_size must include at least the Frame slot
+        if frame_size < 1 {
+            return Err(ExecError::StackOverflow);
+        }
 
         // Stack overflow check
         if self.stack.len() + frame_size > MAX_STACK_SIZE {
@@ -721,11 +724,11 @@ impl VM {
             _ => (0, None),
         };
 
-        // Write return value directly to caller's slot
-        if let Some(slot) = return_slot {
-            // Don't truncate yet - slot might be in our frame for nested returns
-            self.stack[slot] = Slot::Val(value);
-        }
+        // Write return value directly to caller's slot (must happen before truncate)
+        if let Some(slot) = return_slot
+            && let Some(s) = self.stack.get_mut(slot) {
+                *s = Slot::Val(value);
+            }
 
         self.stack.truncate(self.bp);
         self.bp = saved_bp;
@@ -738,6 +741,9 @@ impl VM {
     /// - `by_ref`: if true, creates Ref (mutations flow back); if false, copies value
     pub fn bind_param(&mut self, offset: usize, arg_idx: usize, by_ref: bool) {
         let slot = self.bp + offset;
+        if slot >= self.stack.len() {
+            return;
+        }
         if by_ref {
             self.stack[slot] = Slot::Ref(arg_idx);
         } else if let Some(val) = self.get(arg_idx) {

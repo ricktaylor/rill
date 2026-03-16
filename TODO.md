@@ -147,6 +147,41 @@ Issues identified during code review, ordered by priority.
   `&name` and `format!("{}", name)` naturally. Existing `.0` accesses still
   work and can be cleaned up incrementally.
 
+### Round 2 — Fresh Review Findings
+
+#### Must Fix
+
+- [x] **CR-20: Unchecked indexing in `ret_val` and `bind_param`** `src/exec.rs`
+  Fixed: `ret_val` uses `get_mut()` instead of direct indexing. `bind_param`
+  validates `slot < stack.len()` before access.
+
+- [x] **CR-21: Break values silently discarded** `src/ir/stmt.rs`, `src/ir/control.rs`
+  Fixed: `break value` now pushes `(block_id, var_id)` to `LoopContext.break_values`.
+  `lower_loop` and `lower_while` use break values in a Phi node at the exit block.
+
+- [x] **CR-22: For-loop phi patching can silently fail** `src/ir/control.rs`
+  Fixed: replaced `if let` chain with `.expect()` calls that panic with clear
+  messages if the header block, instruction index, or Phi variant is missing.
+
+- [x] **CR-23: `debug_assert` on `frame_size` should be runtime check** `src/exec.rs`
+  Fixed: changed to runtime `if frame_size < 1 { return Err(StackOverflow) }`.
+
+#### Should Fix
+
+- [x] **CR-24: Array/Map literals in patterns produce misleading false** `src/ir/control.rs`
+  Fixed: emits E105_InvalidPattern diagnostic before returning fallback value.
+
+- [x] **CR-25: Map pattern silently skips unsupported key patterns** `src/ir/control.rs`
+  Fixed: emits E105_InvalidPattern diagnostic on unsupported key patterns.
+
+- [x] **CR-26: No compile-time guard on BaseType variant count** `src/types.rs`
+  Fixed: added `assert!((self as u16) < 16)` in `bit()` — panics at const-eval
+  time if too many variants are added.
+
+- [x] **CR-27: Sequence case implicit in const_fold pattern matching** `src/ir/opt/const_fold.rs`
+  Fixed: added explicit `(BaseType::Sequence, _) => false` with comment explaining
+  that sequences are lazy runtime types with no ConstValue representation.
+
 ## Task Backlog
 
 ### P0 — Critical Path (needed for end-to-end execution)

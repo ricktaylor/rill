@@ -301,6 +301,9 @@ fn pattern_matches(pattern: &crate::ir::MatchPattern, value: &ConstValue) -> boo
                 (BaseType::Bytes, ConstValue::Bytes(_)) => true,
                 (BaseType::Array, ConstValue::Array(_)) => true,
                 (BaseType::Map, ConstValue::Map(_)) => true,
+                // Sequence is a lazy runtime type — no ConstValue representation,
+                // so it can never match a constant value
+                (BaseType::Sequence, _) => false,
                 _ => false,
             }
         }

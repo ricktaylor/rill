@@ -329,7 +329,14 @@ impl<'a> Lowerer<'a> {
                             });
                             k
                         }
-                        _ => continue, // skip unsupported key patterns
+                        _ => {
+                            self.diagnostics.error(
+                                diagnostics::DiagnosticCode::E105_InvalidPattern,
+                                self.current_span,
+                                "map pattern key must be a literal or identifier",
+                            );
+                            continue;
+                        }
                     };
 
                     let val = self.new_temp(TypeSet::all());
@@ -379,7 +386,7 @@ impl<'a> Lowerer<'a> {
     }
 
     /// Convert AST literal to IR literal for pattern matching
-    fn ast_literal_to_ir_literal(&self, lit: &ast::Literal) -> Literal {
+    fn ast_literal_to_ir_literal(&mut self, lit: &ast::Literal) -> Literal {
         match lit {
             ast::Literal::Bool(b) => Literal::Bool(*b),
             ast::Literal::UInt(n) => Literal::UInt(*n),
@@ -387,8 +394,14 @@ impl<'a> Lowerer<'a> {
             ast::Literal::Float(f) => Literal::Float(*f),
             ast::Literal::Text(s) => Literal::Text(s.clone()),
             ast::Literal::Bytes(b) => Literal::Bytes(b.clone()),
-            // Array/Map literals can't be used in patterns directly
-            ast::Literal::Array(_) | ast::Literal::Map(_) => Literal::Bool(false),
+            ast::Literal::Array(_) | ast::Literal::Map(_) => {
+                self.diagnostics.error(
+                    diagnostics::DiagnosticCode::E105_InvalidPattern,
+                    self.current_span,
+                    "array and map literals cannot be used in match patterns",
+                );
+                Literal::Bool(false) // fallback — error already emitted
+            }
         }
     }
 
@@ -457,7 +470,7 @@ impl<'a> Lowerer<'a> {
             self.lower_expression(expr);
         }
 
-        self.loop_stack.pop();
+        let break_values = self.loop_stack.pop().unwrap().break_values;
         self.pop_scope();
 
         self.finish_block(Terminator::Jump { target: header_bb });
@@ -466,9 +479,19 @@ impl<'a> Lowerer<'a> {
         self.current_block = exit_bb;
         self.current_instructions = Vec::new();
 
-        // While loops produce undefined (unless break with value)
-        let result = self.new_temp(TypeSet::empty());
-        self.emit(Instruction::Undefined { dest: result });
+        let result = self.new_temp(if break_values.is_empty() {
+            TypeSet::empty()
+        } else {
+            TypeSet::all()
+        });
+        if break_values.is_empty() {
+            self.emit(Instruction::Undefined { dest: result });
+        } else {
+            self.emit(Instruction::Phi {
+                dest: result,
+                sources: break_values,
+            });
+        }
         result
     }
 
@@ -501,7 +524,7 @@ impl<'a> Lowerer<'a> {
             self.lower_expression(expr);
         }
 
-        self.loop_stack.pop();
+        let break_values = self.loop_stack.pop().unwrap().break_values;
         self.pop_scope();
 
         self.finish_block(Terminator::Jump { target: body_bb });
@@ -511,8 +534,14 @@ impl<'a> Lowerer<'a> {
         self.current_instructions = Vec::new();
 
         let result = self.new_temp(TypeSet::all());
-        // TODO: Phi from break values
-        self.emit(Instruction::Undefined { dest: result });
+        if break_values.is_empty() {
+            self.emit(Instruction::Undefined { dest: result });
+        } else {
+            self.emit(Instruction::Phi {
+                dest: result,
+                sources: break_values,
+            });
+        }
         result
     }
 
@@ -664,12 +693,20 @@ impl<'a> Lowerer<'a> {
         self.finish_block(Terminator::Jump { target: header_bb });
 
         // Patch the phi in the header block with both sources
-        // Find the header block and update the phi instruction
-        if let Some(header_block) = self.blocks.iter_mut().find(|b| b.id == header_bb)
-            && let Some(phi_inst) = header_block.instructions.get_mut(i_phi_idx)
-            && let Instruction::Phi { sources, .. } = &mut phi_inst.node
-        {
-            *sources = vec![(pre_header_bb, i_init), (body_exit_bb, i_next)];
+        let header_block = self
+            .blocks
+            .iter_mut()
+            .find(|b| b.id == header_bb)
+            .expect("for-loop header block must exist");
+        let phi_inst = header_block
+            .instructions
+            .get_mut(i_phi_idx)
+            .expect("for-loop phi instruction must exist at recorded index");
+        match &mut phi_inst.node {
+            Instruction::Phi { sources, .. } => {
+                *sources = vec![(pre_header_bb, i_init), (body_exit_bb, i_next)];
+            }
+            _ => panic!("for-loop instruction at phi index is not a Phi"),
         }
 
         // Exit

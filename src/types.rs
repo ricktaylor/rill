@@ -67,8 +67,14 @@ impl BaseType {
         matches!(self, BaseType::UInt | BaseType::Int)
     }
 
-    /// Bit position for this type in a TypeSet bitfield
+    /// Bit position for this type in a TypeSet bitfield.
+    /// Supports up to 16 types (u16). Adding more requires widening the bitfield.
     const fn bit(self) -> u16 {
+        // Compile-time guard: if this panics, the bitfield type needs widening
+        assert!(
+            (self as u16) < 16,
+            "BaseType has too many variants for u16 bitfield"
+        );
         1 << (self as u16)
     }
 
