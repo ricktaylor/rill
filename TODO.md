@@ -206,9 +206,18 @@ Issues identified during code review, ordered by priority.
 
 #### IR-Level (SSA)
 
+- [ ] **Type-Driven Dead Arm Elimination** — use the existing `TypeAnalysis` result
+      (currently computed but discarded with `let _types = ...`) to prune Match arms
+      where `TypeSet ∩ arm_type = ∅`. A Match with one surviving arm becomes a Jump.
+      This feeds into CFG simplification → DCE. ~30 lines. Dependency chain:
+      ```
+      Type Analysis (DONE) → Dead Arm Elimination → CFG Simplify (DONE) → DCE
+      ```
+
 - [ ] **Dead Code Elimination (DCE)** — remove instructions whose dest VarId is
       never used. Iterate until stable (removing one may make operands dead).
       Respect purity: keep impure Calls even if result unused. ~50-80 lines.
+      Consumes dead arms/blocks from type-driven elimination above.
 
 - [ ] **Copy Propagation** — if `x = Copy(y)`, replace all uses of `x` with `y`
       and remove the Copy. Straightforward in SSA.
