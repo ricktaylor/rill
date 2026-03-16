@@ -769,10 +769,10 @@ Rill minimizes the distinction between expressions and statements. The key insig
 |-----------|------|--------------|
 | `x + 1` | Expression | Computed value |
 | `x = 5` | Expression | Assigned value (or undefined if lvalue invalid) |
-| `expr;` | Statement | Discards result, contributes undefined |
-| `{ stmts; expr }` | Block | Final expression value |
-| `{ stmts; }` | Block | Undefined (no final expression) |
-| `{ }` | Block | Undefined (empty) |
+| `expr;` | Statement | Discards result |
+| `{ stmts; expr }` | Block | Last expression without `;` is the return value |
+| `{ stmts; }` | Block | No final expression → undefined |
+| `{ }` | Block | Empty → undefined |
 
 ### Assignment as Expression
 
@@ -837,23 +837,31 @@ terminators to check lvalue validity before evaluating the rhs.
 
 ### Semicolons and Blocks
 
-The semicolon `;` discards an expression's value:
+The semicolon `;` marks an expression as a statement (value discarded).
+The last expression in a block without `;` becomes the block's return value.
+Control-flow expressions (`if`, `while`, `loop`, `for`, `match`) can appear
+mid-block without `;` — they are void statements. At the end of a block,
+they become the return value.
 
 ```rust
-{
-    5           // Block evaluates to 5
+fn example() { 42 }                    // returns 42
+
+fn example() {
+    if cond { 1 } else { 2 }           // if-expression as return value
 }
 
-{
-    5;          // Semicolon discards, block evaluates to undefined
+fn example() {
+    do_stuff();                         // expression statement (;)
+    if cond { handle() }                // void statement (mid-block, no ;)
+    result                              // final expression (return value)
 }
 
-{
-    let x = 5;  // Binding declaration
-}               // No final expression, evaluates to undefined
+fn example() {
+    let x = 5;                          // binding declaration
+}                                       // no final expression → undefined
 ```
 
-**No Unit type needed** - undefined serves as "absence of meaningful value" uniformly.
+**No Unit type needed** — undefined serves as "absence of meaningful value" uniformly.
 
 ### Binding Declarations vs Expressions
 

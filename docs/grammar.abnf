@@ -53,7 +53,12 @@ regular-params = function-param *("," function-param)
 function-param = ["let" / "with"] identifier   ; let = by-value, with/default = by-reference
 rest-param = ["let" / "with"] ".." identifier  ; Variadic: excess args become Array
 
-block = "{" *statement [expression] "}"
+; A block is a sequence of items enclosed in braces.
+; Each item is either a statement (with ";") or a trailing expression (without ";").
+; The last trailing expression becomes the block's return value.
+; Mid-block trailing expressions (control flow without ";") are void statements.
+block = "{" *block-item "}"
+block-item = statement / expression   ; statement has ";", expression does not
 
 ; ============================================================================
 ; Statements
@@ -86,7 +91,7 @@ break-stmt = "break" [expression] ";"
 continue-stmt = "continue" ";"
 
 ; Expression statement: evaluates expression, discards result
-; The semicolon discards the value; block evaluates to undefined
+; The semicolon marks this as a statement (value discarded)
 expression-stmt = expression ";"
 
 ; ============================================================================
@@ -220,7 +225,7 @@ for-expr = "for" ["let" / "with"] for-binding "in" expression block
 for-binding = identifier "," identifier                ; Pair: for k, v in map / for i, x in arr
             / identifier                              ; Single: for x in arr
 
-block-expr = "{" *statement [expression] "}"
+block-expr = "{" *block-item "}"
 
 ; ============================================================================
 ; Patterns
@@ -397,7 +402,18 @@ CR = %x0D                  ; Carriage return
 ;
 ; 9. Operator precedence follows standard C-like languages
 ;
-; 10. Block expressions evaluate to the last expression (if no semicolon)
+; 10. Block expressions and function bodies evaluate to the last expression
+;     without ";". Expressions with ";" are statements (value discarded).
+;     Control flow (if, while, loop, for, match) can appear mid-block without
+;     ";" — they are void statements. At the end of a block, they become the
+;     return value. Examples:
+;       fn test() { 42 }                          // returns 42
+;       fn test() { if cond { 1 } else { 2 } }   // returns 1 or 2
+;       fn test() { do_stuff(); 42 }              // statement then return
+;       fn test() {
+;           if cond { handle() }                  // void statement (mid-block)
+;           result                                // return value (last item)
+;       }
 ;
 ; 11. Import paths:
 ;    - Unquoted dotted paths (std.bpsec) → standard library modules

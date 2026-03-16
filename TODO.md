@@ -2,44 +2,36 @@
 
 ## Project Overview
 
-Rill is a memory-safe, embeddable scripting language written in Rust. Architecture: Parser (chumsky) -> AST -> IR (SSA) -> VM (stack-based with heap tracking). ~13,400 lines of Rust across 21 source files.
+Rill is a memory-safe, embeddable scripting language written in Rust.
+Architecture: Source → Parser (chumsky) → AST → Lower → IR (SSA) → Optimize → Compile (closure-threaded) → Execute (flat pc-based loop).
 
 ## Current Status (per README + code inspection)
 
 ### Complete
 - Grammar specification (ABNF) — `docs/grammar.abnf`
-- Full parser with tests — `src/parser.rs` (2148 lines)
-- AST and type definitions — `src/ast.rs`, `src/types.rs`
-- VM core with stack/heap tracking — `src/exec.rs` (710 lines)
-- Heap tracking system (CoW HeapVal, refcounted, limit-checked)
-- Builtin registry — `src/builtins.rs` (1456 lines)
-- Diagnostics system — `src/diagnostics.rs` (723 lines)
-- IR type definitions — `src/ir/types.rs`
-- IR lowering (AST -> IR) — `src/ir/` modules: program, stmt, expr, control, pattern, constant, const_eval
-- Optimizer passes started — `src/ir/opt/`: const_fold, type_refinement, guard_elim, definedness
-
-### In Progress
-- [ ] IR lowering completeness — verify all AST nodes are handled
-- [ ] Standard library modules — only prelude builtins registered so far
-
-### Recently Completed
-- [x] Sequence as internal type (`BaseType::Sequence`, `Value::Sequence`, `SeqState`)
-- [x] New for-loop syntax: `for k, v in map` replaces `for [k, v] in map`
-- [x] Pair binding: `for i, x in arr` gives index + element
-- [x] Updated grammar.abnf, parser, AST, IR lowering, example docs
+- Full parser with implicit return support — `src/parser.rs`
+- AST and type definitions — `src/ast.rs`, `src/types.rs` (TypeSet as u16 bitfield)
+- VM core with stack/heap tracking — `src/exec.rs`
+- Heap tracking system (CoW HeapVal, capacity-based, limit-checked)
+- Builtin registry — `src/builtins.rs`
+- Diagnostics system with source spans — `src/diagnostics.rs`
+- IR lowering (AST → SSA IR) with loop-carried phis — `src/ir/`
+- Optimizer passes — const fold, definedness, guard elim, CFG simplify, type refinement
+- Closure-threaded compiler with link phase — `src/compile.rs`
+- Flat pc-based executor — 123 end-to-end tests passing
+- Sequence type (lazy ranges, zero-copy array slices with mutable flag)
+- For-loop pair binding: `for k, v in map`
+- Public API: `compile()`, `Program::call()`, `FunctionHandle` for hot-path
+- Source location utilities: `span_to_line_col()`, `LineCol`
 
 ### Not Yet Started
-- [ ] IR interpreter / code generator — no execution bridge from IR to VM
-- [ ] Register `core::seq_next` builtin (advance sequence, return next or undefined)
-- [ ] Register `core::make_seq` builtin (create sequence from start/end/inclusive)
-- [ ] Register `core::array_seq` builtin (zero-copy array slice as Sequence)
-- [ ] Register `core::collect` builtin (materialize sequence to array)
-- [ ] For-loop type dispatch: emit Match on iterable type for unknown types
-- [ ] For-loop sequence path: seq_next-based loop for Sequence type
+- [ ] Register sequence builtins: `core::make_seq`, `core::seq_next`, `core::array_seq`, `core::collect`
+- [ ] For-loop type dispatch (Match on iterable type for unknown types)
+- [ ] For-loop sequence path (seq_next-based loop for Sequence type)
 - [ ] Dead-store warnings for mutations to non-ref-backed loop variables
-- [ ] Host sequence support: `SeqState::Host` variant (defer trait vs callback decision to embedder API design)
+- [ ] Host sequence support (`SeqState::Host` variant)
+- [ ] Public/private function visibility (affects unused function warnings)
 - [ ] CBOR encode/decode integration
-- [ ] Compiled bytecode format
 - [ ] Comprehensive standard library (std.time, std.cbor, std.encoding, std.parsing)
 - [ ] Module/import system implementation
 - [ ] `with` (reference) binding semantics in IR
@@ -188,7 +180,10 @@ Issues identified during code review, ordered by priority.
 - [x] Bridge IR to VM execution — closure-threaded compiler in `src/compile.rs`
 - [x] End-to-end test: 21 tests covering constants, arithmetic, variables,
       if/else, while, loop/break, recursion, short-circuit logic, builtins
-- [ ] Parser: support final expressions (implicit return without semicolon)
+- [x] Parser: support final expressions (implicit return without semicolon)
+      Block-ending expressions (if, while, loop, for, match) don't need `;`.
+      The last expression without `;` is the block's return value. Uses BlockItem
+      post-processing to resolve the ambiguity.
 - [ ] Verify match/pattern execution correctness
 - [ ] Verify for-loop execution correctness
 
@@ -227,7 +222,7 @@ Issues identified during code review, ordered by priority.
 ```
 src/
   lib.rs              — Public API: compile(), Program::call(), re-exports
-  compile.rs          — IR-to-closure compilation, phi elimination, flat executor
+  compile.rs          — Link phase, closure compilation, phi elimination, flat pc executor
   ast.rs              — AST node types, Span, Spanned
   types.rs            — BaseType, TypeSet
   parser.rs           — Chumsky-based parser -> AST

@@ -305,23 +305,21 @@ fn find_valid_path(options) {
     return result;
 }
 
-// Helper function: demonstrates block expressions
+// Helper function: demonstrates block expressions and implicit return
 fn compute_priority(bundle) {
-    // Block as expression
+    // Block as expression (last expression without ; is the value)
     let base_priority = {
         let urgency = bundle.flags & FLAG_URGENT;
         let importance = bundle.importance;
         urgency * 10 + importance
     };
 
-    // If as expression
-    let adjusted = if bundle.age > 3600 {
+    // If as expression — also the function's implicit return value (no ; or return)
+    if bundle.age > 3600 {
         base_priority * 2
     } else {
         base_priority
-    };
-
-    return adjusted;
+    }
 }
 
 /* Helper function: demonstrates operators */

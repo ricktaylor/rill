@@ -858,8 +858,8 @@ mod tests {
 
     #[test]
     fn test_implicit_return() {
-        // Block expression as return value
-        let val = run_expect("fn test() { return 99; }", "test");
+        // Final expression without semicolon is the return value
+        let val = run_expect("fn test() { 99 }", "test");
         assert_eq!(val, Value::UInt(99));
     }
 
@@ -916,34 +916,25 @@ mod tests {
 
     #[test]
     fn test_if_true() {
-        let val = run_expect(
-            "fn test() { if true { return 1; } else { return 2; } }",
-            "test",
-        );
+        // Implicit return: if-expression is the final expression (no semicolon)
+        let val = run_expect("fn test() { if true { 1 } else { 2 } }", "test");
         assert_eq!(val, Value::UInt(1));
     }
 
     #[test]
     fn test_if_false() {
-        let val = run_expect(
-            "fn test() { if false { return 1; } else { return 2; } }",
-            "test",
-        );
+        let val = run_expect("fn test() { if false { 1 } else { 2 } }", "test");
         assert_eq!(val, Value::UInt(2));
     }
 
     #[test]
     fn test_if_with_comparison() {
         let val = run_expect(
-            "fn test() { let x = 10; if x > 5 { return 1; } else { return 0; } }",
+            "fn test() { let x = 10; if x > 5 { 1 } else { 0 } }",
             "test",
         );
         assert_eq!(val, Value::UInt(1));
     }
-
-    // TODO: Parser needs to support final expressions (no semicolon = return value):
-    //   fn test() { if true { 1 } else { 2 } }  — should return 1
-    //   fn test() { 99 }                         — should return 99
 
     // ========================================================================
     // Loops

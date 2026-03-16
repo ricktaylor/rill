@@ -728,15 +728,59 @@ fn assign_expr<'a>(
 // Control Flow
 // ============================================================================
 
-/// Parse a block body: { statements* final_expr? }
+/// A block item — either a statement (with `;`) or a trailing expression (without `;`).
+/// Used internally by `block_body` to resolve the statement-vs-final-expression ambiguity.
+enum BlockItem {
+    Statement(Stmt),
+    TrailingExpr(Expression),
+}
+
+/// Parse a block body: { items* }
 /// Returns (statements, optional_final_expression)
+///
+/// Each item is either a statement (with `;`) or an expression without `;`.
+/// The LAST trailing expression becomes the block's return value.
+/// Earlier trailing expressions become void statements (e.g., `if cond { }` mid-block).
+/// Non-block expressions without `;` at the end are also final expressions (`42`).
 fn block_body<'a>(
     expr: BoxedParser<'a, Expression>,
 ) -> BoxedParser<'a, (Vec<Stmt>, Option<Expression>)> {
-    statement(expr.clone())
+    // A statement (requires `;` for non-keyword forms)
+    let stmt_item = statement(expr.clone()).map(BlockItem::Statement).boxed();
+
+    // A trailing expression (no `;`) — could be final expr or void control flow
+    let trailing_item = expr
+        .padded_by(whitespace())
+        .map(BlockItem::TrailingExpr)
+        .boxed();
+
+    // Try statement first (with `;`), fall back to trailing expression
+    choice((stmt_item, trailing_item))
         .repeated()
         .collect::<Vec<_>>()
-        .then(expr.padded_by(whitespace()).or_not())
+        .map(|items| {
+            let mut statements = Vec::new();
+            let mut final_expr = None;
+            let len = items.len();
+
+            for (i, item) in items.into_iter().enumerate() {
+                let is_last = i == len - 1;
+                match item {
+                    BlockItem::Statement(stmt) => statements.push(stmt),
+                    BlockItem::TrailingExpr(expr) => {
+                        if is_last {
+                            final_expr = Some(expr);
+                        } else {
+                            // Mid-block expression without ; → void statement
+                            let span = chumsky::span::Span::new((), 0..0);
+                            statements.push(ast::Spanned::new(Statement::Expression(expr), span));
+                        }
+                    }
+                }
+            }
+
+            (statements, final_expr)
+        })
         .delimited_by(
             just('{').padded_by(whitespace()),
             just('}').padded_by(whitespace()),
@@ -1174,37 +1218,16 @@ fn statement_inner<'a>(expr: BoxedParser<'a, Expression>) -> BoxedParser<'a, Sta
     // Note: Assignment is now an expression, not a separate statement form
     // x = y; is parsed as expression-stmt where the expression is an assignment
 
-    // Control flow expressions can be statements without trailing semicolon
-    // This includes: if, while, loop, for, match, and block expressions
-    // We check for the keyword/token first, then parse via the expr parser
-    // (to avoid infinite recursion during parser construction)
-    let control_flow_stmt = choice((
-        kw("if").rewind(),
-        kw("while").rewind(),
-        kw("loop").rewind(),
-        kw("for").rewind(),
-        kw("match").rewind(),
-        just('{').ignored().padded_by(whitespace()).rewind(),
-    ))
-    .ignore_then(expr.clone().padded_by(whitespace()))
-    .map(Statement::Expression)
-    .boxed();
-
-    // Regular expression statements require semicolon
+    // All expression statements require a trailing semicolon.
+    // Control flow used as a statement: `if cond { ... };` or `while cond { ... };`
+    // Control flow as final expression (no ;): handled by block_body's final_expr parser.
     let expression_stmt = expr
         .padded_by(whitespace())
         .then_ignore(just(';').padded_by(whitespace()))
         .map(Statement::Expression)
         .boxed();
 
-    choice((
-        return_stmt,
-        break_stmt,
-        continue_stmt,
-        control_flow_stmt,
-        expression_stmt,
-    ))
-    .boxed()
+    choice((return_stmt, break_stmt, continue_stmt, expression_stmt)).boxed()
 }
 
 // ============================================================================
@@ -1353,15 +1376,6 @@ fn attribute<'a>() -> BoxedParser<'a, ast::Spanned<ast::Attribute>> {
 // ============================================================================
 
 fn function<'a>() -> BoxedParser<'a, ast::Spanned<Function>> {
-    let body = statement(expression())
-        .repeated()
-        .collect::<Vec<_>>()
-        .delimited_by(
-            just('{').padded_by(whitespace()),
-            just('}').padded_by(whitespace()),
-        )
-        .boxed();
-
     attribute()
         .padded_by(whitespace())
         .repeated()
@@ -1372,15 +1386,15 @@ fn function<'a>() -> BoxedParser<'a, ast::Spanned<Function>> {
             just('(').padded_by(whitespace()),
             just(')').padded_by(whitespace()),
         ))
-        .then(body)
+        .then(block_body(expression()))
         .map(
-            |(((attributes, name), (params, rest_param)), statements)| Function {
+            |(((attributes, name), (params, rest_param)), (statements, final_expr))| Function {
                 attributes,
                 name,
                 params,
                 rest_param,
                 statements,
-                final_expr: None, // TODO: handle final expression
+                final_expr: final_expr.map(Box::new),
             },
         )
         .map_with(|f, extra| ast::Spanned::new(f, extra.span()))
