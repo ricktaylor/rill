@@ -30,7 +30,10 @@ Architecture: Source → Parser (chumsky) → AST → Lower → IR (SSA) → Opt
 - [ ] For-loop sequence path (seq_next-based loop for Sequence type)
 - [ ] Dead-store warnings for mutations to non-ref-backed loop variables
 - [ ] Host sequence support (`SeqState::Host` variant)
-- [ ] Public/private function visibility (affects unused function warnings)
+- [ ] Public/private function visibility — structural, not declarative:
+      root file functions/constants = public (embedder entry points),
+      imported file functions/constants = private (DCE can eliminate unused).
+      No `pub` keyword needed. Enables unused-import elimination.
 - [ ] CBOR encode/decode integration
 - [ ] Comprehensive standard library (std.time, std.cbor, std.encoding, std.parsing)
 - [ ] Module/import system implementation
@@ -184,7 +187,8 @@ Issues identified during code review, ordered by priority.
       Block-ending expressions (if, while, loop, for, match) don't need `;`.
       The last expression without `;` is the block's return value. Uses BlockItem
       post-processing to resolve the ambiguity.
-- [ ] Verify match/pattern execution correctness
+- [x] Verify match/pattern execution correctness (9 tests: literals, wildcards,
+      type patterns, guards, if-let, array destructuring)
 - [ ] Verify for-loop execution correctness
 
 ### P1 — Core Functionality
@@ -198,15 +202,54 @@ Issues identified during code review, ordered by priority.
 - [ ] Standard library: `std.encoding` (hex, base64)
 - [ ] Standard library: `std.parsing` (parse_int, etc.)
 
-### P2 — Optimization & Quality
-- [ ] Dead code elimination pass (IR level)
-- [ ] Peephole optimization pass (closure compiler level, between phi resolution and flattening)
-  - Requires tagged `StepKind` intermediate form before conversion to closures
-  - Copy-to-self elimination, dead store removal, const+use fusion, jump threading
-- [ ] Tail-call optimization (IR level: detect tail calls, rewrite to param overwrite + jump to entry)
-- [ ] Additional const folding cases
-- [ ] Type narrowing through control flow
+### P2 — Optimization Passes
+
+#### IR-Level (SSA)
+
+- [ ] **Dead Code Elimination (DCE)** — remove instructions whose dest VarId is
+      never used. Iterate until stable (removing one may make operands dead).
+      Respect purity: keep impure Calls even if result unused. ~50-80 lines.
+
+- [ ] **Copy Propagation** — if `x = Copy(y)`, replace all uses of `x` with `y`
+      and remove the Copy. Straightforward in SSA.
+
+- [ ] **Common Subexpression Elimination (CSE)** — if the same pure operation
+      with the same operands appears twice, reuse the first result. Requires
+      purity checking (already have via `BuiltinMeta.purity`).
+
+- [ ] **Algebraic Simplification** — simplify identities:
+      `x + 0 → x`, `x * 1 → x`, `x * 0 → 0`, `x - x → 0`,
+      `!!x → x`, `x && true → x`, `x || false → x`.
+      Can be part of const folding or a separate pass.
+
+- [ ] **Loop-Invariant Code Motion (LICM)** — lift pure computations whose
+      operands are all defined outside the loop to the pre-header block.
+      Requires: loop detection (back-edges), dominator tree, invariant analysis.
+
+- [ ] **Tail-Call Optimization (TCO)** — detect calls in tail position, rewrite
+      to parameter overwrite + jump to entry block. Eliminates frame allocation
+      for recursive functions. The flat pc-based executor supports this naturally.
+
+- [ ] **Function Inlining** — replace calls to small pure functions with the
+      function body. Clone callee IR into call site. Valuable for helper functions.
+
+- [ ] **Sparse Conditional Constant Propagation (SCCP)** — more powerful than
+      current const fold. Combines constant propagation with unreachable code
+      detection in a single pass. Would subsume const_fold + guard_elim.
+
+#### Closure Compiler Level
+
+- [ ] **Peephole Optimization** — between phi resolution and flattening.
+      Requires tagged `StepKind` intermediate form before conversion to closures.
+      Copy-to-self elimination, dead store removal, const+use fusion, jump threading.
+
+#### Diagnostics
+
 - [ ] Dead-store warnings for non-ref-backed loop variable mutations
+- [ ] Unused variable warnings (from DCE liveness data)
+
+### P2 — Quality
+
 - [ ] Integration test suite
 - [ ] Fuzz testing for parser
 - [ ] Documentation: API docs, embedding guide
@@ -216,6 +259,9 @@ Issues identified during code review, ordered by priority.
 - [ ] REPL / CLI tool
 - [ ] LSP support
 - [ ] Domain-specific module examples (DTN/BPSec)
+- [ ] Loop unrolling (small loops with known iteration count)
+- [ ] Escape analysis (stack-allocate non-escaping collections)
+- [ ] Global Value Numbering (GVN) — more powerful CSE across blocks
 
 ## File Map
 

@@ -674,18 +674,23 @@ impl<'a> Lowerer<'a> {
 
         let header_bb = self.fresh_block();
         let body_bb = self.fresh_block();
+        let latch_bb = self.fresh_block(); // increment block (continue target)
         let exit_bb = self.fresh_block();
 
+        // Snapshot scope for loop-carried phis (handles variables modified in body)
+        let scope_snapshot = self.snapshot_scope();
         let pre_header_bb = self.current_block;
         self.finish_block(Terminator::Jump { target: header_bb });
 
-        // Header: phi for index, then check i < length
+        // Header: loop-carried phis + index phi, then check i < length
         self.current_block = header_bb;
         self.current_instructions = Vec::new();
 
-        // Phi for the loop index — sources filled in after body block is known
+        // Create phis for all in-scope variables (handles sum, etc.)
+        let loop_phis = self.create_loop_phis(pre_header_bb, &scope_snapshot);
+
+        // Manual phi for the loop counter (not in scope snapshot)
         let i_var = self.new_temp(TypeSet::single(types::BaseType::UInt));
-        // Placeholder phi — we'll patch the body source after the body is lowered
         let i_phi_idx = self.current_instructions.len();
         self.emit(Instruction::Phi {
             dest: i_var,
@@ -700,7 +705,7 @@ impl<'a> Lowerer<'a> {
             span: self.current_span,
         });
 
-        // Body: index into iterable, bind variables, execute body, increment
+        // Body: index into iterable, bind variables, execute body
         self.current_block = body_bb;
         self.current_instructions = Vec::new();
         self.push_scope();
@@ -735,8 +740,6 @@ impl<'a> Lowerer<'a> {
                 }
             },
             ast::ForBinding::Pair(key_name, val_name) => {
-                // First variable (key/index) is always by-value
-                // For collections, i_var IS the index — bind it directly
                 let key_var = self.new_var(key_name.clone(), TypeSet::all());
                 self.emit(Instruction::Copy {
                     dest: key_var,
@@ -744,7 +747,6 @@ impl<'a> Lowerer<'a> {
                 });
                 self.bind(key_name, key_var);
 
-                // Second variable (value/element) follows binding mode
                 match mode {
                     BindingMode::Value => {
                         let var = self.new_var(val_name.clone(), TypeSet::all());
@@ -761,9 +763,10 @@ impl<'a> Lowerer<'a> {
             }
         }
 
+        // continue jumps to latch (increment), not header (avoids skipping i++)
         self.loop_stack.push(LoopContext {
             break_target: exit_bb,
-            continue_target: header_bb,
+            continue_target: latch_bb,
             break_values: Vec::new(),
         });
 
@@ -775,9 +778,18 @@ impl<'a> Lowerer<'a> {
         }
 
         self.loop_stack.pop();
-        self.pop_scope();
 
-        // i_next = core::add(i, 1)
+        // Patch loop-carried phis for scope variables (sum, etc.)
+        let body_exit_bb = self.current_block;
+        self.patch_loop_phis(header_bb, body_exit_bb, &loop_phis);
+
+        self.pop_scope();
+        self.finish_block(Terminator::Jump { target: latch_bb });
+
+        // Latch block: increment counter, jump back to header
+        self.current_block = latch_bb;
+        self.current_instructions = Vec::new();
+
         let one = self.new_temp(TypeSet::single(types::BaseType::UInt));
         self.emit(Instruction::Const {
             dest: one,
@@ -785,10 +797,14 @@ impl<'a> Lowerer<'a> {
         });
         let i_next = self.emit_binary_call("add", i_var, one);
 
-        let body_exit_bb = self.current_block;
+        // Also patch loop-carried phis from the latch block
+        // (continue skips the body exit but still needs phi sources)
+        self.patch_loop_phis(header_bb, latch_bb, &loop_phis);
+
+        let latch_exit_bb = self.current_block;
         self.finish_block(Terminator::Jump { target: header_bb });
 
-        // Patch the phi in the header block with both sources
+        // Patch the counter phi with sources from pre-header and latch
         let header_block = self
             .blocks
             .iter_mut()
@@ -800,7 +816,7 @@ impl<'a> Lowerer<'a> {
             .expect("for-loop phi instruction must exist at recorded index");
         match &mut phi_inst.node {
             Instruction::Phi { sources, .. } => {
-                *sources = vec![(pre_header_bb, i_init), (body_exit_bb, i_next)];
+                *sources = vec![(pre_header_bb, i_init), (latch_exit_bb, i_next)];
             }
             _ => panic!("for-loop instruction at phi index is not a Phi"),
         }

@@ -1073,4 +1073,315 @@ mod tests {
         let val = run_expect("fn test() { return !true; }", "test");
         assert_eq!(val, Value::Bool(false));
     }
+
+    // ========================================================================
+    // Match / Pattern Matching
+    // ========================================================================
+
+    #[test]
+    fn test_match_literal() {
+        let val = run_expect(
+            r#"
+            fn test() {
+                let x = 2;
+                match x {
+                    1 => { return 10; },
+                    2 => { return 20; },
+                    3 => { return 30; },
+                    _ => { return 0; },
+                }
+            }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::UInt(20));
+    }
+
+    #[test]
+    fn test_match_wildcard() {
+        let val = run_expect(
+            r#"
+            fn test() {
+                let x = 99;
+                match x {
+                    1 => { return 10; },
+                    _ => { return 42; },
+                }
+            }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::UInt(42));
+    }
+
+    #[test]
+    fn test_match_type_pattern() {
+        let val = run_expect(
+            r#"
+            fn test() {
+                let x = 42;
+                match x {
+                    Bool(b) => { return 0; },
+                    UInt(n) => { return n; },
+                    _ => { return 99; },
+                }
+            }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::UInt(42));
+    }
+
+    #[test]
+    fn test_match_with_guard() {
+        let val = run_expect(
+            r#"
+            fn test() {
+                let x = 15;
+                match x {
+                    UInt(n) if n > 10 => { return 1; },
+                    UInt(n) => { return 2; },
+                    _ => { return 3; },
+                }
+            }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::UInt(1));
+    }
+
+    #[test]
+    fn test_match_guard_fails() {
+        let val = run_expect(
+            r#"
+            fn test() {
+                let x = 5;
+                match x {
+                    UInt(n) if n > 10 => { return 1; },
+                    UInt(n) => { return 2; },
+                    _ => { return 3; },
+                }
+            }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::UInt(2));
+    }
+
+    // ========================================================================
+    // If-Let / If-With Patterns
+    // ========================================================================
+
+    #[test]
+    fn test_if_let_binding() {
+        let val = run_expect(
+            r#"
+            fn test() {
+                let x = 42;
+                if let y = x {
+                    return y + 1;
+                }
+                return 0;
+            }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::UInt(43));
+    }
+
+    #[test]
+    fn test_if_let_type_pattern() {
+        let val = run_expect(
+            r#"
+            fn test() {
+                let x = 42;
+                if let UInt(n) = x {
+                    return n + 10;
+                }
+                return 0;
+            }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::UInt(52));
+    }
+
+    // ========================================================================
+    // Array Destructuring
+    // ========================================================================
+
+    #[test]
+    fn test_let_array_destructure() {
+        let val = run_expect(
+            r#"
+            fn test() {
+                let arr = [10, 20, 30];
+                let [a, b, c] = arr;
+                return a + b + c;
+            }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::UInt(60));
+    }
+
+    #[test]
+    fn test_match_array_pattern() {
+        let val = run_expect(
+            r#"
+            fn test() {
+                let arr = [1, 2];
+                match arr {
+                    [a, b] => { return a + b; },
+                    _ => { return 0; },
+                }
+            }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::UInt(3));
+    }
+
+    // ========================================================================
+    // For Loop Execution
+    // ========================================================================
+
+    #[test]
+    fn test_for_array_sum() {
+        let val = run_expect(
+            r#"
+            fn test() {
+                let arr = [10, 20, 30];
+                let sum = 0;
+                for x in arr {
+                    sum = sum + x;
+                };
+                return sum;
+            }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::UInt(60));
+    }
+
+    #[test]
+    fn test_for_array_with_index() {
+        // Pair binding: i = index, x = element
+        let val = run_expect(
+            r#"
+            fn test() {
+                let arr = [10, 20, 30];
+                let result = 0;
+                for i, x in arr {
+                    result = result + i + x;
+                };
+                return result;
+            }
+            "#,
+            "test",
+        );
+        // (0+10) + (1+20) + (2+30) = 63
+        assert_eq!(val, Value::UInt(63));
+    }
+
+    #[test]
+    fn test_for_with_break() {
+        let val = run_expect(
+            r#"
+            fn test() {
+                let arr = [1, 2, 3, 4, 5];
+                let sum = 0;
+                for x in arr {
+                    if x > 3 { break; };
+                    sum = sum + x;
+                };
+                return sum;
+            }
+            "#,
+            "test",
+        );
+        // 1 + 2 + 3 = 6 (stops before 4)
+        assert_eq!(val, Value::UInt(6));
+    }
+
+    #[test]
+    fn test_for_with_continue() {
+        let val = run_expect(
+            r#"
+            fn test() {
+                let arr = [1, 2, 3, 4, 5];
+                let sum = 0;
+                for x in arr {
+                    if x == 3 { continue; };
+                    sum = sum + x;
+                };
+                return sum;
+            }
+            "#,
+            "test",
+        );
+        // 1 + 2 + 4 + 5 = 12 (skips 3)
+        assert_eq!(val, Value::UInt(12));
+    }
+
+    #[test]
+    fn test_for_empty_array() {
+        let val = run_expect(
+            r#"
+            fn test() {
+                let arr = [];
+                let count = 0;
+                for x in arr {
+                    count = count + 1;
+                };
+                return count;
+            }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::UInt(0));
+    }
+
+    #[test]
+    fn test_for_nested() {
+        let val = run_expect(
+            r#"
+            fn test() {
+                let a = [1, 2];
+                let b = [10, 20];
+                let sum = 0;
+                for x in a {
+                    for y in b {
+                        sum = sum + x * y;
+                    };
+                };
+                return sum;
+            }
+            "#,
+            "test",
+        );
+        // 1*10 + 1*20 + 2*10 + 2*20 = 10 + 20 + 20 + 40 = 90
+        assert_eq!(val, Value::UInt(90));
+    }
+
+    #[test]
+    fn test_for_let_binding() {
+        // for let x — by-value, mutations don't affect source
+        let val = run_expect(
+            r#"
+            fn test() {
+                let arr = [1, 2, 3];
+                let sum = 0;
+                for let x in arr {
+                    x = x * 10;
+                    sum = sum + x;
+                };
+                return sum;
+            }
+            "#,
+            "test",
+        );
+        // 10 + 20 + 30 = 60
+        assert_eq!(val, Value::UInt(60));
+    }
 }

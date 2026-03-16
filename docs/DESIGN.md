@@ -1618,6 +1618,37 @@ my_function(x)                  // Local function (no namespace)
 - Import paths use `.` (dotted notation): `import std.cbor.utils;`
 - Call sites use `::` (qualification): `utils::decode()`
 
+### Visibility
+
+Function and constant visibility is **structural**, not declarative — there is no
+`pub` keyword.
+
+| Declared in | Visibility | Callable by embedder? | DCE eligible? |
+|------------|------------|----------------------|---------------|
+| Root file | Public | Yes (`FunctionHandle`) | No — always kept |
+| Imported file | Private | No | Yes — removed if unused |
+
+The root file is the file passed to `compile()`. Everything declared directly in
+it is a potential entry point for the embedder. Imported files provide helper
+functions and constants that are implementation details.
+
+```rust
+// root.rill — all functions here are public
+import "./helpers.rill";
+
+fn process(bundle) { ... }       // public — embedder can call this
+fn validate(bundle) { ... }      // public — embedder can call this
+const MAX_TTL = 86400;           // public — visible to embedder
+
+// helpers.rill — all functions here are private
+fn compute_checksum(data) { ... } // private — only callable from root
+fn internal_helper() { ... }      // private — if unused, eliminated by DCE
+```
+
+This means there is no such thing as an "unused function" in the root file —
+every root function is a potential entry point. Imported functions that are
+never referenced are dead code and can be eliminated during compilation.
+
 ### Reserved Namespaces
 
 | Namespace | Purpose | User-definable? |
