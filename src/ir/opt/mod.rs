@@ -84,7 +84,5 @@ pub fn optimize_function(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     // Integration tests for the full pipeline will go here
 }

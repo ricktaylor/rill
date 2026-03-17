@@ -18,20 +18,6 @@ impl<T> Spanned<T> {
     pub fn new(node: T, span: Span) -> Self {
         Spanned { node, span }
     }
-
-    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Spanned<U> {
-        Spanned {
-            node: f(self.node),
-            span: self.span,
-        }
-    }
-
-    pub fn as_ref(&self) -> Spanned<&T> {
-        Spanned {
-            node: &self.node,
-            span: self.span,
-        }
-    }
 }
 
 impl<T: PartialEq> PartialEq for Spanned<T> {
@@ -97,9 +83,6 @@ impl PartialEq<&str> for Identifier {
 // ============================================================================
 // Spanned Type Aliases
 // ============================================================================
-
-/// Expression with source span
-pub type Expr = Spanned<Expression>;
 
 /// Statement with source span
 pub type Stmt = Spanned<Statement>;
@@ -462,12 +445,13 @@ pub enum UnaryOperator {
 }
 
 impl UnaryOperator {
-    /// Core builtin name for this operator (short name, e.g. "neg")
-    pub fn builtin_name(&self) -> &'static str {
+    /// Map to the corresponding IntrinsicOp
+    pub fn intrinsic_op(&self) -> crate::ir::IntrinsicOp {
+        use crate::ir::IntrinsicOp;
         match self {
-            UnaryOperator::Negate => "neg",
-            UnaryOperator::Not => "not",
-            UnaryOperator::BitwiseNot => "bit_not",
+            UnaryOperator::Negate => IntrinsicOp::Neg,
+            UnaryOperator::Not => IntrinsicOp::Not,
+            UnaryOperator::BitwiseNot => IntrinsicOp::BitNot,
         }
     }
 }
@@ -505,25 +489,25 @@ pub enum BinaryOperator {
 }
 
 impl BinaryOperator {
-    /// Core builtin name for operators that map directly to a single builtin.
+    /// Map to the corresponding IntrinsicOp.
     /// Returns None for reflexive operators (!=, >, <=, >=) and short-circuit
-    /// operators (&&, ||) which require special lowering.
-    pub fn builtin_name(&self) -> Option<&'static str> {
+    /// operators (&&, ||) which require multi-instruction lowering.
+    pub fn intrinsic_op(&self) -> Option<crate::ir::IntrinsicOp> {
+        use crate::ir::IntrinsicOp;
         match self {
-            BinaryOperator::Add => Some("add"),
-            BinaryOperator::Subtract => Some("sub"),
-            BinaryOperator::Multiply => Some("mul"),
-            BinaryOperator::Divide => Some("div"),
-            BinaryOperator::Modulo => Some("mod"),
-            BinaryOperator::Equal => Some("eq"),
-            BinaryOperator::Less => Some("lt"),
-            BinaryOperator::BitwiseAnd => Some("bit_and"),
-            BinaryOperator::BitwiseOr => Some("bit_or"),
-            BinaryOperator::BitwiseXor => Some("bit_xor"),
-            BinaryOperator::ShiftLeft => Some("shl"),
-            BinaryOperator::ShiftRight => Some("shr"),
-            BinaryOperator::BitTest => Some("bit_test"),
-            // These require special lowering (reflexive expansion or short-circuit)
+            BinaryOperator::Add => Some(IntrinsicOp::Add),
+            BinaryOperator::Subtract => Some(IntrinsicOp::Sub),
+            BinaryOperator::Multiply => Some(IntrinsicOp::Mul),
+            BinaryOperator::Divide => Some(IntrinsicOp::Div),
+            BinaryOperator::Modulo => Some(IntrinsicOp::Mod),
+            BinaryOperator::Equal => Some(IntrinsicOp::Eq),
+            BinaryOperator::Less => Some(IntrinsicOp::Lt),
+            BinaryOperator::BitwiseAnd => Some(IntrinsicOp::BitAnd),
+            BinaryOperator::BitwiseOr => Some(IntrinsicOp::BitOr),
+            BinaryOperator::BitwiseXor => Some(IntrinsicOp::BitXor),
+            BinaryOperator::ShiftLeft => Some(IntrinsicOp::Shl),
+            BinaryOperator::ShiftRight => Some(IntrinsicOp::Shr),
+            BinaryOperator::BitTest => Some(IntrinsicOp::BitTest),
             BinaryOperator::NotEqual
             | BinaryOperator::Greater
             | BinaryOperator::LessEqual
@@ -550,21 +534,22 @@ pub enum AssignmentOp {
 }
 
 impl AssignmentOp {
-    /// Core builtin name for the underlying operation.
-    /// Returns None for plain Assign (=) which doesn't use a builtin.
-    pub fn builtin_name(&self) -> Option<&'static str> {
+    /// Map to the corresponding IntrinsicOp.
+    /// Returns None for plain Assign (=).
+    pub fn intrinsic_op(&self) -> Option<crate::ir::IntrinsicOp> {
+        use crate::ir::IntrinsicOp;
         match self {
             AssignmentOp::Assign => None,
-            AssignmentOp::AddAssign => Some("add"),
-            AssignmentOp::SubAssign => Some("sub"),
-            AssignmentOp::MulAssign => Some("mul"),
-            AssignmentOp::DivAssign => Some("div"),
-            AssignmentOp::ModAssign => Some("mod"),
-            AssignmentOp::AndAssign => Some("bit_and"),
-            AssignmentOp::OrAssign => Some("bit_or"),
-            AssignmentOp::XorAssign => Some("bit_xor"),
-            AssignmentOp::ShlAssign => Some("shl"),
-            AssignmentOp::ShrAssign => Some("shr"),
+            AssignmentOp::AddAssign => Some(IntrinsicOp::Add),
+            AssignmentOp::SubAssign => Some(IntrinsicOp::Sub),
+            AssignmentOp::MulAssign => Some(IntrinsicOp::Mul),
+            AssignmentOp::DivAssign => Some(IntrinsicOp::Div),
+            AssignmentOp::ModAssign => Some(IntrinsicOp::Mod),
+            AssignmentOp::AndAssign => Some(IntrinsicOp::BitAnd),
+            AssignmentOp::OrAssign => Some(IntrinsicOp::BitOr),
+            AssignmentOp::XorAssign => Some(IntrinsicOp::BitXor),
+            AssignmentOp::ShlAssign => Some(IntrinsicOp::Shl),
+            AssignmentOp::ShrAssign => Some(IntrinsicOp::Shr),
         }
     }
 }

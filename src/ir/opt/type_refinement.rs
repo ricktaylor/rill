@@ -136,13 +136,9 @@ fn transfer_instruction(
             state.insert(*dest, result.unwrap_or_else(all_types));
         }
 
-        // Intrinsic: depends on the operation
+        // Intrinsic: use the op's result_type method
         Instruction::Intrinsic { dest, op, .. } => {
-            use crate::ir::IntrinsicOp;
-            let result_type = match op {
-                IntrinsicOp::And | IntrinsicOp::Or => TypeSet::single(BaseType::Bool),
-            };
-            state.insert(*dest, result_type);
+            state.insert(*dest, op.result_type());
         }
 
         // Call: use builtin metadata if available
@@ -421,7 +417,7 @@ pub fn analyze_types(function: &Function, builtins: Option<&BuiltinRegistry>) ->
 mod tests {
     use super::*;
     use crate::ast;
-    use crate::ir::{BasicBlock, Literal, MatchPattern, Param, SpannedInst, dummy_span};
+    use crate::ir::{BasicBlock, Literal, MatchPattern, Param, SpannedInst};
 
     fn var(id: u32) -> VarId {
         VarId(id)
@@ -437,33 +433,24 @@ mod tests {
 
     /// Helper to wrap an instruction with a dummy span
     fn si(inst: Instruction) -> SpannedInst {
-        ast::Spanned::new(inst, dummy_span())
+        ast::Spanned::new(inst, ast::Span::default())
     }
 
     fn make_function(blocks: Vec<BasicBlock>) -> Function {
         Function {
-            name: ident("test"),
-            attributes: vec![],
-            params: vec![],
-            rest_param: None,
-            locals: vec![],
             blocks,
-            entry_block: block(0),
+            ..Default::default()
         }
     }
 
     fn make_function_with_param(param_var: VarId, blocks: Vec<BasicBlock>) -> Function {
         Function {
-            name: ident("test"),
-            attributes: vec![],
             params: vec![Param {
                 var: param_var,
                 by_ref: false,
             }],
-            rest_param: None,
-            locals: vec![],
             blocks,
-            entry_block: block(0),
+            ..Default::default()
         }
     }
 
@@ -558,7 +545,7 @@ mod tests {
                         (MatchPattern::Type(BaseType::Int), block(2)),
                     ],
                     default: block(3),
-                    span: dummy_span(),
+                    span: ast::Span::default(),
                 },
             },
             BasicBlock {
@@ -619,7 +606,7 @@ mod tests {
                     value: var(1),
                     defined: block(1),
                     undefined: block(2),
-                    span: dummy_span(),
+                    span: ast::Span::default(),
                 },
             },
             BasicBlock {
@@ -661,7 +648,7 @@ mod tests {
                     condition: var(0),
                     then_target: block(1),
                     else_target: block(2),
-                    span: dummy_span(),
+                    span: ast::Span::default(),
                 },
             },
             BasicBlock {

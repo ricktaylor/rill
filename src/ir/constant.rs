@@ -164,36 +164,35 @@ impl<'a> Lowerer<'a> {
         let lhs = self.const_eval_expr(left)?;
         let rhs = self.const_eval_expr(right)?;
 
-        // Reflexive comparison operators expand to combinations of eq/lt/not
+        // Reflexive comparison operators expand to combinations of Eq/Lt/Not
         match op {
-            // a != b  →  not(eq(a, b))
+            // a != b  →  Not(Eq(a, b))
             ast::BinaryOperator::NotEqual => {
-                let eq_result = self.call_const_builtin("core::eq", &[lhs, rhs])?;
-                return self.call_const_builtin("core::not", &[eq_result]);
+                let eq_result = self.eval_intrinsic(IntrinsicOp::Eq, &[lhs, rhs])?;
+                return self.eval_intrinsic(IntrinsicOp::Not, &[eq_result]);
             }
-            // a > b  →  lt(b, a)  (swap operands)
+            // a > b  →  Lt(b, a)  (swap operands)
             ast::BinaryOperator::Greater => {
-                return self.call_const_builtin("core::lt", &[rhs, lhs]);
+                return self.eval_intrinsic(IntrinsicOp::Lt, &[rhs, lhs]);
             }
-            // a <= b  →  not(lt(b, a))
+            // a <= b  →  Not(Lt(b, a))
             ast::BinaryOperator::LessEqual => {
-                let lt_result = self.call_const_builtin("core::lt", &[rhs, lhs])?;
-                return self.call_const_builtin("core::not", &[lt_result]);
+                let lt_result = self.eval_intrinsic(IntrinsicOp::Lt, &[rhs, lhs])?;
+                return self.eval_intrinsic(IntrinsicOp::Not, &[lt_result]);
             }
-            // a >= b  →  not(lt(a, b))
+            // a >= b  →  Not(Lt(a, b))
             ast::BinaryOperator::GreaterEqual => {
-                let lt_result = self.call_const_builtin("core::lt", &[lhs, rhs])?;
-                return self.call_const_builtin("core::not", &[lt_result]);
+                let lt_result = self.eval_intrinsic(IntrinsicOp::Lt, &[lhs, rhs])?;
+                return self.eval_intrinsic(IntrinsicOp::Not, &[lt_result]);
             }
             _ => {}
         }
 
-        // Direct builtin mapping for remaining operators
-        let short_name = op
-            .builtin_name()
+        // Direct intrinsic mapping for remaining operators
+        let intrinsic = op
+            .intrinsic_op()
             .expect("reflexive/short-circuit ops handled above");
-        let full_name = format!("core::{}", short_name);
-        self.call_const_builtin(&full_name, &[lhs, rhs])
+        self.eval_intrinsic(intrinsic, &[lhs, rhs])
     }
 
     /// Evaluate a unary operation at compile time
@@ -203,9 +202,7 @@ impl<'a> Lowerer<'a> {
         operand: &ast::Expression,
     ) -> ConstResult<ConstValue> {
         let arg = self.const_eval_expr(operand)?;
-
-        let full_name = format!("core::{}", op.builtin_name());
-        self.call_const_builtin(&full_name, &[arg])
+        self.eval_intrinsic(op.intrinsic_op(), &[arg])
     }
 
     /// Evaluate a function call at compile time
@@ -219,15 +216,26 @@ impl<'a> Lowerer<'a> {
         let args: ConstResult<Vec<_>> = arguments.iter().map(|e| self.const_eval_expr(e)).collect();
         let args = args?;
 
-        // Build the qualified name for builtin lookup, matching lower_function_call logic:
-        // - Explicit namespace: "ns::name"
-        // - Unqualified: try "core::name" (builtins live in core namespace)
-        let full_name = match namespace {
+        // Check for known intrinsic functions first (no registry lookup needed)
+        if namespace.is_none()
+            && let Some(op) = intrinsic_by_name(name)
+        {
+            return self.eval_intrinsic(op, &args);
+        }
+
+        // Fall through to registry lookup for host-provided builtins
+        let lookup_name = match namespace {
             Some(ns) => format!("{}::{}", ns, name),
-            None => format!("core::{}", name),
+            None => name.to_string(),
         };
 
-        self.call_const_builtin(&full_name, &args)
+        self.call_const_builtin(&lookup_name, &args)
+    }
+
+    /// Evaluate an intrinsic at compile time
+    fn eval_intrinsic(&self, op: IntrinsicOp, args: &[ConstValue]) -> ConstResult<ConstValue> {
+        const_eval::eval_intrinsic_const(op, args)
+            .ok_or_else(|| format!("constant evaluation of {:?} failed", op))
     }
 
     /// Call a builtin's const evaluator

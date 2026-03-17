@@ -45,11 +45,6 @@ use chumsky::span::Span;
 use diagnostics::{DiagnosticCode, Diagnostics};
 use std::collections::HashMap;
 
-/// Create a placeholder span (for errors where we don't have source location)
-pub fn dummy_span() -> ast::Span {
-    ast::Span::new((), 0..0)
-}
-
 // ============================================================================
 // Binding Mode
 // ============================================================================
@@ -125,7 +120,7 @@ impl<'a> Lowerer<'a> {
             blocks: Vec::new(),
             current_block: BlockId(0),
             current_instructions: Vec::new(),
-            current_span: dummy_span(),
+            current_span: ast::Span::default(),
             loop_stack: Vec::new(),
         }
     }
@@ -142,16 +137,6 @@ impl<'a> Lowerer<'a> {
         };
         self.diagnostics
             .error(DiagnosticCode::E100_UndefinedVariable, span, msg);
-    }
-
-    /// Emit an error for an undefined function
-    pub fn error_undefined_fn(&mut self, namespace: Option<&str>, name: &str, span: ast::Span) {
-        let msg = match namespace {
-            Some(ns) => format!("undefined function `{}::{}`", ns, name),
-            None => format!("undefined function `{}`", name),
-        };
-        self.diagnostics
-            .error(DiagnosticCode::E101_UndefinedFunction, span, msg);
     }
 
     /// Emit an error for invalid loop control (break/continue outside loop)
@@ -274,12 +259,6 @@ impl<'a> Lowerer<'a> {
         self.set_span(stmt.span);
         self.lower_statement(&stmt.node);
     }
-
-    /// Lower a spanned expression, setting the current span first
-    pub fn lower_expr(&mut self, expr: &ast::Expr) -> VarId {
-        self.set_span(expr.span);
-        self.lower_expression(&expr.node)
-    }
 }
 
 // ============================================================================
@@ -326,9 +305,7 @@ mod tests {
     use crate::diagnostics::Diagnostics;
 
     fn test_registry() -> builtins::BuiltinRegistry {
-        let mut registry = builtins::BuiltinRegistry::new();
-        builtins::register_core_builtins(&mut registry);
-        registry
+        builtins::standard_builtins()
     }
 
     fn try_parse(source: &str) -> ast::AstProgram {

@@ -17,7 +17,7 @@ use super::{BlockId, Function, FunctionRef, Instruction, Terminator, VarId};
 use crate::builtins::BuiltinRegistry;
 use crate::diagnostics::{DiagnosticCode, Diagnostics};
 use crate::ir::const_eval::{
-    const_and, const_index, const_or, const_to_literal, eval_builtin_const, literal_to_const,
+    const_index, const_to_literal, eval_builtin_const, eval_intrinsic_const, literal_to_const,
 };
 use crate::ir::{ConstValue, IntrinsicOp};
 use std::collections::HashMap;
@@ -332,17 +332,19 @@ fn try_fold_intrinsic(
     args: &[VarId],
     constants: &ConstantMap,
 ) -> Option<ConstValue> {
-    // Collect constant arguments (partial collection for short-circuit)
-    let const_args: Vec<ConstValue> = args
-        .iter()
-        .filter_map(|v| constants.get(v).cloned())
-        .collect();
-
-    // Use shared helpers for short-circuit logic
-    match op {
-        IntrinsicOp::And => const_and(&const_args),
-        IntrinsicOp::Or => const_or(&const_args),
+    // For short-circuit ops (And, Or), we can fold with partial constants
+    if matches!(op, IntrinsicOp::And | IntrinsicOp::Or) {
+        let const_args: Vec<ConstValue> = args
+            .iter()
+            .filter_map(|v| constants.get(v).cloned())
+            .collect();
+        return eval_intrinsic_const(op, &const_args);
     }
+
+    // For all other ops, all arguments must be constant
+    let const_args: Option<Vec<ConstValue>> =
+        args.iter().map(|v| constants.get(v).cloned()).collect();
+    eval_intrinsic_const(op, &const_args?)
 }
 
 /// Try to fold a Phi with all constant sources of the same value
@@ -382,7 +384,7 @@ mod tests {
     use crate::ast;
     use crate::builtins::standard_builtins;
     use crate::diagnostics::Diagnostics;
-    use crate::ir::{BasicBlock, CallArg, Literal, Param, SpannedInst, dummy_span};
+    use crate::ir::{BasicBlock, Literal, SpannedInst};
 
     fn var(id: u32) -> VarId {
         VarId(id)
@@ -392,24 +394,15 @@ mod tests {
         BlockId(id)
     }
 
-    fn ident(s: &str) -> ast::Identifier {
-        ast::Identifier(s.to_string())
-    }
-
-    /// Helper to wrap an instruction with a dummy span
+    /// Helper to wrap an instruction with a default span
     fn si(inst: Instruction) -> SpannedInst {
-        ast::Spanned::new(inst, dummy_span())
+        ast::Spanned::new(inst, ast::Span::default())
     }
 
     fn make_function(blocks: Vec<BasicBlock>) -> Function {
         Function {
-            name: ident("test"),
-            attributes: vec![],
-            params: vec![],
-            rest_param: None,
-            locals: vec![],
             blocks,
-            entry_block: block(0),
+            ..Default::default()
         }
     }
 
@@ -458,7 +451,7 @@ mod tests {
                     condition: var(0),
                     then_target: block(1),
                     else_target: block(2),
-                    span: dummy_span(),
+                    span: ast::Span::default(),
                 },
             },
             BasicBlock {
@@ -498,7 +491,7 @@ mod tests {
                     condition: var(0),
                     then_target: block(1),
                     else_target: block(2),
-                    span: dummy_span(),
+                    span: ast::Span::default(),
                 },
             },
             BasicBlock {
@@ -538,7 +531,7 @@ mod tests {
                     value: var(0),
                     defined: block(1),
                     undefined: block(2),
-                    span: dummy_span(),
+                    span: ast::Span::default(),
                 },
             },
             BasicBlock {
@@ -645,7 +638,7 @@ mod tests {
                     condition: var(0),
                     then_target: block(1),
                     else_target: block(2),
-                    span: dummy_span(),
+                    span: ast::Span::default(),
                 },
             },
             BasicBlock {
@@ -689,12 +682,6 @@ mod tests {
 
     #[test]
     fn test_fold_array_index() {
-        let builtins = standard_builtins();
-
-        // Create a function that indexes into a constant array
-        // This test is limited because we can't create Array literals directly
-        // In practice, arrays come from core::make_array which would be folded first
-
         let mut constants: ConstantMap = HashMap::new();
         constants.insert(
             var(0),

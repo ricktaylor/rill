@@ -84,10 +84,10 @@ impl<'a> Lowerer<'a> {
                 }
 
                 // Compute length for rest and after patterns
-                let length = self.emit_unary_call("len", value);
+                let length = self.emit_unary_intrinsic(IntrinsicOp::Len, value);
 
                 // Bind rest variable as a zero-copy Sequence over the source array.
-                // core::array_seq(array, start, end, mutable) -> Sequence(ArraySlice)
+                // ArraySeq(array, start, end, mutable) -> Sequence(ArraySlice)
                 //
                 // Mutability follows the binding mode:
                 //   let [a, ..rest] = arr   → mutable=false, iteration is by-value
@@ -105,7 +105,7 @@ impl<'a> Lowerer<'a> {
                         dest: after_len,
                         value: Literal::UInt(after.len() as u64),
                     });
-                    let end = self.emit_binary_call("sub", length, after_len);
+                    let end = self.emit_binary_intrinsic(IntrinsicOp::Sub, length, after_len);
 
                     let is_mutable = self.new_temp(TypeSet::single(types::BaseType::Bool));
                     self.emit(Instruction::Const {
@@ -114,27 +114,10 @@ impl<'a> Lowerer<'a> {
                     });
 
                     let rest_val = self.new_temp(TypeSet::single(types::BaseType::Sequence));
-                    self.emit(Instruction::Call {
+                    self.emit(Instruction::Intrinsic {
                         dest: rest_val,
-                        function: FunctionRef::core("array_seq"),
-                        args: vec![
-                            CallArg {
-                                value,
-                                by_ref: false,
-                            },
-                            CallArg {
-                                value: start,
-                                by_ref: false,
-                            },
-                            CallArg {
-                                value: end,
-                                by_ref: false,
-                            },
-                            CallArg {
-                                value: is_mutable,
-                                by_ref: false,
-                            },
-                        ],
+                        op: IntrinsicOp::ArraySeq,
+                        args: vec![value, start, end, is_mutable],
                     });
 
                     let rest_var = self.new_var(
@@ -155,7 +138,8 @@ impl<'a> Lowerer<'a> {
                         dest: after_len,
                         value: Literal::UInt(after.len() as u64),
                     });
-                    let after_start = self.emit_binary_call("sub", length, after_len);
+                    let after_start =
+                        self.emit_binary_intrinsic(IntrinsicOp::Sub, length, after_len);
 
                     for (i, pat) in after.iter().enumerate() {
                         let offset = self.new_temp(TypeSet::single(types::BaseType::UInt));
@@ -163,7 +147,7 @@ impl<'a> Lowerer<'a> {
                             dest: offset,
                             value: Literal::UInt(i as u64),
                         });
-                        let idx = self.emit_binary_call("add", after_start, offset);
+                        let idx = self.emit_binary_intrinsic(IntrinsicOp::Add, after_start, offset);
 
                         let elem = self.new_temp(TypeSet::all());
                         self.emit(Instruction::Index {

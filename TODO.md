@@ -3,7 +3,7 @@
 ## Project Overview
 
 Rill is a memory-safe, embeddable scripting language written in Rust.
-Architecture: Source → Parser (chumsky) → AST → Lower → IR (SSA) → Optimize → Compile (closure-threaded) → Execute (flat pc-based loop).
+Architecture: Source → Parser (chumsky) → AST → Lower (operators → IntrinsicOp) → IR (SSA) → Optimize → Compile (closure-threaded) → Execute (flat pc-based loop).
 
 ## Current Status (per README + code inspection)
 
@@ -13,7 +13,9 @@ Architecture: Source → Parser (chumsky) → AST → Lower → IR (SSA) → Opt
 - AST and type definitions — `src/ast.rs`, `src/types.rs` (TypeSet as u16 bitfield)
 - VM core with stack/heap tracking — `src/exec.rs`
 - Heap tracking system (CoW HeapVal, capacity-based, limit-checked)
-- Builtin registry — `src/builtins.rs`
+- Builtin registry for host-provided extern functions — `src/builtins.rs`
+- IntrinsicOp: all operators, len, collection construction are intrinsics (not builtins)
+  Runtime in `compile.rs::exec_intrinsic`, const-eval in `ir/const_eval.rs::eval_intrinsic_const`
 - Diagnostics system with source spans — `src/diagnostics.rs`
 - IR lowering (AST → SSA IR) with loop-carried phis — `src/ir/`
 - Optimizer passes — const fold, definedness, guard elim, CFG simplify, type refinement
@@ -25,9 +27,10 @@ Architecture: Source → Parser (chumsky) → AST → Lower → IR (SSA) → Opt
 - Source location utilities: `span_to_line_col()`, `LineCol`
 
 ### Not Yet Started
-- [ ] Register sequence builtins: `core::make_seq`, `core::seq_next`, `core::array_seq`, `core::collect`
+- [ ] Implement sequence intrinsics at runtime: `MakeSeq`, `ArraySeq` (currently return None)
+- [ ] Add `SeqNext` intrinsic for sequence consumption in for-loops
 - [ ] For-loop type dispatch (Match on iterable type for unknown types)
-- [ ] For-loop sequence path (seq_next-based loop for Sequence type)
+- [ ] For-loop sequence path (SeqNext-based loop for Sequence type)
 - [ ] Dead-store warnings for mutations to non-ref-backed loop variables
 - [ ] Host sequence support (`SeqState::Host` variant)
 - [ ] Public/private function visibility — structural, not declarative:
@@ -193,9 +196,9 @@ Issues identified during code review, ordered by priority.
 - [x] FunctionHandle API for hot-path execution (no HashMap lookup per call)
 
 ### P1 — Core Functionality
-- [ ] Register missing builtins: `core::make_seq`, `core::seq_next`, `core::array_seq`, `core::collect`
+- [ ] Implement `MakeSeq`/`ArraySeq`/`SeqNext` intrinsic runtime in `exec_intrinsic`
 - [ ] For-loop type dispatch (Match on iterable type for unknown types)
-- [ ] For-loop sequence path (seq_next-based loop for Sequence type)
+- [ ] For-loop sequence path (SeqNext-based loop for Sequence type)
 - [ ] Host sequence support (`SeqState::Host` variant, defer trait design to embedder API)
 - [ ] Module/import resolution system
 - [ ] Standard library: `std.cbor` (encode/decode)
@@ -205,53 +208,112 @@ Issues identified during code review, ordered by priority.
 
 ### P2 — Optimization Passes
 
+#### Type-Specialized Compilation (Phase 2 of intrinsic refactor)
+
+Operators are now `IntrinsicOp` (Phase 1 complete). Phase 2 uses type analysis
+to specialize them at compile time, eliminating runtime type dispatch.
+
+**Dependency chain:**
+```
+TypeAnalysis (DONE) → Coercion Insertion → StepKind Emission → Peephole → Closures
+```
+
+- [ ] **Thread TypeAnalysis to compilation** — pass the `TypeAnalysis` result
+      (currently computed but discarded with `let _types = ...`) through to
+      `compile_program` / `compile_function`. Each VarId gets a known TypeSet.
+
+- [ ] **Add `Widen` intrinsic for explicit type coercion** — new `IntrinsicOp::Widen`
+      with a target type. Only 3 numeric coercion edges: UInt→Int, UInt→Float,
+      Int→Float. Coercion is currently implicit in the 10-way match inside each
+      arithmetic op; making it explicit enables folding and hoisting.
+
+- [ ] **Coercion insertion pass** — new IR pass after type refinement. Walks
+      `Intrinsic { op: Add, args: [v1, v2] }`, checks refined types of v1/v2.
+      If mixed (e.g. UInt+Int), inserts `Intrinsic { op: Widen }` to promote
+      the narrower operand, then rewrites the Add to operate on same-type args.
+      If both already same type, no change. If unknown, leave for generic dispatch.
+      Pipeline position:
+      ```
+      ... → Type Refinement → Coercion Insertion → Cleanup Const Fold → CFG Simplify
+      ```
+
+- [ ] **Define `StepKind` intermediate** — tagged enum between IR compilation
+      and closure generation. Enables pattern-matching on instruction sequences.
+      ```rust
+      enum StepKind {
+          // Type-specialized (when TypeAnalysis proves both args same type)
+          AddUU { dest, a, b },    // u64 + u64, single checked_add
+          AddII { dest, a, b },    // i64 + i64
+          AddFF { dest, a, b },    // f64 + f64
+          AddGeneric { dest, a, b }, // unknown types, full dispatch
+          // Same pattern for Sub, Mul, Div, Mod, Lt, Eq, ...
+          // Shared coercion steps (3 total, reused across all ops)
+          WidenUIntToInt { dest, src },
+          WidenUIntToFloat { dest, src },
+          WidenIntToFloat { dest, src },
+          // Non-arithmetic (always same codegen)
+          Copy { dest, src },
+          Const { dest, value },
+          Call { dest, func, args },
+          CallUser { dest, func_idx, args },
+          Jump(usize),
+          Branch { cond, then_, else_ },
+          // ...
+      }
+      ```
+
+- [ ] **Type-aware StepKind emission** — when compiling `Intrinsic { op: Add }`,
+      consult TypeAnalysis for the operand types:
+      - `(UInt, UInt)` → `StepKind::AddUU`
+      - `(Int, Int)` → `StepKind::AddII` (after coercion pass widened operands)
+      - unknown → `StepKind::AddGeneric`
+      The specialized variants compile to a single `checked_add` with no enum
+      match on Value — the type is statically known.
+
+- [ ] **Peephole optimization on StepKind** — pattern-match on StepKind sequences
+      before converting to closures:
+      - Copy-to-self elimination: `Copy { dest: 5, src: 5 }` → remove
+      - Dead store removal: write to slot never read → remove
+      - Const+use fusion: `Const { dest: 3, value: 1 }` + `AddUU { a: 3, ... }`
+        → `AddUU_Imm { a, imm: 1 }` (or just inline the constant)
+      - Redundant coercion elimination: same Widen applied twice → reuse first
+      - Coercion chain collapsing: UInt→Int then Int→Float → UInt→Float
+      - Jump threading: `Jump(A)` where A is `Jump(B)` → `Jump(B)`
+
+- [ ] **Loop-invariant coercion hoisting** — a Widen of a loop-invariant value
+      can be moved to the pre-header. Common case: `for i in 0..n` where `n`
+      is Int but `i` is UInt — the coercion of `n` only needs to happen once.
+
 #### IR-Level (SSA)
 
-- [ ] **Type-Driven Dead Arm Elimination** — use the existing `TypeAnalysis` result
-      (currently computed but discarded with `let _types = ...`) to prune Match arms
-      where `TypeSet ∩ arm_type = ∅`. A Match with one surviving arm becomes a Jump.
-      This feeds into CFG simplification → DCE. ~30 lines. Dependency chain:
-      ```
-      Type Analysis (DONE) → Dead Arm Elimination → CFG Simplify (DONE) → DCE
-      ```
+- [ ] **Type-Driven Dead Arm Elimination** — use `TypeAnalysis` to prune Match
+      arms where `TypeSet ∩ arm_type = ∅`. A Match with one surviving arm becomes
+      a Jump. Feeds into CFG simplification → DCE. ~30 lines.
 
 - [ ] **Dead Code Elimination (DCE)** — remove instructions whose dest VarId is
-      never used. Iterate until stable (removing one may make operands dead).
-      Respect purity: keep impure Calls even if result unused. ~50-80 lines.
-      Consumes dead arms/blocks from type-driven elimination above.
+      never used. Iterate until stable. Respect purity: keep impure Calls even if
+      result unused. ~50-80 lines.
 
-- [ ] **Copy Propagation** — if `x = Copy(y)`, replace all uses of `x` with `y`
-      and remove the Copy. Straightforward in SSA.
+- [ ] **Copy Propagation** — if `x = Copy(y)`, replace all uses of `x` with `y`.
+      Straightforward in SSA.
 
-- [ ] **Common Subexpression Elimination (CSE)** — if the same pure operation
-      with the same operands appears twice, reuse the first result. Requires
-      purity checking (already have via `BuiltinMeta.purity`).
+- [ ] **Common Subexpression Elimination (CSE)** — reuse results of identical pure
+      operations. Purity checking via `IntrinsicOp::is_fallible()` and
+      `BuiltinMeta.purity`.
 
-- [ ] **Algebraic Simplification** — simplify identities:
-      `x + 0 → x`, `x * 1 → x`, `x * 0 → 0`, `x - x → 0`,
-      `!!x → x`, `x && true → x`, `x || false → x`.
-      Can be part of const folding or a separate pass.
+- [ ] **Algebraic Simplification** — `x + 0 → x`, `x * 1 → x`, `x * 0 → 0`,
+      `x - x → 0`, `!!x → x`, `x && true → x`, `x || false → x`.
 
-- [ ] **Loop-Invariant Code Motion (LICM)** — lift pure computations whose
-      operands are all defined outside the loop to the pre-header block.
-      Requires: loop detection (back-edges), dominator tree, invariant analysis.
+- [ ] **Loop-Invariant Code Motion (LICM)** — lift pure computations with
+      loop-external operands to pre-header. Requires loop detection, dominator tree.
 
-- [ ] **Tail-Call Optimization (TCO)** — detect calls in tail position, rewrite
-      to parameter overwrite + jump to entry block. Eliminates frame allocation
-      for recursive functions. The flat pc-based executor supports this naturally.
+- [ ] **Tail-Call Optimization (TCO)** — rewrite tail calls to parameter overwrite
+      + jump to entry. The flat pc-based executor supports this naturally.
 
-- [ ] **Function Inlining** — replace calls to small pure functions with the
-      function body. Clone callee IR into call site. Valuable for helper functions.
+- [ ] **Function Inlining** — clone callee IR into call site for small pure functions.
 
-- [ ] **Sparse Conditional Constant Propagation (SCCP)** — more powerful than
-      current const fold. Combines constant propagation with unreachable code
-      detection in a single pass. Would subsume const_fold + guard_elim.
-
-#### Closure Compiler Level
-
-- [ ] **Peephole Optimization** — between phi resolution and flattening.
-      Requires tagged `StepKind` intermediate form before conversion to closures.
-      Copy-to-self elimination, dead store removal, const+use fusion, jump threading.
+- [ ] **Sparse Conditional Constant Propagation (SCCP)** — combines constant
+      propagation with unreachable code detection. Would subsume const_fold + guard_elim.
 
 #### Diagnostics
 
@@ -282,7 +344,7 @@ src/
   ast.rs              — AST node types, Span, Spanned
   types.rs            — BaseType, TypeSet
   parser.rs           — Chumsky-based parser -> AST
-  builtins.rs         — BuiltinRegistry, core builtin definitions
+  builtins.rs         — BuiltinRegistry for host-provided extern functions (empty by default)
   diagnostics.rs      — Error/warning accumulator with codes
   exec.rs             — VM, Heap, HeapVal, Value, Slot, Float
   ir/
@@ -294,7 +356,7 @@ src/
     control.rs        — Control flow lowering (if, match, loops)
     pattern.rs        — Pattern destructuring lowering
     constant.rs       — Constant expression lowering
-    const_eval.rs     — Compile-time constant evaluation
+    const_eval.rs     — Compile-time constant evaluation (intrinsic + builtin)
     opt/
       mod.rs          — Optimizer pass runner
       const_fold.rs   — Constant folding pass

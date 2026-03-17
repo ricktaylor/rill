@@ -208,23 +208,14 @@ impl<'a> Lowerer<'a> {
     }
 
     fn lower_array_literal(&mut self, elements: &[ast::Expression]) -> VarId {
-        let element_vars: Vec<VarId> = elements.iter().map(|e| self.lower_expression(e)).collect();
+        let args: Vec<VarId> = elements.iter().map(|e| self.lower_expression(e)).collect();
 
         let dest = self.new_temp(TypeSet::single(types::BaseType::Array));
-        let args: Vec<CallArg> = element_vars
-            .into_iter()
-            .map(|v| CallArg {
-                value: v,
-                by_ref: false,
-            })
-            .collect();
-
-        self.emit(Instruction::Call {
+        self.emit(Instruction::Intrinsic {
             dest,
-            function: FunctionRef::core("make_array"),
+            op: IntrinsicOp::MakeArray,
             args,
         });
-
         dest
     }
 
@@ -234,29 +225,14 @@ impl<'a> Lowerer<'a> {
             .map(|(k, v)| (self.lower_expression(k), self.lower_expression(v)))
             .collect();
 
-        let dest = self.new_temp(TypeSet::single(types::BaseType::Map));
-        let args: Vec<CallArg> = entry_vars
-            .into_iter()
-            .flat_map(|(k, v)| {
-                [
-                    CallArg {
-                        value: k,
-                        by_ref: false,
-                    },
-                    CallArg {
-                        value: v,
-                        by_ref: false,
-                    },
-                ]
-            })
-            .collect();
+        let args: Vec<VarId> = entry_vars.into_iter().flat_map(|(k, v)| [k, v]).collect();
 
-        self.emit(Instruction::Call {
+        let dest = self.new_temp(TypeSet::single(types::BaseType::Map));
+        self.emit(Instruction::Intrinsic {
             dest,
-            function: FunctionRef::core("make_map"),
+            op: IntrinsicOp::MakeMap,
             args,
         });
-
         dest
     }
 
@@ -276,70 +252,61 @@ impl<'a> Lowerer<'a> {
         let lhs = self.lower_expression(left);
         let rhs = self.lower_expression(right);
 
-        // Reflexive comparison operators expand to combinations of eq/lt/not
-        // This reduces the number of builtins and enables optimization
+        // Reflexive comparison operators expand to combinations of Eq/Lt/Not
+        // This reduces the number of intrinsics and enables optimization
         match op {
-            // a != b  →  not(eq(a, b))
+            // a != b  →  Not(Eq(a, b))
             ast::BinaryOperator::NotEqual => {
-                let eq_result = self.emit_binary_call("eq", lhs, rhs);
-                return self.emit_unary_call("not", eq_result);
+                let eq_result = self.emit_binary_intrinsic(IntrinsicOp::Eq, lhs, rhs);
+                return self.emit_unary_intrinsic(IntrinsicOp::Not, eq_result);
             }
-            // a > b  →  lt(b, a)  (swap operands)
+            // a > b  →  Lt(b, a)  (swap operands)
             ast::BinaryOperator::Greater => {
-                return self.emit_binary_call("lt", rhs, lhs);
+                return self.emit_binary_intrinsic(IntrinsicOp::Lt, rhs, lhs);
             }
-            // a <= b  →  not(lt(b, a))
+            // a <= b  →  Not(Lt(b, a))
             ast::BinaryOperator::LessEqual => {
-                let lt_result = self.emit_binary_call("lt", rhs, lhs);
-                return self.emit_unary_call("not", lt_result);
+                let lt_result = self.emit_binary_intrinsic(IntrinsicOp::Lt, rhs, lhs);
+                return self.emit_unary_intrinsic(IntrinsicOp::Not, lt_result);
             }
-            // a >= b  →  not(lt(a, b))
+            // a >= b  →  Not(Lt(a, b))
             ast::BinaryOperator::GreaterEqual => {
-                let lt_result = self.emit_binary_call("lt", lhs, rhs);
-                return self.emit_unary_call("not", lt_result);
+                let lt_result = self.emit_binary_intrinsic(IntrinsicOp::Lt, lhs, rhs);
+                return self.emit_unary_intrinsic(IntrinsicOp::Not, lt_result);
             }
             _ => {}
         }
 
-        // Direct builtin mapping for remaining operators
-        let builtin = op
-            .builtin_name()
+        // Direct intrinsic mapping for remaining operators
+        let intrinsic = op
+            .intrinsic_op()
             .expect("reflexive/short-circuit ops handled above");
-        self.emit_binary_call(builtin, lhs, rhs)
+        self.emit_binary_intrinsic(intrinsic, lhs, rhs)
     }
 
-    /// Helper to emit a binary core builtin call.
-    /// `builtin` is the short name (e.g., "add"), not the qualified name.
-    pub(crate) fn emit_binary_call(&mut self, builtin: &str, lhs: VarId, rhs: VarId) -> VarId {
-        let dest = self.new_temp(TypeSet::all());
-        self.emit(Instruction::Call {
+    /// Emit a binary intrinsic operation.
+    pub(crate) fn emit_binary_intrinsic(
+        &mut self,
+        op: IntrinsicOp,
+        lhs: VarId,
+        rhs: VarId,
+    ) -> VarId {
+        let dest = self.new_temp(op.result_type());
+        self.emit(Instruction::Intrinsic {
             dest,
-            function: FunctionRef::core(builtin),
-            args: vec![
-                CallArg {
-                    value: lhs,
-                    by_ref: false,
-                },
-                CallArg {
-                    value: rhs,
-                    by_ref: false,
-                },
-            ],
+            op,
+            args: vec![lhs, rhs],
         });
         dest
     }
 
-    /// Helper to emit a unary core builtin call.
-    /// `builtin` is the short name (e.g., "not"), not the qualified name.
-    pub(crate) fn emit_unary_call(&mut self, builtin: &str, arg: VarId) -> VarId {
-        let dest = self.new_temp(TypeSet::all());
-        self.emit(Instruction::Call {
+    /// Emit a unary intrinsic operation.
+    pub(crate) fn emit_unary_intrinsic(&mut self, op: IntrinsicOp, arg: VarId) -> VarId {
+        let dest = self.new_temp(op.result_type());
+        self.emit(Instruction::Intrinsic {
             dest,
-            function: FunctionRef::core(builtin),
-            args: vec![CallArg {
-                value: arg,
-                by_ref: false,
-            }],
+            op,
+            args: vec![arg],
         });
         dest
     }
@@ -426,9 +393,7 @@ impl<'a> Lowerer<'a> {
 
     fn lower_unary_op(&mut self, op: &ast::UnaryOperator, operand: &ast::Expression) -> VarId {
         let arg = self.lower_expression(operand);
-        let builtin = op.builtin_name();
-
-        self.emit_unary_call(builtin, arg)
+        self.emit_unary_intrinsic(op.intrinsic_op(), arg)
     }
 
     pub fn lower_function_call(
@@ -437,32 +402,25 @@ impl<'a> Lowerer<'a> {
         name: &ast::Identifier,
         arguments: &[ast::Expression],
     ) -> VarId {
-        // Determine the effective namespace and check for intrinsics
-        let is_core_namespace = namespace.as_ref().map(|ns| *ns == "core").unwrap_or(false);
-
-        // For qualified core:: calls or unqualified calls, check intrinsics first
-        // (Unqualified calls implicitly look in core:: after local/imported)
-        if (is_core_namespace || namespace.is_none())
+        // Check for compiler intrinsics first (is_some, is_uint, etc.)
+        // These lower to control flow, not function calls.
+        if namespace.is_none()
             && let Some(result) = self.try_lower_intrinsic(name, arguments)
         {
             return result;
         }
 
-        // Resolve the full name for builtin lookup
-        let full_name = if is_core_namespace {
-            // Explicit core:: qualification
-            format!("core::{name}")
-        } else if namespace.is_some() {
-            // Other namespace qualification
-            format!("{}::{name}", namespace.as_ref().unwrap())
+        // Build the lookup name for the builtin registry.
+        // The registry now contains only user-callable extern functions
+        // (no core:: prefix needed).
+        let lookup_name = if let Some(ns) = namespace {
+            format!("{ns}::{name}")
         } else {
-            // Unqualified: try core:: prefix for builtin lookup
-            // (In future: check local/imported functions first)
-            format!("core::{name}")
+            name.to_string()
         };
 
         // Check if the function exists in the registry
-        let builtin_def = self.builtins.get(&full_name);
+        let builtin_def = self.builtins.get(&lookup_name);
 
         let param_specs = builtin_def.map(|b| &b.meta.params);
 
@@ -481,24 +439,11 @@ impl<'a> Lowerer<'a> {
             })
             .collect();
 
-        // Emit the call with the resolved namespace.
-        // If found in builtins, use core:: prefix. Otherwise keep the original
-        // namespace (None for unqualified user-defined function calls).
-        let resolved_namespace = if builtin_def.is_some() {
-            if is_core_namespace || namespace.is_none() {
-                Some(ast::Identifier("core".to_string()))
-            } else {
-                namespace.cloned()
-            }
-        } else {
-            namespace.cloned()
-        };
-
         let dest = self.new_temp(TypeSet::all());
         self.emit(Instruction::Call {
             dest,
             function: FunctionRef {
-                namespace: resolved_namespace,
+                namespace: namespace.cloned(),
                 name: name.clone(),
             },
             args,
@@ -510,6 +455,12 @@ impl<'a> Lowerer<'a> {
     /// with matching arity, None if it should be handled as a regular builtin call.
     fn try_lower_intrinsic(&mut self, name: &str, arguments: &[ast::Expression]) -> Option<VarId> {
         match name {
+            // Single-arg intrinsics that lower to a simple Intrinsic instruction
+            "len" if arguments.len() == 1 => {
+                let arg = self.lower_expression(&arguments[0]);
+                Some(self.emit_unary_intrinsic(IntrinsicOp::Len, arg))
+            }
+            // Control-flow intrinsics (Guard/Match + Phi)
             "is_some" => self.lower_intrinsic_is_some(arguments),
             "is_uint" => self.lower_intrinsic_is_type(types::BaseType::UInt, arguments),
             "is_int" => self.lower_intrinsic_is_type(types::BaseType::Int, arguments),

@@ -68,20 +68,6 @@ pub fn eval_builtin_const(
     eval_fn(args)
 }
 
-/// Evaluate a builtin by name with constant arguments
-///
-/// This is a convenience wrapper for when you have a string name
-/// rather than a FunctionRef.
-pub fn eval_builtin_const_by_name(
-    name: &str,
-    args: &[ConstValue],
-    registry: &BuiltinRegistry,
-) -> Option<ConstValue> {
-    let builtin = registry.get(name)?;
-    let eval_fn = builtin.meta.purity.const_eval()?;
-    eval_fn(args)
-}
-
 // ============================================================================
 // Collection Indexing
 // ============================================================================
@@ -129,6 +115,301 @@ pub fn const_index(base: &ConstValue, key: &ConstValue) -> Option<ConstValue> {
             .map(|b| ConstValue::UInt(*b as u64)),
         _ => None,
     }
+}
+
+// ============================================================================
+// Intrinsic Const Evaluation
+// ============================================================================
+
+/// Evaluate an intrinsic operation at compile time with constant arguments.
+///
+/// This replaces the old approach of looking up const-eval functions from the
+/// BuiltinRegistry. All operator semantics are defined here, in one place.
+pub fn eval_intrinsic_const(op: crate::ir::IntrinsicOp, args: &[ConstValue]) -> Option<ConstValue> {
+    use crate::ir::IntrinsicOp;
+    match op {
+        // -- Arithmetic --
+        IntrinsicOp::Add => const_add(args),
+        IntrinsicOp::Sub => const_sub(args),
+        IntrinsicOp::Mul => const_mul(args),
+        IntrinsicOp::Div => const_div(args),
+        IntrinsicOp::Mod => const_mod(args),
+        IntrinsicOp::Neg => const_neg(args),
+
+        // -- Comparison --
+        IntrinsicOp::Eq => const_eq(args),
+        IntrinsicOp::Lt => const_lt(args),
+
+        // -- Logical --
+        IntrinsicOp::Not => const_not(args),
+        IntrinsicOp::And => const_and(args),
+        IntrinsicOp::Or => const_or(args),
+
+        // -- Bitwise --
+        IntrinsicOp::BitAnd => const_bit_and(args),
+        IntrinsicOp::BitOr => const_bit_or(args),
+        IntrinsicOp::BitXor => const_bit_xor(args),
+        IntrinsicOp::BitNot => const_bit_not(args),
+        IntrinsicOp::Shl => const_shl(args),
+        IntrinsicOp::Shr => const_shr(args),
+        IntrinsicOp::BitTest => const_bit_test(args),
+        IntrinsicOp::BitSet => const_bit_set(args),
+
+        // -- Collection --
+        IntrinsicOp::Len => const_len(args),
+        IntrinsicOp::MakeArray => Some(ConstValue::Array(args.to_vec())),
+        IntrinsicOp::MakeMap => {
+            if !args.len().is_multiple_of(2) {
+                return None;
+            }
+            let pairs = args
+                .chunks(2)
+                .map(|c| (c[0].clone(), c[1].clone()))
+                .collect();
+            Some(ConstValue::Map(pairs))
+        }
+
+        // Sequences are runtime-only (lazy), can't const-eval
+        IntrinsicOp::MakeSeq | IntrinsicOp::ArraySeq => None,
+    }
+}
+
+// -- Arithmetic const-eval --
+
+fn const_add(args: &[ConstValue]) -> Option<ConstValue> {
+    match (args.first()?, args.get(1)?) {
+        (ConstValue::UInt(a), ConstValue::UInt(b)) => a.checked_add(*b).map(ConstValue::UInt),
+        (ConstValue::Int(a), ConstValue::Int(b)) => a.checked_add(*b).map(ConstValue::Int),
+        (ConstValue::Float(a), ConstValue::Float(b)) => Some(ConstValue::Float(a + b)),
+        (ConstValue::UInt(a), ConstValue::Int(b)) => i64::try_from(*a)
+            .ok()
+            .and_then(|a| a.checked_add(*b))
+            .map(ConstValue::Int),
+        (ConstValue::Int(a), ConstValue::UInt(b)) => i64::try_from(*b)
+            .ok()
+            .and_then(|b| a.checked_add(b))
+            .map(ConstValue::Int),
+        (ConstValue::UInt(a), ConstValue::Float(b)) => Some(ConstValue::Float(*a as f64 + b)),
+        (ConstValue::Float(a), ConstValue::UInt(b)) => Some(ConstValue::Float(a + *b as f64)),
+        (ConstValue::Int(a), ConstValue::Float(b)) => Some(ConstValue::Float(*a as f64 + b)),
+        (ConstValue::Float(a), ConstValue::Int(b)) => Some(ConstValue::Float(a + *b as f64)),
+        _ => None,
+    }
+}
+
+fn const_sub(args: &[ConstValue]) -> Option<ConstValue> {
+    match (args.first()?, args.get(1)?) {
+        (ConstValue::UInt(a), ConstValue::UInt(b)) => a.checked_sub(*b).map(ConstValue::UInt),
+        (ConstValue::Int(a), ConstValue::Int(b)) => a.checked_sub(*b).map(ConstValue::Int),
+        (ConstValue::Float(a), ConstValue::Float(b)) => Some(ConstValue::Float(a - b)),
+        (ConstValue::UInt(a), ConstValue::Int(b)) => i64::try_from(*a)
+            .ok()
+            .and_then(|a| a.checked_sub(*b))
+            .map(ConstValue::Int),
+        (ConstValue::Int(a), ConstValue::UInt(b)) => i64::try_from(*b)
+            .ok()
+            .and_then(|b| a.checked_sub(b))
+            .map(ConstValue::Int),
+        (ConstValue::UInt(a), ConstValue::Float(b)) => Some(ConstValue::Float(*a as f64 - b)),
+        (ConstValue::Float(a), ConstValue::UInt(b)) => Some(ConstValue::Float(a - *b as f64)),
+        (ConstValue::Int(a), ConstValue::Float(b)) => Some(ConstValue::Float(*a as f64 - b)),
+        (ConstValue::Float(a), ConstValue::Int(b)) => Some(ConstValue::Float(a - *b as f64)),
+        _ => None,
+    }
+}
+
+fn const_mul(args: &[ConstValue]) -> Option<ConstValue> {
+    match (args.first()?, args.get(1)?) {
+        (ConstValue::UInt(a), ConstValue::UInt(b)) => a.checked_mul(*b).map(ConstValue::UInt),
+        (ConstValue::Int(a), ConstValue::Int(b)) => a.checked_mul(*b).map(ConstValue::Int),
+        (ConstValue::Float(a), ConstValue::Float(b)) => Some(ConstValue::Float(a * b)),
+        (ConstValue::UInt(a), ConstValue::Int(b)) => i64::try_from(*a)
+            .ok()
+            .and_then(|a| a.checked_mul(*b))
+            .map(ConstValue::Int),
+        (ConstValue::Int(a), ConstValue::UInt(b)) => i64::try_from(*b)
+            .ok()
+            .and_then(|b| a.checked_mul(b))
+            .map(ConstValue::Int),
+        (ConstValue::UInt(a), ConstValue::Float(b)) => Some(ConstValue::Float(*a as f64 * b)),
+        (ConstValue::Float(a), ConstValue::UInt(b)) => Some(ConstValue::Float(a * *b as f64)),
+        (ConstValue::Int(a), ConstValue::Float(b)) => Some(ConstValue::Float(*a as f64 * b)),
+        (ConstValue::Float(a), ConstValue::Int(b)) => Some(ConstValue::Float(a * *b as f64)),
+        _ => None,
+    }
+}
+
+fn const_div(args: &[ConstValue]) -> Option<ConstValue> {
+    match (args.first()?, args.get(1)?) {
+        (ConstValue::UInt(a), ConstValue::UInt(b)) => a.checked_div(*b).map(ConstValue::UInt),
+        (ConstValue::Int(a), ConstValue::Int(b)) => a.checked_div(*b).map(ConstValue::Int),
+        (ConstValue::Float(a), ConstValue::Float(b)) => Some(ConstValue::Float(a / b)),
+        (ConstValue::UInt(a), ConstValue::Int(b)) => i64::try_from(*a)
+            .ok()
+            .and_then(|a| a.checked_div(*b))
+            .map(ConstValue::Int),
+        (ConstValue::Int(a), ConstValue::UInt(b)) => i64::try_from(*b)
+            .ok()
+            .and_then(|b| a.checked_div(b))
+            .map(ConstValue::Int),
+        (ConstValue::UInt(a), ConstValue::Float(b)) => Some(ConstValue::Float(*a as f64 / b)),
+        (ConstValue::Float(a), ConstValue::UInt(b)) => Some(ConstValue::Float(a / *b as f64)),
+        (ConstValue::Int(a), ConstValue::Float(b)) => Some(ConstValue::Float(*a as f64 / b)),
+        (ConstValue::Float(a), ConstValue::Int(b)) => Some(ConstValue::Float(a / *b as f64)),
+        _ => None,
+    }
+}
+
+fn const_mod(args: &[ConstValue]) -> Option<ConstValue> {
+    match (args.first()?, args.get(1)?) {
+        (ConstValue::UInt(a), ConstValue::UInt(b)) => a.checked_rem(*b).map(ConstValue::UInt),
+        (ConstValue::Int(a), ConstValue::Int(b)) => a.checked_rem(*b).map(ConstValue::Int),
+        (ConstValue::Float(a), ConstValue::Float(b)) => Some(ConstValue::Float(a % b)),
+        (ConstValue::UInt(a), ConstValue::Int(b)) => i64::try_from(*a)
+            .ok()
+            .and_then(|a| a.checked_rem(*b))
+            .map(ConstValue::Int),
+        (ConstValue::Int(a), ConstValue::UInt(b)) => i64::try_from(*b)
+            .ok()
+            .and_then(|b| a.checked_rem(b))
+            .map(ConstValue::Int),
+        _ => None,
+    }
+}
+
+fn const_neg(args: &[ConstValue]) -> Option<ConstValue> {
+    match args.first()? {
+        ConstValue::Int(a) => a.checked_neg().map(ConstValue::Int),
+        ConstValue::Float(a) => Some(ConstValue::Float(-a)),
+        ConstValue::UInt(a) => i64::try_from(*a)
+            .ok()
+            .and_then(|v| v.checked_neg())
+            .map(ConstValue::Int),
+        _ => None,
+    }
+}
+
+// -- Comparison const-eval --
+
+fn const_eq(args: &[ConstValue]) -> Option<ConstValue> {
+    Some(ConstValue::Bool(args.first()? == args.get(1)?))
+}
+
+fn const_lt(args: &[ConstValue]) -> Option<ConstValue> {
+    let result = match (args.first()?, args.get(1)?) {
+        (ConstValue::UInt(a), ConstValue::UInt(b)) => a < b,
+        (ConstValue::Int(a), ConstValue::Int(b)) => a < b,
+        (ConstValue::Float(a), ConstValue::Float(b)) => a < b,
+        (ConstValue::UInt(a), ConstValue::Int(b)) => (*a as i128) < (*b as i128),
+        (ConstValue::Int(a), ConstValue::UInt(b)) => (*a as i128) < (*b as i128),
+        (ConstValue::UInt(a), ConstValue::Float(b)) => (*a as f64) < *b,
+        (ConstValue::Float(a), ConstValue::UInt(b)) => *a < (*b as f64),
+        (ConstValue::Int(a), ConstValue::Float(b)) => (*a as f64) < *b,
+        (ConstValue::Float(a), ConstValue::Int(b)) => *a < (*b as f64),
+        _ => return None,
+    };
+    Some(ConstValue::Bool(result))
+}
+
+// -- Logical const-eval --
+
+fn const_not(args: &[ConstValue]) -> Option<ConstValue> {
+    if let Some(ConstValue::Bool(a)) = args.first() {
+        Some(ConstValue::Bool(!a))
+    } else {
+        None
+    }
+}
+
+// -- Bitwise const-eval --
+
+fn const_bit_and(args: &[ConstValue]) -> Option<ConstValue> {
+    if let (Some(ConstValue::UInt(a)), Some(ConstValue::UInt(b))) = (args.first(), args.get(1)) {
+        Some(ConstValue::UInt(a & b))
+    } else {
+        None
+    }
+}
+
+fn const_bit_or(args: &[ConstValue]) -> Option<ConstValue> {
+    if let (Some(ConstValue::UInt(a)), Some(ConstValue::UInt(b))) = (args.first(), args.get(1)) {
+        Some(ConstValue::UInt(a | b))
+    } else {
+        None
+    }
+}
+
+fn const_bit_xor(args: &[ConstValue]) -> Option<ConstValue> {
+    if let (Some(ConstValue::UInt(a)), Some(ConstValue::UInt(b))) = (args.first(), args.get(1)) {
+        Some(ConstValue::UInt(a ^ b))
+    } else {
+        None
+    }
+}
+
+fn const_bit_not(args: &[ConstValue]) -> Option<ConstValue> {
+    if let Some(ConstValue::UInt(a)) = args.first() {
+        Some(ConstValue::UInt(!a))
+    } else {
+        None
+    }
+}
+
+fn const_shl(args: &[ConstValue]) -> Option<ConstValue> {
+    if let (Some(ConstValue::UInt(a)), Some(ConstValue::UInt(b))) = (args.first(), args.get(1)) {
+        Some(ConstValue::UInt(a.wrapping_shl(*b as u32)))
+    } else {
+        None
+    }
+}
+
+fn const_shr(args: &[ConstValue]) -> Option<ConstValue> {
+    if let (Some(ConstValue::UInt(a)), Some(ConstValue::UInt(b))) = (args.first(), args.get(1)) {
+        Some(ConstValue::UInt(a.wrapping_shr(*b as u32)))
+    } else {
+        None
+    }
+}
+
+fn const_bit_test(args: &[ConstValue]) -> Option<ConstValue> {
+    if let (Some(ConstValue::UInt(x)), Some(ConstValue::UInt(b))) = (args.first(), args.get(1)) {
+        if *b >= 64 {
+            None
+        } else {
+            Some(ConstValue::Bool((x >> b) & 1 == 1))
+        }
+    } else {
+        None
+    }
+}
+
+fn const_bit_set(args: &[ConstValue]) -> Option<ConstValue> {
+    if let (Some(ConstValue::UInt(x)), Some(ConstValue::UInt(b)), Some(ConstValue::Bool(v))) =
+        (args.first(), args.get(1), args.get(2))
+    {
+        if *b >= 64 {
+            None
+        } else if *v {
+            Some(ConstValue::UInt(x | (1 << b)))
+        } else {
+            Some(ConstValue::UInt(x & !(1 << b)))
+        }
+    } else {
+        None
+    }
+}
+
+// -- Collection const-eval --
+
+fn const_len(args: &[ConstValue]) -> Option<ConstValue> {
+    let len = match args.first()? {
+        ConstValue::Text(s) => s.chars().count() as u64,
+        ConstValue::Bytes(b) => b.len() as u64,
+        ConstValue::Array(arr) => arr.len() as u64,
+        ConstValue::Map(map) => map.len() as u64,
+        _ => return None,
+    };
+    Some(ConstValue::UInt(len))
 }
 
 // ============================================================================

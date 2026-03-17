@@ -1543,30 +1543,27 @@ pub fn parse(input: &str, diags: &mut Diagnostics) -> Option<AstProgram> {
     }
 }
 
-/// Parse a single expression (useful for REPL or testing)
-///
-/// Returns `Some(Expression)` if parsing succeeded, `None` if there were errors.
-/// Errors are emitted to the provided diagnostics accumulator.
-pub fn parse_expression(input: &str, diags: &mut Diagnostics) -> Option<Expression> {
-    let result = whitespace()
-        .ignore_then(expression())
-        .then_ignore(whitespace())
-        .then_ignore(end())
-        .parse(input)
-        .into_result();
-
-    match result {
-        Ok(expr) => Some(expr),
-        Err(errors) => {
-            convert_parse_errors(errors, diags);
-            None
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Parse a single expression (test helper)
+    fn parse_expression(input: &str, diags: &mut Diagnostics) -> Option<Expression> {
+        let result = whitespace()
+            .ignore_then(expression())
+            .then_ignore(whitespace())
+            .then_ignore(end())
+            .parse(input)
+            .into_result();
+
+        match result {
+            Ok(expr) => Some(expr),
+            Err(errors) => {
+                convert_parse_errors(errors, diags);
+                None
+            }
+        }
+    }
 
     // Test helper: parse expression and return Result for easy assertion
     fn try_parse_expr(input: &str) -> Result<Expression, ()> {

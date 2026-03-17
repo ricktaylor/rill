@@ -29,11 +29,12 @@
 
 use crate::builtins::{BuiltinImpl, BuiltinRegistry, ExecResult};
 use crate::diagnostics::Diagnostics;
-use crate::exec::{ExecError, HeapVal, VM, Value};
+use crate::exec::{ExecError, Float, HeapVal, VM, Value};
 use crate::ir::{
-    BasicBlock, BlockId, ConstValue, Function, Instruction, IntrinsicOp, IrProgram, Literal,
-    MatchPattern, Terminator, VarId,
+    BasicBlock, BlockId, Function, Instruction, IntrinsicOp, IrProgram, Literal, MatchPattern,
+    Terminator, VarId,
 };
+use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 
 // ============================================================================
@@ -45,15 +46,12 @@ pub struct CompiledProgram {
     functions: Vec<CompiledFunction>,
     /// Function name → index into `functions`
     pub(crate) func_index: HashMap<String, usize>,
-    /// Compile-time evaluated constants
-    constants: Vec<(String, Value)>,
     /// Warnings from compilation (unused functions, etc.)
     pub warnings: Diagnostics,
 }
 
 /// A compiled function — flat array of step closures with block offsets.
 struct CompiledFunction {
-    name: String,
     /// All step closures for all blocks, flattened into a single contiguous array.
     /// Block boundaries are recorded in `block_starts`.
     steps: Vec<Step>,
@@ -63,7 +61,6 @@ struct CompiledFunction {
     entry: usize, // index into block_starts
     frame_size: usize,
     param_count: usize,
-    params_by_ref: Vec<bool>,
 }
 
 /// A step closure. Captures operands, operates on VM.
@@ -118,32 +115,6 @@ fn literal_to_value(lit: &Literal, heap: &crate::exec::HeapRef) -> Result<Value,
         }
         Literal::Text(s) => Value::Text(HeapVal::new(s.clone(), heap.clone())?),
         Literal::Bytes(b) => Value::Bytes(HeapVal::new(b.clone(), heap.clone())?),
-    })
-}
-
-fn const_to_value(cv: &ConstValue, heap: &crate::exec::HeapRef) -> Result<Value, ExecError> {
-    Ok(match cv {
-        ConstValue::Bool(b) => Value::Bool(*b),
-        ConstValue::UInt(n) => Value::UInt(*n),
-        ConstValue::Int(n) => Value::Int(*n),
-        ConstValue::Float(f) => match crate::exec::Float::new(*f) {
-            Some(float) => Value::Float(float),
-            None => Value::Bool(false),
-        },
-        ConstValue::Text(s) => Value::Text(HeapVal::new(s.clone(), heap.clone())?),
-        ConstValue::Bytes(b) => Value::Bytes(HeapVal::new(b.clone(), heap.clone())?),
-        ConstValue::Array(elems) => {
-            let vals: Result<Vec<Value>, ExecError> =
-                elems.iter().map(|e| const_to_value(e, heap)).collect();
-            Value::Array(HeapVal::new(vals?, heap.clone())?)
-        }
-        ConstValue::Map(pairs) => {
-            let mut map = indexmap::IndexMap::new();
-            for (k, v) in pairs {
-                map.insert(const_to_value(k, heap)?, const_to_value(v, heap)?);
-            }
-            Value::Map(HeapVal::new(map, heap.clone())?)
-        }
     })
 }
 
@@ -224,12 +195,9 @@ pub fn compile_program(
         }
     }
 
-    let constants: Vec<(String, Value)> = Vec::new();
-
     let mut program = CompiledProgram {
         functions: compiled_functions,
         func_index,
-        constants,
         warnings: Diagnostics::new(),
     };
 
@@ -371,16 +339,12 @@ fn compile_function(func: &Function, link_map: &LinkMap) -> Result<CompiledFunct
         .get(&func.entry_block)
         .expect("entry block must exist");
 
-    let params_by_ref = func.params.iter().map(|p| p.by_ref).collect();
-
     Ok(CompiledFunction {
-        name: func.name.to_string(),
         steps,
         block_starts,
         entry,
         frame_size,
         param_count: func.params.len(),
-        params_by_ref,
     })
 }
 
@@ -534,42 +498,11 @@ fn compile_instruction(
         }
 
         Instruction::Intrinsic { dest, op, args } => {
-            // Intrinsics should have been lowered to control flow,
-            // but handle them as a fallback
             let d = slot(*dest);
             let op = *op;
             let arg_slots: Vec<usize> = args.iter().map(|v| slot(*v)).collect();
             Box::new(move |vm: &mut VM, _prog| {
-                let result = match op {
-                    IntrinsicOp::And => {
-                        let a = vm.local(arg_slots[0]).and_then(|v| match v {
-                            Value::Bool(b) => Some(*b),
-                            _ => None,
-                        });
-                        let b = vm.local(arg_slots[1]).and_then(|v| match v {
-                            Value::Bool(b) => Some(*b),
-                            _ => None,
-                        });
-                        match (a, b) {
-                            (Some(a), Some(b)) => Some(Value::Bool(a && b)),
-                            _ => None,
-                        }
-                    }
-                    IntrinsicOp::Or => {
-                        let a = vm.local(arg_slots[0]).and_then(|v| match v {
-                            Value::Bool(b) => Some(*b),
-                            _ => None,
-                        });
-                        let b = vm.local(arg_slots[1]).and_then(|v| match v {
-                            Value::Bool(b) => Some(*b),
-                            _ => None,
-                        });
-                        match (a, b) {
-                            (Some(a), Some(b)) => Some(Value::Bool(a || b)),
-                            _ => None,
-                        }
-                    }
-                };
+                let result = exec_intrinsic(op, &arg_slots, vm)?;
                 match result {
                     Some(val) => vm.set_local(d, val),
                     None => vm.set_local_uninit(d),
@@ -754,6 +687,363 @@ pub fn execute_by_index(
         Action::Exit(_val) => Ok(None), // TODO: propagate exit to driver
         Action::Continue | Action::NextBlock(_) => unreachable!(),
     }
+}
+
+// ============================================================================
+// Intrinsic Runtime Execution
+// ============================================================================
+
+/// Execute an intrinsic operation at runtime.
+///
+/// Returns `Some(value)` on success, `None` for undefined (type mismatch,
+/// overflow, out-of-bounds, etc.)
+fn exec_intrinsic(
+    op: IntrinsicOp,
+    arg_slots: &[usize],
+    vm: &mut VM,
+) -> Result<Option<Value>, ExecError> {
+    match op {
+        // -- Arithmetic --
+        IntrinsicOp::Add => {
+            let (a, b) = get_two(arg_slots, vm);
+            Ok(match (a, b) {
+                (Some(Value::UInt(a)), Some(Value::UInt(b))) => a.checked_add(*b).map(Value::UInt),
+                (Some(Value::Int(a)), Some(Value::Int(b))) => a.checked_add(*b).map(Value::Int),
+                (Some(Value::Float(a)), Some(Value::Float(b))) => {
+                    Float::new(a.get() + b.get()).map(Value::Float)
+                }
+                (Some(Value::UInt(a)), Some(Value::Int(b))) => i64::try_from(*a)
+                    .ok()
+                    .and_then(|a| a.checked_add(*b))
+                    .map(Value::Int),
+                (Some(Value::Int(a)), Some(Value::UInt(b))) => i64::try_from(*b)
+                    .ok()
+                    .and_then(|b| a.checked_add(b))
+                    .map(Value::Int),
+                (Some(Value::UInt(a)), Some(Value::Float(b))) => {
+                    Float::new(*a as f64 + b.get()).map(Value::Float)
+                }
+                (Some(Value::Float(a)), Some(Value::UInt(b))) => {
+                    Float::new(a.get() + *b as f64).map(Value::Float)
+                }
+                (Some(Value::Int(a)), Some(Value::Float(b))) => {
+                    Float::new(*a as f64 + b.get()).map(Value::Float)
+                }
+                (Some(Value::Float(a)), Some(Value::Int(b))) => {
+                    Float::new(a.get() + *b as f64).map(Value::Float)
+                }
+                _ => None,
+            })
+        }
+        IntrinsicOp::Sub => {
+            let (a, b) = get_two(arg_slots, vm);
+            Ok(match (a, b) {
+                (Some(Value::UInt(a)), Some(Value::UInt(b))) => a.checked_sub(*b).map(Value::UInt),
+                (Some(Value::Int(a)), Some(Value::Int(b))) => a.checked_sub(*b).map(Value::Int),
+                (Some(Value::Float(a)), Some(Value::Float(b))) => {
+                    Float::new(a.get() - b.get()).map(Value::Float)
+                }
+                (Some(Value::UInt(a)), Some(Value::Int(b))) => i64::try_from(*a)
+                    .ok()
+                    .and_then(|a| a.checked_sub(*b))
+                    .map(Value::Int),
+                (Some(Value::Int(a)), Some(Value::UInt(b))) => i64::try_from(*b)
+                    .ok()
+                    .and_then(|b| a.checked_sub(b))
+                    .map(Value::Int),
+                (Some(Value::UInt(a)), Some(Value::Float(b))) => {
+                    Float::new(*a as f64 - b.get()).map(Value::Float)
+                }
+                (Some(Value::Float(a)), Some(Value::UInt(b))) => {
+                    Float::new(a.get() - *b as f64).map(Value::Float)
+                }
+                (Some(Value::Int(a)), Some(Value::Float(b))) => {
+                    Float::new(*a as f64 - b.get()).map(Value::Float)
+                }
+                (Some(Value::Float(a)), Some(Value::Int(b))) => {
+                    Float::new(a.get() - *b as f64).map(Value::Float)
+                }
+                _ => None,
+            })
+        }
+        IntrinsicOp::Mul => {
+            let (a, b) = get_two(arg_slots, vm);
+            Ok(match (a, b) {
+                (Some(Value::UInt(a)), Some(Value::UInt(b))) => a.checked_mul(*b).map(Value::UInt),
+                (Some(Value::Int(a)), Some(Value::Int(b))) => a.checked_mul(*b).map(Value::Int),
+                (Some(Value::Float(a)), Some(Value::Float(b))) => {
+                    Float::new(a.get() * b.get()).map(Value::Float)
+                }
+                (Some(Value::UInt(a)), Some(Value::Int(b))) => i64::try_from(*a)
+                    .ok()
+                    .and_then(|a| a.checked_mul(*b))
+                    .map(Value::Int),
+                (Some(Value::Int(a)), Some(Value::UInt(b))) => i64::try_from(*b)
+                    .ok()
+                    .and_then(|b| a.checked_mul(b))
+                    .map(Value::Int),
+                (Some(Value::UInt(a)), Some(Value::Float(b))) => {
+                    Float::new(*a as f64 * b.get()).map(Value::Float)
+                }
+                (Some(Value::Float(a)), Some(Value::UInt(b))) => {
+                    Float::new(a.get() * *b as f64).map(Value::Float)
+                }
+                (Some(Value::Int(a)), Some(Value::Float(b))) => {
+                    Float::new(*a as f64 * b.get()).map(Value::Float)
+                }
+                (Some(Value::Float(a)), Some(Value::Int(b))) => {
+                    Float::new(a.get() * *b as f64).map(Value::Float)
+                }
+                _ => None,
+            })
+        }
+        IntrinsicOp::Div => {
+            let (a, b) = get_two(arg_slots, vm);
+            Ok(match (a, b) {
+                (Some(Value::UInt(a)), Some(Value::UInt(b))) => a.checked_div(*b).map(Value::UInt),
+                (Some(Value::Int(a)), Some(Value::Int(b))) => a.checked_div(*b).map(Value::Int),
+                (Some(Value::Float(a)), Some(Value::Float(b))) => {
+                    Float::new(a.get() / b.get()).map(Value::Float)
+                }
+                (Some(Value::UInt(a)), Some(Value::Int(b))) => i64::try_from(*a)
+                    .ok()
+                    .and_then(|a| a.checked_div(*b))
+                    .map(Value::Int),
+                (Some(Value::Int(a)), Some(Value::UInt(b))) => i64::try_from(*b)
+                    .ok()
+                    .and_then(|b| a.checked_div(b))
+                    .map(Value::Int),
+                (Some(Value::UInt(a)), Some(Value::Float(b))) => {
+                    Float::new(*a as f64 / b.get()).map(Value::Float)
+                }
+                (Some(Value::Float(a)), Some(Value::UInt(b))) => {
+                    Float::new(a.get() / *b as f64).map(Value::Float)
+                }
+                (Some(Value::Int(a)), Some(Value::Float(b))) => {
+                    Float::new(*a as f64 / b.get()).map(Value::Float)
+                }
+                (Some(Value::Float(a)), Some(Value::Int(b))) => {
+                    Float::new(a.get() / *b as f64).map(Value::Float)
+                }
+                _ => None,
+            })
+        }
+        IntrinsicOp::Mod => {
+            let (a, b) = get_two(arg_slots, vm);
+            Ok(match (a, b) {
+                (Some(Value::UInt(a)), Some(Value::UInt(b))) => a.checked_rem(*b).map(Value::UInt),
+                (Some(Value::Int(a)), Some(Value::Int(b))) => a.checked_rem(*b).map(Value::Int),
+                (Some(Value::Float(a)), Some(Value::Float(b))) => {
+                    Float::new(a.get() % b.get()).map(Value::Float)
+                }
+                (Some(Value::UInt(a)), Some(Value::Int(b))) => i64::try_from(*a)
+                    .ok()
+                    .and_then(|a| a.checked_rem(*b))
+                    .map(Value::Int),
+                (Some(Value::Int(a)), Some(Value::UInt(b))) => i64::try_from(*b)
+                    .ok()
+                    .and_then(|b| a.checked_rem(b))
+                    .map(Value::Int),
+                _ => None,
+            })
+        }
+        IntrinsicOp::Neg => {
+            let a = vm.local(arg_slots[0]);
+            Ok(match a {
+                Some(Value::Int(a)) => a.checked_neg().map(Value::Int),
+                Some(Value::Float(a)) => Float::new(-a.get()).map(Value::Float),
+                Some(Value::UInt(a)) => i64::try_from(*a)
+                    .ok()
+                    .and_then(|v| v.checked_neg())
+                    .map(Value::Int),
+                _ => None,
+            })
+        }
+
+        // -- Comparison --
+        IntrinsicOp::Eq => {
+            let (a, b) = get_two(arg_slots, vm);
+            Ok(match (a, b) {
+                (Some(a), Some(b)) => Some(Value::Bool(a == b)),
+                _ => None,
+            })
+        }
+        IntrinsicOp::Lt => {
+            let (a, b) = get_two(arg_slots, vm);
+            Ok(match (a, b) {
+                (Some(Value::UInt(a)), Some(Value::UInt(b))) => Some(Value::Bool(a < b)),
+                (Some(Value::Int(a)), Some(Value::Int(b))) => Some(Value::Bool(a < b)),
+                (Some(Value::Float(a)), Some(Value::Float(b))) => {
+                    Some(Value::Bool(a.get() < b.get()))
+                }
+                (Some(Value::UInt(a)), Some(Value::Int(b))) => {
+                    Some(Value::Bool((*a as i128) < (*b as i128)))
+                }
+                (Some(Value::Int(a)), Some(Value::UInt(b))) => {
+                    Some(Value::Bool((*a as i128) < (*b as i128)))
+                }
+                (Some(Value::UInt(a)), Some(Value::Float(b))) => {
+                    Some(Value::Bool((*a as f64) < b.get()))
+                }
+                (Some(Value::Float(a)), Some(Value::UInt(b))) => {
+                    Some(Value::Bool(a.get() < (*b as f64)))
+                }
+                (Some(Value::Int(a)), Some(Value::Float(b))) => {
+                    Some(Value::Bool((*a as f64) < b.get()))
+                }
+                (Some(Value::Float(a)), Some(Value::Int(b))) => {
+                    Some(Value::Bool(a.get() < (*b as f64)))
+                }
+                _ => None,
+            })
+        }
+
+        // -- Logical --
+        IntrinsicOp::Not => {
+            let a = vm.local(arg_slots[0]);
+            Ok(match a {
+                Some(Value::Bool(b)) => Some(Value::Bool(!b)),
+                _ => None,
+            })
+        }
+        IntrinsicOp::And => {
+            let (a, b) = get_two(arg_slots, vm);
+            Ok(match (a, b) {
+                (Some(Value::Bool(a)), Some(Value::Bool(b))) => Some(Value::Bool(*a && *b)),
+                _ => None,
+            })
+        }
+        IntrinsicOp::Or => {
+            let (a, b) = get_two(arg_slots, vm);
+            Ok(match (a, b) {
+                (Some(Value::Bool(a)), Some(Value::Bool(b))) => Some(Value::Bool(*a || *b)),
+                _ => None,
+            })
+        }
+
+        // -- Bitwise --
+        IntrinsicOp::BitAnd => {
+            let (a, b) = get_two(arg_slots, vm);
+            Ok(match (a, b) {
+                (Some(Value::UInt(a)), Some(Value::UInt(b))) => Some(Value::UInt(a & b)),
+                _ => None,
+            })
+        }
+        IntrinsicOp::BitOr => {
+            let (a, b) = get_two(arg_slots, vm);
+            Ok(match (a, b) {
+                (Some(Value::UInt(a)), Some(Value::UInt(b))) => Some(Value::UInt(a | b)),
+                _ => None,
+            })
+        }
+        IntrinsicOp::BitXor => {
+            let (a, b) = get_two(arg_slots, vm);
+            Ok(match (a, b) {
+                (Some(Value::UInt(a)), Some(Value::UInt(b))) => Some(Value::UInt(a ^ b)),
+                _ => None,
+            })
+        }
+        IntrinsicOp::BitNot => {
+            let a = vm.local(arg_slots[0]);
+            Ok(match a {
+                Some(Value::UInt(a)) => Some(Value::UInt(!a)),
+                _ => None,
+            })
+        }
+        IntrinsicOp::Shl => {
+            let (a, b) = get_two(arg_slots, vm);
+            Ok(match (a, b) {
+                (Some(Value::UInt(a)), Some(Value::UInt(b))) => {
+                    Some(Value::UInt(a.wrapping_shl(*b as u32)))
+                }
+                _ => None,
+            })
+        }
+        IntrinsicOp::Shr => {
+            let (a, b) = get_two(arg_slots, vm);
+            Ok(match (a, b) {
+                (Some(Value::UInt(a)), Some(Value::UInt(b))) => {
+                    Some(Value::UInt(a.wrapping_shr(*b as u32)))
+                }
+                _ => None,
+            })
+        }
+        IntrinsicOp::BitTest => {
+            let (x, b) = get_two(arg_slots, vm);
+            Ok(match (x, b) {
+                (Some(Value::UInt(x)), Some(Value::UInt(b))) => {
+                    if *b >= 64 {
+                        None
+                    } else {
+                        Some(Value::Bool((x >> b) & 1 == 1))
+                    }
+                }
+                _ => None,
+            })
+        }
+        IntrinsicOp::BitSet => {
+            let (x, b) = get_two(arg_slots, vm);
+            let v = vm.local(arg_slots[2]);
+            Ok(match (x, b, v) {
+                (Some(Value::UInt(x)), Some(Value::UInt(b)), Some(Value::Bool(v))) => {
+                    if *b >= 64 {
+                        None
+                    } else if *v {
+                        Some(Value::UInt(x | (1 << b)))
+                    } else {
+                        Some(Value::UInt(x & !(1 << b)))
+                    }
+                }
+                _ => None,
+            })
+        }
+
+        // -- Collection --
+        IntrinsicOp::Len => {
+            let a = vm.local(arg_slots[0]);
+            Ok(match a {
+                Some(Value::Text(s)) => Some(Value::UInt(s.chars().count() as u64)),
+                Some(Value::Bytes(b)) => Some(Value::UInt(b.len() as u64)),
+                Some(Value::Array(arr)) => Some(Value::UInt(arr.len() as u64)),
+                Some(Value::Map(map)) => Some(Value::UInt(map.len() as u64)),
+                _ => None,
+            })
+        }
+        IntrinsicOp::MakeArray => {
+            let elems: Vec<Value> = arg_slots
+                .iter()
+                .filter_map(|s| vm.local(*s).cloned())
+                .collect();
+            let arr = HeapVal::new(elems, vm.heap())?;
+            Ok(Some(Value::Array(arr)))
+        }
+        IntrinsicOp::MakeMap => {
+            if !arg_slots.len().is_multiple_of(2) {
+                return Ok(None);
+            }
+            let map: IndexMap<Value, Value> = arg_slots
+                .chunks(2)
+                .filter_map(|pair| {
+                    let k = vm.local(pair[0]).cloned()?;
+                    let v = vm.local(pair[1]).cloned()?;
+                    Some((k, v))
+                })
+                .collect();
+            let heap_map = HeapVal::new(map, vm.heap())?;
+            Ok(Some(Value::Map(heap_map)))
+        }
+
+        // -- Sequence (runtime-only, not yet implemented) --
+        IntrinsicOp::MakeSeq | IntrinsicOp::ArraySeq => {
+            // TODO: implement when Sequence runtime is ready
+            Ok(None)
+        }
+    }
+}
+
+/// Helper: get two values from slots
+fn get_two<'a>(slots: &[usize], vm: &'a VM) -> (Option<&'a Value>, Option<&'a Value>) {
+    (vm.local(slots[0]), vm.local(slots[1]))
 }
 
 /// Execute a compiled function by index.

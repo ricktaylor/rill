@@ -263,16 +263,17 @@ fn transfer_instruction(
             }
         }
 
-        // Intrinsic operations on defined values produce defined results
-        Instruction::Intrinsic { dest, args, .. } => {
+        // Intrinsic operations: definedness depends on fallibility and arg definedness
+        Instruction::Intrinsic { dest, op, args } => {
             let all_defined = args
                 .iter()
                 .all(|arg| state.get(arg).copied() == Some(Definedness::Defined));
-            if all_defined {
+            if all_defined && !op.is_fallible() {
+                // All args defined and op can't fail → result is defined
                 state.insert(*dest, Definedness::Defined);
             } else {
                 state.insert(*dest, Definedness::MaybeDefined);
-                // Find first undefined arg
+                // Find first undefined arg for provenance tracking
                 if let Some(undefined_arg) = args
                     .iter()
                     .find(|arg| state.get(arg).copied() != Some(Definedness::Defined))
@@ -1038,7 +1039,7 @@ fn emit_maybe_undefined_warning(
 mod tests {
     use super::*;
     use crate::ast;
-    use crate::ir::{BasicBlock, Literal, Param, SpannedInst, dummy_span};
+    use crate::ir::{BasicBlock, IntrinsicOp, Literal, Param, SpannedInst};
 
     // Helper to create a VarId
     fn var(id: u32) -> VarId {
@@ -1057,35 +1058,26 @@ mod tests {
 
     /// Helper to wrap an instruction with a dummy span
     fn si(inst: Instruction) -> SpannedInst {
-        ast::Spanned::new(inst, dummy_span())
+        ast::Spanned::new(inst, ast::Span::default())
     }
 
     /// Build a minimal function with the given blocks
     fn make_function(blocks: Vec<BasicBlock>) -> Function {
         Function {
-            name: ident("test"),
-            attributes: vec![],
-            params: vec![],
-            rest_param: None,
-            locals: vec![],
             blocks,
-            entry_block: block(0),
+            ..Default::default()
         }
     }
 
     /// Build a function with one parameter
     fn make_function_with_param(param_var: VarId, blocks: Vec<BasicBlock>) -> Function {
         Function {
-            name: ident("test"),
-            attributes: vec![],
             params: vec![Param {
                 var: param_var,
                 by_ref: false,
             }],
-            rest_param: None,
-            locals: vec![],
             blocks,
-            entry_block: block(0),
+            ..Default::default()
         }
     }
 
@@ -1268,7 +1260,7 @@ mod tests {
                     value: var(0),
                     defined: block(1),
                     undefined: block(2),
-                    span: dummy_span(),
+                    span: ast::Span::default(),
                 },
             },
             // Block 1: Defined branch
@@ -1306,7 +1298,7 @@ mod tests {
                     value: var(1),
                     defined: block(1),
                     undefined: block(2),
-                    span: dummy_span(),
+                    span: ast::Span::default(),
                 },
             },
             // Block 1: Defined branch
@@ -1354,7 +1346,7 @@ mod tests {
                     condition: var(0),
                     then_target: block(1),
                     else_target: block(2),
-                    span: dummy_span(),
+                    span: ast::Span::default(),
                 },
             },
             // Block 1: Then branch - x = 1 (Defined)
@@ -1416,7 +1408,7 @@ mod tests {
                     condition: var(0),
                     then_target: block(1),
                     else_target: block(2),
-                    span: dummy_span(),
+                    span: ast::Span::default(),
                 },
             },
             BasicBlock {
@@ -1477,7 +1469,7 @@ mod tests {
                     condition: var(0),
                     then_target: block(2),
                     else_target: block(3),
-                    span: dummy_span(),
+                    span: ast::Span::default(),
                 },
             },
             // Block 2: Loop body
@@ -1598,16 +1590,11 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_call_with_always_defined_return() {
-        use crate::builtins::standard_builtins;
-
-        // core.make_array returns Array (not optional) - always defined
-        let registry = standard_builtins();
-
+    fn test_intrinsic_infallible_defined() {
+        // MakeArray is infallible - always defined when all args are defined
         let blocks = vec![BasicBlock {
             id: block(0),
             instructions: vec![
-                // Create some constant args
                 si(Instruction::Const {
                     dest: var(0),
                     value: Literal::UInt(1),
@@ -1616,23 +1603,10 @@ mod tests {
                     dest: var(1),
                     value: Literal::UInt(2),
                 }),
-                // Call core.make_array with defined args
-                si(Instruction::Call {
+                si(Instruction::Intrinsic {
                     dest: var(2),
-                    function: FunctionRef {
-                        namespace: None,
-                        name: ident("core::make_array"),
-                    },
-                    args: vec![
-                        CallArg {
-                            value: var(0),
-                            by_ref: false,
-                        },
-                        CallArg {
-                            value: var(1),
-                            by_ref: false,
-                        },
-                    ],
+                    op: IntrinsicOp::MakeArray,
+                    args: vec![var(0), var(1)],
                 }),
             ],
             terminator: Terminator::Return {
@@ -1641,29 +1615,14 @@ mod tests {
         }];
 
         let func = make_function(blocks);
-
-        // Without registry - conservatively MaybeDefined
-        let analysis_no_reg = analyze_definedness(&func, None);
-        assert_eq!(
-            analysis_no_reg.get_at_exit(block(0), var(2)),
-            Definedness::MaybeDefined
-        );
-
-        // With registry - Defined (core.make_array is infallible)
-        let analysis_with_reg = analyze_definedness(&func, Some(&registry));
-        assert_eq!(
-            analysis_with_reg.get_at_exit(block(0), var(2)),
-            Definedness::Defined
-        );
+        let analysis = analyze_definedness(&func, None);
+        // MakeArray is infallible and all args defined → Defined
+        assert_eq!(analysis.get_at_exit(block(0), var(2)), Definedness::Defined);
     }
 
     #[test]
-    fn test_call_with_fallible_return() {
-        use crate::builtins::standard_builtins;
-
-        // core.add is fallible (overflow possible) - may return undefined
-        let registry = standard_builtins();
-
+    fn test_intrinsic_fallible_maybe_defined() {
+        // Add is fallible (overflow possible) - may return undefined
         let blocks = vec![BasicBlock {
             id: block(0),
             instructions: vec![
@@ -1675,22 +1634,10 @@ mod tests {
                     dest: var(1),
                     value: Literal::UInt(2),
                 }),
-                si(Instruction::Call {
+                si(Instruction::Intrinsic {
                     dest: var(2),
-                    function: FunctionRef {
-                        namespace: None,
-                        name: ident("core::add"),
-                    },
-                    args: vec![
-                        CallArg {
-                            value: var(0),
-                            by_ref: false,
-                        },
-                        CallArg {
-                            value: var(1),
-                            by_ref: false,
-                        },
-                    ],
+                    op: IntrinsicOp::Add,
+                    args: vec![var(0), var(1)],
                 }),
             ],
             terminator: Terminator::Return {
@@ -1699,9 +1646,8 @@ mod tests {
         }];
 
         let func = make_function(blocks);
-
-        // Even with registry, core.add is fallible (may overflow), so MaybeDefined
-        let analysis = analyze_definedness(&func, Some(&registry));
+        let analysis = analyze_definedness(&func, None);
+        // Add is fallible (may overflow), so MaybeDefined
         assert_eq!(
             analysis.get_at_exit(block(0), var(2)),
             Definedness::MaybeDefined
@@ -1757,7 +1703,7 @@ mod tests {
                     condition: var(0),
                     then_target: block(1),
                     else_target: block(1),
-                    span: dummy_span(),
+                    span: ast::Span::default(),
                 },
             },
             BasicBlock {
@@ -1790,7 +1736,7 @@ mod tests {
                     condition: var(0),
                     then_target: block(1),
                     else_target: block(1),
-                    span: dummy_span(),
+                    span: ast::Span::default(),
                 },
             },
             BasicBlock {
@@ -1858,7 +1804,7 @@ mod tests {
                     value: var(1),
                     defined: block(1),
                     undefined: block(2),
-                    span: dummy_span(),
+                    span: ast::Span::default(),
                 },
             },
             // Defined branch - var(1) is Defined here

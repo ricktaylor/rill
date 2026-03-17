@@ -253,7 +253,7 @@ pub fn eliminate_guards_and_simplify(
 mod tests {
     use super::*;
     use crate::ast;
-    use crate::ir::{BasicBlock, Instruction, Literal, Param, SpannedInst, VarId, dummy_span};
+    use crate::ir::{BasicBlock, Instruction, Literal, Param, SpannedInst, VarId};
 
     fn var(id: u32) -> VarId {
         VarId(id)
@@ -263,39 +263,26 @@ mod tests {
         BlockId(id)
     }
 
-    fn ident(s: &str) -> ast::Identifier {
-        ast::Identifier(s.to_string())
-    }
-
-    /// Helper to wrap an instruction with a dummy span
+    /// Helper to wrap an instruction with a default span
     fn si(inst: Instruction) -> SpannedInst {
-        ast::Spanned::new(inst, dummy_span())
+        ast::Spanned::new(inst, ast::Span::default())
     }
 
     fn make_function(blocks: Vec<BasicBlock>) -> Function {
         Function {
-            name: ident("test"),
-            attributes: vec![],
-            params: vec![],
-            rest_param: None,
-            locals: vec![],
             blocks,
-            entry_block: block(0),
+            ..Default::default()
         }
     }
 
     fn make_function_with_param(param_var: VarId, blocks: Vec<BasicBlock>) -> Function {
         Function {
-            name: ident("test"),
-            attributes: vec![],
             params: vec![Param {
                 var: param_var,
                 by_ref: false,
             }],
-            rest_param: None,
-            locals: vec![],
             blocks,
-            entry_block: block(0),
+            ..Default::default()
         }
     }
 
@@ -321,7 +308,7 @@ mod tests {
                     value: var(0),
                     defined: block(1),
                     undefined: block(2),
-                    span: dummy_span(),
+                    span: ast::Span::default(),
                 },
             },
             BasicBlock {
@@ -364,7 +351,7 @@ mod tests {
                     value: var(0),
                     defined: block(1),
                     undefined: block(2),
-                    span: dummy_span(),
+                    span: ast::Span::default(),
                 },
             },
             BasicBlock {
@@ -405,7 +392,7 @@ mod tests {
                     value: var(0),
                     defined: block(1),
                     undefined: block(2),
-                    span: dummy_span(),
+                    span: ast::Span::default(),
                 },
             },
             BasicBlock {
@@ -447,7 +434,7 @@ mod tests {
                     value: var(0),
                     defined: block(1),
                     undefined: block(2),
-                    span: dummy_span(),
+                    span: ast::Span::default(),
                 },
             },
             BasicBlock {
@@ -457,7 +444,7 @@ mod tests {
                     value: var(0),
                     defined: block(3),
                     undefined: block(4),
-                    span: dummy_span(),
+                    span: ast::Span::default(),
                 },
             },
             BasicBlock {
@@ -594,7 +581,7 @@ mod tests {
                     condition: var(0),
                     then_target: block(1),
                     else_target: block(1),
-                    span: dummy_span(),
+                    span: ast::Span::default(),
                 },
             },
             BasicBlock {
@@ -630,7 +617,7 @@ mod tests {
                     value: var(0),
                     defined: block(1),
                     undefined: block(2),
-                    span: dummy_span(),
+                    span: ast::Span::default(),
                 },
             },
             BasicBlock {

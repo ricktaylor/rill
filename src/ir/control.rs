@@ -215,10 +215,10 @@ impl<'a> Lowerer<'a> {
                 }
 
                 // Compute length for rest and after patterns
-                let length = self.emit_unary_call("len", value);
+                let length = self.emit_unary_intrinsic(IntrinsicOp::Len, value);
 
                 // Bind rest variable as a zero-copy Sequence over the source array.
-                // core::array_seq(array, start, end, mutable) -> Sequence(ArraySlice)
+                // ArraySeq(array, start, end, mutable) -> Sequence(ArraySlice)
                 // Mutability follows binding mode: with = mutable (write-back),
                 // let = immutable (by-value iteration only).
                 if let Some(rest_name) = rest {
@@ -233,7 +233,7 @@ impl<'a> Lowerer<'a> {
                         dest: after_len_val,
                         value: Literal::UInt(after.len() as u64),
                     });
-                    let end = self.emit_binary_call("sub", length, after_len_val);
+                    let end = self.emit_binary_intrinsic(IntrinsicOp::Sub, length, after_len_val);
 
                     let is_mutable = self.new_temp(TypeSet::single(types::BaseType::Bool));
                     self.emit(Instruction::Const {
@@ -242,27 +242,10 @@ impl<'a> Lowerer<'a> {
                     });
 
                     let rest_val = self.new_temp(TypeSet::single(types::BaseType::Sequence));
-                    self.emit(Instruction::Call {
+                    self.emit(Instruction::Intrinsic {
                         dest: rest_val,
-                        function: FunctionRef::core("array_seq"),
-                        args: vec![
-                            CallArg {
-                                value,
-                                by_ref: false,
-                            },
-                            CallArg {
-                                value: start,
-                                by_ref: false,
-                            },
-                            CallArg {
-                                value: end,
-                                by_ref: false,
-                            },
-                            CallArg {
-                                value: is_mutable,
-                                by_ref: false,
-                            },
-                        ],
+                        op: IntrinsicOp::ArraySeq,
+                        args: vec![value, start, end, is_mutable],
                     });
 
                     let rest_var = self.new_var(
@@ -283,7 +266,8 @@ impl<'a> Lowerer<'a> {
                         dest: after_len_val,
                         value: Literal::UInt(after.len() as u64),
                     });
-                    let after_start = self.emit_binary_call("sub", length, after_len_val);
+                    let after_start =
+                        self.emit_binary_intrinsic(IntrinsicOp::Sub, length, after_len_val);
 
                     for (i, pat) in after.iter().enumerate() {
                         let offset = self.new_temp(TypeSet::single(types::BaseType::UInt));
@@ -291,7 +275,7 @@ impl<'a> Lowerer<'a> {
                             dest: offset,
                             value: Literal::UInt(i as u64),
                         });
-                        let idx = self.emit_binary_call("add", after_start, offset);
+                        let idx = self.emit_binary_intrinsic(IntrinsicOp::Add, after_start, offset);
 
                         let elem = self.new_temp(TypeSet::all());
                         self.emit(Instruction::Index {
@@ -662,8 +646,8 @@ impl<'a> Lowerer<'a> {
     ) -> VarId {
         let iter_var = self.lower_expression(iterable);
 
-        // length = core::len(iter)
-        let length = self.emit_unary_call("len", iter_var);
+        // length = Len(iter)
+        let length = self.emit_unary_intrinsic(IntrinsicOp::Len, iter_var);
 
         // i = 0
         let i_init = self.new_temp(TypeSet::single(types::BaseType::UInt));
@@ -697,7 +681,7 @@ impl<'a> Lowerer<'a> {
             sources: vec![], // patched below
         });
 
-        let has_more = self.emit_binary_call("lt", i_var, length);
+        let has_more = self.emit_binary_intrinsic(IntrinsicOp::Lt, i_var, length);
         self.finish_block(Terminator::If {
             condition: has_more,
             then_target: body_bb,
@@ -795,7 +779,7 @@ impl<'a> Lowerer<'a> {
             dest: one,
             value: Literal::UInt(1),
         });
-        let i_next = self.emit_binary_call("add", i_var, one);
+        let i_next = self.emit_binary_intrinsic(IntrinsicOp::Add, i_var, one);
 
         // Also patch loop-carried phis from the latch block
         // (continue skips the body exit but still needs phi sources)
@@ -911,10 +895,10 @@ impl<'a> Lowerer<'a> {
         result
     }
 
-    /// Lower a `..` / `..=` expression as a call to `core::make_seq(start, end, inclusive)`.
+    /// Lower a `..` / `..=` expression as a MakeSeq intrinsic.
     ///
-    /// The builtin creates a Sequence value (lazy, O(1) memory). The `inclusive`
-    /// flag is passed as a Bool argument so the builtin can handle both `..` and `..=`.
+    /// Creates a Sequence value (lazy, O(1) memory). The `inclusive`
+    /// flag is passed as a Bool argument to handle both `..` and `..=`.
     pub fn lower_range(
         &mut self,
         start: &ast::Expression,
@@ -930,23 +914,10 @@ impl<'a> Lowerer<'a> {
         });
 
         let dest = self.new_temp(TypeSet::single(types::BaseType::Sequence));
-        self.emit(Instruction::Call {
+        self.emit(Instruction::Intrinsic {
             dest,
-            function: FunctionRef::core("make_seq"),
-            args: vec![
-                CallArg {
-                    value: start_var,
-                    by_ref: false,
-                },
-                CallArg {
-                    value: end_var,
-                    by_ref: false,
-                },
-                CallArg {
-                    value: inclusive_var,
-                    by_ref: false,
-                },
-            ],
+            op: IntrinsicOp::MakeSeq,
+            args: vec![start_var, end_var, inclusive_var],
         });
         dest
     }

@@ -17,24 +17,116 @@ use super::*;
 pub use crate::types::{BaseType, TypeSet};
 
 // ============================================================================
-// Builtin Operations
+// Intrinsic Operations
 // ============================================================================
 
-/// Intrinsic operations that require control flow (short-circuit evaluation)
+/// Language-defined operations with fixed semantics.
 ///
-/// These are the only operations that remain as intrinsics because they cannot
-/// be implemented as simple function calls - they must control whether their
-/// operands are evaluated.
+/// These are "processor instructions" — the compiler knows their exact
+/// semantics, arity, types, and const-eval behavior. They are never
+/// user-callable by name; they exist only as lowering targets for syntax.
 ///
-/// All other operators (arithmetic, comparison, bitwise, etc.) are implemented
-/// as `core.*` builtins with `Purity::Const(eval_fn)` for compile-time folding.
+/// Separating intrinsics from the `BuiltinRegistry` enables:
+/// - Type-specialized code generation (e.g., `Add` on two `UInt` values
+///   compiles to a single `u64::checked_add`, not a 10-way type dispatch)
+/// - Peephole optimization via a `StepKind` intermediate
+/// - A clean `BuiltinRegistry` containing only host-provided extern functions
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IntrinsicOp {
-    /// Logical AND with short-circuit evaluation
-    And,
+    // -- Arithmetic --
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Neg,
 
-    /// Logical OR with short-circuit evaluation
+    // -- Comparison --
+    Eq,
+    Lt,
+
+    // -- Logical --
+    Not,
+    And,
     Or,
+
+    // -- Bitwise --
+    BitAnd,
+    BitOr,
+    BitXor,
+    BitNot,
+    Shl,
+    Shr,
+    BitTest,
+    BitSet,
+
+    // -- Collection --
+    Len,
+    MakeArray,
+    MakeMap,
+
+    // -- Sequence --
+    MakeSeq,
+    ArraySeq,
+}
+
+impl IntrinsicOp {
+    /// Whether this operation can fail (return undefined) for domain reasons.
+    /// Impure operations are always fallible; this covers the pure/const case.
+    pub fn is_fallible(self) -> bool {
+        match self {
+            // Arithmetic can overflow / divide-by-zero
+            Self::Add | Self::Sub | Self::Mul | Self::Div | Self::Mod | Self::Neg => true,
+            // Comparison: type mismatch → undefined
+            Self::Eq => false,
+            Self::Lt => true,
+            // Logical: always succeed on correct types
+            Self::Not | Self::And | Self::Or => false,
+            // Bitwise: bit_test/bit_set can go out of bounds
+            Self::BitAnd | Self::BitOr | Self::BitXor | Self::BitNot | Self::Shl | Self::Shr => {
+                false
+            }
+            Self::BitTest | Self::BitSet => true,
+            // Collection
+            Self::Len => true, // wrong type → undefined
+            Self::MakeArray => false,
+            Self::MakeMap => true, // odd arg count
+            // Sequence
+            Self::MakeSeq | Self::ArraySeq => false,
+        }
+    }
+
+    /// Result type hint (before type refinement narrows further).
+    pub fn result_type(self) -> TypeSet {
+        match self {
+            Self::Add | Self::Sub | Self::Mul | Self::Div | Self::Mod | Self::Neg => {
+                TypeSet::numeric()
+            }
+            Self::Eq | Self::Lt | Self::Not | Self::And | Self::Or | Self::BitTest => {
+                TypeSet::bool()
+            }
+            Self::BitAnd
+            | Self::BitOr
+            | Self::BitXor
+            | Self::BitNot
+            | Self::Shl
+            | Self::Shr
+            | Self::BitSet
+            | Self::Len => TypeSet::uint(),
+            Self::MakeArray => TypeSet::single(BaseType::Array),
+            Self::MakeMap => TypeSet::single(BaseType::Map),
+            Self::MakeSeq | Self::ArraySeq => TypeSet::single(BaseType::Sequence),
+        }
+    }
+}
+
+/// Map a user-callable function name to its IntrinsicOp, if it's a
+/// language-defined intrinsic rather than a host-provided extern.
+pub fn intrinsic_by_name(name: &str) -> Option<IntrinsicOp> {
+    match name {
+        "len" => Some(IntrinsicOp::Len),
+        _ => None,
+    }
 }
 
 // ============================================================================
@@ -187,6 +279,17 @@ pub struct BasicBlock {
     pub terminator: Terminator,
 }
 
+impl BasicBlock {
+    /// Create a block with the given id, empty instructions, and Unreachable terminator.
+    pub fn new(id: BlockId) -> Self {
+        BasicBlock {
+            id,
+            instructions: Vec::new(),
+            terminator: Terminator::Unreachable,
+        }
+    }
+}
+
 /// Block terminator (control flow)
 #[derive(Debug, Clone)]
 pub enum Terminator {
@@ -282,6 +385,20 @@ pub struct Function {
     pub locals: Vec<Var>,
     pub blocks: Vec<BasicBlock>,
     pub entry_block: BlockId,
+}
+
+impl Default for Function {
+    fn default() -> Self {
+        Function {
+            name: ast::Identifier("_".to_string()),
+            attributes: Vec::new(),
+            params: Vec::new(),
+            rest_param: None,
+            locals: Vec::new(),
+            blocks: Vec::new(),
+            entry_block: BlockId(0),
+        }
+    }
 }
 
 /// Function parameter with binding mode

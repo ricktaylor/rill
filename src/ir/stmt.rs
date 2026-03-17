@@ -124,7 +124,7 @@ impl<'a> Lowerer<'a> {
             }
 
             // Bit test as lvalue: x @ b = bool_value
-            // Calls core.bit_set(x, b, value) which returns the new value or undefined
+            // Uses BitSet intrinsic which returns the new value or undefined
             ast::Expression::BinaryOp {
                 left,
                 op: ast::BinaryOperator::BitTest,
@@ -134,21 +134,7 @@ impl<'a> Lowerer<'a> {
                 let bit = self.lower_expression(right);
 
                 // Check if the bit is accessible by testing first
-                let bit_check = self.new_temp(TypeSet::all());
-                self.emit(Instruction::Call {
-                    dest: bit_check,
-                    function: FunctionRef::core("bit_test"),
-                    args: vec![
-                        CallArg {
-                            value: base,
-                            by_ref: false,
-                        },
-                        CallArg {
-                            value: bit,
-                            by_ref: false,
-                        },
-                    ],
-                });
+                let bit_check = self.emit_binary_intrinsic(IntrinsicOp::BitTest, base, bit);
 
                 // Short-circuit: only evaluate rhs if bit is accessible
                 let defined_bb = self.fresh_block();
@@ -174,25 +160,12 @@ impl<'a> Lowerer<'a> {
                     self.lower_compound_op(bit_check, op, rhs)
                 };
 
-                // Call core::bit_set to set or clear the bit
-                let set_result = self.new_temp(TypeSet::all());
-                self.emit(Instruction::Call {
+                // Use BitSet intrinsic to set or clear the bit
+                let set_result = self.new_temp(TypeSet::uint());
+                self.emit(Instruction::Intrinsic {
                     dest: set_result,
-                    function: FunctionRef::core("bit_set"),
-                    args: vec![
-                        CallArg {
-                            value: base,
-                            by_ref: true, // by-ref so we can modify the original
-                        },
-                        CallArg {
-                            value: bit,
-                            by_ref: false,
-                        },
-                        CallArg {
-                            value: final_value,
-                            by_ref: false,
-                        },
-                    ],
+                    op: IntrinsicOp::BitSet,
+                    args: vec![base, bit, final_value],
                 });
                 let defined_exit = self.current_block;
                 self.finish_block(Terminator::Jump { target: join_bb });
@@ -228,26 +201,11 @@ impl<'a> Lowerer<'a> {
 
     /// Lower a compound assignment operator (+=, -=, etc.)
     fn lower_compound_op(&mut self, lhs: VarId, op: &ast::AssignmentOp, rhs: VarId) -> VarId {
-        let builtin = op
-            .builtin_name()
+        let intrinsic = op
+            .intrinsic_op()
             .expect("plain Assign should not reach lower_compound_op");
 
-        let dest = self.new_temp(TypeSet::from_types(all_types()));
-        self.emit(Instruction::Call {
-            dest,
-            function: FunctionRef::core(builtin),
-            args: vec![
-                CallArg {
-                    value: lhs,
-                    by_ref: false,
-                },
-                CallArg {
-                    value: rhs,
-                    by_ref: false,
-                },
-            ],
-        });
-        dest
+        self.emit_binary_intrinsic(intrinsic, lhs, rhs)
     }
 
     /// Lower assignment to an indexed location (arr[i] or obj.field).
