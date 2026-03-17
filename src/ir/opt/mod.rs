@@ -18,12 +18,14 @@ mod guard_elim;
 mod type_refinement;
 
 pub use const_fold::fold_constants;
-pub use definedness::analyze_definedness;
+pub use definedness::{analyze_definedness, check_definedness};
 pub use guard_elim::{eliminate_guards, simplify_cfg};
 pub use type_refinement::analyze_types;
 
 // Import IR types from parent module
-use super::{BlockId, CallArg, Function, FunctionRef, Instruction, IrProgram, Terminator, VarId};
+use super::{
+    BlockId, CallArg, Function, FunctionRef, Instruction, IntrinsicOp, IrProgram, Terminator, VarId,
+};
 
 // Import builtins for metadata lookup
 use crate::builtins::BuiltinRegistry;
@@ -46,40 +48,100 @@ pub fn optimize_function(
     builtins: &BuiltinRegistry,
     diagnostics: &mut Diagnostics,
 ) {
-    // Pass 1: Early constant folding
-    // Fold obvious compile-time constants before analysis
-    fold_constants(function, builtins, diagnostics);
+    // ── Phase 1: Optimize to fixpoint ────────────────────────────────────
+    //
+    // Loop const fold → definedness → guard elim → CFG simplify until
+    // no pass makes any changes. Typically converges in 1-2 iterations.
+    // Extra iterations handle cascading effects: const fold may expose
+    // new Defined values → guard elim removes guards → CFG simplify
+    // removes dead blocks → Phi nodes lose sources → new constants.
 
-    // Pass 2: Definedness analysis
-    let definedness = analyze_definedness(function, Some(builtins));
+    let mut first_iteration = true;
+    loop {
+        let folded = fold_constants(function, builtins, diagnostics);
 
-    // Pass 2.5: Diagnostics (TODO)
-    // emit_diagnostics(function, &definedness);
+        let definedness = analyze_definedness(function, Some(builtins));
 
-    // Pass 3: Guard elimination
-    let _guards_eliminated = eliminate_guards(function, &definedness);
+        // Emit definedness diagnostics only on the first iteration,
+        // before guard elimination reshapes the control flow.
+        if first_iteration {
+            check_definedness(function, &definedness, Some(builtins), diagnostics);
+            first_iteration = false;
+        }
 
-    // Pass 3.5: CFG simplification
-    let _blocks_removed = simplify_cfg(function);
+        let guards = eliminate_guards(function, &definedness);
+        let blocks = simplify_cfg(function);
 
-    // Pass 4: Type refinement analysis
-    let _types = analyze_types(function, Some(builtins));
-    // TODO: Use type analysis for:
-    // - Dead arm elimination in Match
-    // - Type-specialized code generation
+        if folded + guards + blocks == 0 {
+            break;
+        }
+    }
 
-    // Pass 5: Constant folding (cleanup)
-    // Fold constants exposed by guard elimination and CFG simplification
-    fold_constants(function, builtins, diagnostics);
+    // ── Phase 2: Type-informed analysis (on simplified CFG) ────────────
 
-    // Pass 5.5: Final CFG simplification
-    // Cleanup fold may create new Jumps (from folded If/Guard with constant
-    // conditions). Merge any new linear chains so the closure compiler sees
-    // minimal blocks with no unnecessary NextBlock transitions.
-    let _blocks_removed2 = simplify_cfg(function);
+    // Type refinement — intrinsic-aware: Add(UInt, UInt) → {UInt}.
+    let types = analyze_types(function, Some(builtins));
 
-    // Pass 6: Dead code elimination (TODO)
+    // Type mismatch diagnostics (W009)
+    check_intrinsic_types(function, &types, diagnostics);
+
+    // Future: coercion insertion goes here. It generates Match + Widen +
+    // monomorphic ops, with Undefined for invalid type combinations.
+    // This acts as a fine-grained second definedness pass — the expanded
+    // IR has explicit Undefined for type mismatches. Running the Phase 1
+    // loop again on the expanded IR would exploit this automatically.
+
+    // ── Phase 3: Cleanup ───────────────────────────────────────────────
+
+    // Dead code elimination (TODO)
     // eliminate_dead_code(function);
+}
+
+/// Warn when intrinsic operand types guarantee the result is always undefined.
+///
+/// For example, `true + [1, 2]` — Add requires numeric operands, but Bool and
+/// Array have no intersection with numeric. The result is always undefined,
+/// which is almost certainly a bug.
+fn check_intrinsic_types(
+    function: &Function,
+    types: &type_refinement::TypeAnalysis,
+    diagnostics: &mut Diagnostics,
+) {
+    for block in &function.blocks {
+        for inst in &block.instructions {
+            let Instruction::Intrinsic { op, args, .. } = &inst.node else {
+                continue;
+            };
+
+            // Skip variadic ops where param_type doesn't apply per-arg
+            if matches!(
+                op,
+                IntrinsicOp::MakeArray | IntrinsicOp::MakeMap | IntrinsicOp::ArraySeq
+            ) {
+                continue;
+            }
+
+            for (i, arg) in args.iter().enumerate() {
+                let required = op.param_type(i);
+                let actual = types
+                    .get_at_exit(block.id, *arg)
+                    .copied()
+                    .unwrap_or(crate::types::TypeSet::all());
+
+                if actual.intersection(&required).is_empty() && !actual.is_empty() {
+                    diagnostics.warning(
+                        crate::diagnostics::DiagnosticCode::W009_TypeMismatch,
+                        inst.span,
+                        format!(
+                            "in function `{}`: {:?} requires {:?} but argument has type {:?} — result is always undefined",
+                            function.name, op, required, actual,
+                        ),
+                    );
+                    break; // one warning per instruction is enough
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

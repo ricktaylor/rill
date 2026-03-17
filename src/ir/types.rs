@@ -46,9 +46,8 @@ pub enum IntrinsicOp {
     Lt,
 
     // -- Logical --
+    // Note: && and || lower to control flow (If + Phi), not Intrinsic instructions.
     Not,
-    And,
-    Or,
 
     // -- Bitwise --
     BitAnd,
@@ -81,7 +80,7 @@ impl IntrinsicOp {
             Self::Eq => false,
             Self::Lt => true,
             // Logical: always succeed on correct types
-            Self::Not | Self::And | Self::Or => false,
+            Self::Not => false,
             // Bitwise: bit_test/bit_set can go out of bounds
             Self::BitAnd | Self::BitOr | Self::BitXor | Self::BitNot | Self::Shl | Self::Shr => {
                 false
@@ -96,15 +95,54 @@ impl IntrinsicOp {
         }
     }
 
-    /// Result type hint (before type refinement narrows further).
+    /// Required type for each argument position.
+    ///
+    /// Returns the TypeSet of types that are valid for each argument. If the
+    /// actual operand type has no intersection with the required type, the
+    /// operation will always produce undefined — which is almost certainly a bug.
+    pub fn param_type(self, index: usize) -> TypeSet {
+        match self {
+            // Arithmetic: both args must be numeric
+            Self::Add | Self::Sub | Self::Mul | Self::Div | Self::Mod => TypeSet::numeric(),
+            Self::Neg => TypeSet::numeric(),
+
+            // Comparison
+            Self::Eq => TypeSet::all(), // any two values can be compared
+            Self::Lt => TypeSet::numeric(),
+
+            // Logical: Bool only
+            Self::Not => TypeSet::bool(),
+
+            // Bitwise: UInt only
+            Self::BitAnd
+            | Self::BitOr
+            | Self::BitXor
+            | Self::BitNot
+            | Self::Shl
+            | Self::Shr
+            | Self::BitTest => TypeSet::uint(),
+            Self::BitSet => match index {
+                0 | 1 => TypeSet::uint(), // x and bit position
+                _ => TypeSet::bool(),     // value to set
+            },
+
+            // Collection
+            Self::Len => TypeSet::collection(),
+            Self::MakeArray | Self::MakeMap => TypeSet::all(),
+
+            // Sequence
+            Self::MakeSeq => TypeSet::numeric(), // start/end are numeric
+            Self::ArraySeq => TypeSet::all(),
+        }
+    }
+
+    /// Static result type (worst case, ignoring operand types).
     pub fn result_type(self) -> TypeSet {
         match self {
             Self::Add | Self::Sub | Self::Mul | Self::Div | Self::Mod | Self::Neg => {
                 TypeSet::numeric()
             }
-            Self::Eq | Self::Lt | Self::Not | Self::And | Self::Or | Self::BitTest => {
-                TypeSet::bool()
-            }
+            Self::Eq | Self::Lt | Self::Not | Self::BitTest => TypeSet::bool(),
             Self::BitAnd
             | Self::BitOr
             | Self::BitXor
@@ -117,6 +155,111 @@ impl IntrinsicOp {
             Self::MakeMap => TypeSet::single(BaseType::Map),
             Self::MakeSeq | Self::ArraySeq => TypeSet::single(BaseType::Sequence),
         }
+    }
+
+    /// Refined result type given known operand types.
+    ///
+    /// For arithmetic ops, the result type follows the numeric promotion
+    /// lattice: UInt + UInt → UInt, UInt + Int → Int, anything + Float → Float.
+    /// If operand types are unknown or mixed, falls back to `result_type()`.
+    pub fn result_type_refined(self, arg_types: &[TypeSet]) -> TypeSet {
+        match self {
+            // Arithmetic: result type follows promotion rules
+            Self::Add | Self::Sub | Self::Mul | Self::Div | Self::Mod => {
+                if let (Some(a), Some(b)) = (arg_types.first(), arg_types.get(1)) {
+                    numeric_result_type(*a, *b)
+                } else {
+                    self.result_type()
+                }
+            }
+            Self::Neg => {
+                if let Some(a) = arg_types.first()
+                    && a.is_single()
+                {
+                    if a.contains(BaseType::UInt) || a.contains(BaseType::Int) {
+                        // neg(UInt) → Int, neg(Int) → Int
+                        return TypeSet::single(BaseType::Int);
+                    }
+                    if a.contains(BaseType::Float) {
+                        return TypeSet::single(BaseType::Float);
+                    }
+                }
+                self.result_type()
+            }
+            // Comparison: result type follows promotion for the comparison,
+            // but the output is always Bool
+            Self::Eq | Self::Lt | Self::Not | Self::BitTest => TypeSet::bool(),
+            // Everything else has a fixed result type regardless of operands
+            _ => self.result_type(),
+        }
+    }
+}
+
+/// Compute the numeric result type given two operand TypeSets.
+///
+/// Follows the promotion lattice: UInt ⊂ Int ⊂ Float.
+/// - Same type → same type (UInt+UInt → UInt)
+/// - Mixed integers → Int (UInt+Int → Int)
+/// - Anything + Float → Float
+/// - Non-numeric or ambiguous → numeric() (all three)
+fn numeric_result_type(a: TypeSet, b: TypeSet) -> TypeSet {
+    // Both must be single numeric types for precise refinement
+    if !a.is_single() || !b.is_single() {
+        // If both are subsets of numeric, the result is at most numeric
+        let numeric = TypeSet::numeric();
+        if a.intersection(&numeric) == a && b.intersection(&numeric) == b {
+            // Compute the union of possible result types from the promotion lattice
+            return promote_union(a, b);
+        }
+        return TypeSet::numeric();
+    }
+
+    let a_has = |t| a.contains(t);
+    let b_has = |t| b.contains(t);
+
+    // Float + anything → Float
+    if a_has(BaseType::Float) || b_has(BaseType::Float) {
+        return TypeSet::single(BaseType::Float);
+    }
+    // Int + UInt → Int, Int + Int → Int
+    if a_has(BaseType::Int) || b_has(BaseType::Int) {
+        return TypeSet::single(BaseType::Int);
+    }
+    // UInt + UInt → UInt
+    if a_has(BaseType::UInt) && b_has(BaseType::UInt) {
+        return TypeSet::single(BaseType::UInt);
+    }
+    TypeSet::numeric()
+}
+
+/// Compute the union of possible promoted types when operands have multi-type sets.
+fn promote_union(a: TypeSet, b: TypeSet) -> TypeSet {
+    let mut result = TypeSet::empty();
+
+    let a_u = a.contains(BaseType::UInt);
+    let a_i = a.contains(BaseType::Int);
+    let a_f = a.contains(BaseType::Float);
+    let b_u = b.contains(BaseType::UInt);
+    let b_i = b.contains(BaseType::Int);
+    let b_f = b.contains(BaseType::Float);
+
+    // UInt + UInt → UInt
+    if a_u && b_u {
+        result = result.union(&TypeSet::single(BaseType::UInt));
+    }
+    // Int + Int, UInt + Int, Int + UInt → Int
+    if (a_i && b_i) || (a_u && b_i) || (a_i && b_u) {
+        result = result.union(&TypeSet::single(BaseType::Int));
+    }
+    // Float + anything numeric → Float
+    if a_f || b_f {
+        result = result.union(&TypeSet::single(BaseType::Float));
+    }
+
+    if result.is_empty() {
+        TypeSet::numeric()
+    } else {
+        result
     }
 }
 

@@ -549,9 +549,10 @@ impl BuiltinRegistry {
 /// comparison, bitwise, etc.) and compiler-internal synthetics (MakeArray,
 /// MakeMap, etc.) are handled as `IntrinsicOp` and never appear here.
 pub fn standard_builtins() -> BuiltinRegistry {
-    // All language-defined functions (len, is_some, is_uint, etc.) are now
-    // handled as intrinsics in try_lower_intrinsic. This registry is
-    // reserved for host-provided extern functions.
+    // Only `len` is a compiler intrinsic (via try_lower_intrinsic).
+    // Type-checking (is_uint, etc.) and presence-checking (is_some)
+    // are user-definable — will move to a prelude in the future.
+    // This registry is reserved for host-provided extern functions.
     //
     // Future: exit, encode, decode, print, etc.
 

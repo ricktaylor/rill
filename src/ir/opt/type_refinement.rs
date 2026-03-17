@@ -136,9 +136,13 @@ fn transfer_instruction(
             state.insert(*dest, result.unwrap_or_else(all_types));
         }
 
-        // Intrinsic: use the op's result_type method
-        Instruction::Intrinsic { dest, op, .. } => {
-            state.insert(*dest, op.result_type());
+        // Intrinsic: refine result type based on operand types
+        Instruction::Intrinsic { dest, op, args } => {
+            let arg_types: Vec<TypeSet> = args
+                .iter()
+                .map(|v| state.get(v).cloned().unwrap_or_else(all_types))
+                .collect();
+            state.insert(*dest, op.result_type_refined(&arg_types));
         }
 
         // Call: use builtin metadata if available

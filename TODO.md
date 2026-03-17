@@ -19,6 +19,12 @@ Architecture: Source → Parser (chumsky) → AST → Lower (operators → Intri
 - Diagnostics system with source spans — `src/diagnostics.rs`
 - IR lowering (AST → SSA IR) with loop-carried phis — `src/ir/`
 - Optimizer passes — const fold, definedness, guard elim, CFG simplify, type refinement
+- Type refinement is intrinsic-aware: refines result types based on operand types
+  (e.g. Add(UInt, UInt) → UInt, not generic numeric). Uses promotion lattice.
+- Type mismatch warnings (W009): detects intrinsic ops with incompatible operand types
+  that will always produce undefined (e.g. `"hello" + 5`, `!42`, `len(true)`)
+- Definedness diagnostics (E200/E201): warns on use of undefined/maybe-undefined values
+  with provenance tracking (traces back to originating call/index operation)
 - Closure-threaded compiler with link phase — `src/compile.rs`
 - Flat pc-based executor — 123 end-to-end tests passing
 - Sequence type (lazy ranges, zero-copy array slices with mutable flag)
@@ -37,6 +43,8 @@ Architecture: Source → Parser (chumsky) → AST → Lower (operators → Intri
       root file functions/constants = public (embedder entry points),
       imported file functions/constants = private (DCE can eliminate unused).
       No `pub` keyword needed. Enables unused-import elimination.
+- [ ] Prelude: standard utility functions (is_some, is_uint, is_int, ..., default, etc.)
+      User-definable functions loaded automatically — not intrinsics.
 - [ ] CBOR encode/decode integration
 - [ ] Comprehensive standard library (std.time, std.cbor, std.encoding, std.parsing)
 - [ ] Module/import system implementation
@@ -61,10 +69,10 @@ Issues identified during code review, ordered by priority.
   matching `lower_function_call` logic.
 
 - [x] **CR-4: `FunctionRef` naming inconsistent between call sites**
-  Fixed: added `FunctionRef::core(name)` constructor. Converted all internal
-  builtin call sites in `expr.rs` and `stmt.rs` to use it. Also refactored
-  `emit_binary_call`/`emit_unary_call` to take short names and reused them
-  in `lower_binary_op`/`lower_unary_op`.
+  Fixed: originally added `FunctionRef::core(name)` constructor. Later
+  superseded by IntrinsicOp refactor — operators now emit
+  `Instruction::Intrinsic` via `emit_binary_intrinsic`/`emit_unary_intrinsic`,
+  `FunctionRef::core()` is no longer used.
 
 - [x] **CR-5: `match` lowering is broken** `src/ir/control.rs`
   Fixed: reuses `lower_if_pattern` for each arm with `next_bb` as the failure
@@ -72,13 +80,12 @@ Issues identified during code review, ordered by priority.
   trees are a future optimization). Respects `binding_is_value` for ref/value mode.
 
 - [x] **CR-6: `for` loop lowering is non-functional** `src/ir/control.rs`
-  Fixed: implemented index-based iteration using `core::len` and `core::lt`.
+  Fixed: implemented index-based iteration using `Len` and `Lt` intrinsics.
   Handles both single and pair bindings. Respects `binding_is_value`.
   Later updated for new `for k, v in map` syntax and Sequence type.
 
 - [x] **CR-7: Range lowering is non-functional** `src/ir/control.rs`
-  Fixed: lowers to `core::make_seq(start, end, inclusive)` call producing
-  a Sequence value. Note: `core::make_seq` builtin must be registered.
+  Fixed: lowers to `MakeSeq` intrinsic producing a Sequence value.
 
 - [x] **CR-13: `Value::is_empty()` wrong for scalars** `src/exec.rs`
   Fixed: returns `false` for scalars (no `len`), `true` only for empty
@@ -99,11 +106,10 @@ Issues identified during code review, ordered by priority.
   if-let/match):
   - `Pattern::Type`: emits Match terminator, binds inner on match, undefined on mismatch
   - `Pattern::Map`: indexes by literal/variable key, binds value patterns
-  - `..rest`: produces a zero-copy Sequence via `core::array_seq(arr, start, end, mutable)`.
+  - `..rest`: produces a zero-copy Sequence via `ArraySeq` intrinsic.
     `SeqState::ArraySlice` has a `mutable` flag controlled by binding mode:
     `let` → immutable (by-value iteration), `with` → mutable (write-back to source).
   - `after` patterns: indexes from end using `len - after.len() + i`
-  Note: requires `core::array_seq` builtin to be registered.
 
 - [x] **CR-10: `HeapSize` undercounts allocations** `src/exec.rs`
   Fixed: use `capacity()` instead of `len()` for Vec, String, IndexMap.
@@ -128,9 +134,9 @@ Issues identified during code review, ordered by priority.
   ArrayAccess and MemberAccess now call it with 2 lines each.
 
 - [x] **CR-16: Operator-to-builtin mapping duplicated** `src/ir/expr.rs` + `src/ir/constant.rs`
-  Fixed: added `BinaryOperator::builtin_name()`, `UnaryOperator::builtin_name()`,
-  and `AssignmentOp::builtin_name()` methods on the AST enums. All three lowering
-  sites (`expr.rs`, `constant.rs`, `stmt.rs`) now use the shared methods.
+  Fixed: added `intrinsic_op()` methods on `BinaryOperator`, `UnaryOperator`,
+  and `AssignmentOp` AST enums. All lowering sites use the shared methods.
+  Old `builtin_name()` methods removed.
 
 - [x] **CR-17: `terminator_successors()` reimplemented** `src/ir/opt/type_refinement.rs`
   Fixed: removed duplicate, uses `block.terminator.successors()` directly.
@@ -210,79 +216,120 @@ Issues identified during code review, ordered by priority.
 
 #### Type-Specialized Compilation (Phase 2 of intrinsic refactor)
 
-Operators are now `IntrinsicOp` (Phase 1 complete). Phase 2 uses type analysis
-to specialize them at compile time, eliminating runtime type dispatch.
+Operators are now `IntrinsicOp` (Phase 1 complete). Type refinement is
+intrinsic-aware — it refines result types using the numeric promotion lattice
+and detects guaranteed-undefined operations (W009 warnings).
 
-**Dependency chain:**
+Phase 2 uses the refined type info to generate explicit guard/coercion/operation
+sequences at the IR level, then lets the existing optimizer pipeline (guard
+elimination, CFG simplify, const fold) collapse them when types are provably known.
+
+**Key insight:** specialization happens in the IR using existing control flow
+primitives (Match, Guard, Phi), not in a separate StepKind layer. The existing
+optimizer handles all the simplification — no new infrastructure needed beyond
+`Widen` and the coercion insertion pass.
+
+**Completed prerequisites:**
+- [x] IntrinsicOp with `is_fallible()`, `result_type()`, `param_type()` methods
+- [x] `result_type_refined()` — narrows result types based on operand types
+      (e.g. Add(UInt, UInt) → UInt, Add(UInt, Int) → Int, Add(UInt, Float) → Float)
+- [x] `numeric_result_type()` / `promote_union()` — promotion lattice logic
+- [x] W009 type mismatch warnings — detects ops where operand types guarantee undefined
+- [x] Type refinement pass uses `result_type_refined()` for intrinsics
+
+**Two-phase definedness model:**
 ```
-TypeAnalysis (DONE) → Coercion Insertion → StepKind Emission → Peephole → Closures
+Phase 1 (coarse — before type info):
+  Const Fold → Definedness (coarse) → Diagnostics → Guard Elim → CFG Simplify
+  [all DONE]
+
+Phase 2 (type-informed — on simplified CFG):
+  Type Refinement (DONE) → Coercion Insertion (generates Match + Widen + Undefined)
+    → Definedness (fine — sees explicit Undefined from coercion)
+      → Guard Elim → CFG Simplify → Const Fold → CFG Simplify
+        → Type-aware closure compilation
 ```
 
-- [ ] **Thread TypeAnalysis to compilation** — pass the `TypeAnalysis` result
-      (currently computed but discarded with `let _types = ...`) through to
-      `compile_program` / `compile_function`. Each VarId gets a known TypeSet.
+The coercion pass bridges type analysis and definedness: it transforms type
+mismatches into explicit `Undefined` instructions that the existing definedness
+analysis can reason about — no new analysis infrastructure needed.
 
-- [ ] **Add `Widen` intrinsic for explicit type coercion** — new `IntrinsicOp::Widen`
-      with a target type. Only 3 numeric coercion edges: UInt→Int, UInt→Float,
-      Int→Float. Coercion is currently implicit in the 10-way match inside each
-      arithmetic op; making it explicit enables folding and hoisting.
+**Example:** `v3 = Add(v1, v2)` where `v1: {UInt, Int}`, `v2: {UInt}`:
+```
+Match v1 {
+    UInt → block_uu,
+    Int  → block_iu,
+    default → block_undef,
+}
+block_uu:                            // v1: UInt, v2: UInt
+    v3a = Intrinsic(Add, [v1, v2])   // both UInt → compiler emits checked_add
+    Jump → join
+block_iu:                            // v1: Int, v2: UInt
+    v4 = Intrinsic(Widen, [v2])      // UInt → Int
+    v3b = Intrinsic(Add, [v1, v4])   // both Int → compiler emits checked_add
+    Jump → join
+block_undef:
+    v3c = Undefined
+    Jump → join
+join:
+    v3 = Phi(block_uu: v3a, block_iu: v3b, block_undef: v3c)
+```
 
-- [ ] **Coercion insertion pass** — new IR pass after type refinement. Walks
-      `Intrinsic { op: Add, args: [v1, v2] }`, checks refined types of v1/v2.
-      If mixed (e.g. UInt+Int), inserts `Intrinsic { op: Widen }` to promote
-      the narrower operand, then rewrites the Add to operate on same-type args.
-      If both already same type, no change. If unknown, leave for generic dispatch.
+If TypeAnalysis already proves `v1: {UInt}`, guard elimination collapses the
+Match to `Jump → block_uu`, CFG simplify merges the blocks, and we're left
+with just `v3 = Intrinsic(Add, [v1, v2])` — both args provably UInt, no guards.
+
+**Steps:**
+
+- [ ] **Add `Widen` to IntrinsicOp** — explicit numeric type coercion. Only 3
+      edges in the promotion lattice: UInt→Int, UInt→Float, Int→Float. Target
+      type encoded as a Const Bool/UInt arg (avoiding new IR fields). Const-eval
+      and runtime execution are trivial (checked conversion). Coercion is
+      currently implicit inside each arithmetic op's 10-way match; making it
+      explicit enables folding, hoisting, and elimination.
+
+- [ ] **Coercion insertion pass** — new IR pass after type refinement. For each
+      `Intrinsic { op: Add/Sub/Mul/... }`, consult TypeAnalysis for operand types:
+      - **Both same type** (e.g. UInt+UInt): no change needed.
+      - **Mixed known types** (e.g. UInt+Int): insert `Widen` for the narrower
+        operand, rewrite the op to use the widened value.
+      - **Partially known** (e.g. v1: {UInt,Int}, v2: {UInt}): generate a Match
+        on v1's type, with one branch per possible combination. Each branch gets
+        the appropriate Widen + monomorphic op. Join with Phi.
+      - **Incompatible types** (e.g. Text+UInt): emit `Instruction::Undefined`.
+        This is the type-informed definedness determination — the operation
+        provably cannot succeed.
+      - **Fully unknown**: leave as generic (full runtime dispatch).
+
+      The coercion pass acts as a **fine-grained second definedness pass**:
+      the expanded IR has explicit `Undefined` instructions for invalid type
+      combinations. Running definedness analysis + guard elimination again
+      on the expanded IR exploits this — guards on provably-undefined results
+      collapse, dead branches are eliminated.
+
       Pipeline position:
       ```
-      ... → Type Refinement → Coercion Insertion → Cleanup Const Fold → CFG Simplify
+      ... → Type Refinement → Coercion Insertion
+          → Definedness (fine) → Guard Elim → CFG Simplify
+          → Cleanup Const Fold → CFG Simplify
       ```
 
-- [ ] **Define `StepKind` intermediate** — tagged enum between IR compilation
-      and closure generation. Enables pattern-matching on instruction sequences.
-      ```rust
-      enum StepKind {
-          // Type-specialized (when TypeAnalysis proves both args same type)
-          AddUU { dest, a, b },    // u64 + u64, single checked_add
-          AddII { dest, a, b },    // i64 + i64
-          AddFF { dest, a, b },    // f64 + f64
-          AddGeneric { dest, a, b }, // unknown types, full dispatch
-          // Same pattern for Sub, Mul, Div, Mod, Lt, Eq, ...
-          // Shared coercion steps (3 total, reused across all ops)
-          WidenUIntToInt { dest, src },
-          WidenUIntToFloat { dest, src },
-          WidenIntToFloat { dest, src },
-          // Non-arithmetic (always same codegen)
-          Copy { dest, src },
-          Const { dest, value },
-          Call { dest, func, args },
-          CallUser { dest, func_idx, args },
-          Jump(usize),
-          Branch { cond, then_, else_ },
-          // ...
-      }
-      ```
+- [ ] **Thread TypeAnalysis to closure compiler** — pass the `TypeAnalysis`
+      result (currently computed but discarded with `let _types = ...`) through
+      to `compile_program`. When compiling `Intrinsic(Add, [v1, v2])`, check
+      the refined types of v1 and v2. If both are proven single-type (e.g.
+      both UInt), emit a specialized closure that skips the type dispatch
+      entirely — just `u64::checked_add` on the raw values.
 
-- [ ] **Type-aware StepKind emission** — when compiling `Intrinsic { op: Add }`,
-      consult TypeAnalysis for the operand types:
-      - `(UInt, UInt)` → `StepKind::AddUU`
-      - `(Int, Int)` → `StepKind::AddII` (after coercion pass widened operands)
-      - unknown → `StepKind::AddGeneric`
-      The specialized variants compile to a single `checked_add` with no enum
-      match on Value — the type is statically known.
+- [ ] **Const-fold Widen** — `Widen(Const(42_u64))` where target is Int folds
+      to `Const(42_i64)`. Already handled by `eval_intrinsic_const` once Widen
+      is added. The cleanup const fold pass after coercion insertion will pick
+      this up automatically.
 
-- [ ] **Peephole optimization on StepKind** — pattern-match on StepKind sequences
-      before converting to closures:
-      - Copy-to-self elimination: `Copy { dest: 5, src: 5 }` → remove
-      - Dead store removal: write to slot never read → remove
-      - Const+use fusion: `Const { dest: 3, value: 1 }` + `AddUU { a: 3, ... }`
-        → `AddUU_Imm { a, imm: 1 }` (or just inline the constant)
-      - Redundant coercion elimination: same Widen applied twice → reuse first
-      - Coercion chain collapsing: UInt→Int then Int→Float → UInt→Float
-      - Jump threading: `Jump(A)` where A is `Jump(B)` → `Jump(B)`
-
-- [ ] **Loop-invariant coercion hoisting** — a Widen of a loop-invariant value
-      can be moved to the pre-header. Common case: `for i in 0..n` where `n`
-      is Int but `i` is UInt — the coercion of `n` only needs to happen once.
+- [ ] **Redundant coercion elimination** — after guard elimination collapses
+      branches, a Widen whose input is already the target type is a no-op.
+      DCE or a simple peephole can remove it. Coercion chains (UInt→Int→Float)
+      can be collapsed to UInt→Float by algebraic simplification.
 
 #### IR-Level (SSA)
 
@@ -312,9 +359,6 @@ TypeAnalysis (DONE) → Coercion Insertion → StepKind Emission → Peephole �
 
 - [ ] **Function Inlining** — clone callee IR into call site for small pure functions.
 
-- [ ] **Sparse Conditional Constant Propagation (SCCP)** — combines constant
-      propagation with unreachable code detection. Would subsume const_fold + guard_elim.
-
 #### Diagnostics
 
 - [ ] Dead-store warnings for non-ref-backed loop variable mutations
@@ -327,6 +371,11 @@ TypeAnalysis (DONE) → Coercion Insertion → StepKind Emission → Peephole �
 - [ ] Documentation: API docs, embedding guide
 
 ### P3 — Future
+- [ ] **StepKind intermediate for peephole** — optional tagged enum between IR
+      compilation and closure generation. Enables pattern-matching on instruction
+      sequences: copy-to-self elimination, dead store removal, const+use fusion,
+      jump threading. Not needed for type specialization (handled at IR level)
+      but useful for low-level closure optimization.
 - [ ] Compiled bytecode serialization format
 - [ ] REPL / CLI tool
 - [ ] LSP support
@@ -340,7 +389,7 @@ TypeAnalysis (DONE) → Coercion Insertion → StepKind Emission → Peephole �
 ```
 src/
   lib.rs              — Public API: compile(), Program::call(), re-exports
-  compile.rs          — Link phase, closure compilation, phi elimination, flat pc executor
+  compile.rs          — Link phase, closure compilation, exec_intrinsic, phi elimination, flat pc executor
   ast.rs              — AST node types, Span, Spanned
   types.rs            — BaseType, TypeSet
   parser.rs           — Chumsky-based parser -> AST
@@ -349,7 +398,7 @@ src/
   exec.rs             — VM, Heap, HeapVal, Value, Slot, Float
   ir/
     mod.rs            — Lowerer state, scope management, public lower() API
-    types.rs          — IR types: VarId, BlockId, Instruction, Terminator, Program, etc.
+    types.rs          — IR types: VarId, BlockId, Instruction, IntrinsicOp, Terminator, etc.
     program.rs        — Top-level program lowering (constants, functions)
     stmt.rs           — Statement lowering
     expr.rs           — Expression lowering

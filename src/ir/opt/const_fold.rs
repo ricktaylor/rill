@@ -30,12 +30,14 @@ pub type ConstantMap = HashMap<VarId, ConstValue>;
 /// Replaces instructions with constant results and simplifies control flow
 /// when conditions are constant. Emits warnings for redundant guards and
 /// unreachable match arms.
+/// Returns the number of instructions/terminators folded.
 pub fn fold_constants(
     function: &mut Function,
     builtins: &BuiltinRegistry,
     diagnostics: &mut Diagnostics,
-) {
+) -> usize {
     let mut constants: ConstantMap = HashMap::new();
+    let mut folded = 0;
 
     // Collect constant values, iterating to fixpoint.
     // With proper SSA, each VarId is assigned exactly once, so this
@@ -51,8 +53,11 @@ pub fn fold_constants(
     // Second pass: replace instructions that produce constants
     for block in &mut function.blocks {
         for spanned_inst in &mut block.instructions {
-            if let Some(folded) = try_fold_instruction(&spanned_inst.node, &constants, builtins) {
-                spanned_inst.node = folded;
+            if let Some(replacement) =
+                try_fold_instruction(&spanned_inst.node, &constants, builtins)
+            {
+                spanned_inst.node = replacement;
+                folded += 1;
             }
         }
 
@@ -61,8 +66,11 @@ pub fn fold_constants(
             try_simplify_terminator(&block.terminator, &constants, &function.name, diagnostics)
         {
             block.terminator = simplified;
+            folded += 1;
         }
     }
+
+    folded
 }
 
 /// Collect constant values from instructions (SSA: each VarId assigned once)
@@ -332,16 +340,7 @@ fn try_fold_intrinsic(
     args: &[VarId],
     constants: &ConstantMap,
 ) -> Option<ConstValue> {
-    // For short-circuit ops (And, Or), we can fold with partial constants
-    if matches!(op, IntrinsicOp::And | IntrinsicOp::Or) {
-        let const_args: Vec<ConstValue> = args
-            .iter()
-            .filter_map(|v| constants.get(v).cloned())
-            .collect();
-        return eval_intrinsic_const(op, &const_args);
-    }
-
-    // For all other ops, all arguments must be constant
+    // All arguments must be constant
     let const_args: Option<Vec<ConstValue>> =
         args.iter().map(|v| constants.get(v).cloned()).collect();
     eval_intrinsic_const(op, &const_args?)
@@ -554,75 +553,6 @@ mod tests {
         assert!(matches!(
             func.blocks[0].terminator,
             Terminator::Jump { target } if target == block(1)
-        ));
-    }
-
-    #[test]
-    fn test_fold_intrinsic_and() {
-        let builtins = standard_builtins();
-        let blocks = vec![BasicBlock {
-            id: block(0),
-            instructions: vec![
-                si(Instruction::Const {
-                    dest: var(0),
-                    value: Literal::Bool(true),
-                }),
-                si(Instruction::Const {
-                    dest: var(1),
-                    value: Literal::Bool(false),
-                }),
-                si(Instruction::Intrinsic {
-                    dest: var(2),
-                    op: IntrinsicOp::And,
-                    args: vec![var(0), var(1)],
-                }),
-            ],
-            terminator: Terminator::Return {
-                value: Some(var(2)),
-            },
-        }];
-
-        let mut func = make_function(blocks);
-        let mut diags = Diagnostics::new();
-        fold_constants(&mut func, &builtins, &mut diags);
-
-        // var(2) should now be a Const false
-        assert!(matches!(
-            &func.blocks[0].instructions[2].node,
-            Instruction::Const { dest, value: Literal::Bool(false) } if *dest == var(2)
-        ));
-    }
-
-    #[test]
-    fn test_fold_intrinsic_or_short_circuit() {
-        let builtins = standard_builtins();
-        let blocks = vec![BasicBlock {
-            id: block(0),
-            instructions: vec![
-                si(Instruction::Const {
-                    dest: var(0),
-                    value: Literal::Bool(true),
-                }),
-                // var(1) is NOT constant, but we can still fold because first arg is true
-                si(Instruction::Intrinsic {
-                    dest: var(2),
-                    op: IntrinsicOp::Or,
-                    args: vec![var(0), var(1)],
-                }),
-            ],
-            terminator: Terminator::Return {
-                value: Some(var(2)),
-            },
-        }];
-
-        let mut func = make_function(blocks);
-        let mut diags = Diagnostics::new();
-        fold_constants(&mut func, &builtins, &mut diags);
-
-        // var(2) should now be a Const true (short-circuit)
-        assert!(matches!(
-            &func.blocks[0].instructions[1].node,
-            Instruction::Const { dest, value: Literal::Bool(true) } if *dest == var(2)
         ));
     }
 

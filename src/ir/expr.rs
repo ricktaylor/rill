@@ -402,8 +402,8 @@ impl<'a> Lowerer<'a> {
         name: &ast::Identifier,
         arguments: &[ast::Expression],
     ) -> VarId {
-        // Check for compiler intrinsics first (is_some, is_uint, etc.)
-        // These lower to control flow, not function calls.
+        // Check for compiler intrinsics first (e.g. len).
+        // These lower to Instruction::Intrinsic, not function calls.
         if namespace.is_none()
             && let Some(result) = self.try_lower_intrinsic(name, arguments)
         {
@@ -451,138 +451,15 @@ impl<'a> Lowerer<'a> {
         dest
     }
 
-    /// Try to lower a call as a core intrinsic. Returns Some(result) if it's an intrinsic
-    /// with matching arity, None if it should be handled as a regular builtin call.
+    /// Try to lower a call as a compiler intrinsic.
+    /// Returns Some(result) if recognized, None to fall through to normal call resolution.
     fn try_lower_intrinsic(&mut self, name: &str, arguments: &[ast::Expression]) -> Option<VarId> {
         match name {
-            // Single-arg intrinsics that lower to a simple Intrinsic instruction
             "len" if arguments.len() == 1 => {
                 let arg = self.lower_expression(&arguments[0]);
                 Some(self.emit_unary_intrinsic(IntrinsicOp::Len, arg))
             }
-            // Control-flow intrinsics (Guard/Match + Phi)
-            "is_some" => self.lower_intrinsic_is_some(arguments),
-            "is_uint" => self.lower_intrinsic_is_type(types::BaseType::UInt, arguments),
-            "is_int" => self.lower_intrinsic_is_type(types::BaseType::Int, arguments),
-            "is_float" => self.lower_intrinsic_is_type(types::BaseType::Float, arguments),
-            "is_bool" => self.lower_intrinsic_is_type(types::BaseType::Bool, arguments),
-            "is_text" => self.lower_intrinsic_is_type(types::BaseType::Text, arguments),
-            "is_bytes" => self.lower_intrinsic_is_type(types::BaseType::Bytes, arguments),
-            "is_array" => self.lower_intrinsic_is_type(types::BaseType::Array, arguments),
-            "is_map" => self.lower_intrinsic_is_type(types::BaseType::Map, arguments),
             _ => None,
         }
-    }
-
-    /// Lower is_some(x) intrinsic: Guard x → (true), (false) + Phi
-    /// Returns None if arity doesn't match, allowing fallthrough to normal lookup
-    fn lower_intrinsic_is_some(&mut self, arguments: &[ast::Expression]) -> Option<VarId> {
-        if arguments.len() != 1 {
-            return None; // Fall through to normal function lookup
-        }
-
-        let value = self.lower_expression(&arguments[0]);
-
-        // Create blocks for defined and undefined paths
-        let defined_block = self.fresh_block();
-        let undefined_block = self.fresh_block();
-        let join_block = self.fresh_block();
-
-        // Guard on the value
-        self.finish_block(Terminator::Guard {
-            value,
-            defined: defined_block,
-            undefined: undefined_block,
-            span: self.current_span,
-        });
-
-        // Defined path: result = true
-        self.current_block = defined_block;
-        self.current_instructions = Vec::new();
-        let true_val = self.new_temp(TypeSet::single(types::BaseType::Bool));
-        self.emit(Instruction::Const {
-            dest: true_val,
-            value: Literal::Bool(true),
-        });
-        self.finish_block(Terminator::Jump { target: join_block });
-
-        // Undefined path: result = false
-        self.current_block = undefined_block;
-        self.current_instructions = Vec::new();
-        let false_val = self.new_temp(TypeSet::single(types::BaseType::Bool));
-        self.emit(Instruction::Const {
-            dest: false_val,
-            value: Literal::Bool(false),
-        });
-        self.finish_block(Terminator::Jump { target: join_block });
-
-        // Join with Phi
-        self.current_block = join_block;
-        self.current_instructions = Vec::new();
-        let result = self.new_temp(TypeSet::single(types::BaseType::Bool));
-        self.emit(Instruction::Phi {
-            dest: result,
-            sources: vec![(defined_block, true_val), (undefined_block, false_val)],
-        });
-
-        Some(result)
-    }
-
-    /// Lower is_uint(x), is_int(x), etc. intrinsic: Match on type → (true), (false) + Phi
-    /// Returns None if arity doesn't match, allowing fallthrough to normal lookup
-    fn lower_intrinsic_is_type(
-        &mut self,
-        expected_type: types::BaseType,
-        arguments: &[ast::Expression],
-    ) -> Option<VarId> {
-        if arguments.len() != 1 {
-            return None; // Fall through to normal function lookup
-        }
-
-        let value = self.lower_expression(&arguments[0]);
-
-        // Create blocks for match and default paths
-        let match_block = self.fresh_block();
-        let default_block = self.fresh_block();
-        let join_block = self.fresh_block();
-
-        // Match on type
-        self.finish_block(Terminator::Match {
-            value,
-            arms: vec![(MatchPattern::Type(expected_type), match_block)],
-            default: default_block,
-            span: self.current_span,
-        });
-
-        // Match path: result = true
-        self.current_block = match_block;
-        self.current_instructions = Vec::new();
-        let true_val = self.new_temp(TypeSet::single(types::BaseType::Bool));
-        self.emit(Instruction::Const {
-            dest: true_val,
-            value: Literal::Bool(true),
-        });
-        self.finish_block(Terminator::Jump { target: join_block });
-
-        // Default path: result = false
-        self.current_block = default_block;
-        self.current_instructions = Vec::new();
-        let false_val = self.new_temp(TypeSet::single(types::BaseType::Bool));
-        self.emit(Instruction::Const {
-            dest: false_val,
-            value: Literal::Bool(false),
-        });
-        self.finish_block(Terminator::Jump { target: join_block });
-
-        // Join with Phi
-        self.current_block = join_block;
-        self.current_instructions = Vec::new();
-        let result = self.new_temp(TypeSet::single(types::BaseType::Bool));
-        self.emit(Instruction::Phi {
-            dest: result,
-            sources: vec![(match_block, true_val), (default_block, false_val)],
-        });
-
-        Some(result)
     }
 }

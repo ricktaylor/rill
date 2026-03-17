@@ -55,29 +55,6 @@ impl Definedness {
             _ => MaybeDefined,
         }
     }
-
-    /// Join operation: least upper bound
-    ///
-    /// Used when combining information from multiple paths
-    pub fn join(self, other: Definedness) -> Definedness {
-        use Definedness::*;
-        match (self, other) {
-            (Undefined, Undefined) => Undefined,
-            (Defined, Defined) => Defined,
-            _ => MaybeDefined,
-        }
-    }
-
-    /// Check if this state is at least as defined as another
-    pub fn at_least_as_defined_as(self, other: Definedness) -> bool {
-        use Definedness::*;
-        match (self, other) {
-            (Defined, _) => true,
-            (MaybeDefined, Undefined | MaybeDefined) => true,
-            (Undefined, Undefined) => true,
-            _ => false,
-        }
-    }
 }
 
 // ============================================================================
@@ -135,11 +112,6 @@ impl DefinednessAnalysis {
             .get(&(block, var))
             .copied()
             .unwrap_or(Definedness::MaybeDefined)
-    }
-
-    /// Get the provenance (source of undefined-ness) for a variable
-    pub fn get_provenance(&self, var: VarId) -> Option<&UndefinedSource> {
-        self.provenance.get(&var)
     }
 }
 
@@ -539,73 +511,6 @@ pub fn analyze_definedness(
         at_exit,
         provenance,
     }
-}
-
-// ============================================================================
-// Function Return Analysis
-// ============================================================================
-
-/// Metadata about a user-defined function's return behavior
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FunctionReturnInfo {
-    /// The definedness of the function's return value
-    pub return_definedness: Definedness,
-}
-
-/// Map from function name to return info
-pub type FunctionReturnMap = HashMap<crate::ast::Identifier, FunctionReturnInfo>;
-
-/// Analyze the return definedness of a function
-///
-/// Examines all Return terminators and computes the meet of their values'
-/// definedness states to determine what the function returns.
-pub fn analyze_return_definedness(
-    function: &Function,
-    analysis: &DefinednessAnalysis,
-) -> FunctionReturnInfo {
-    let mut return_definedness: Option<Definedness> = None;
-
-    for block in &function.blocks {
-        if let Terminator::Return { value } = &block.terminator {
-            let this_return = match value {
-                Some(var) => {
-                    // Get definedness at block exit (after all instructions)
-                    analysis
-                        .at_exit
-                        .get(&(block.id, *var))
-                        .copied()
-                        .unwrap_or(Definedness::MaybeDefined)
-                }
-                None => Definedness::Undefined, // No return value = undefined
-            };
-
-            return_definedness = Some(match return_definedness {
-                None => this_return,
-                Some(prev) => prev.meet(this_return),
-            });
-        }
-    }
-
-    FunctionReturnInfo {
-        return_definedness: return_definedness.unwrap_or(Definedness::Undefined),
-    }
-}
-
-/// Analyze return definedness for all functions in a program
-pub fn analyze_all_returns(
-    functions: &[Function],
-    analyses: &HashMap<crate::ast::Identifier, DefinednessAnalysis>,
-) -> FunctionReturnMap {
-    let mut map = FunctionReturnMap::new();
-
-    for function in functions {
-        if let Some(analysis) = analyses.get(&function.name) {
-            let info = analyze_return_definedness(function, analysis);
-            map.insert(function.name.clone(), info);
-        }
-    }
-
-    map
 }
 
 // ============================================================================
@@ -1252,37 +1157,6 @@ mod tests {
         //     }
         // }
         let blocks = vec![
-            // Block 0: Entry with Guard
-            BasicBlock {
-                id: block(0),
-                instructions: vec![],
-                terminator: Terminator::Guard {
-                    value: var(0),
-                    defined: block(1),
-                    undefined: block(2),
-                    span: ast::Span::default(),
-                },
-            },
-            // Block 1: Defined branch
-            BasicBlock {
-                id: block(1),
-                instructions: vec![],
-                terminator: Terminator::Return {
-                    value: Some(var(0)),
-                },
-            },
-            // Block 2: Undefined branch
-            BasicBlock {
-                id: block(2),
-                instructions: vec![],
-                terminator: Terminator::Return { value: None },
-            },
-        ];
-
-        // x starts as MaybeDefined (we'll use a call result to simulate this)
-        // Actually, let's make x a parameter which is Defined
-        // Then create a MaybeDefined value via Index
-        let blocks = vec![
             // Block 0: Create maybe-defined value and guard on it
             BasicBlock {
                 id: block(0),
@@ -1516,26 +1390,6 @@ mod tests {
         assert_eq!(Defined.meet(MaybeDefined), MaybeDefined);
         assert_eq!(MaybeDefined.meet(Undefined), MaybeDefined);
         assert_eq!(MaybeDefined.meet(MaybeDefined), MaybeDefined);
-    }
-
-    #[test]
-    fn test_lattice_ordering() {
-        use Definedness::*;
-
-        // Defined is at least as defined as everything
-        assert!(Defined.at_least_as_defined_as(Defined));
-        assert!(Defined.at_least_as_defined_as(MaybeDefined));
-        assert!(Defined.at_least_as_defined_as(Undefined));
-
-        // MaybeDefined is at least as defined as itself and Undefined
-        assert!(MaybeDefined.at_least_as_defined_as(MaybeDefined));
-        assert!(MaybeDefined.at_least_as_defined_as(Undefined));
-        assert!(!MaybeDefined.at_least_as_defined_as(Defined));
-
-        // Undefined is only at least as defined as itself
-        assert!(Undefined.at_least_as_defined_as(Undefined));
-        assert!(!Undefined.at_least_as_defined_as(MaybeDefined));
-        assert!(!Undefined.at_least_as_defined_as(Defined));
     }
 
     // ========================================================================

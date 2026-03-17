@@ -41,7 +41,6 @@ pub use types::*;
 
 // Parent module imports
 use super::*;
-use chumsky::span::Span;
 use diagnostics::{DiagnosticCode, Diagnostics};
 use std::collections::HashMap;
 

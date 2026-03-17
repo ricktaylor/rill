@@ -5,9 +5,8 @@
 //!    value's definedness is known (Defined or Undefined)
 //! 2. Simplify the resulting CFG by merging blocks and removing unreachable code
 
-use super::definedness::{Definedness, DefinednessAnalysis, analyze_definedness};
+use super::definedness::{Definedness, DefinednessAnalysis};
 use super::{BlockId, Function, Instruction, Terminator};
-use crate::builtins::BuiltinRegistry;
 use std::collections::{HashMap, HashSet};
 
 // ============================================================================
@@ -226,25 +225,6 @@ fn merge_block_chains(function: &mut Function) {
 // Combined Pass
 // ============================================================================
 
-/// Run guard elimination and CFG simplification
-///
-/// Returns (guards_eliminated, blocks_removed)
-pub fn eliminate_guards_and_simplify(
-    function: &mut Function,
-    builtins: Option<&BuiltinRegistry>,
-) -> (usize, usize) {
-    // Run definedness analysis
-    let analysis = analyze_definedness(function, builtins);
-
-    // Eliminate guards
-    let guards_eliminated = eliminate_guards(function, &analysis);
-
-    // Simplify CFG
-    let blocks_removed = simplify_cfg(function);
-
-    (guards_eliminated, blocks_removed)
-}
-
 // ============================================================================
 // Tests
 // ============================================================================
@@ -253,6 +233,7 @@ pub fn eliminate_guards_and_simplify(
 mod tests {
     use super::*;
     use crate::ast;
+    use crate::ir::opt::analyze_definedness;
     use crate::ir::{BasicBlock, Instruction, Literal, Param, SpannedInst, VarId};
 
     fn var(id: u32) -> VarId {
@@ -637,7 +618,9 @@ mod tests {
         ];
 
         let mut func = make_function(blocks);
-        let (guards, blocks_removed) = eliminate_guards_and_simplify(&mut func, None);
+        let analysis = analyze_definedness(&func, None);
+        let guards = eliminate_guards(&mut func, &analysis);
+        let blocks_removed = simplify_cfg(&mut func);
 
         assert_eq!(guards, 1);
         assert!(blocks_removed >= 1); // At least B2 removed, possibly B0+B1 merged

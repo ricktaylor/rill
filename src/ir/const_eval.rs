@@ -141,9 +141,8 @@ pub fn eval_intrinsic_const(op: crate::ir::IntrinsicOp, args: &[ConstValue]) -> 
         IntrinsicOp::Lt => const_lt(args),
 
         // -- Logical --
+        // Note: && and || lower to control flow, not Intrinsic instructions.
         IntrinsicOp::Not => const_not(args),
-        IntrinsicOp::And => const_and(args),
-        IntrinsicOp::Or => const_or(args),
 
         // -- Bitwise --
         IntrinsicOp::BitAnd => const_bit_and(args),
@@ -413,60 +412,6 @@ fn const_len(args: &[ConstValue]) -> Option<ConstValue> {
 }
 
 // ============================================================================
-// Short-Circuit Logic
-// ============================================================================
-
-/// Evaluate logical AND with short-circuit semantics
-///
-/// - If first arg is `false`, returns `false` without evaluating second
-/// - If both are known booleans, returns the result
-/// - Otherwise returns `None`
-pub fn const_and(args: &[ConstValue]) -> Option<ConstValue> {
-    if args.is_empty() {
-        return None;
-    }
-
-    // Short-circuit: false && _ = false
-    if let ConstValue::Bool(false) = &args[0] {
-        return Some(ConstValue::Bool(false));
-    }
-
-    // Both args needed for full evaluation
-    if args.len() >= 2
-        && let (ConstValue::Bool(a), ConstValue::Bool(b)) = (&args[0], &args[1])
-    {
-        return Some(ConstValue::Bool(*a && *b));
-    }
-
-    None
-}
-
-/// Evaluate logical OR with short-circuit semantics
-///
-/// - If first arg is `true`, returns `true` without evaluating second
-/// - If both are known booleans, returns the result
-/// - Otherwise returns `None`
-pub fn const_or(args: &[ConstValue]) -> Option<ConstValue> {
-    if args.is_empty() {
-        return None;
-    }
-
-    // Short-circuit: true || _ = true
-    if let ConstValue::Bool(true) = &args[0] {
-        return Some(ConstValue::Bool(true));
-    }
-
-    // Both args needed for full evaluation
-    if args.len() >= 2
-        && let (ConstValue::Bool(a), ConstValue::Bool(b)) = (&args[0], &args[1])
-    {
-        return Some(ConstValue::Bool(*a || *b));
-    }
-
-    None
-}
-
-// ============================================================================
 // Tests
 // ============================================================================
 
@@ -552,44 +497,6 @@ mod tests {
         assert_eq!(
             const_index(&map, &ConstValue::Text("c".to_string())),
             None // Not found
-        );
-    }
-
-    #[test]
-    fn test_const_and() {
-        // Short-circuit
-        assert_eq!(
-            const_and(&[ConstValue::Bool(false)]),
-            Some(ConstValue::Bool(false))
-        );
-
-        // Full evaluation
-        assert_eq!(
-            const_and(&[ConstValue::Bool(true), ConstValue::Bool(true)]),
-            Some(ConstValue::Bool(true))
-        );
-        assert_eq!(
-            const_and(&[ConstValue::Bool(true), ConstValue::Bool(false)]),
-            Some(ConstValue::Bool(false))
-        );
-    }
-
-    #[test]
-    fn test_const_or() {
-        // Short-circuit
-        assert_eq!(
-            const_or(&[ConstValue::Bool(true)]),
-            Some(ConstValue::Bool(true))
-        );
-
-        // Full evaluation
-        assert_eq!(
-            const_or(&[ConstValue::Bool(false), ConstValue::Bool(false)]),
-            Some(ConstValue::Bool(false))
-        );
-        assert_eq!(
-            const_or(&[ConstValue::Bool(false), ConstValue::Bool(true)]),
-            Some(ConstValue::Bool(true))
         );
     }
 }

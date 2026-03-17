@@ -906,20 +906,6 @@ fn exec_intrinsic(
                 _ => None,
             })
         }
-        IntrinsicOp::And => {
-            let (a, b) = get_two(arg_slots, vm);
-            Ok(match (a, b) {
-                (Some(Value::Bool(a)), Some(Value::Bool(b))) => Some(Value::Bool(*a && *b)),
-                _ => None,
-            })
-        }
-        IntrinsicOp::Or => {
-            let (a, b) = get_two(arg_slots, vm);
-            Ok(match (a, b) {
-                (Some(Value::Bool(a)), Some(Value::Bool(b))) => Some(Value::Bool(*a || *b)),
-                _ => None,
-            })
-        }
 
         // -- Bitwise --
         IntrinsicOp::BitAnd => {

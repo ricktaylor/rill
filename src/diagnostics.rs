@@ -164,6 +164,8 @@ pub enum DiagnosticCode {
     W007_ImplicitConversion,
     /// Deprecated feature
     W008_Deprecated,
+    /// Operation on incompatible types (always produces undefined)
+    W009_TypeMismatch,
 }
 
 impl DiagnosticCode {
@@ -218,6 +220,7 @@ impl DiagnosticCode {
             DiagnosticCode::W006_RedundantTypeCheck => "W006",
             DiagnosticCode::W007_ImplicitConversion => "W007",
             DiagnosticCode::W008_Deprecated => "W008",
+            DiagnosticCode::W009_TypeMismatch => "W009",
         }
     }
 
@@ -232,7 +235,8 @@ impl DiagnosticCode {
             | DiagnosticCode::W005_RedundantGuard
             | DiagnosticCode::W006_RedundantTypeCheck
             | DiagnosticCode::W007_ImplicitConversion
-            | DiagnosticCode::W008_Deprecated => Severity::Warning,
+            | DiagnosticCode::W008_Deprecated
+            | DiagnosticCode::W009_TypeMismatch => Severity::Warning,
 
             // Everything else is an error
             _ => Severity::Error,

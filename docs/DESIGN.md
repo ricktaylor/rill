@@ -460,32 +460,34 @@ params and sets `pc` to the entry offset instead of recursing through
 
 | Category | Description | Examples |
 |----------|-------------|----------|
-| **Intrinsic** | Short-circuit operators (require control flow) | `And`, `Or` |
-| **Function** | Everything else (may be inlined or called) | `core::add`, `len()`, `exit()` |
+| **Intrinsic** | Language-defined operations with fixed semantics | `Add`, `Eq`, `Len`, `MakeArray` |
+| **Extern Call** | Host-provided functions registered by embedder | `exit()`, `decode()`, `validate()` |
 
-**Intrinsics** are minimal - only `And` (`&&`) and `Or` (`||`) which require
-short-circuit evaluation (control flow to skip the second operand).
+**Intrinsics** (`IntrinsicOp` enum) cover all language-defined operations:
 
-**Core builtins** (`core::*`) implement all other operators with `Purity::Const`:
+- Arithmetic: `Add`, `Sub`, `Mul`, `Div`, `Mod`, `Neg`
+- Comparison: `Eq`, `Lt`
+- Logical: `Not`, `And`, `Or`
+- Bitwise: `BitAnd`, `BitOr`, `BitXor`, `BitNot`, `Shl`, `Shr`, `BitTest`, `BitSet`
+- Collection: `Len`, `MakeArray`, `MakeMap`
+- Sequence: `MakeSeq`, `ArraySeq`
 
-- Arithmetic: `core::add`, `core::sub`, `core::mul`, `core::div`, `core::mod`, `core::neg`
-- Comparison: `core::eq`, `core::lt`
-- Logical: `core::not`
-- Bitwise: `core::bit_and`, `core::bit_or`, `core::bit_xor`, `core::bit_not`, `core::shl`, `core::shr`, `core::bit_test`, `core::bit_set`
+Intrinsics emit `Instruction::Intrinsic { op, args }` in the IR. The compiler
+knows their exact semantics, arity, result types, and fallibility — enabling
+const folding, type refinement, and type mismatch diagnostics without any
+registry lookup. `1 + 2` lowers to `Intrinsic(Add, [1, 2])` which the optimizer
+folds to `3` using the inline const evaluator.
 
-These const builtins enable compile-time folding: `1 + 2` lowers to `Call("core::add", [1, 2])`
-which the optimizer folds to `3` using the const evaluator.
-
-**Other functions** include user-defined, prelude, and host-provided:
-
-- *Prelude*: `len()`, `concat()`, `to_uint()`, `is_uint()`, `is_some()`, etc.
-- *Host*: `exit()`, `decode()`, `validate()`
-
-Functions may be inlined by the optimizer. Some prelude functions always inline
-because the expansion is simpler than a call:
+**Some intrinsics expand to control flow** instead of a single instruction:
 
 - `is_uint(x)` → `Match(x, [(Type(UInt), BB_t)], BB_f)` + Phi → Bool
 - `is_some(x)` → `Guard(x, BB_t, BB_f)` + Phi → Bool
+- `x && y` → `If(x, evaluate_y, false)` + Phi (short-circuit)
+- `x || y` → `If(x, true, evaluate_y)` + Phi (short-circuit)
+
+**Extern calls** (`Instruction::Call`) are reserved for host-provided functions
+registered via the `BuiltinRegistry`. The standard registry is empty — all
+language-defined functions are intrinsics.
 
 ### Pattern Lowering Example
 
@@ -543,35 +545,44 @@ BB_continue:
 
 ### Intrinsic Operations
 
-Intrinsics are minimal - only the short-circuit boolean operators that require
-control flow to avoid evaluating the second operand:
+All language-defined operations are `IntrinsicOp` variants, compiled directly
+without registry lookup. Each intrinsic carries metadata methods:
 
-| Intrinsic | Syntax | Semantics |
-|-----------|--------|-----------|
-| `And` | `&&` | Short-circuit: `false && x` → `false` without evaluating `x` |
-| `Or` | `\|\|` | Short-circuit: `true \|\| x` → `true` without evaluating `x` |
+- `is_fallible()` — whether it can return undefined (overflow, type mismatch)
+- `result_type()` — static result type (e.g. `Add` → `{UInt, Int, Float}`)
+- `result_type_refined(arg_types)` — refined result using promotion lattice
+- `param_type(index)` — required type per argument (for mismatch detection)
 
-All other operators are implemented as **core builtins** with `Purity::Const`:
+| Category | Syntax | IntrinsicOp | Fallible |
+|----------|--------|-------------|----------|
+| Arithmetic | `+` `-` `*` `/` `%` `-x` | `Add`, `Sub`, `Mul`, `Div`, `Mod`, `Neg` | Yes (overflow) |
+| Comparison | `==` `<` | `Eq`, `Lt` | No / Yes |
+| Comparison | `!=` `>` `<=` `>=` | Expanded to `Eq`/`Lt`/`Not` | — |
+| Logical | `!` `&&` `\|\|` | `Not`, `And`, `Or` | No |
+| Bitwise | `&` `\|` `^` `~` `<<` `>>` | `BitAnd`, `BitOr`, `BitXor`, `BitNot`, `Shl`, `Shr` | No |
+| Bit access | `@` | `BitTest` (read), `BitSet` (write) | Yes (OOB) |
+| Collection | `len(x)` `[a,b]` `{k:v}` | `Len`, `MakeArray`, `MakeMap` | Yes / No / Yes |
+| Sequence | `start..end` `..rest` | `MakeSeq`, `ArraySeq` | No |
 
-| Category | Syntax | Builtin |
-|----------|--------|---------|
-| Comparison | `==` `<` | `core::eq`, `core::lt` |
-| Comparison | `!=` `>` `<=` `>=` | *Intrinsics* → expand to `eq`/`lt`/`not` |
-| Arithmetic | `+` `-` `*` `/` `%` `-x` | `core::add`, `core::sub`, `core::mul`, `core::div`, `core::mod`, `core::neg` |
-| Logical | `!` | `core::not` |
-| Bitwise | `&` `\|` `^` `~` `<<` `>>` | `core::bit_and`, `core::bit_or`, `core::bit_xor`, `core::bit_not`, `core::shl`, `core::shr` |
-| Bit access | `@` | `core::bit_test` (read), `core::bit_set` (write) |
+Short-circuit operators (`&&`, `||`) lower to control flow (If + Phi), not a
+single `Instruction::Intrinsic`. All other operators lower to
+`Instruction::Intrinsic { op, args }`.
 
-Other builtins with appropriate purity annotations:
+Reflexive comparisons expand during lowering:
+- `a != b` → `Not(Eq(a, b))`
+- `a > b` → `Lt(b, a)` (swap)
+- `a <= b` → `Not(Lt(b, a))`
+- `a >= b` → `Not(Lt(a, b))`
 
-- Collection: `len()`, `concat()`, `push()`, `insert()`, `sub_slice()`, `collect()`
-- Sequences: created by `..` operator; `core::make_seq`, `core::seq_next`, `core::array_seq`
-- Type conversion: `to_uint()`, `to_int()`, `to_float()`, `to_text()`
-- Type checking: `is_uint()`, `is_some()`, etc.
+**Type-refined result types:** The type refinement pass uses `result_type_refined()`
+to narrow intrinsic results based on operand types. For example, `Add(UInt, UInt)`
+produces `{UInt}` not `{UInt, Int, Float}`. This follows the numeric promotion
+lattice: `UInt + UInt → UInt`, `UInt + Int → Int`, `anything + Float → Float`.
 
-The runtime executes intrinsics and builtins the same way. The distinction exists
-because intrinsics require control flow, while builtins are simple function calls
-that can be const-folded when arguments are known at compile time.
+**Type mismatch warnings (W009):** After type refinement, the optimizer checks
+whether any intrinsic's operand types have zero intersection with the required
+types. If so, the result is guaranteed undefined — almost certainly a bug.
+Example: `"hello" + 5` warns because `Add` requires numeric but got Text.
 
 ### Control Flow Primitives
 
@@ -939,89 +950,120 @@ flags @ 100 = true;    // No-op, assignment evaluates to undefined
 
 ### Implementation
 
-The `@` operator lowers to builtin calls:
+The `@` operator lowers to intrinsics:
 
-- Read: `core::bit_test(value, bit)` → Bool or undefined
-- Write: `core::bit_set(value, bit, bool)` → value or undefined
+- Read: `Intrinsic(BitTest, [value, bit])` → Bool or undefined
+- Write: `Intrinsic(BitSet, [value, bit, bool])` → UInt or undefined
 
 ---
 
 ## Optimization Pipeline
 
 The IR goes through a series of optimization passes after lowering. The passes are
-ordered to maximize effectiveness: earlier passes simplify the CFG, enabling later
-passes to do more work.
+organized into two phases: **coarse** (before type info) and **type-informed**
+(on the simplified CFG after guard elimination).
 
 ### Pass Overview
 
 ```
 IR (lowered)
     │
+    │  ── Phase 1: Fixpoint loop ──
+    ▼
+┌──────────────────────────────────────┐
+│  ┌─────────────────────┐            │
+│  │ Constant Folding    │            │
+│  └──────────┬──────────┘            │
+│             ▼                       │
+│  ┌─────────────────────┐            │
+│  │ Definedness Analysis│            │
+│  │ + Diagnostics (1st) │            │
+│  └──────────┬──────────┘            │
+│             ▼                       │
+│  ┌─────────────────────┐            │
+│  │ Guard Elimination   │            │
+│  │ + CFG Simplification│            │
+│  └──────────┬──────────┘            │
+│             │ ◄── repeat while      │
+│             │     any pass changed  │
+└─────────────┴────────────────────────┘
+    │
+    │  ── Phase 2: Type-informed ──
     ▼
 ┌─────────────────────┐
-│ Constant Folding    │  Fold obvious compile-time constants early
+│ Type Refinement     │  Intrinsic-aware: Add(UInt,UInt) → {UInt}
 └──────────┬──────────┘
-           │
            ▼
 ┌─────────────────────┐
-│ Definedness Analysis │  Compute which values are provably defined
+│ Type Diagnostics    │  W009: type mismatch → always undefined
 └──────────┬──────────┘
-           │
            ▼
-┌─────────────────────┐
-│ Diagnostics         │  Emit warnings/errors based on definedness
-└──────────┬──────────┘
-           │
+┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐
+  Coercion Insertion     (planned) Match + Widen + Undefined
+  + Phase 1 loop again   (re-run fixpoint on expanded IR)
+└ ─ ─ ─ ─ ┬ ─ ─ ─ ─ ┘
            ▼
-┌─────────────────────┐
-│ Guard Elimination   │  Remove Guards for provably-defined values
-└──────────┬──────────┘
-           │
-           ▼
-┌─────────────────────┐
-│ CFG Simplification  │  Merge blocks, remove unreachable code
-└──────────┬──────────┘
-           │
-           ▼
-┌─────────────────────┐
-│ Type Refinement     │  Narrow TypeSets based on control flow
-└──────────┬──────────┘
-           │
-           ▼
-┌─────────────────────┐
-│ Constant Folding    │  Cleanup pass after CFG changes
-└──────────┬──────────┘
-           │
-           ▼
-┌─────────────────────┐
-│ Dead Code Elimination│  Remove unused computations (planned)
-└──────────┬──────────┘
-           │
+┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐
+  Dead Code Elimination  (planned)
+└ ─ ─ ─ ─ ┬ ─ ─ ─ ─ ┘
            ▼
 IR (optimized)
 ```
+
+### Fixpoint Iteration
+
+The Phase 1 passes (const fold, definedness, guard elim, CFG simplify) run
+in a loop until no pass makes changes. This handles cascading effects:
+
+- Const fold may turn a Phi into a constant → definedness sees Defined
+- Guard elimination removes guards → CFG simplify removes dead blocks
+- Dead block removal simplifies Phi nodes → new constant folding opportunities
+
+Typically converges in 1-2 iterations. Diagnostics (E200/E201) are emitted
+only on the first iteration, before guard elimination reshapes the flow.
+
+### Two-Phase Definedness
+
+The coercion insertion pass (planned) bridges type analysis into definedness:
+
+1. **Phase 1** (coarse): Uses `is_fallible()` only. `Add(Text, UInt)` is
+   conservatively `MaybeDefined` — Add *can* fail, but we don't know from
+   definedness alone that it *always* fails for these types.
+
+2. **After coercion insertion**: The coercion pass consults TypeAnalysis and
+   emits explicit `Instruction::Undefined` for invalid type combinations.
+   Re-running the Phase 1 fixpoint loop on the expanded IR sees these
+   Undefined instructions → proves `Undefined` instead of `MaybeDefined`
+   → eliminates guards → removes dead branches. No new infrastructure
+   needed — just re-enter the existing loop.
 
 ### Pass 1: Early Constant Folding
 
 **Goal:** Fold obvious compile-time constants before analysis.
 
 This pass runs first to simplify the IR before analysis passes. It evaluates
-const builtin calls (like `core::add(1, 2)`) when all arguments are literal
+intrinsic operations (via `eval_intrinsic_const`) when all arguments are literal
 constants, replacing them with `Const` instructions.
 
 **Transformations:**
 
-- `Call core::add(Const(1), Const(2))` → `Const(3)`
-- `Call core::eq(Const(true), Const(false))` → `Const(false)`
+- `Intrinsic(Add, [Const(1), Const(2)])` → `Const(3)`
+- `Intrinsic(Eq, [Const(true), Const(false)])` → `Const(false)`
 - Constant If conditions → `Jump` to appropriate target
 
 Running constant folding early simplifies the CFG for subsequent analysis passes.
 
-### Pass 2: Definedness Analysis
+### Pass 2: Definedness Analysis (Coarse)
 
 **Goal:** Determine which variables are provably defined (not Undefined).
 
-This analysis is orthogonal to type analysis - a value can be "definitely defined"
+This is the coarse pass — it uses `IntrinsicOp::is_fallible()` to determine whether
+an operation might return undefined, but has no type information. `Add(Text, UInt)`
+is conservatively `MaybeDefined` (Add *can* fail), not `Undefined` (it *always* fails
+for these types). The fine-grained pass after coercion insertion (planned) will
+tighten this.
+
+Definedness is orthogonal to type analysis - a value can be "definitely defined"
 without knowing its concrete type, and vice versa. Definedness flows from sources
 (literals, constants) through operations and merges at control flow joins.
 
@@ -1049,7 +1091,9 @@ without knowing its concrete type, and vice versa. Definedness flows from source
 | `Undefined { dest }` | `Undefined` |
 | `Copy { dest, src }` | inherits from `src` |
 | `Index { dest, .. }` | `MaybeDefined` (OOB possible) |
-| `Call { dest, function, .. }` | depends on function return signature |
+| `Intrinsic { op, .. }` infallible, all args Defined | `Defined` |
+| `Intrinsic { op, .. }` fallible or args MaybeDefined | `MaybeDefined` |
+| `Call { dest, function, .. }` | depends on `BuiltinMeta.purity` |
 | `Phi { dest, sources }` | meet of all sources |
 
 **Control flow refinement:**
@@ -1086,30 +1130,33 @@ operation computing the most conservative (lowest) definedness at join points.
 
 **Output:** Map of `(BlockId, VarId) → Definedness` (definedness at block entry/exit)
 
-### Pass 2.5: Diagnostics
+### Pass 2.5: Definedness Diagnostics
 
 **Goal:** Emit warnings and errors based on definedness analysis.
 
-Uses the computed definedness lattice to detect problematic code patterns:
+Walks the IR and checks each instruction's operands against the computed
+definedness state. Runs before guard elimination reshapes the control flow,
+so provenance chains (tracing back to the root cause of undefined-ness) are
+still intact.
 
-**Warnings (code compiles, but may have issues):**
+**Checks:**
 
-| Condition | Warning |
-|-----------|---------|
-| Assignment to `MaybeDefined` lvalue without checking result | "unchecked assignment to potentially-undefined location" |
-| Using `MaybeDefined` value where `Defined` expected (without guard) | "value may be undefined; consider using `if let`" |
+| Context | Definitely Undefined | Maybe Undefined |
+|---------|---------------------|-----------------|
+| Control flow (`if` condition, `match` scrutinee) | **E200** error | **E201** warning |
+| Data flow (intrinsic arg, index base/key, etc.) | **E200** warning | **E201** warning |
 
-**Errors (code does not compile):**
+**Provenance tracking:** Each diagnostic includes the root cause — where the
+undefined value originated. Traces propagation chains through Copy/Phi back to
+the source (a fallible Call, an Index operation, etc.).
 
-| Condition | Error |
-|-----------|-------|
-| Using `Undefined` value where `Defined` required | "value is definitely undefined" |
-| Assignment to `Undefined` lvalue | "assignment to definitely-undefined location has no effect" |
-| Calling function with `Undefined` argument for non-optional parameter | "passing undefined to non-optional parameter" |
-
-**Rationale:** The definedness lattice is computed anyway for Guard elimination.
-Using it for diagnostics catches bugs early (compile-time vs runtime) without
-additional analysis cost.
+Example:
+```
+warning[E201]: use of possibly undefined value `_5` as argument 1 to
+    intrinsic `Add` in function `process`
+  --> src:12:5
+  = note: value originates from call to `parse_input`
+```
 
 ### Pass 3: Guard Elimination
 
@@ -1135,7 +1182,7 @@ After Guard elimination, run CFG simplification:
 This runs after Guard elimination so the CFG is simpler. Type refinement tracks
 the possible concrete types (Bool, UInt, Int, etc.) at each program point.
 
-**Lattice:** Powerset of `{Bool, UInt, Int, Float, Text, Bytes, Array, Map}`
+**Lattice:** Powerset of `{Bool, UInt, Int, Float, Text, Bytes, Array, Map, Sequence}`
 
 Meet = intersection (narrowing), Join = union (at Phi nodes)
 
@@ -1145,20 +1192,43 @@ Meet = intersection (narrowing), Join = union (at Phi nodes)
 |-------------|--------------|
 | `Const { value: Literal::Bool(_), .. }` | `{Bool}` |
 | `Const { value: Literal::UInt(_), .. }` | `{UInt}` |
-| `Call { function: "core::add", .. }` | `{UInt, Int, Float}` |
-| `Call { function: "core::eq", .. }` | `{Bool}` |
-| `Call { function: "len", .. }` | `{UInt}` |
+| `Intrinsic { op: Add, args: [UInt, UInt] }` | `{UInt}` (via promotion lattice) |
+| `Intrinsic { op: Add, args: [UInt, Int] }` | `{Int}` (promoted) |
+| `Intrinsic { op: Add, args: [?, Float] }` | `{Float}` (promoted) |
+| `Intrinsic { op: Eq, .. }` | `{Bool}` |
+| `Intrinsic { op: Len, .. }` | `{UInt}` |
+| `Intrinsic { op: MakeArray, .. }` | `{Array}` |
 | `Index { .. }` | depends on base type |
 | `Phi { .. }` | union of source types |
+
+**Intrinsic-aware refinement:** The pass calls `op.result_type_refined(arg_types)`
+which uses the numeric promotion lattice to produce precise result types.
+`Add(UInt, UInt)` → `{UInt}`, not `{UInt, Int, Float}`.
+
+**Numeric promotion lattice:** `UInt ⊂ Int ⊂ Float`
+- Same type → same type: `UInt + UInt → UInt`
+- Mixed integers → Int: `UInt + Int → Int`
+- Anything + Float → Float: `Int + Float → Float`
 
 **Control flow refinement:**
 
 At a `Match` terminator with `Type(t)` pattern:
 - In the matching arm: value has type `{t}`
 
-**Optimizations enabled:**
+### Pass 4.5: Type Mismatch Diagnostics
+
+After type refinement, the optimizer checks each `Intrinsic` instruction:
+if any argument's refined type has zero intersection with the required type
+(`IntrinsicOp::param_type()`), the result is guaranteed undefined. This emits
+a W009 warning — almost certainly a user bug.
+
+Example: `"hello" + 5` — `Add` requires numeric args, but Text has no
+intersection with `{UInt, Int, Float}` → W009.
+
+**Optimizations enabled by type refinement:**
 - Remove impossible Match arms (type not in TypeSet)
 - Specialize polymorphic operations when type is known
+- Future: coercion insertion generates guard trees using refined types
 
 ### Pass 5: Cleanup Constant Folding
 
@@ -1169,7 +1239,8 @@ may emerge. This pass runs the same constant folding logic as Pass 1 to clean up
 
 **Transformations:**
 
-- Fold `Call` to const builtins: `core::add(1, 2)` → `Const(3)`
+- Fold `Intrinsic` ops with const args: `Intrinsic(Add, [1, 2])` → `Const(3)`
+- Fold `Call` to const builtins with const args
 - Simplify `If` terminators: `If { condition: Const(true), .. }` → `Jump { target: then }`
 - Replace variable references with `Const` instructions when value is known
 
@@ -1653,47 +1724,22 @@ never referenced are dead code and can be eliminated during compilation.
 
 | Namespace | Purpose | User-definable? |
 |-----------|---------|-----------------|
-| `core` | Primitives + intrinsics (`core::eq`, `core::is_some`) | No - reserved |
 | (embedding) | Host-provided (`console`, `file`, etc.) | Registered by host |
 | (user) | Imported modules, local definitions | Yes |
 
-### The `core::` Namespace
-
-The `core::` namespace contains both **builtins** (runtime functions) and
-**intrinsics** (compile-time expansions):
-
-```rill
-// Builtins - runtime calls
-core::eq(a, b)           // Equality comparison
-core::add(a, b)          // Addition
-core::len(arr)           // Collection length
-
-// Intrinsics - compile-time expansion
-core::is_some(x)         // → Guard + Phi
-core::is_uint(x)         // → Match + Phi
-```
-
-Users cannot define a `core` module or import anything as `core`.
+No `core::` namespace is reserved — all language-defined operations are intrinsics
+recognized by the compiler during lowering, not namespace-qualified functions.
 
 ### Name Lookup Order
 
 When resolving an unqualified function call, the lowerer searches in order:
 
-1. **Local functions** - Defined in current module
-2. **Imported functions** - From `import` statements
-3. **Prelude** - Unqualified names from `core::` (embedding's choice)
+1. **Intrinsics** — `len()`, `is_some()`, `is_uint()`, etc. (checked first via `try_lower_intrinsic`)
+2. **Registry** — host-provided extern functions (via `BuiltinRegistry`)
+3. **User functions** — defined in current module or imported
 
-This means users can shadow prelude functions:
-
-```rill
-fn is_some(x) { x != 0 }  // User's version
-
-is_some(value)            // Calls user's function (shadows prelude)
-core::is_some(value)      // Always calls intrinsic (Guard+Phi expansion)
-```
-
-Qualified calls (`core::name`, `module::name`) bypass local lookup and go
-directly to the specified namespace.
+For const declarations, `intrinsic_by_name()` maps function names to `IntrinsicOp`
+before falling through to the registry.
 
 ### Embedding-Provided Namespaces
 
@@ -1712,33 +1758,24 @@ context.register_namespace("console", vec![
 console::log("Hello, world!")
 ```
 
-### Prelude
+### Prelude (Planned)
 
-All `core::` functions are automatically available as unqualified names. The
-prelude is implicit - no configuration needed.
+A future prelude will provide standard utility functions that are automatically
+available without imports. These are regular user-defined functions, not intrinsics:
 
-**Builtins** (registered in `standard_builtins()`):
 ```rill
-len(arr)        // → core::len (runtime call)
-exit()          // → core::exit (runtime call, exits)
+// Planned prelude functions (user-definable, identical IR to hand-written):
+fn is_some(x) { if let _ = x { true } else { false } }
+fn is_uint(x) { match x { UInt(_) => true, _ => false } }
+fn is_int(x) { match x { Int(_) => true, _ => false } }
+// ... etc for all types
+fn default(value, fallback) { if let v = value { v } else { fallback } }
 ```
 
-**Intrinsics** (compiler-recognized, expand to IR):
-```rill
-is_some(x)      // → core::is_some (Guard + Phi expansion)
-is_uint(x)      // → core::is_uint (Match + Phi expansion)
-is_int(x)       // → core::is_int
-is_float(x)     // → core::is_float
-is_bool(x)      // → core::is_bool
-is_text(x)      // → core::is_text
-is_bytes(x)     // → core::is_bytes
-is_array(x)     // → core::is_array
-is_map(x)       // → core::is_map
-```
-
-The prelude is essentially `use core::*;` applied implicitly. Users can shadow
-any prelude name by defining their own function, but can always access the
-original via explicit `core::` qualification.
+The only compiler intrinsic that is user-callable by name is `len()`, which the
+compiler recognizes in `try_lower_intrinsic` and emits as `Intrinsic(Len, [x])`.
+This is necessary because `len()` is used internally by for-loop lowering and
+pattern matching.
 
 ---
 
@@ -1746,148 +1783,89 @@ original via explicit `core::` qualification.
 
 Rill distinguishes between two types of "built-in" functionality:
 
-| Concept | Definition | When Evaluated | Can Handle Undefined? |
-|---------|------------|----------------|----------------------|
-| **Builtin** | Rust function linked into the interpreter | Runtime (VM execution) | No - short-circuited before call |
-| **Intrinsic** | Syntactic construct that expands to IR | Compile time (lowering) | Yes - expands to Guard-based control flow |
+| Concept | Definition | When Evaluated | Registered? |
+|---------|------------|----------------|-------------|
+| **Intrinsic** | Language-defined operation with fixed semantics | Compile time + Runtime | No — hard-coded in `IntrinsicOp` enum |
+| **Extern** | Host-provided Rust function | Runtime (VM execution) | Yes — via `BuiltinRegistry` |
 
 ### Design Philosophy
 
-The core principle is **minimal semantics**: Rill has very few intrinsics, keeping the
-language simple and consistent. Users can implement convenience functions themselves
-with no performance penalty (they compile to the same IR).
+**Intrinsics are minimal.** Only operations that require compiler knowledge are
+intrinsics: operators (need type dispatch), `len()` (used in for-loop lowering),
+and literal constructors. Functions like `is_some()` and `is_uint()` are
+user-definable — they compile to identical IR via normal `match`/`if let` syntax.
+
+**Externs are the embedding API.** Host applications register functions that scripts
+can call by name. The standard registry is empty.
 
 ---
 
 ## Intrinsics
 
-Intrinsics are syntactic constructs that expand to IR sequences during AST→IR lowering.
-They are not function calls - they generate inline control flow.
+Intrinsics are operations with fixed semantics known to the compiler. Most lower
+to `Instruction::Intrinsic { op: IntrinsicOp, args }`. Some expand to control flow.
 
-### Current Intrinsics
+### Lowering Table
 
-| Syntax | Expands To | Purpose |
-|--------|------------|---------|
-| `x + y` | `Call core::add(x, y)` | Arithmetic (maps to builtin) |
-| `x && y` | `Guard x → (evaluate y), (false)` + Phi | Short-circuit AND |
-| `x \|\| y` | `Guard x → (true), (evaluate y)` + Phi | Short-circuit OR |
-| `x != y` | `Call core::not(Call core::eq(x, y))` | Reflexive comparison |
-| `x > y` | `Call core::lt(y, x)` | Reflexive comparison (swap) |
-| `x <= y` | `Call core::not(Call core::lt(y, x))` | Reflexive comparison |
-| `x >= y` | `Call core::not(Call core::lt(x, y))` | Reflexive comparison |
-| `[a, b, c]` | `Call core::make_array(a, b, c)` | Array literal |
-| `{k: v, ...}` | `Call core::make_map(k, v, ...)` | Map literal |
-| `if cond { a } else { b }` | `If` terminator + blocks + Phi | Conditional |
-| `if let p = x { a } else { b }` | `Guard` + pattern match + blocks + Phi | Undefined-aware conditional |
-| `arr[i] = v` (lvalue) | `Index` + `Guard` + `SetIndex` + Phi | Short-circuit assignment |
-| `is_some(x)` | `Guard x → (true), (false)` + Phi | Check if defined |
-| `is_uint(x)` | `Match x → UInt:(true), default:(false)` + Phi | Type check |
-| `is_int(x)` | `Match x → Int:(true), default:(false)` + Phi | Type check |
-| `is_float(x)` | `Match x → Float:(true), default:(false)` + Phi | Type check |
-| `is_bool(x)` | `Match x → Bool:(true), default:(false)` + Phi | Type check |
-| `is_text(x)` | `Match x → Text:(true), default:(false)` + Phi | Type check |
-| `is_bytes(x)` | `Match x → Bytes:(true), default:(false)` + Phi | Type check |
-| `is_array(x)` | `Match x → Array:(true), default:(false)` + Phi | Type check |
-| `is_map(x)` | `Match x → Map:(true), default:(false)` + Phi | Type check |
+| Syntax | Lowers To | Category |
+|--------|-----------|----------|
+| `x + y` | `Intrinsic(Add, [x, y])` | Single instruction |
+| `x == y` | `Intrinsic(Eq, [x, y])` | Single instruction |
+| `-x` | `Intrinsic(Neg, [x])` | Single instruction |
+| `len(x)` | `Intrinsic(Len, [x])` | Single instruction |
+| `[a, b, c]` | `Intrinsic(MakeArray, [a, b, c])` | Single instruction |
+| `{k: v, ...}` | `Intrinsic(MakeMap, [k, v, ...])` | Single instruction |
+| `start..end` | `Intrinsic(MakeSeq, [start, end, inclusive])` | Single instruction |
+| `x != y` | `Not(Eq(x, y))` | Multi-instruction expansion |
+| `x > y` | `Lt(y, x)` | Operand swap |
+| `x <= y` | `Not(Lt(y, x))` | Multi-instruction expansion |
+| `x >= y` | `Not(Lt(x, y))` | Multi-instruction expansion |
+| `x && y` | `If(x, evaluate_y, false)` + Phi | Control flow (short-circuit) |
+| `x \|\| y` | `If(x, true, evaluate_y)` + Phi | Control flow (short-circuit) |
+| `if cond { a } else { b }` | `If` terminator + blocks + Phi | Control flow |
+| `arr[i] = v` (lvalue) | `Index` + `Guard` + `SetIndex` + Phi | Control flow |
 
 ### Reflexive Comparison Operators
 
-The comparison operators `!=`, `>`, `<=`, `>=` are implemented as intrinsics that
-expand to combinations of the primitive builtins `core::eq`, `core::lt`, and `core::not`:
+The comparison operators `!=`, `>`, `<=`, `>=` expand to combinations of the
+primitive intrinsics `Eq`, `Lt`, and `Not`:
 
-- `a != b` → `not(eq(a, b))`
-- `a > b` → `lt(b, a)` (operands swapped)
-- `a <= b` → `not(lt(b, a))`
-- `a >= b` → `not(lt(a, b))`
+- `a != b` → `Not(Eq(a, b))`
+- `a > b` → `Lt(b, a)` (operands swapped)
+- `a <= b` → `Not(Lt(b, a))`
+- `a >= b` → `Not(Lt(a, b))`
 
-This reduces the builtin set to just `eq` and `lt` for comparisons, which is
+This reduces the intrinsic set to just `Eq` and `Lt` for comparisons, which is
 sufficient because Rill uses `undefined` instead of IEEE-754 NaN. Without NaN's
 special comparison semantics (where `NaN != NaN` is true), mathematical reflexivity
 holds and these expansions are equivalent to dedicated operators.
 
-### Function-like Intrinsics
+### User-Definable Utility Functions
 
-The `is_*` family are function-like intrinsics that expand to control flow.
-
-**`is_some(x)`** - Checks whether a value is defined:
-
-```rill
-if is_some(arr[100]) {
-    // arr[100] exists
-}
-```
-
-Expands to:
-```
-Block N:
-  Guard x → defined: N+1, undefined: N+2
-
-Block N+1:
-  result_true = const true
-  Jump N+3
-
-Block N+2:
-  result_false = const false
-  Jump N+3
-
-Block N+3:
-  result = Phi [(N+1, result_true), (N+2, result_false)]
-```
-
-This is exactly the same IR as `if let _ = x { true } else { false }`.
-
-**`is_uint(x)`, `is_int(x)`, etc.** - Type checking intrinsics:
+Functions like `is_some()`, `is_uint()`, `default()`, etc. are **not intrinsics**.
+Users define them as regular functions — they compile to identical IR:
 
 ```rill
-if is_uint(value) {
-    // value is a UInt
-}
+fn is_some(x) { if let _ = x { true } else { false } }
+fn is_uint(x) { match x { UInt(_) => true, _ => false } }
+fn default(value, fallback) { if let v = value { v } else { fallback } }
 ```
 
-Expands to a type match:
-```
-Block N:
-  Match x → UInt: N+1, default: N+2
+These produce the same Guard/Match + Phi control flow that a compiler intrinsic
+would. There is no performance penalty — the IR is identical.
 
-Block N+1:
-  result_true = const true
-  Jump N+3
-
-Block N+2:
-  result_false = const false
-  Jump N+3
-
-Block N+3:
-  result = Phi [(N+1, result_true), (N+2, result_false)]
-```
-
-This is equivalent to `if let UInt(_) = x { true } else { false }`.
-
-### Why Not More Intrinsics?
-
-Functions like `default(x, fallback)` or `coalesce(a, b, c)` were considered but
-rejected as unnecessary. Users can define them with no penalty:
-
-```rill
-fn default(value, fallback) {
-    if let v = value { v } else { fallback }
-}
-```
-
-This compiles to identical IR as a hypothetical intrinsic would.
+A future prelude will provide standard definitions of common utility functions.
 
 ---
 
-## Builtin System
+## Extern Function System (BuiltinRegistry)
 
-Builtins are Rust functions registered with metadata that drives compiler decisions.
-They execute at runtime in the VM. Follows Lua embedding API patterns.
+The `BuiltinRegistry` is the embedding API — how host applications register
+functions that Rill scripts can call by name. It follows Lua embedding patterns.
 
-### Key Property: Builtins Never Receive Undefined
-
-The IR short-circuits via Guards before calling any builtin. If an argument might
-be undefined, the call is wrapped in control flow that skips it when undefined.
-This means builtin implementations don't need to handle undefined inputs.
+The standard registry is **empty**. All language-defined operations (`+`, `len()`,
+`is_uint()`, etc.) are intrinsics. The registry exists purely for host-provided
+functionality like `exit()`, `encode()`, or domain-specific operations.
 
 ### Builtin Metadata
 
@@ -1899,155 +1877,59 @@ struct BuiltinMeta {
 }
 
 enum ReturnBehavior {
-    /// Returns a value of this type to the caller
-    Returns(TypeSig),
-
-    /// Never returns - exits to driver with typed value
-    /// Lowers to Terminator::Exit
-    Exits(TypeSig),
+    Returns(TypeSet),    // Normal return to caller
+    Exits(TypeSet),      // Diverges — exits to driver
 }
 
-/// Function pointer for compile-time evaluation
-type ConstEvalFn = fn(&[ConstValue]) -> Option<ConstValue>;
-
 enum Purity {
-    /// Has side effects or depends on external state
-    /// Implicitly fallible - may return undefined due to external factors
-    Impure,
-
-    /// No side effects, deterministic given same inputs
-    /// fallible: true if domain errors possible (overflow, type mismatch)
-    Pure { fallible: bool },
-
-    /// Can be evaluated at compile time
-    /// fallible: true if domain errors possible
-    Const { eval: ConstEvalFn, fallible: bool },
+    Impure,                                    // Side effects, always fallible
+    Pure { fallible: bool },                   // No side effects, can't const-eval
+    Const { eval: ConstEvalFn, fallible: bool }, // Can evaluate at compile time
 }
 ```
 
 ### Purity and Fallibility
 
-Fallibility indicates whether an operation may return undefined:
-
 | Purity | Fallible | May Return Undefined? | Example |
 |--------|----------|----------------------|---------|
-| `Impure` | (always) | Yes - external factors | I/O operations |
-| `Pure { fallible: true }` | Yes | Yes - domain errors | - |
-| `Pure { fallible: false }` | No | No - always succeeds | - |
-| `Const { fallible: true, .. }` | Yes | Yes - overflow, type errors | `core::add` |
-| `Const { fallible: false, .. }` | No | No - always succeeds | `core::make_array` |
+| `Impure` | (always) | Yes - external factors | I/O, network |
+| `Pure { fallible: false }` | No | No - always succeeds | Pure helper |
+| `Const { fallible: true, .. }` | Yes | Yes - domain errors | Encoding |
 
-The optimizer uses `purity.may_return_undefined()` to determine definedness of results.
-
-### Builtin Registry
-
-```rust
-struct BuiltinRegistry {
-    builtins: HashMap<String, BuiltinDef>,
-}
-
-struct BuiltinDef {
-    name: String,
-    implementation: BuiltinImpl,
-    meta: BuiltinMeta,
-}
-
-enum BuiltinImpl {
-    Native(fn(&mut VM, &[Value]) -> ExecResult),
-    Closure(Box<dyn Fn(&mut VM, &[Value]) -> ExecResult>),
-}
-
-enum ExecResult {
-    Return(Option<Value>),  // Normal return (None = undefined)
-    Exit(Value),            // Hard exit to driver
-}
-```
-
-### Lowering Behavior
-
-During IR lowering, builtin calls are resolved:
-
-1. If `returns` is `Exits(_)` → emit `Terminator::Exit`
-2. If `purity` is `Const { eval, .. }`:
-   - Valid in const expressions
-   - If all arguments are const, call `eval` to compute result at compile time
-3. If `purity` is `Pure` or `Const` → can be reordered/eliminated/CSE'd
-
-### Current Builtins
-
-**Core primitives** (used in IR, map to VM opcodes):
-
-| Category | Builtins | Fallible | Notes |
-|----------|----------|----------|-------|
-| Arithmetic | `core::add`, `sub`, `mul`, `div`, `mod`, `neg` | Yes | Overflow possible |
-| Comparison | `core::eq`, `lt` | Yes | Type mismatch possible |
-| Bitwise | `core::bit_and`, `bit_or`, `bit_xor`, `bit_not`, `shl`, `shr` | Yes | Type mismatch |
-| Bitwise | `core::bit_test`, `bit_set` | Yes | OOB if bit >= 64 |
-| Logical | `core::not` | Yes | Type mismatch |
-| Collections | `core::make_array` | **No** | Always succeeds |
-| Collections | `core::make_map` | Yes | Fails on odd arg count |
-| Utility | `len` | Yes | Type mismatch |
-
-**External functions** (runtime dispatch to Rust):
-
-| Function | Fallible | Notes |
-|----------|----------|-------|
-| `drop` | N/A | Diverges (Exits to driver) |
-
-Embedding environments add more external functions (e.g., `console.log`, `file.read`).
-These are just function calls at every level - no special IR or codegen treatment.
-
-### Three-Phase Compilation Model
-
-Operators and builtins are handled differently at each compilation phase:
-
-| Phase | Handling | Example: `a >= b` |
-|-------|----------|-------------------|
-| **Const eval** | Chain const evaluators directly → `ConstValue` | `const_eval_lt(a,b)` then `const_eval_not(result)` |
-| **IR lowering** | Expand to primitive `Call` instructions | `Call core::lt(a,b)` then `Call core::not(result)` |
-| **Codegen** | Peephole pattern match → efficient VM opcodes | `not(lt(a,b))` → `GEQ a, b` |
-
-**Why this design:**
-
-1. **Const eval**: Direct evaluation, no intermediate representation needed
-2. **IR lowering**: Expand reflexive operators to primitives for maximum optimization
-   - Enables: CSE, dead code elimination, double-negation removal, branch inversion
-3. **Codegen**: Pattern match to recover efficient instructions
-   - `not(eq(a,b))` → `NEQ`
-   - `not(lt(b,a))` → `LEQ`
-   - `lt(b,a)` → `GT`
-
-**Builtin categories:**
-
-| Category | IR Level | VM Level | Example |
-|----------|----------|----------|---------|
-| **Primitives** | `Call` instruction | Direct opcode | `core::eq`, `core::add` |
-| **Codegen-only** | Expanded to primitives | Dedicated opcode | `neq`, `leq`, `gt`, `geq` |
-| **External** | `Call` instruction | Runtime dispatch | `drop`, `console.log` |
-
-Codegen-only instructions exist to optimize common patterns but aren't needed at IR
-level where the expanded form enables better optimization.
+The optimizer uses `purity.may_return_undefined()` for definedness analysis.
+Intrinsics use `IntrinsicOp::is_fallible()` directly instead.
 
 ### Example Registration
 
 ```rust
-// Array construction - infallible (always succeeds)
-BuiltinDef::new("core::make_array", builtin_make_array)
-    .returns(TypeSig::of(BaseType::Array))
-    .const_eval_infallible(const_eval_make_array)
+let mut registry = BuiltinRegistry::new();
 
-// Addition - fallible (overflow possible)
-BuiltinDef::new("core::add", builtin_add)
-    .param("a", TypeSig::numeric())
-    .param("b", TypeSig::numeric())
-    .returns(TypeSig::numeric())
-    .const_eval(const_eval_add)  // fallible by default
+// Exit — diverges, implicitly impure
+registry.register(
+    BuiltinDef::new("exit", exit_impl)
+        .param_optional("code", TypeSet::uint())
+        .exits(TypeSet::uint())
+);
 
-// Exit - diverges, implicitly impure
-BuiltinDef::new("drop", builtin_drop)
-    .param_optional("reason", TypeSig::uint())
-    .exits(TypeSig::uint())
+// Host-provided encoding
+registry.register(
+    BuiltinDef::new("encode", cbor_encode_impl)
+        .param("value", TypeSet::all())
+        .returns(TypeSet::bytes())
+        .pure()
+);
 ```
+
+### Intrinsic vs Extern: Compilation
+
+| Aspect | Intrinsic (`IntrinsicOp`) | Extern (`BuiltinRegistry`) |
+|--------|--------------------------|---------------------------|
+| **Registration** | Hard-coded in `IntrinsicOp` enum | `registry.register(BuiltinDef)` |
+| **IR instruction** | `Instruction::Intrinsic { op, args }` | `Instruction::Call { function, args }` |
+| **Const eval** | `eval_intrinsic_const()` in `const_eval.rs` | `Purity::Const { eval }` function pointer |
+| **Runtime** | `exec_intrinsic()` in `compile.rs` | Function pointer via `LinkMap` |
+| **Type info** | `param_type()`, `result_type_refined()` | `BuiltinMeta.params`, `BuiltinMeta.returns` |
+| **Link phase** | Not needed — compiled directly | Resolved via `LinkMap` at link time |
 
 ---
 
@@ -2402,18 +2284,11 @@ is natural:
 
 ### Why separate Definedness and Type analysis passes?
 
-The TypeSet structure has two orthogonal axes:
+These are independent concerns with different lattices:
+- **Definedness**: 3-value lattice (`Defined` / `MaybeDefined` / `Undefined`)
+- **Type**: powerset of `{Bool, UInt, Int, Float, Text, Bytes, Array, Map, Sequence}`
 
-```rust
-pub struct TypeSet {
-    pub types: BTreeSet<BaseType>,   // Concrete types: Bool, UInt, etc.
-    pub maybe_undefined: bool,        // Could be undefined?
-}
-```
-
-These are independent concerns:
-- A value can be "definitely defined" without knowing its type
-- A value can have a known type but still be "maybe undefined"
+A value can be "definitely defined" without knowing its type, and vice versa.
 
 Splitting the analyses provides:
 
@@ -2424,10 +2299,17 @@ Splitting the analyses provides:
    from type errors ("expected UInt, got Text")
 4. **Efficiency**: Type refinement runs on a simpler CFG with fewer blocks
 
-The alternative (unified analysis) would require a product lattice of
-`Definedness × TypeSet`, which is more complex and doesn't naturally separate
-the two kinds of errors.
+However, the two analyses are not fully independent — type analysis can *inform*
+definedness. For example, `Add(Text, UInt)` is conservatively `MaybeDefined` in
+the coarse pass (Add is fallible), but type analysis proves the result is always
+undefined (Text is not numeric).
+
+The coercion insertion pass (planned) bridges this gap: it consults type analysis
+and generates explicit `Instruction::Undefined` for invalid type combinations.
+Running definedness analysis again on the expanded IR tightens `MaybeDefined` to
+`Undefined` where types prove the operation cannot succeed — no unified lattice
+needed.
 
 ---
 
-*Last updated: Updated optimization pipeline to reflect implemented passes.*
+*Last updated: IntrinsicOp refactor, two-phase definedness, type-informed optimization pipeline.*
