@@ -181,15 +181,16 @@ Issues identified during code review, ordered by priority.
 
 ### P0 — Critical Path (needed for end-to-end execution)
 - [x] Bridge IR to VM execution — closure-threaded compiler in `src/compile.rs`
-- [x] End-to-end test: 21 tests covering constants, arithmetic, variables,
-      if/else, while, loop/break, recursion, short-circuit logic, builtins
-- [x] Parser: support final expressions (implicit return without semicolon)
-      Block-ending expressions (if, while, loop, for, match) don't need `;`.
-      The last expression without `;` is the block's return value. Uses BlockItem
-      post-processing to resolve the ambiguity.
-- [x] Verify match/pattern execution correctness (9 tests: literals, wildcards,
-      type patterns, guards, if-let, array destructuring)
-- [ ] Verify for-loop execution correctness
+- [x] End-to-end tests: 139 tests passing — constants, arithmetic, variables,
+      if/else, while, loop/break, recursion, short-circuit logic, builtins,
+      match patterns (literals, wildcards, types, guards, if-let, array destructure),
+      for-loops (array sum, index pairs, break, continue, nested, empty, let binding)
+- [x] Parser: implicit return via BlockItem post-processing
+- [x] Verify match/pattern execution correctness (9 tests)
+- [x] Verify for-loop execution correctness (7 tests)
+- [x] Proper SSA with loop-carried phis (while, loop, for)
+- [x] Closure-threaded compiler with link phase, phi elimination, flat pc executor
+- [x] FunctionHandle API for hot-path execution (no HashMap lookup per call)
 
 ### P1 — Core Functionality
 - [ ] Register missing builtins: `core::make_seq`, `core::seq_next`, `core::array_seq`, `core::collect`
