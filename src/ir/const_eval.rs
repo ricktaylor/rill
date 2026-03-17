@@ -169,7 +169,7 @@ pub fn eval_intrinsic_const(op: crate::ir::IntrinsicOp, args: &[ConstValue]) -> 
         }
 
         // Sequences are runtime-only (lazy), can't const-eval
-        IntrinsicOp::MakeSeq | IntrinsicOp::ArraySeq => None,
+        IntrinsicOp::MakeSeq | IntrinsicOp::ArraySeq | IntrinsicOp::SeqNext => None,
     }
 }
 

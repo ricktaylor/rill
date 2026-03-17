@@ -710,6 +710,12 @@ impl<'a> Lowerer<'a> {
         body: &[ast::Stmt],
         body_expr: &Option<Box<ast::Expression>>,
     ) -> VarId {
+        // If the iterable is a Range expression, use the sequence path
+        // (SeqNext-based consumption instead of index-based iteration).
+        if matches!(iterable, ast::Expression::Range { .. }) {
+            return self.lower_for_seq(binding_is_value, binding, iterable, body, body_expr);
+        }
+
         let iter_var = self.lower_expression(iterable);
 
         // length = Len(iter)
@@ -888,6 +894,145 @@ impl<'a> Lowerer<'a> {
             }
             _ => panic!("for-loop instruction at phi index is not a Phi"),
         }
+
+        // Exit
+        self.current_block = exit_bb;
+        self.current_instructions = Vec::new();
+
+        let result = self.new_temp(TypeSet::empty());
+        self.emit(Instruction::Undefined { dest: result });
+        result
+    }
+
+    /// Lower a for loop over a Sequence using SeqNext-based consumption.
+    ///
+    /// Lowers `for x in seq { body }` to:
+    /// ```text
+    /// seq = iterable
+    /// header: elem = SeqNext(seq)
+    ///         Guard elem → body, exit
+    /// body:   bind x = elem; ... body ...; jump header
+    /// exit:   undefined
+    /// ```
+    ///
+    /// Unlike index-based iteration, this consumes the sequence in-place
+    /// via SeqNext (mutates the SeqState). No counter or length needed.
+    fn lower_for_seq(
+        &mut self,
+        binding_is_value: bool,
+        binding: &ast::ForBinding,
+        iterable: &ast::Expression,
+        body: &[ast::Stmt],
+        body_expr: &Option<Box<ast::Expression>>,
+    ) -> VarId {
+        let seq_var = self.lower_expression(iterable);
+
+        let header_bb = self.fresh_block();
+        let body_bb = self.fresh_block();
+        let exit_bb = self.fresh_block();
+
+        // Snapshot scope for loop-carried phis
+        let scope_snapshot = self.snapshot_scope();
+        let pre_header_bb = self.current_block;
+        self.finish_block(Terminator::Jump { target: header_bb });
+
+        // Header: create loop-carried phis, then try SeqNext
+        self.current_block = header_bb;
+        self.current_instructions = Vec::new();
+        let loop_phis = self.create_loop_phis(pre_header_bb, &scope_snapshot);
+
+        // elem = SeqNext(seq) — returns next value or undefined if exhausted
+        let elem = self.new_temp(TypeSet::all());
+        self.emit(Instruction::Intrinsic {
+            dest: elem,
+            op: IntrinsicOp::SeqNext,
+            args: vec![seq_var],
+        });
+
+        // Guard: if elem is defined → body, else → exit
+        self.finish_block(Terminator::Guard {
+            value: elem,
+            defined: body_bb,
+            undefined: exit_bb,
+            span: self.current_span,
+        });
+
+        // Body: bind variables, execute body
+        self.current_block = body_bb;
+        self.current_instructions = Vec::new();
+        self.push_scope();
+
+        let _mode = if binding_is_value {
+            BindingMode::Value
+        } else {
+            BindingMode::Reference
+        };
+
+        // Bind loop variable(s)
+        // Note: sequences are always by-value (no backing collection to write back to).
+        // The `mode` flag is still passed for consistency but MakeRef is not used.
+        match binding {
+            ast::ForBinding::Single(name) => {
+                let var = self.new_var(name.clone(), TypeSet::all());
+                self.emit(Instruction::Copy {
+                    dest: var,
+                    src: elem,
+                });
+                self.bind(name, var);
+            }
+            ast::ForBinding::Pair(_key_name, _val_name) => {
+                // Pair binding on sequences doesn't have a natural key.
+                // For ranges, the "key" would be the iteration count, but
+                // that's not tracked in SeqNext. Bind both to the value for now.
+                // TODO: track iteration index for pair binding on sequences
+                let var = self.new_var(
+                    match binding {
+                        ast::ForBinding::Pair(_, val) => val.clone(),
+                        _ => unreachable!(),
+                    },
+                    TypeSet::all(),
+                );
+                self.emit(Instruction::Copy {
+                    dest: var,
+                    src: elem,
+                });
+                if let ast::ForBinding::Pair(key_name, val_name) = binding {
+                    self.bind(val_name, var);
+                    // Key is undefined for sequences (no natural index)
+                    let undef = self.new_temp(TypeSet::empty());
+                    self.emit(Instruction::Undefined { dest: undef });
+                    let key_var = self.new_var(key_name.clone(), TypeSet::all());
+                    self.emit(Instruction::Copy {
+                        dest: key_var,
+                        src: undef,
+                    });
+                    self.bind(key_name, key_var);
+                }
+            }
+        }
+
+        // continue jumps back to header (try next element)
+        self.loop_stack.push(LoopContext {
+            break_target: exit_bb,
+            continue_target: header_bb,
+            break_values: Vec::new(),
+        });
+
+        for stmt in body {
+            self.lower_stmt(stmt);
+        }
+        if let Some(expr) = body_expr {
+            self.lower_expression(expr);
+        }
+
+        self.loop_stack.pop();
+
+        // Patch loop-carried phis with post-body values
+        let body_exit_bb = self.current_block;
+        self.patch_loop_phis(header_bb, body_exit_bb, &loop_phis);
+
+        self.pop_scope();
+        self.finish_block(Terminator::Jump { target: header_bb });
 
         // Exit
         self.current_block = exit_bb;

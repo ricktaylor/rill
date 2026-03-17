@@ -33,10 +33,9 @@ Architecture: Source → Parser (chumsky) → AST → Lower (operators → Intri
 - Source location utilities: `span_to_line_col()`, `LineCol`
 
 ### Not Yet Started
-- [ ] Implement sequence intrinsics at runtime: `MakeSeq`, `ArraySeq` (currently return None)
-- [ ] Add `SeqNext` intrinsic for sequence consumption in for-loops
+- [x] Implement sequence intrinsics at runtime: `MakeSeq`, `ArraySeq`, `SeqNext`
+- [x] For-loop sequence path (SeqNext-based loop for Sequence/Range iterables)
 - [ ] For-loop type dispatch (Match on iterable type for unknown types)
-- [ ] For-loop sequence path (SeqNext-based loop for Sequence type)
 - [ ] Dead-store warnings for mutations to non-ref-backed loop variables
 - [ ] Host sequence support (`SeqState::Host` variant)
 - [ ] Public/private function visibility — structural, not declarative:
@@ -216,9 +215,10 @@ Issues identified during code review, ordered by priority.
 
 ### P1 — Core Functionality
 - [x] Reference tracking in IR — `with` binding write-back via MakeRef + WriteRef
-- [ ] Implement `MakeSeq`/`ArraySeq`/`SeqNext` intrinsic runtime in `exec_intrinsic`
+- [x] Sequence runtime: `MakeSeq`, `ArraySeq`, `SeqNext` in `exec_intrinsic`
+      `Len` extended for Sequence. `VM::seq_next()` for borrow-safe mutation.
+- [x] For-loop sequence path: `lower_for_seq` uses SeqNext + Guard for range iteration
 - [ ] For-loop type dispatch (Match on iterable type for unknown types)
-- [ ] For-loop sequence path (SeqNext-based loop for Sequence type)
 - [ ] Host sequence support (`SeqState::Host` variant, defer trait design to embedder API)
 - [ ] Module/import resolution system
 - [ ] Standard library: `std.cbor` (encode/decode)

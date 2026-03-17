@@ -899,6 +899,21 @@ impl VM {
         Ok(idx)
     }
 
+    /// Advance a Sequence at the given absolute index, returning the next value.
+    /// Returns None if the slot is not a Sequence or the sequence is exhausted.
+    /// Mutates the sequence in-place (CoW: clones if shared).
+    pub fn seq_next(&mut self, idx: usize) -> Result<Option<Value>, ExecError> {
+        let resolved = self.resolve(idx);
+        let heap = &*self.heap;
+        match self.stack.get_mut(resolved).and_then(|s| s.as_value_mut()) {
+            Some(Value::Sequence(seq)) => {
+                let state = seq.make_mut(heap)?;
+                Ok(state.next())
+            }
+            _ => Ok(None),
+        }
+    }
+
     pub fn push_bool(&mut self, b: bool) -> Result<usize, ExecError> {
         self.push(Value::Bool(b))
     }

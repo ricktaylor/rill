@@ -29,7 +29,7 @@
 
 use crate::builtins::{BuiltinImpl, BuiltinRegistry, ExecResult};
 use crate::diagnostics::Diagnostics;
-use crate::exec::{ExecError, Float, HeapVal, VM, Value};
+use crate::exec::{ExecError, Float, HeapVal, SeqState, VM, Value};
 use crate::ir::{
     BasicBlock, BlockId, Function, Instruction, IntrinsicOp, IrProgram, Literal, MatchPattern,
     Terminator, VarId,
@@ -1081,6 +1081,7 @@ fn exec_intrinsic(
                 Some(Value::Bytes(b)) => Some(Value::UInt(b.len() as u64)),
                 Some(Value::Array(arr)) => Some(Value::UInt(arr.len() as u64)),
                 Some(Value::Map(map)) => Some(Value::UInt(map.len() as u64)),
+                Some(Value::Sequence(seq)) => seq.remaining().map(|n| Value::UInt(n as u64)),
                 _ => None,
             })
         }
@@ -1108,10 +1109,78 @@ fn exec_intrinsic(
             Ok(Some(Value::Map(heap_map)))
         }
 
-        // -- Sequence (runtime-only, not yet implemented) --
-        IntrinsicOp::MakeSeq | IntrinsicOp::ArraySeq => {
-            // TODO: implement when Sequence runtime is ready
-            Ok(None)
+        // -- Sequence --
+        IntrinsicOp::MakeSeq => {
+            // MakeSeq(start, end, inclusive) → Sequence(Range)
+            let inclusive = match vm.local(arg_slots[2]) {
+                Some(Value::Bool(b)) => *b,
+                _ => false,
+            };
+            let seq = match (vm.local(arg_slots[0]), vm.local(arg_slots[1])) {
+                (Some(Value::UInt(start)), Some(Value::UInt(end))) => Some(SeqState::RangeUInt {
+                    current: *start,
+                    end: *end,
+                    inclusive,
+                }),
+                (Some(Value::Int(start)), Some(Value::Int(end))) => Some(SeqState::RangeInt {
+                    current: *start,
+                    end: *end,
+                    inclusive,
+                }),
+                // Mixed: promote UInt to Int
+                (Some(Value::UInt(start)), Some(Value::Int(end))) => Some(SeqState::RangeInt {
+                    current: *start as i64,
+                    end: *end,
+                    inclusive,
+                }),
+                (Some(Value::Int(start)), Some(Value::UInt(end))) => Some(SeqState::RangeInt {
+                    current: *start,
+                    end: *end as i64,
+                    inclusive,
+                }),
+                _ => None,
+            };
+            match seq {
+                Some(state) => {
+                    let hv = HeapVal::new(state, vm.heap())?;
+                    Ok(Some(Value::Sequence(hv)))
+                }
+                None => Ok(None),
+            }
+        }
+        IntrinsicOp::ArraySeq => {
+            // ArraySeq(array, start, end, mutable) → Sequence(ArraySlice)
+            let start = match vm.local(arg_slots[1]) {
+                Some(Value::UInt(n)) => *n as usize,
+                _ => return Ok(None),
+            };
+            let end = match vm.local(arg_slots[2]) {
+                Some(Value::UInt(n)) => *n as usize,
+                _ => return Ok(None),
+            };
+            let mutable = match vm.local(arg_slots[3]) {
+                Some(Value::Bool(b)) => *b,
+                _ => false,
+            };
+            match vm.local(arg_slots[0]) {
+                Some(Value::Array(arr)) => {
+                    let state = SeqState::ArraySlice {
+                        source: arr.clone(),
+                        start,
+                        end,
+                        mutable,
+                    };
+                    let hv = HeapVal::new(state, vm.heap())?;
+                    Ok(Some(Value::Sequence(hv)))
+                }
+                _ => Ok(None),
+            }
+        }
+        IntrinsicOp::SeqNext => {
+            // SeqNext(seq) → next element or None (undefined)
+            // Mutates the sequence in-place (advances position).
+            // Uses VM::seq_next to handle borrow splitting (heap vs stack).
+            vm.seq_next(vm.bp() + arg_slots[0])
         }
     }
 }
@@ -1749,4 +1818,161 @@ mod tests {
         // 10 + 20 + 30 = 60
         assert_eq!(val, Value::UInt(60));
     }
+
+    // ========================================================================
+    // Sequence / Range Execution
+    // ========================================================================
+
+    #[test]
+    fn test_range_sum() {
+        // for i in 0..5 { sum += i } → 0+1+2+3+4 = 10
+        let val = run_expect(
+            r#"
+            fn test() {
+                let sum = 0;
+                for i in 0..5 {
+                    sum = sum + i;
+                };
+                return sum;
+            }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::UInt(10));
+    }
+
+    #[test]
+    fn test_range_inclusive_sum() {
+        // for i in 0..=4 { sum += i } → 0+1+2+3+4 = 10
+        let val = run_expect(
+            r#"
+            fn test() {
+                let sum = 0;
+                for i in 0..=4 {
+                    sum = sum + i;
+                };
+                return sum;
+            }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::UInt(10));
+    }
+
+    #[test]
+    fn test_range_empty() {
+        // 5..3 is empty — body never runs
+        let val = run_expect(
+            r#"
+            fn test() {
+                let sum = 0;
+                for i in 5..3 {
+                    sum = sum + i;
+                };
+                return sum;
+            }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::UInt(0));
+    }
+
+    #[test]
+    fn test_range_with_break() {
+        // 0..10 with break at 3 → 0+1+2 = 3
+        let val = run_expect(
+            r#"
+            fn test() {
+                let sum = 0;
+                for i in 0..10 {
+                    if i == 3 { break; };
+                    sum = sum + i;
+                };
+                return sum;
+            }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::UInt(3));
+    }
+
+    #[test]
+    fn test_range_with_continue() {
+        // 0..6, skip even numbers → 1+3+5 = 9
+        let val = run_expect(
+            r#"
+            fn test() {
+                let sum = 0;
+                for i in 0..6 {
+                    if i % 2 == 0 { continue; };
+                    sum = sum + i;
+                };
+                return sum;
+            }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::UInt(9));
+    }
+
+    #[test]
+    fn test_range_single_element() {
+        // 5..6 has one element: 5
+        let val = run_expect(
+            r#"
+            fn test() {
+                let sum = 0;
+                for i in 5..6 {
+                    sum = sum + i;
+                };
+                return sum;
+            }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::UInt(5));
+    }
+
+    #[test]
+    fn test_range_nested() {
+        // Nested ranges: for i in 0..3 { for j in 0..3 { count++ } }
+        let val = run_expect(
+            r#"
+            fn test() {
+                let count = 0;
+                for i in 0..3 {
+                    for j in 0..3 {
+                        count = count + 1;
+                    };
+                };
+                return count;
+            }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::UInt(9));
+    }
+
+    #[test]
+    fn test_range_dynamic_bounds() {
+        // Range with dynamic bounds from array length
+        let val = run_expect(
+            r#"
+            fn test() {
+                let arr = [10, 20, 30];
+                let sum = 0;
+                for i in 0..len(arr) {
+                    sum = sum + arr[i];
+                };
+                return sum;
+            }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::UInt(60));
+    }
+
+    // Note: iterating a Sequence stored in a variable (`let r = 1..4; for i in r {}`)
+    // requires for-loop type dispatch (Match on iterable type), which is a separate
+    // TODO. Currently only direct Range expressions in for-loops use the seq path.
 }

@@ -67,6 +67,7 @@ pub enum IntrinsicOp {
     // -- Sequence --
     MakeSeq,
     ArraySeq,
+    SeqNext,
 }
 
 impl IntrinsicOp {
@@ -92,6 +93,7 @@ impl IntrinsicOp {
             Self::MakeMap => true, // odd arg count
             // Sequence
             Self::MakeSeq | Self::ArraySeq => false,
+            Self::SeqNext => true, // exhausted → undefined
         }
     }
 
@@ -133,6 +135,7 @@ impl IntrinsicOp {
             // Sequence
             Self::MakeSeq => TypeSet::numeric(), // start/end are numeric
             Self::ArraySeq => TypeSet::all(),
+            Self::SeqNext => TypeSet::single(BaseType::Sequence), // arg must be Sequence
         }
     }
 
@@ -154,6 +157,7 @@ impl IntrinsicOp {
             Self::MakeArray => TypeSet::single(BaseType::Array),
             Self::MakeMap => TypeSet::single(BaseType::Map),
             Self::MakeSeq | Self::ArraySeq => TypeSet::single(BaseType::Sequence),
+            Self::SeqNext => TypeSet::all(), // element could be any type
         }
     }
 
