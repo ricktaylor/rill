@@ -15,11 +15,13 @@
 mod const_fold;
 mod definedness;
 mod guard_elim;
+mod ref_elision;
 mod type_refinement;
 
 pub use const_fold::fold_constants;
 pub use definedness::{analyze_definedness, check_definedness};
 pub use guard_elim::{eliminate_guards, simplify_cfg};
+pub use ref_elision::elide_refs;
 pub use type_refinement::analyze_types;
 
 // Import IR types from parent module
@@ -59,6 +61,7 @@ pub fn optimize_function(
     let mut first_iteration = true;
     loop {
         let folded = fold_constants(function, builtins, diagnostics);
+        let refs = elide_refs(function);
 
         let definedness = analyze_definedness(function, Some(builtins));
 
@@ -72,7 +75,7 @@ pub fn optimize_function(
         let guards = eliminate_guards(function, &definedness);
         let blocks = simplify_cfg(function);
 
-        if folded + guards + blocks == 0 {
+        if folded + refs + guards + blocks == 0 {
             break;
         }
     }

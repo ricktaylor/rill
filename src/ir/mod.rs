@@ -57,6 +57,20 @@ pub enum BindingMode {
     Reference,
 }
 
+/// Origin of a reference binding: tracks what a `with`-bound variable refers to.
+///
+/// Used by the lowerer to emit `WriteRef` instructions when a ref-backed
+/// variable is assigned. The optimizer can then see write-back explicitly.
+#[derive(Clone)]
+pub struct RefOrigin {
+    /// The MakeRef dest VarId (the reference variable)
+    pub ref_var: VarId,
+    /// The collection or variable being referenced
+    pub base: VarId,
+    /// The key into the collection (None for whole-value refs)
+    pub key: Option<VarId>,
+}
+
 // ============================================================================
 // Lowerer State
 // ============================================================================
@@ -78,6 +92,10 @@ pub struct Lowerer<'a> {
 
     /// Stack of scopes for variable name resolution
     pub scopes: Vec<HashMap<ast::Identifier, VarId>>,
+
+    /// Reference origin tracking (scoped like `scopes`).
+    /// Maps variable names to their RefOrigin when bound via `with`.
+    pub ref_origins: Vec<HashMap<ast::Identifier, RefOrigin>>,
 
     /// All variables declared in the current function
     pub vars: Vec<Var>,
@@ -115,6 +133,7 @@ impl<'a> Lowerer<'a> {
             next_var_id: 0,
             next_block_id: 0,
             scopes: Vec::new(),
+            ref_origins: Vec::new(),
             vars: Vec::new(),
             blocks: Vec::new(),
             current_block: BlockId(0),
@@ -202,10 +221,12 @@ impl<'a> Lowerer<'a> {
 
     pub fn push_scope(&mut self) {
         self.scopes.push(HashMap::new());
+        self.ref_origins.push(HashMap::new());
     }
 
     pub fn pop_scope(&mut self) {
         self.scopes.pop();
+        self.ref_origins.pop();
     }
 
     pub fn bind(&mut self, name: &ast::Identifier, var: VarId) {
@@ -218,6 +239,27 @@ impl<'a> Lowerer<'a> {
         for scope in self.scopes.iter().rev() {
             if let Some(&var) = scope.get(name) {
                 return Some(var);
+            }
+        }
+        None
+    }
+
+    // ========================================================================
+    // Reference Origin Tracking
+    // ========================================================================
+
+    /// Record that `name` is a reference binding with the given origin.
+    pub fn bind_ref(&mut self, name: &ast::Identifier, origin: RefOrigin) {
+        if let Some(scope) = self.ref_origins.last_mut() {
+            scope.insert(name.clone(), origin);
+        }
+    }
+
+    /// Look up whether `name` is a reference-backed variable.
+    pub fn lookup_ref(&self, name: &ast::Identifier) -> Option<&RefOrigin> {
+        for scope in self.ref_origins.iter().rev() {
+            if let Some(origin) = scope.get(name) {
+                return Some(origin);
             }
         }
         None

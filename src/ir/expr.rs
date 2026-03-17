@@ -462,4 +462,77 @@ impl<'a> Lowerer<'a> {
             _ => None,
         }
     }
+
+    /// Lower an expression for a `with` binding, extracting ref origin if the
+    /// expression is an indexed access.
+    ///
+    /// Returns `(value_var, ref_origin)`:
+    /// - For `arr[i]` / `obj.field`: emits MakeRef, returns `Some(RefOrigin)`
+    /// - For plain variables: emits MakeRef (whole-value), returns `Some(RefOrigin)`
+    /// - For other expressions: returns `(value, None)` — no ref tracking
+    pub fn lower_ref_expression(&mut self, expr: &ast::Expression) -> (VarId, Option<RefOrigin>) {
+        match expr {
+            ast::Expression::ArrayAccess { array, index } => {
+                let base = self.lower_expression(array);
+                let key = self.lower_expression(index);
+                let dest = self.new_temp(TypeSet::all());
+                self.emit(Instruction::MakeRef {
+                    dest,
+                    base,
+                    key: Some(key),
+                });
+                let origin = RefOrigin {
+                    ref_var: dest,
+                    base,
+                    key: Some(key),
+                };
+                (dest, Some(origin))
+            }
+
+            ast::Expression::MemberAccess { object, member } => {
+                let base = self.lower_expression(object);
+                let key = self.lower_expression(member);
+                let dest = self.new_temp(TypeSet::all());
+                self.emit(Instruction::MakeRef {
+                    dest,
+                    base,
+                    key: Some(key),
+                });
+                let origin = RefOrigin {
+                    ref_var: dest,
+                    base,
+                    key: Some(key),
+                };
+                (dest, Some(origin))
+            }
+
+            ast::Expression::Variable(name) => {
+                if let Some(var) = self.lookup(name) {
+                    let dest = self.new_temp(TypeSet::all());
+                    self.emit(Instruction::MakeRef {
+                        dest,
+                        base: var,
+                        key: None,
+                    });
+                    let origin = RefOrigin {
+                        ref_var: dest,
+                        base: var,
+                        key: None,
+                    };
+                    (dest, Some(origin))
+                } else {
+                    // Fall through to normal lowering (will emit error)
+                    let var = self.lower_expression(expr);
+                    (var, None)
+                }
+            }
+
+            // For complex expressions (function calls, blocks, etc.),
+            // there's no location to write back to.
+            _ => {
+                let var = self.lower_expression(expr);
+                (var, None)
+            }
+        }
+    }
 }

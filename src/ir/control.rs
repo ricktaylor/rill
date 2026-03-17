@@ -45,13 +45,19 @@ impl<'a> Lowerer<'a> {
                 ast::IfCondition::Let { pattern, value } => {
                     // Lower value and check if pattern matches
                     let value_var = self.lower_expression(value);
-                    self.lower_if_pattern(pattern, value_var, BindingMode::Value, else_bb);
+                    self.lower_if_pattern(pattern, value_var, BindingMode::Value, else_bb, None);
                 }
 
                 ast::IfCondition::With { pattern, value } => {
                     // Lower value and check if pattern matches (by-reference)
-                    let value_var = self.lower_expression(value);
-                    self.lower_if_pattern(pattern, value_var, BindingMode::Reference, else_bb);
+                    let (value_var, ref_origin) = self.lower_ref_expression(value);
+                    self.lower_if_pattern(
+                        pattern,
+                        value_var,
+                        BindingMode::Reference,
+                        else_bb,
+                        ref_origin,
+                    );
                 }
             }
         }
@@ -109,6 +115,11 @@ impl<'a> Lowerer<'a> {
     /// On match: binds variables and continues to next instruction
     /// On mismatch: jumps to else_bb
     ///
+    /// `ref_origin` is passed for `if with` bindings so that variable
+    /// patterns record their ref origin for write-back via WriteRef.
+    /// For compound patterns (Array, Map), element-level ref origins are
+    /// created internally when mode is Reference.
+    ///
     /// Optimization: Match terminators implicitly reject undefined values
     /// (they won't match any type pattern), so we only emit Guard when
     /// there's no subsequent Match (i.e., simple variable patterns).
@@ -118,6 +129,7 @@ impl<'a> Lowerer<'a> {
         value: VarId,
         mode: BindingMode,
         else_bb: BlockId,
+        ref_origin: Option<RefOrigin>,
     ) {
         match &pattern.node {
             ast::Pattern::Wildcard => {
@@ -138,6 +150,9 @@ impl<'a> Lowerer<'a> {
                     }
                     BindingMode::Reference => {
                         self.bind(name, value);
+                        if let Some(origin) = ref_origin {
+                            self.bind_ref(name, origin);
+                        }
                     }
                 }
             }
@@ -153,14 +168,31 @@ impl<'a> Lowerer<'a> {
                         dest: idx,
                         value: Literal::UInt(i as u64),
                     });
-                    let elem = self.new_temp(TypeSet::all());
-                    self.emit(Instruction::Index {
-                        dest: elem,
-                        base: value,
-                        key: idx,
-                    });
-                    // Recursively match element pattern
-                    self.lower_if_pattern(elem_pat, elem, mode, else_bb);
+
+                    let (elem, elem_origin) = if matches!(mode, BindingMode::Reference) {
+                        let dest = self.new_temp(TypeSet::all());
+                        self.emit(Instruction::MakeRef {
+                            dest,
+                            base: value,
+                            key: Some(idx),
+                        });
+                        let origin = RefOrigin {
+                            ref_var: dest,
+                            base: value,
+                            key: Some(idx),
+                        };
+                        (dest, Some(origin))
+                    } else {
+                        let dest = self.new_temp(TypeSet::all());
+                        self.emit(Instruction::Index {
+                            dest,
+                            base: value,
+                            key: idx,
+                        });
+                        (dest, None)
+                    };
+
+                    self.lower_if_pattern(elem_pat, elem, mode, else_bb, elem_origin);
                 }
             }
 
@@ -183,9 +215,9 @@ impl<'a> Lowerer<'a> {
                     return;
                 }
 
-                // If there's a nested binding, process it
+                // If there's a nested binding, process it (pass ref_origin through)
                 if let Some(inner_pat) = binding {
-                    self.lower_if_pattern(inner_pat.as_ref(), value, mode, else_bb);
+                    self.lower_if_pattern(inner_pat.as_ref(), value, mode, else_bb, ref_origin);
                 }
             }
 
@@ -205,13 +237,31 @@ impl<'a> Lowerer<'a> {
                         dest: idx,
                         value: Literal::UInt(i as u64),
                     });
-                    let elem = self.new_temp(TypeSet::all());
-                    self.emit(Instruction::Index {
-                        dest: elem,
-                        base: value,
-                        key: idx,
-                    });
-                    self.lower_if_pattern(pat, elem, mode, else_bb);
+
+                    let (elem, elem_origin) = if matches!(mode, BindingMode::Reference) {
+                        let dest = self.new_temp(TypeSet::all());
+                        self.emit(Instruction::MakeRef {
+                            dest,
+                            base: value,
+                            key: Some(idx),
+                        });
+                        let origin = RefOrigin {
+                            ref_var: dest,
+                            base: value,
+                            key: Some(idx),
+                        };
+                        (dest, Some(origin))
+                    } else {
+                        let dest = self.new_temp(TypeSet::all());
+                        self.emit(Instruction::Index {
+                            dest,
+                            base: value,
+                            key: idx,
+                        });
+                        (dest, None)
+                    };
+
+                    self.lower_if_pattern(pat, elem, mode, else_bb, elem_origin);
                 }
 
                 // Compute length for rest and after patterns
@@ -277,14 +327,30 @@ impl<'a> Lowerer<'a> {
                         });
                         let idx = self.emit_binary_intrinsic(IntrinsicOp::Add, after_start, offset);
 
-                        let elem = self.new_temp(TypeSet::all());
-                        self.emit(Instruction::Index {
-                            dest: elem,
-                            base: value,
-                            key: idx,
-                        });
+                        let (elem, elem_origin) = if matches!(mode, BindingMode::Reference) {
+                            let dest = self.new_temp(TypeSet::all());
+                            self.emit(Instruction::MakeRef {
+                                dest,
+                                base: value,
+                                key: Some(idx),
+                            });
+                            let origin = RefOrigin {
+                                ref_var: dest,
+                                base: value,
+                                key: Some(idx),
+                            };
+                            (dest, Some(origin))
+                        } else {
+                            let dest = self.new_temp(TypeSet::all());
+                            self.emit(Instruction::Index {
+                                dest,
+                                base: value,
+                                key: idx,
+                            });
+                            (dest, None)
+                        };
 
-                        self.lower_if_pattern(pat, elem, mode, else_bb);
+                        self.lower_if_pattern(pat, elem, mode, else_bb, elem_origin);
                     }
                 }
             }
@@ -323,16 +389,32 @@ impl<'a> Lowerer<'a> {
                         }
                     };
 
-                    let val = self.new_temp(TypeSet::all());
-                    self.emit(Instruction::Index {
-                        dest: val,
-                        base: value,
-                        key: key_var,
-                    });
+                    let (val, val_origin) = if matches!(mode, BindingMode::Reference) {
+                        let dest = self.new_temp(TypeSet::all());
+                        self.emit(Instruction::MakeRef {
+                            dest,
+                            base: value,
+                            key: Some(key_var),
+                        });
+                        let origin = RefOrigin {
+                            ref_var: dest,
+                            base: value,
+                            key: Some(key_var),
+                        };
+                        (dest, Some(origin))
+                    } else {
+                        let dest = self.new_temp(TypeSet::all());
+                        self.emit(Instruction::Index {
+                            dest,
+                            base: value,
+                            key: key_var,
+                        });
+                        (dest, None)
+                    };
 
                     // Value must be present for the pattern to match
                     self.emit_guard(val, else_bb);
-                    self.lower_if_pattern(val_pat, val, mode, else_bb);
+                    self.lower_if_pattern(val_pat, val, mode, else_bb, val_origin);
                 }
             }
         }
@@ -694,18 +776,34 @@ impl<'a> Lowerer<'a> {
         self.current_instructions = Vec::new();
         self.push_scope();
 
-        // elem = iter[i]
-        let elem = self.new_temp(TypeSet::all());
-        self.emit(Instruction::Index {
-            dest: elem,
-            base: iter_var,
-            key: i_var,
-        });
-
         let mode = if binding_is_value {
             BindingMode::Value
         } else {
             BindingMode::Reference
+        };
+
+        // Read element from iterable — use MakeRef for by-ref binding
+        let (elem, elem_origin) = if matches!(mode, BindingMode::Reference) {
+            let dest = self.new_temp(TypeSet::all());
+            self.emit(Instruction::MakeRef {
+                dest,
+                base: iter_var,
+                key: Some(i_var),
+            });
+            let origin = RefOrigin {
+                ref_var: dest,
+                base: iter_var,
+                key: Some(i_var),
+            };
+            (dest, Some(origin))
+        } else {
+            let dest = self.new_temp(TypeSet::all());
+            self.emit(Instruction::Index {
+                dest,
+                base: iter_var,
+                key: i_var,
+            });
+            (dest, None)
         };
 
         // Bind loop variable(s)
@@ -721,6 +819,9 @@ impl<'a> Lowerer<'a> {
                 }
                 BindingMode::Reference => {
                     self.bind(name, elem);
+                    if let Some(origin) = elem_origin.clone() {
+                        self.bind_ref(name, origin);
+                    }
                 }
             },
             ast::ForBinding::Pair(key_name, val_name) => {
@@ -742,6 +843,9 @@ impl<'a> Lowerer<'a> {
                     }
                     BindingMode::Reference => {
                         self.bind(val_name, elem);
+                        if let Some(origin) = elem_origin.clone() {
+                            self.bind_ref(val_name, origin);
+                        }
                     }
                 }
             }
@@ -839,7 +943,10 @@ impl<'a> Lowerer<'a> {
             self.push_scope();
 
             // Check pattern — on mismatch, jumps to next_bb
-            self.lower_if_pattern(&arm.pattern, scrutinee, mode, next_bb);
+            // No top-level ref_origin for match (the scrutinee is a value,
+            // not an indexed access). Element-level ref origins are created
+            // internally for Array/Map destructuring when mode is Reference.
+            self.lower_if_pattern(&arm.pattern, scrutinee, mode, next_bb, None);
 
             // Check guard if present
             if let Some(ref guard) = arm.guard {

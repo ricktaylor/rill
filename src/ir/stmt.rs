@@ -21,8 +21,15 @@ impl<'a> Lowerer<'a> {
             }
 
             ast::Statement::With { pattern, value } => {
-                let value_var = self.lower_expression(value);
-                self.lower_pattern_binding(&pattern.node, value_var, BindingMode::Reference);
+                // Extract ref origin from the value expression if it's indexed access.
+                // This enables write-back: `with x = arr[i]; x = 10` → arr[i] = 10.
+                let (value_var, ref_origin) = self.lower_ref_expression(value);
+                self.lower_pattern_binding_ref(
+                    &pattern.node,
+                    value_var,
+                    BindingMode::Reference,
+                    ref_origin,
+                );
             }
 
             // Note: Assignment is now an Expression, not a Statement
@@ -98,6 +105,15 @@ impl<'a> Lowerer<'a> {
                         return self.error_placeholder();
                     }
                 };
+
+                // If this variable is ref-backed, emit WriteRef to write
+                // the new value back to the source location.
+                if let Some(origin) = self.lookup_ref(name).cloned() {
+                    self.emit(Instruction::WriteRef {
+                        ref_var: origin.ref_var,
+                        value: final_value,
+                    });
+                }
 
                 // SSA: create a new VarId for each assignment, rebind the name.
                 // Loop-carried variables are handled by phi nodes constructed

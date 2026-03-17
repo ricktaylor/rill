@@ -20,6 +20,20 @@ impl<'a> Lowerer<'a> {
         value: VarId,
         mode: BindingMode,
     ) {
+        self.lower_pattern_binding_ref(pattern, value, mode, None);
+    }
+
+    /// Lower a pattern binding with optional ref origin tracking.
+    ///
+    /// When `ref_origin` is `Some`, the value came from a `with` binding and
+    /// the ref origin is recorded so that subsequent assignments emit `WriteRef`.
+    pub fn lower_pattern_binding_ref(
+        &mut self,
+        pattern: &ast::Pattern,
+        value: VarId,
+        mode: BindingMode,
+        ref_origin: Option<RefOrigin>,
+    ) {
         match pattern {
             ast::Pattern::Wildcard => {
                 // Ignore the value
@@ -33,6 +47,10 @@ impl<'a> Lowerer<'a> {
                 }
                 BindingMode::Reference => {
                     self.bind(name, value);
+                    // Record the ref origin so assignments to this name emit WriteRef
+                    if let Some(origin) = ref_origin {
+                        self.bind_ref(name, origin);
+                    }
                 }
             },
 
@@ -49,14 +67,30 @@ impl<'a> Lowerer<'a> {
                         value: Literal::UInt(i as u64),
                     });
 
-                    let elem = self.new_temp(TypeSet::all());
-                    self.emit(Instruction::Index {
-                        dest: elem,
-                        base: value,
-                        key: idx,
-                    });
+                    let (elem, elem_origin) = if matches!(mode, BindingMode::Reference) {
+                        let dest = self.new_temp(TypeSet::all());
+                        self.emit(Instruction::MakeRef {
+                            dest,
+                            base: value,
+                            key: Some(idx),
+                        });
+                        let origin = RefOrigin {
+                            ref_var: dest,
+                            base: value,
+                            key: Some(idx),
+                        };
+                        (dest, Some(origin))
+                    } else {
+                        let dest = self.new_temp(TypeSet::all());
+                        self.emit(Instruction::Index {
+                            dest,
+                            base: value,
+                            key: idx,
+                        });
+                        (dest, None)
+                    };
 
-                    self.lower_pattern_binding(&pat.node, elem, mode);
+                    self.lower_pattern_binding_ref(&pat.node, elem, mode, elem_origin);
                 }
             }
 
@@ -73,14 +107,30 @@ impl<'a> Lowerer<'a> {
                         value: Literal::UInt(i as u64),
                     });
 
-                    let elem = self.new_temp(TypeSet::all());
-                    self.emit(Instruction::Index {
-                        dest: elem,
-                        base: value,
-                        key: idx,
-                    });
+                    let (elem, elem_origin) = if matches!(mode, BindingMode::Reference) {
+                        let dest = self.new_temp(TypeSet::all());
+                        self.emit(Instruction::MakeRef {
+                            dest,
+                            base: value,
+                            key: Some(idx),
+                        });
+                        let origin = RefOrigin {
+                            ref_var: dest,
+                            base: value,
+                            key: Some(idx),
+                        };
+                        (dest, Some(origin))
+                    } else {
+                        let dest = self.new_temp(TypeSet::all());
+                        self.emit(Instruction::Index {
+                            dest,
+                            base: value,
+                            key: idx,
+                        });
+                        (dest, None)
+                    };
 
-                    self.lower_pattern_binding(&pat.node, elem, mode);
+                    self.lower_pattern_binding_ref(&pat.node, elem, mode, elem_origin);
                 }
 
                 // Compute length for rest and after patterns
@@ -149,14 +199,30 @@ impl<'a> Lowerer<'a> {
                         });
                         let idx = self.emit_binary_intrinsic(IntrinsicOp::Add, after_start, offset);
 
-                        let elem = self.new_temp(TypeSet::all());
-                        self.emit(Instruction::Index {
-                            dest: elem,
-                            base: value,
-                            key: idx,
-                        });
+                        let (elem, elem_origin) = if matches!(mode, BindingMode::Reference) {
+                            let dest = self.new_temp(TypeSet::all());
+                            self.emit(Instruction::MakeRef {
+                                dest,
+                                base: value,
+                                key: Some(idx),
+                            });
+                            let origin = RefOrigin {
+                                ref_var: dest,
+                                base: value,
+                                key: Some(idx),
+                            };
+                            (dest, Some(origin))
+                        } else {
+                            let dest = self.new_temp(TypeSet::all());
+                            self.emit(Instruction::Index {
+                                dest,
+                                base: value,
+                                key: idx,
+                            });
+                            (dest, None)
+                        };
 
-                        self.lower_pattern_binding(&pat.node, elem, mode);
+                        self.lower_pattern_binding_ref(&pat.node, elem, mode, elem_origin);
                     }
                 }
             }
@@ -187,14 +253,30 @@ impl<'a> Lowerer<'a> {
                         }
                     };
 
-                    let val = self.new_temp(TypeSet::all());
-                    self.emit(Instruction::Index {
-                        dest: val,
-                        base: value,
-                        key: key_var,
-                    });
+                    let (val, val_origin) = if matches!(mode, BindingMode::Reference) {
+                        let dest = self.new_temp(TypeSet::all());
+                        self.emit(Instruction::MakeRef {
+                            dest,
+                            base: value,
+                            key: Some(key_var),
+                        });
+                        let origin = RefOrigin {
+                            ref_var: dest,
+                            base: value,
+                            key: Some(key_var),
+                        };
+                        (dest, Some(origin))
+                    } else {
+                        let dest = self.new_temp(TypeSet::all());
+                        self.emit(Instruction::Index {
+                            dest,
+                            base: value,
+                            key: key_var,
+                        });
+                        (dest, None)
+                    };
 
-                    self.lower_pattern_binding(&val_pat.node, val, mode);
+                    self.lower_pattern_binding_ref(&val_pat.node, val, mode, val_origin);
                 }
             }
 
@@ -219,7 +301,12 @@ impl<'a> Lowerer<'a> {
                     self.current_block = match_bb;
                     self.current_instructions = Vec::new();
                     if let Some(inner) = binding {
-                        self.lower_pattern_binding(&inner.node, value, mode);
+                        self.lower_pattern_binding_ref(
+                            &inner.node,
+                            value,
+                            mode,
+                            ref_origin.clone(),
+                        );
                     }
                     self.finish_block(Terminator::Jump { target: join_bb });
 

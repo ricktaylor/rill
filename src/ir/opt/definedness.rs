@@ -279,23 +279,30 @@ fn transfer_instruction(
             }
         }
 
-        // MakeRef creates a reference, which is defined if base and key are defined
+        // MakeRef creates a reference, which is defined if base (and key, if present) are defined
         Instruction::MakeRef { dest, base, key } => {
             let base_def = state
                 .get(base)
                 .copied()
                 .unwrap_or(Definedness::MaybeDefined);
-            let key_def = state.get(key).copied().unwrap_or(Definedness::MaybeDefined);
+            let key_def = key
+                .map(|k| state.get(&k).copied().unwrap_or(Definedness::MaybeDefined))
+                .unwrap_or(Definedness::Defined);
             // Reference creation itself succeeds, but the referenced slot may be undefined
             // The reference is defined, but dereferencing it may yield undefined
             state.insert(*dest, Definedness::MaybeDefined); // Target may not exist
             // Track provenance from base or key if undefined
             if base_def != Definedness::Defined {
                 provenance.insert(*dest, UndefinedSource::Propagated { from: *base });
-            } else if key_def != Definedness::Defined {
-                provenance.insert(*dest, UndefinedSource::Propagated { from: *key });
+            } else if let Some(k) = key
+                && key_def != Definedness::Defined
+            {
+                provenance.insert(*dest, UndefinedSource::Propagated { from: *k });
             }
         }
+
+        // WriteRef writes through a reference — side effect only, no dest
+        Instruction::WriteRef { .. } => {}
 
         // Drop doesn't produce a value
         Instruction::Drop { .. } => {}
@@ -684,10 +691,35 @@ fn check_instruction_uses(
                 span,
                 diagnostics,
             );
+            if let Some(k) = key {
+                check_var_use(
+                    *k,
+                    state,
+                    "reference key",
+                    func_name,
+                    provenance,
+                    false,
+                    span,
+                    diagnostics,
+                );
+            }
+        }
+
+        Instruction::WriteRef { ref_var, value } => {
             check_var_use(
-                *key,
+                *ref_var,
                 state,
-                "reference key",
+                "write-back reference",
+                func_name,
+                provenance,
+                false,
+                span,
+                diagnostics,
+            );
+            check_var_use(
+                *value,
+                state,
+                "write-back value",
                 func_name,
                 provenance,
                 false,

@@ -248,7 +248,7 @@ fn promote_union(a: TypeSet, b: TypeSet) -> TypeSet {
         result = result.union(&TypeSet::single(BaseType::UInt));
     }
     // Int + Int, UInt + Int, Int + UInt → Int
-    if (a_i && b_i) || (a_u && b_i) || (a_i && b_u) {
+    if (a_u || a_i) && b_i || (a_i && b_u) {
         result = result.union(&TypeSet::single(BaseType::Int));
     }
     // Float + anything numeric → Float
@@ -343,12 +343,30 @@ pub enum Instruction {
         args: Vec<CallArg>,
     },
 
-    /// Create a reference binding for `with` statements
+    /// Create a reference binding for `with` statements.
+    ///
+    /// Reads the value at `base[key]` (element ref) or `base` (whole-value ref)
+    /// into `dest`, and records that `dest` is a reference to that location.
+    /// The optimizer uses this provenance to reason about write-back semantics.
+    ///
+    /// - `key: Some(k)` — element reference: `with x = arr[i]`
+    /// - `key: None` — whole-value reference: `with x = y`
     MakeRef {
         dest: VarId,
         base: VarId,
-        key: VarId,
+        key: Option<VarId>,
     },
+
+    /// Write through a reference created by MakeRef.
+    ///
+    /// Semantically: writes `value` back to the location that `ref_var` references.
+    /// The compiler resolves `ref_var` to its MakeRef to find (base, key) and
+    /// emits the appropriate SetIndex or slot write.
+    ///
+    /// This instruction has no `dest` — it is a side effect (mutating a collection
+    /// or variable through a reference). The optimizer can see these explicitly
+    /// and reason about dead write-backs, forwarding, etc.
+    WriteRef { ref_var: VarId, value: VarId },
 
     /// Mark end of variable scope - slots can be reclaimed
     Drop { vars: Vec<VarId> },

@@ -48,7 +48,20 @@ Architecture: Source → Parser (chumsky) → AST → Lower (operators → Intri
 - [ ] CBOR encode/decode integration
 - [ ] Comprehensive standard library (std.time, std.cbor, std.encoding, std.parsing)
 - [ ] Module/import system implementation
-- [ ] `with` (reference) binding semantics in IR
+- [x] `with` (reference) binding semantics in IR — Phase 1 complete:
+      MakeRef (key: Option<VarId>) + WriteRef instructions. Lowerer emits
+      MakeRef for `with` bindings, WriteRef on assignment to ref-backed vars.
+      Compiler resolves WriteRef to SetIndex (element) or slot write (whole-value).
+      Ref origins tracked in scoped HashMap. Optimizer passes updated.
+- [x] `if with` / match arm ref tracking — lower_if_pattern takes ref_origin,
+      emits MakeRef for element access in Reference mode, propagates origins
+- [x] Ref elision pass (`ir/opt/ref_elision.rs`) — runs in fixpoint loop:
+      - Read-only element refs demoted to Index (no WriteRef → no ref needed)
+      - Read-only whole-value refs demoted to Copy (base never written → no Slot::Ref needed)
+      - Ref chain shortening (MakeRef through MakeRef → skip to resolved base)
+- [ ] `with` reference semantics — future:
+      - Dead write-back elimination (optimizer can see WriteRef, remove when unused)
+      - Ref-backed loop variable dead-store warnings
 - [ ] Optimizer: dead code elimination pass
 
 ## Code Review Fixes
@@ -202,6 +215,7 @@ Issues identified during code review, ordered by priority.
 - [x] FunctionHandle API for hot-path execution (no HashMap lookup per call)
 
 ### P1 — Core Functionality
+- [x] Reference tracking in IR — `with` binding write-back via MakeRef + WriteRef
 - [ ] Implement `MakeSeq`/`ArraySeq`/`SeqNext` intrinsic runtime in `exec_intrinsic`
 - [ ] For-loop type dispatch (Match on iterable type for unknown types)
 - [ ] For-loop sequence path (SeqNext-based loop for Sequence type)
@@ -409,6 +423,7 @@ src/
     opt/
       mod.rs          — Optimizer pass runner
       const_fold.rs   — Constant folding pass
+      ref_elision.rs  — Ref elision (MakeRef → Copy/Index, chain shortening)
       type_refinement.rs — Type set refinement
       guard_elim.rs   — Guard elimination
       definedness.rs  — Definedness analysis

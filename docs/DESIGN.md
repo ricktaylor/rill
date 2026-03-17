@@ -206,7 +206,7 @@ pub struct FrameInfo {
 
 pub enum Slot {
     Val(Value),           // Actual value (16 bytes)
-    Ref(usize),           // Reference to another slot
+    Ref(usize),           // Reference to another slot (used by MakeRef with key: None)
     Frame(Box<FrameInfo>), // Frame info (boxed to keep Slot small)
     Uninit,               // Reserved but unassigned
 }
@@ -237,18 +237,73 @@ vm.ret_val(result);
 
 ### Reference Binding (`with`)
 
-```rust
-// Source: with x = arr[0];
-// IR: creates Ref slot pointing to arr[0]
+Reference bindings create tracked aliases so that mutations flow back to the
+source. The IR makes this explicit with two instructions: `MakeRef` creates the
+reference and `WriteRef` performs write-back. The optimizer can see both and
+reason about dead write-backs, forwarding, and alias relationships.
 
-vm.set_local_ref(x_offset, arr_element_idx);
+**Element references** (`with x = arr[i]`):
 
-// Reading x: follows Ref chain
-let val = vm.local(x_offset);  // resolves Ref
-
-// Writing x: resolves Ref, writes to target
-vm.set_local(x_offset, new_val);  // mutates arr[0]
 ```
+// IR:
+v0 = MakeRef { base: arr, key: Some(i) }   // reads arr[i], records provenance
+// bind "x" → v0
+
+// x = 10  →  assignment to ref-backed variable
+v1 = Const(10)
+WriteRef { ref_var: v0, value: v1 }          // write-back: arr[i] = 10
+// rebind "x" → v1 (for subsequent SSA reads)
+```
+
+At runtime, `MakeRef` with a key reads the element (like `Index`). `WriteRef`
+resolves the ref_var back to its MakeRef to find (base, key) and emits a
+`SetIndex` on the collection.
+
+**Whole-value references** (`with x = y`):
+
+```
+// IR:
+v0 = MakeRef { base: y, key: None }         // whole-value ref
+// bind "x" → v0
+
+// x = 10
+v1 = Const(10)
+WriteRef { ref_var: v0, value: v1 }          // write-back to y's slot
+// rebind "x" → v1
+```
+
+At runtime, `MakeRef` without a key creates a `Slot::Ref` pointing to the
+base's stack slot. `WriteRef` writes directly to the base slot, so the source
+variable sees the new value.
+
+**For-loop references** (`for x in arr { x += 1 }`):
+
+```
+// IR (body block):
+v_ref = MakeRef { base: iter, key: Some(i_phi) }   // refs iter[i]
+// bind "x" → v_ref
+
+// x += 1  →  compound assignment
+v_old = v_ref                            // current value
+v_new = Intrinsic(Add, [v_old, 1])
+WriteRef { ref_var: v_ref, value: v_new }   // write-back: iter[i] = v_new
+// rebind "x" → v_new
+```
+
+The write-back is emitted at the point of assignment — correct even with
+`break` and `continue` (no deferred write-back needed).
+
+**Ref origin tracking:** The lowerer maintains a scoped `ref_origins` map
+(`Identifier → RefOrigin { ref_var, base, key }`) alongside the normal scope
+stack. When a ref-backed variable is assigned, the lowerer looks up its
+`RefOrigin` and emits `WriteRef`.
+
+**Compiler resolution:** At compile time, `build_ref_map()` collects all
+`MakeRef` instructions into a `VarId → RefMeta { base_slot, key_slot }` map.
+When compiling `WriteRef`, the compiler looks up the ref_var to find the
+base and key slots and emits the appropriate closure:
+- Element ref (key_slot is Some): SetIndex on the collection
+- Whole-value ref (key_slot is None): set_local on the base slot
 
 ### Resource Limits
 
@@ -454,7 +509,7 @@ params and sets `pc` to the entry offset instead of recursing through
 - **SSA form**: Single Static Assignment for optimization
 - **Pattern lowering**: Complex patterns → primitive operations
 - **Intrinsics minimal**: Only short-circuit operators (`&&`, `||`)
-- **Reference tracking**: Compile-time alias analysis
+- **Explicit references**: `MakeRef`/`WriteRef` make ref semantics visible to the optimizer
 
 ### Two Categories of Operations
 
@@ -541,6 +596,31 @@ BB_fail:
 
 BB_continue:
     // execution continues
+```
+
+**Reference pattern** — `with` bindings use `MakeRef` instead of `Index`,
+enabling write-back via `WriteRef`:
+
+```
+AST: with [a, b] = arr;
+
+IR:
+BB0:
+    Match(arr, [(Array(2), BB_bind)], BB_fail)
+
+BB_bind:
+    %a = MakeRef(arr, Some(0))     // ref to arr[0]
+    %b = MakeRef(arr, Some(1))     // ref to arr[1]
+    Jump(BB_continue)
+
+BB_fail:
+    %a = Undefined
+    %b = Undefined
+    Jump(BB_continue)
+
+BB_continue:
+    // a and b are ref-backed: assignment emits WriteRef
+    // e.g. a = 10  →  WriteRef(%a, 10) + rebind
 ```
 
 ### Intrinsic Operations
@@ -976,6 +1056,10 @@ IR (lowered)
 │  └──────────┬──────────┘            │
 │             ▼                       │
 │  ┌─────────────────────┐            │
+│  │ Ref Elision         │            │
+│  └──────────┬──────────┘            │
+│             ▼                       │
+│  ┌─────────────────────┐            │
 │  │ Definedness Analysis│            │
 │  │ + Diagnostics (1st) │            │
 │  └──────────┬──────────┘            │
@@ -1012,12 +1096,15 @@ IR (optimized)
 
 ### Fixpoint Iteration
 
-The Phase 1 passes (const fold, definedness, guard elim, CFG simplify) run
-in a loop until no pass makes changes. This handles cascading effects:
+The Phase 1 passes (const fold, ref elision, definedness, guard elim, CFG
+simplify) run in a loop until no pass makes changes. This handles cascading
+effects:
 
 - Const fold may turn a Phi into a constant → definedness sees Defined
+- Ref elision demotes read-only MakeRefs → exposes Copy/Index for const fold
 - Guard elimination removes guards → CFG simplify removes dead blocks
 - Dead block removal simplifies Phi nodes → new constant folding opportunities
+- CFG simplify may remove WriteRefs → ref elision demotes more MakeRefs
 
 Typically converges in 1-2 iterations. Diagnostics (E200/E201) are emitted
 only on the first iteration, before guard elimination reshapes the flow.
@@ -1052,6 +1139,39 @@ constants, replacing them with `Const` instructions.
 - Constant If conditions → `Jump` to appropriate target
 
 Running constant folding early simplifies the CFG for subsequent analysis passes.
+
+### Pass 1.5: Ref Elision
+
+**Goal:** Eliminate unnecessary `MakeRef` indirection.
+
+`MakeRef` instructions create explicit reference bindings for `with` semantics.
+Many of these are read-only — the variable is never written through (`WriteRef`).
+In those cases the runtime `Slot::Ref` indirection is pure overhead. This pass
+demotes them to cheaper instructions.
+
+**Three rewrites:**
+
+| Rewrite | Condition | Before → After |
+|---------|-----------|----------------|
+| Chain shortening | `base` from `MakeRef(_, orig, None)` | `MakeRef(d, base, None)` → `MakeRef(d, orig, None)` |
+| Element demotion | No `WriteRef` targets `dest` | `MakeRef(d, b, Some(k))` → `Index(d, b, k)` |
+| Whole-value demotion | No `WriteRef` targets `dest` AND base not in `written_bases` | `MakeRef(d, b, None)` → `Copy(d, b)` |
+
+**Written bases:** A base is "written" if any `WriteRef` in the function
+modifies it — either through a whole-value write (`key: None`) or an element
+write (`key: Some`, which mutates the collection). The pass follows `MakeRef`
+chains to find the resolved base. If a sibling ref to the same base has a
+`WriteRef`, the `Slot::Ref` alias must stay live so reads see the mutation.
+
+**Example:** `with x = arr; with y = arr[0]; y = 10` — the `WriteRef` for `y`
+writes to `arr`, so `arr` is in `written_bases`. If another ref aliases `arr`
+via `MakeRef(_, arr, None)`, it cannot be demoted to `Copy` because it must
+see the mutation to `arr[0]`.
+
+**Interaction with fixpoint:** Runs after constant folding. As other passes
+remove dead code (unreachable blocks, eliminated guards), `WriteRef`
+instructions may become unreachable. On the next fixpoint iteration, ref
+elision sees fewer `WriteRef`s and can demote more `MakeRef`s.
 
 ### Pass 2: Definedness Analysis (Coarse)
 
@@ -1091,6 +1211,8 @@ without knowing its concrete type, and vice versa. Definedness flows from source
 | `Undefined { dest }` | `Undefined` |
 | `Copy { dest, src }` | inherits from `src` |
 | `Index { dest, .. }` | `MaybeDefined` (OOB possible) |
+| `MakeRef { dest, .. }` | `MaybeDefined` (target may not exist) |
+| `WriteRef { .. }` | no dest (side effect only) |
 | `Intrinsic { op, .. }` infallible, all args Defined | `Defined` |
 | `Intrinsic { op, .. }` fallible or args MaybeDefined | `MaybeDefined` |
 | `Call { dest, function, .. }` | depends on `BuiltinMeta.purity` |
@@ -1199,6 +1321,8 @@ Meet = intersection (narrowing), Join = union (at Phi nodes)
 | `Intrinsic { op: Len, .. }` | `{UInt}` |
 | `Intrinsic { op: MakeArray, .. }` | `{Array}` |
 | `Index { .. }` | depends on base type |
+| `MakeRef { .. }` | all types (ref target could be any type) |
+| `WriteRef { .. }` | no dest (side effect only) |
 | `Phi { .. }` | union of source types |
 
 **Intrinsic-aware refinement:** The pass calls `op.result_type_refined(arg_types)`
@@ -1252,7 +1376,7 @@ may emerge. This pass runs the same constant folding logic as Pass 1 to clean up
 
 1. Mark as "live":
    - Variables used in `Return`, `Exit` terminators
-   - Variables used in `SetIndex` (side effect)
+   - Variables used in `SetIndex` or `WriteRef` (side effects)
    - Variables used in impure `Call` arguments
    - Variables used in terminator conditions (`If`, `Guard`, `Match`)
 
@@ -1275,6 +1399,7 @@ src/ir/
 ├── opt/
 │   ├── mod.rs             # Pipeline orchestration, optimize()
 │   ├── const_fold.rs      # Passes 1 & 5: Constant folding
+│   ├── ref_elision.rs     # Pass 1.5: Ref elision (MakeRef → Copy/Index)
 │   ├── definedness.rs     # Pass 2: Definedness analysis + diagnostics
 │   ├── guard_elim.rs      # Pass 3: Guard elimination + CFG simplification
 │   └── type_refinement.rs # Pass 4: Type refinement
@@ -1286,12 +1411,12 @@ Some passes may enable further optimizations by others. The pipeline can iterate
 
 ```rust
 loop {
-    let changed = false;
-    changed |= guard_eliminate(&mut ir);
-    changed |= simplify_cfg(&mut ir);
-    changed |= const_propagate(&mut ir);
-    changed |= dce(&mut ir);
-    if !changed { break; }
+    let folded = fold_constants(&mut func, builtins, diagnostics);
+    let refs = elide_refs(&mut func);
+    let analysis = analyze_definedness(&func, Some(builtins));
+    let guards = eliminate_guards(&mut func, &analysis);
+    let blocks = simplify_cfg(&mut func);
+    if folded + refs + guards + blocks == 0 { break; }
 }
 ```
 
@@ -1426,6 +1551,34 @@ The compiler warns on mutations to non-ref-backed loop variables (dead stores).
 **Why allow explicit `with`?** Self-documenting code. When you write `fn process(with bundle)`,
 it signals intent: "I will mutate this parameter." The explicit keyword is optional but encouraged
 for clarity.
+
+**IR-level reference architecture:**
+
+Reference semantics are explicit in the IR via two instructions, making them
+visible to the optimizer (no hidden aliasing):
+
+| Instruction | Emitted When | Runtime Effect |
+|-------------|-------------|----------------|
+| `MakeRef { dest, base, key: Some(k) }` | `with x = arr[i]`, for-loop by-ref | Reads `base[key]` into `dest` (like Index) |
+| `MakeRef { dest, base, key: None }` | `with x = y` | Creates `Slot::Ref` pointing to base's slot |
+| `WriteRef { ref_var, value }` | Assignment to ref-backed variable | Element: `SetIndex(base, key, value)`. Whole-value: slot write |
+
+The lowerer tracks ref origins in a scoped `HashMap<Identifier, RefOrigin>`
+(managed alongside the scope stack). When a ref-backed variable is assigned
+(`x = 10`), the lowerer:
+1. Looks up `x` in `ref_origins` → finds `RefOrigin { ref_var, base, key }`
+2. Emits `WriteRef { ref_var, value: v_new }`
+3. Creates a new SSA VarId and rebinds `x` (normal SSA behaviour)
+
+The optimizer can then:
+- See `MakeRef` and know which variables are references and to what
+- See `WriteRef` and know which collections are mutated through references
+- Eliminate dead `WriteRef` (collection never read after write-back)
+- Forward values through `WriteRef` (a read after write-back returns the written value)
+- Reduce `MakeRef` → `Index` when no `WriteRef` uses it (read-only ref)
+
+Pattern destructuring with `with` (`with [a, b] = arr`) emits `MakeRef` for
+each element instead of `Index`, propagating ref origins to each bound variable.
 
 ### Variadic Functions (Rest Parameters)
 
@@ -1824,6 +1977,9 @@ to `Instruction::Intrinsic { op: IntrinsicOp, args }`. Some expand to control fl
 | `x \|\| y` | `If(x, true, evaluate_y)` + Phi | Control flow (short-circuit) |
 | `if cond { a } else { b }` | `If` terminator + blocks + Phi | Control flow |
 | `arr[i] = v` (lvalue) | `Index` + `Guard` + `SetIndex` + Phi | Control flow |
+| `with x = arr[i]` | `MakeRef(arr, Some(i))` | Reference binding |
+| `with x = y` | `MakeRef(y, None)` | Reference binding |
+| `x = v` (ref-backed) | `WriteRef(ref_var, v)` + Copy + rebind | Write-back through reference |
 
 ### Reflexive Comparison Operators
 
@@ -2158,7 +2314,7 @@ The driver topologically sorts filters to honor these dependencies.
 - [x] Value types with Hash/Eq
 - [x] Sequence type (SeqState: RangeUInt, RangeInt, ArraySlice with mutable flag)
 - [x] Call convention with return slots
-- [x] Reference binding via Slot::Ref
+- [x] Reference binding via Slot::Ref (VM) + MakeRef/WriteRef (IR)
 - [x] Builtin registry and metadata system
 - [x] Optimization passes:
   - [x] Constant folding (early + cleanup)
@@ -2181,6 +2337,8 @@ The driver topologically sorts filters to honor these dependencies.
 - [ ] For-loop type dispatch (Match on iterable type for unknown types)
 - [ ] For-loop sequence path (seq_next-based loop for Sequence type)
 - [ ] Dead-store warnings for non-ref-backed loop variable mutations
+- [ ] `if with` / match arm ref origin tracking (Phase 2)
+- [ ] Dead write-back elimination (WriteRef where collection is never read after)
 - [ ] Host sequence support (`SeqState::Host` variant)
 - [ ] Standard library modules (std.time, std.cbor, std.encoding, std.parsing)
 - [ ] Module/import resolution system

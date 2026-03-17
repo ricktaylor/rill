@@ -161,6 +161,9 @@ fn transfer_instruction(
             state.insert(*dest, all_types());
         }
 
+        // WriteRef: side effect only (writes through a reference), no dest
+        Instruction::WriteRef { .. } => {}
+
         // Drop doesn't produce a value
         Instruction::Drop { .. } => {}
     }

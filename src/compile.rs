@@ -267,9 +267,38 @@ fn link_functions(
     link_map
 }
 
+/// Metadata for a reference created by MakeRef — used by WriteRef at compile time
+/// to determine how to emit the write-back.
+struct RefMeta {
+    base_slot: usize,
+    key_slot: Option<usize>,
+}
+
+/// Build a map from MakeRef dest VarId → RefMeta for WriteRef resolution.
+fn build_ref_map(blocks: &[BasicBlock]) -> HashMap<VarId, RefMeta> {
+    let mut map = HashMap::new();
+    for block in blocks {
+        for inst in &block.instructions {
+            if let Instruction::MakeRef { dest, base, key } = &inst.node {
+                map.insert(
+                    *dest,
+                    RefMeta {
+                        base_slot: slot(*base),
+                        key_slot: key.map(slot),
+                    },
+                );
+            }
+        }
+    }
+    map
+}
+
 fn compile_function(func: &Function, link_map: &LinkMap) -> Result<CompiledFunction, ExecError> {
     let block_map = build_block_map(&func.blocks);
     let frame_size = 1 + func.locals.len(); // slot 0 = Frame, then locals
+
+    // Collect MakeRef metadata for WriteRef resolution
+    let ref_map = build_ref_map(&func.blocks);
 
     // First pass: compile all blocks, collecting phi metadata
     let mut blocks = Vec::new();
@@ -299,7 +328,7 @@ fn compile_function(func: &Function, link_map: &LinkMap) -> Result<CompiledFunct
             }
         }
 
-        blocks.push(compile_block(ir_block, &block_map, link_map)?);
+        blocks.push(compile_block(ir_block, &block_map, link_map, &ref_map)?);
     }
 
     // Second pass: resolve phis by inserting copies into predecessor blocks.
@@ -352,6 +381,7 @@ fn compile_block(
     block: &BasicBlock,
     block_map: &HashMap<BlockId, usize>,
     link_map: &LinkMap,
+    ref_map: &HashMap<VarId, RefMeta>,
 ) -> Result<Vec<Step>, ExecError> {
     let mut steps: Vec<Step> = Vec::new();
 
@@ -361,7 +391,7 @@ fn compile_block(
             // copies are inserted into predecessor blocks
             Instruction::Phi { .. } => {}
             inst => {
-                if let Some(step) = compile_instruction(inst, block_map, link_map)? {
+                if let Some(step) = compile_instruction(inst, block_map, link_map, ref_map)? {
                     steps.push(step);
                 }
             }
@@ -378,6 +408,7 @@ fn compile_instruction(
     inst: &Instruction,
     _block_map: &HashMap<BlockId, usize>,
     link_map: &LinkMap,
+    ref_map: &HashMap<VarId, RefMeta>,
 ) -> Result<Option<Step>, ExecError> {
     Ok(Some(match inst {
         Instruction::Const { dest, value } => {
@@ -512,22 +543,79 @@ fn compile_instruction(
         }
 
         Instruction::MakeRef { dest, base, key } => {
-            // TODO: proper reference tracking for write-back
-            // For now, treat as Index (read the value)
             let d = slot(*dest);
             let b = slot(*base);
-            let k = slot(*key);
-            Box::new(move |vm: &mut VM, _prog| {
-                let result = match (vm.local(b), vm.local(k)) {
-                    (Some(base_val), Some(key_val)) => index_value(base_val, key_val),
-                    _ => None,
-                };
-                match result {
-                    Some(val) => vm.set_local(d, val),
-                    None => vm.set_local_uninit(d),
+            match key {
+                Some(k) => {
+                    // Element reference: read base[key] into dest
+                    let k = slot(*k);
+                    Box::new(move |vm: &mut VM, _prog| {
+                        let result = match (vm.local(b), vm.local(k)) {
+                            (Some(base_val), Some(key_val)) => index_value(base_val, key_val),
+                            _ => None,
+                        };
+                        match result {
+                            Some(val) => vm.set_local(d, val),
+                            None => vm.set_local_uninit(d),
+                        }
+                        Ok(Action::Continue)
+                    })
                 }
-                Ok(Action::Continue)
-            })
+                None => {
+                    // Whole-value reference: create a Slot::Ref to base's slot
+                    Box::new(move |vm: &mut VM, _prog| {
+                        vm.set_local_ref(d, vm.bp() + b);
+                        Ok(Action::Continue)
+                    })
+                }
+            }
+        }
+
+        Instruction::WriteRef { ref_var, value } => {
+            let v = slot(*value);
+            // Look up the MakeRef that created this ref_var to find
+            // the base and key slots for write-back.
+            if let Some(meta) = ref_map.get(ref_var) {
+                let base_slot = meta.base_slot;
+                match meta.key_slot {
+                    Some(key_slot) => {
+                        // Element write-back: SetIndex(base, key, value)
+                        Box::new(move |vm: &mut VM, _prog| {
+                            if let (Some(key_val), Some(new_val)) =
+                                (vm.local(key_slot).cloned(), vm.local(v).cloned())
+                            {
+                                match &key_val {
+                                    Value::UInt(idx) => {
+                                        let _ = vm.set_array_elem(
+                                            vm.bp() + base_slot,
+                                            *idx as usize,
+                                            new_val,
+                                        );
+                                    }
+                                    _ => {
+                                        let _ =
+                                            vm.set_map_entry(vm.bp() + base_slot, key_val, new_val);
+                                    }
+                                }
+                            }
+                            Ok(Action::Continue)
+                        })
+                    }
+                    None => {
+                        // Whole-value write-back: write to base's slot directly
+                        Box::new(move |vm: &mut VM, _prog| {
+                            if let Some(val) = vm.local(v).cloned() {
+                                vm.set_local(base_slot, val);
+                            }
+                            Ok(Action::Continue)
+                        })
+                    }
+                }
+            } else {
+                // MakeRef not found — shouldn't happen in well-formed IR.
+                // No-op fallback.
+                return Ok(None);
+            }
         }
 
         Instruction::Drop { .. } => {
