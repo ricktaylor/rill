@@ -481,11 +481,7 @@ impl<'a> Lowerer<'a> {
                     base,
                     key: Some(key),
                 });
-                let origin = RefOrigin {
-                    ref_var: dest,
-                    base,
-                    key: Some(key),
-                };
+                let origin = RefOrigin { ref_var: dest };
                 (dest, Some(origin))
             }
 
@@ -498,11 +494,7 @@ impl<'a> Lowerer<'a> {
                     base,
                     key: Some(key),
                 });
-                let origin = RefOrigin {
-                    ref_var: dest,
-                    base,
-                    key: Some(key),
-                };
+                let origin = RefOrigin { ref_var: dest };
                 (dest, Some(origin))
             }
 
@@ -514,11 +506,7 @@ impl<'a> Lowerer<'a> {
                         base: var,
                         key: None,
                     });
-                    let origin = RefOrigin {
-                        ref_var: dest,
-                        base: var,
-                        key: None,
-                    };
+                    let origin = RefOrigin { ref_var: dest };
                     (dest, Some(origin))
                 } else {
                     // Fall through to normal lowering (will emit error)

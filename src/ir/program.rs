@@ -144,13 +144,8 @@ impl<'a> Lowerer<'a> {
             return None;
         }
 
-        // Extract attributes
-        let attributes: Vec<ast::Attribute> =
-            func.attributes.iter().map(|a| a.node.clone()).collect();
-
         Some(Function {
             name: func.name.clone(),
-            attributes,
             params,
             rest_param,
             locals: std::mem::take(&mut self.vars),

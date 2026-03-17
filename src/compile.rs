@@ -302,6 +302,7 @@ fn compile_function(func: &Function, link_map: &LinkMap) -> Result<CompiledFunct
 
     // First pass: compile all blocks, collecting phi metadata
     let mut blocks = Vec::new();
+    #[allow(clippy::type_complexity)]
     let mut pending_phis: Vec<(usize, usize, Vec<(usize, usize)>)> = Vec::new();
     // pending_phis: (dest_slot, join_block_idx, [(pred_block_idx, src_slot)])
 

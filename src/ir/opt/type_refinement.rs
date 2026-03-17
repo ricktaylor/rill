@@ -27,6 +27,7 @@ pub type TypeMap = HashMap<(BlockId, VarId), TypeSet>;
 #[derive(Debug)]
 pub struct TypeAnalysis {
     /// TypeSet of each variable at each block's entry point
+    #[allow(dead_code)]
     pub at_entry: TypeMap,
 
     /// TypeSet of each variable at each block's exit point
@@ -35,6 +36,7 @@ pub struct TypeAnalysis {
 
 impl TypeAnalysis {
     /// Get the TypeSet of a variable at a block's entry
+    #[allow(dead_code)]
     pub fn get_at_entry(&self, block: BlockId, var: VarId) -> Option<&TypeSet> {
         self.at_entry.get(&(block, var))
     }
@@ -708,7 +710,6 @@ mod tests {
 
         let func = Function {
             name: ident("test"),
-            attributes: vec![],
             params: vec![Param {
                 var: var(0),
                 by_ref: false,

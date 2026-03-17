@@ -23,26 +23,10 @@ stdlib-path = identifier *("." identifier)  ; std.bpsec, std.cbor.utils
 file-path = string-literal  ; "../common/bundle_age.flt"
 
 ; ============================================================================
-; Attributes
-; ============================================================================
-
-; Rust-style attributes: #[name] or #[name(args)]
-; Args can be flags, literals, or key: value pairs
-attribute = "#[" identifier ["(" attr-arg-list ")"] "]"
-
-attr-arg-list = attr-arg *("," attr-arg)
-
-attr-arg = identifier ":" literal    ; Named: timeout: 5000
-         / identifier                ; Flag: export, required
-         / literal                   ; Positional: 5000, "text"
-
-; ============================================================================
 ; Functions
 ; ============================================================================
 
-; All functions use unified syntax with optional attributes
-; Driver selects entry points by signature/attributes, not syntax
-function = *attribute "fn" identifier "(" [param-list] ")" block
+function = "fn" identifier "(" [param-list] ")" block
 
 ; Function parameters: default is by-reference, `let` makes by-value
 ; `with` is explicit by-reference (optional, for symmetry)
@@ -610,30 +594,7 @@ CR = %x0D                  ; Carriage return
 ;      }
 ;    - Type names: UInt, Int, Float, Bool, Text, Bytes, Array, Map
 ;
-; 28. Function attributes:
-;    - Rust-style syntax: #[name] or #[name(args)]
-;    - Placed before fn keyword, multiple allowed
-;    - Argument forms:
-;      #[export]                      // flag (no args)
-;      #[after(validate, encrypt)]    // identifier list
-;      #[priority(10)]                // literal value
-;      #[config(timeout: 5000)]       // named value (key: literal)
-;      #[param(x, required, type: "Bundle")]  // mixed
-;    - Standard attributes:
-;      #[export]           - marks function as externally callable
-;      #[after(fn1, fn2)]  - ordering dependencies
-;      #[pure]             - no side effects
-;    - Drivers can register custom attributes
-;    - Examples:
-;      #[export]
-;      #[after(validate)]
-;      fn check_ttl(bundle) {
-;          if bundle.age > MAX_TTL {
-;              exit(LIFETIME_EXPIRED);  // builtin, not keyword
-;          }
-;      }
-;
-; 29. Bit test/set operator (@):
+; 28. Bit test/set operator (@):
 ;    - Syntax: X @ B where X is a UInt and B is a UInt bit position
 ;    - As rvalue: returns true if bit B is set in X, false if clear
 ;    - As lvalue: sets bit B if assigned true, clears if assigned false

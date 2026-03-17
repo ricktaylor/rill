@@ -122,30 +122,6 @@ pub enum ImportPath {
 }
 
 // ============================================================================
-// Attributes
-// ============================================================================
-
-/// Function attribute: #[name] or #[name(args)]
-#[derive(Debug, Clone)]
-pub struct Attribute {
-    pub name: Identifier,
-    pub args: Vec<AttributeArg>,
-}
-
-/// Argument to an attribute
-#[derive(Debug, Clone)]
-pub enum AttributeArg {
-    /// Flag identifier: `export`, `required`
-    Flag(Identifier),
-
-    /// Positional literal value: `5000`, `"text"`
-    Literal(Literal),
-
-    /// Named value: `timeout: 5000`, `reason: "deprecated"`
-    Named { key: Identifier, value: Literal },
-}
-
-// ============================================================================
 // Functions
 // ============================================================================
 
@@ -159,13 +135,9 @@ pub struct FunctionParam {
     pub is_value: bool,
 }
 
-/// Function definition with optional attributes
-/// All functions use the same structure; the driver selects entry points
-/// based on signatures and attributes, not syntax.
+/// Function definition
 #[derive(Debug, Clone)]
 pub struct Function {
-    /// Attributes: #[export], #[after(validate)], etc.
-    pub attributes: Vec<Spanned<Attribute>>,
     /// Function name
     pub name: Identifier,
     /// Parameters with binding mode

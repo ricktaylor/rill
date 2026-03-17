@@ -1693,85 +1693,6 @@ DTN bundle blocks without materializing them all into an Array).
 
 ---
 
-## Attributes
-
-Functions can be annotated with attributes that provide metadata for the compiler
-and driver. Attributes use Rust-style syntax.
-
-### Syntax
-
-```
-#[name]                           // Flag attribute
-#[name(arg1, arg2)]               // With arguments
-#[name(key: value)]               // Named argument
-#[name(arg, key: value, flag)]    // Mixed
-```
-
-### Argument Forms
-
-| Form | Example | Use |
-|------|---------|-----|
-| Flag | `export` | Boolean markers |
-| Identifier | `validate` | References to other functions |
-| Literal | `5000`, `"text"` | Configuration values |
-| Named | `timeout: 5000` | Key-value configuration |
-
-### Standard Attributes
-
-| Attribute | Purpose |
-|-----------|---------|
-| `#[export]` | Mark as externally callable entry point |
-| `#[after(fn1, fn2)]` | Ordering dependencies |
-| `#[pure]` | No side effects (optimization hint) |
-
-### AST Representation
-
-```rust
-pub struct Attribute {
-    pub name: Identifier,
-    pub args: Vec<AttributeArg>,
-}
-
-pub enum AttributeArg {
-    Flag(Identifier),                        // export
-    Literal(Literal),                        // 5000
-    Named { key: Identifier, value: Literal }, // timeout: 5000
-}
-```
-
-### Attribute Registry
-
-Drivers can register custom attributes, similar to builtins:
-
-```rust
-let mut attrs = AttributeRegistry::new();
-
-attrs.register("after", |args| {
-    // args contains identifiers for dependencies
-    Ok(AttributeValue::RunAfter(args.to_vec()))
-});
-
-attrs.register("priority", |args| {
-    // Custom driver attribute
-    Ok(AttributeValue::Custom("priority", args))
-});
-```
-
-### Example
-
-```
-#[export]
-#[after(validate_signature)]
-#[config(timeout: 5000, retries: 3)]
-fn process_bundle(bundle) {
-    if bundle.age > MAX_TTL {
-        exit(LIFETIME_EXPIRED);
-    }
-}
-```
-
----
-
 ## Error Handling
 
 ### Execution Errors
@@ -2140,19 +2061,12 @@ struct FunctionMeta {
     name: String,
     params: Vec<ParamMeta>,
     return_type: TypeSignature,
-    attributes: Vec<Attribute>,
 }
 
 struct ParamMeta {
     name: String,
     type_sig: TypeSignature,
     by_ref: bool,
-}
-
-enum Attribute {
-    RunAfter(Vec<String>),  // Execution ordering dependencies
-    EntryPoint,             // Externally callable
-    Pure,                   // No side effects
 }
 ```
 
@@ -2167,11 +2081,8 @@ let handlers: Vec<_> = compiled.functions
     .filter(|f| matches_signature(f, &expected_sig))
     .collect();
 
-// Optionally sort by RunAfter dependencies
-let ordered = topo_sort(handlers);
-
 // Execute
-for handler in ordered {
+for handler in handlers {
     let result = call(handler, &mut context);
     // Handle result based on application needs
 }
@@ -2193,7 +2104,6 @@ Tag(0xF1700) Module {
             name: text,
             params: [ParamMeta...],
             returns: TypeSignature | null,  // null = diverging
-            attrs: [Attribute...],
             code: Tag(0xF1702) [Instruction...],
         },
         ...
@@ -2287,16 +2197,8 @@ FilterResult::Continue
 
 ### Ordering Dependencies
 
-Filters can declare ordering constraints via the `RunAfter` attribute:
-
-```
-#[after(validate_signature)]
-fn check_payload(bundle) {
-    // Only runs after validate_signature
-}
-```
-
-The driver topologically sorts filters to honor these dependencies.
+Filters can declare ordering constraints via the host driver. The driver
+topologically sorts filters to honor dependencies.
 
 ---
 
@@ -2418,16 +2320,6 @@ for driver binding enables:
 - Driver flexibility (select by signature, not syntax)
 - Cleaner language (fewer keywords, uniform semantics)
 - `exit()` as a builtin rather than special syntax
-
-### Why Rust-style attributes with `:` for named values?
-
-Attributes provide extensible metadata without language keywords:
-
-- Rust-style `#[attr]` is familiar and visually distinct from code
-- Using `:` instead of `=` for named values avoids confusion with assignment
-- Consistent with map literal syntax (`{key: value}`)
-- Drivers can register custom attributes, like builtins
-- Attributes compile to metadata, not runtime code
 
 ### Why CBOR for compiled binary format?
 

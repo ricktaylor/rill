@@ -231,20 +231,6 @@ fn bytes_literal<'a>() -> BoxedParser<'a, Literal> {
         .boxed()
 }
 
-/// Combined parser for any simple literal (for use in attributes)
-fn literal<'a>() -> BoxedParser<'a, Literal> {
-    choice((
-        bool_literal(),
-        bytes_literal(),
-        float_literal(),
-        int_literal(),
-        uint_literal(),
-        text_literal(),
-    ))
-    .padded_by(whitespace())
-    .boxed()
-}
-
 // ============================================================================
 // Operators
 // ============================================================================
@@ -1330,66 +1316,19 @@ fn param_list<'a>() -> BoxedParser<'a, (Vec<ast::FunctionParam>, Option<ast::Fun
 }
 
 // ============================================================================
-// Attributes
-// ============================================================================
-
-fn attribute_arg<'a>() -> BoxedParser<'a, ast::AttributeArg> {
-    // Named: identifier ":" literal
-    let named = ident()
-        .then_ignore(just(':').padded_by(whitespace()))
-        .then(literal())
-        .map(|(key, value)| ast::AttributeArg::Named { key, value });
-
-    // Literal value (try before flag since numbers could be ambiguous)
-    let lit = literal().map(ast::AttributeArg::Literal);
-
-    // Flag: just an identifier
-    let flag = ident().map(ast::AttributeArg::Flag);
-
-    // Try named first, then literal, then flag
-    named.or(lit).or(flag).padded_by(whitespace()).boxed()
-}
-
-fn attribute<'a>() -> BoxedParser<'a, ast::Spanned<ast::Attribute>> {
-    let args = attribute_arg()
-        .separated_by(just(',').padded_by(whitespace()))
-        .collect::<Vec<_>>()
-        .delimited_by(
-            just('(').padded_by(whitespace()),
-            just(')').padded_by(whitespace()),
-        )
-        .or_not()
-        .map(|args| args.unwrap_or_default());
-
-    just("#[")
-        .padded_by(whitespace())
-        .ignore_then(ident())
-        .then(args)
-        .then_ignore(just(']').padded_by(whitespace()))
-        .map(|(name, args)| ast::Attribute { name, args })
-        .map_with(|attr, extra| ast::Spanned::new(attr, extra.span()))
-        .boxed()
-}
-
-// ============================================================================
 // Functions
 // ============================================================================
 
 fn function<'a>() -> BoxedParser<'a, ast::Spanned<Function>> {
-    attribute()
-        .padded_by(whitespace())
-        .repeated()
-        .collect::<Vec<_>>()
-        .then_ignore(kw("fn"))
-        .then(ident())
+    kw("fn")
+        .ignore_then(ident())
         .then(param_list().delimited_by(
             just('(').padded_by(whitespace()),
             just(')').padded_by(whitespace()),
         ))
         .then(block_body(expression()))
         .map(
-            |(((attributes, name), (params, rest_param)), (statements, final_expr))| Function {
-                attributes,
+            |((name, (params, rest_param)), (statements, final_expr))| Function {
                 name,
                 params,
                 rest_param,

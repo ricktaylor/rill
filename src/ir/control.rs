@@ -176,11 +176,7 @@ impl<'a> Lowerer<'a> {
                             base: value,
                             key: Some(idx),
                         });
-                        let origin = RefOrigin {
-                            ref_var: dest,
-                            base: value,
-                            key: Some(idx),
-                        };
+                        let origin = RefOrigin { ref_var: dest };
                         (dest, Some(origin))
                     } else {
                         let dest = self.new_temp(TypeSet::all());
@@ -245,11 +241,7 @@ impl<'a> Lowerer<'a> {
                             base: value,
                             key: Some(idx),
                         });
-                        let origin = RefOrigin {
-                            ref_var: dest,
-                            base: value,
-                            key: Some(idx),
-                        };
+                        let origin = RefOrigin { ref_var: dest };
                         (dest, Some(origin))
                     } else {
                         let dest = self.new_temp(TypeSet::all());
@@ -334,11 +326,7 @@ impl<'a> Lowerer<'a> {
                                 base: value,
                                 key: Some(idx),
                             });
-                            let origin = RefOrigin {
-                                ref_var: dest,
-                                base: value,
-                                key: Some(idx),
-                            };
+                            let origin = RefOrigin { ref_var: dest };
                             (dest, Some(origin))
                         } else {
                             let dest = self.new_temp(TypeSet::all());
@@ -396,11 +384,7 @@ impl<'a> Lowerer<'a> {
                             base: value,
                             key: Some(key_var),
                         });
-                        let origin = RefOrigin {
-                            ref_var: dest,
-                            base: value,
-                            key: Some(key_var),
-                        };
+                        let origin = RefOrigin { ref_var: dest };
                         (dest, Some(origin))
                     } else {
                         let dest = self.new_temp(TypeSet::all());
@@ -790,11 +774,7 @@ impl<'a> Lowerer<'a> {
                 base: iter_var,
                 key: Some(i_var),
             });
-            let origin = RefOrigin {
-                ref_var: dest,
-                base: iter_var,
-                key: Some(i_var),
-            };
+            let origin = RefOrigin { ref_var: dest };
             (dest, Some(origin))
         } else {
             let dest = self.new_temp(TypeSet::all());

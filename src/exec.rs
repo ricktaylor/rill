@@ -335,6 +335,7 @@ pub enum SeqState {
 
 impl SeqState {
     /// Advance the sequence and return the next value, or None if exhausted.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<Value> {
         match self {
             SeqState::RangeUInt {

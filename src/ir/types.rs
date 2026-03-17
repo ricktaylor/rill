@@ -282,6 +282,7 @@ pub struct VarId(pub u32);
 
 /// SSA variable metadata
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct Var {
     pub id: VarId,
     pub name: ast::Identifier,
@@ -368,7 +369,8 @@ pub enum Instruction {
     /// and reason about dead write-backs, forwarding, etc.
     WriteRef { ref_var: VarId, value: VarId },
 
-    /// Mark end of variable scope - slots can be reclaimed
+    /// Mark end of variable scope - slots can be reclaimed (planned)
+    #[allow(dead_code)]
     Drop { vars: Vec<VarId> },
 }
 
@@ -440,17 +442,6 @@ pub struct BasicBlock {
     pub terminator: Terminator,
 }
 
-impl BasicBlock {
-    /// Create a block with the given id, empty instructions, and Unreachable terminator.
-    pub fn new(id: BlockId) -> Self {
-        BasicBlock {
-            id,
-            instructions: Vec::new(),
-            terminator: Terminator::Unreachable,
-        }
-    }
-}
-
 /// Block terminator (control flow)
 #[derive(Debug, Clone)]
 pub enum Terminator {
@@ -485,6 +476,7 @@ pub enum Terminator {
     Return { value: Option<VarId> },
 
     /// Hard exit to driver (from diverging builtins like drop())
+    #[allow(dead_code)]
     Exit { value: VarId },
 
     /// Unreachable code (placeholder after merging)
@@ -540,7 +532,6 @@ pub enum MatchPattern {
 #[derive(Debug, Clone)]
 pub struct Function {
     pub name: ast::Identifier,
-    pub attributes: Vec<ast::Attribute>,
     pub params: Vec<Param>,
     pub rest_param: Option<Param>,
     pub locals: Vec<Var>,
@@ -552,7 +543,6 @@ impl Default for Function {
     fn default() -> Self {
         Function {
             name: ast::Identifier("_".to_string()),
-            attributes: Vec::new(),
             params: Vec::new(),
             rest_param: None,
             locals: Vec::new(),
@@ -564,6 +554,7 @@ impl Default for Function {
 
 /// Function parameter with binding mode
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct Param {
     pub var: VarId,
     pub by_ref: bool,
@@ -571,6 +562,7 @@ pub struct Param {
 
 /// Complete IR program
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct IrProgram {
     pub functions: Vec<Function>,
     pub constants: Vec<ConstBinding>,
@@ -579,6 +571,7 @@ pub struct IrProgram {
 
 /// A constant binding (result of const pattern matching)
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ConstBinding {
     pub name: ast::Identifier,
     pub value: ConstValue,
@@ -586,6 +579,7 @@ pub struct ConstBinding {
 
 /// Import declaration for module resolution
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct Import {
     pub namespace: ast::Identifier,
     pub path: ast::ImportPath,

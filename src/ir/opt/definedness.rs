@@ -99,6 +99,7 @@ pub struct DefinednessAnalysis {
 
 impl DefinednessAnalysis {
     /// Get the definedness of a variable at a block's entry
+    #[allow(dead_code)]
     pub fn get_at_entry(&self, block: BlockId, var: VarId) -> Definedness {
         self.at_entry
             .get(&(block, var))
@@ -798,6 +799,7 @@ fn check_terminator_uses(
 ///
 /// If `is_control_flow` is true, definitely-undefined emits an error (E200).
 /// Otherwise, definitely-undefined emits a warning (same as maybe-undefined).
+#[allow(clippy::too_many_arguments)]
 fn check_var_use(
     var: VarId,
     state: &HashMap<VarId, Definedness>,

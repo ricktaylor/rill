@@ -60,15 +60,12 @@ pub enum BindingMode {
 /// Origin of a reference binding: tracks what a `with`-bound variable refers to.
 ///
 /// Used by the lowerer to emit `WriteRef` instructions when a ref-backed
-/// variable is assigned. The optimizer can then see write-back explicitly.
+/// variable is assigned. The `ref_var` is the dest of the MakeRef instruction;
+/// the compiler resolves it to (base, key) via `build_ref_map` at compile time.
 #[derive(Clone)]
 pub struct RefOrigin {
     /// The MakeRef dest VarId (the reference variable)
     pub ref_var: VarId,
-    /// The collection or variable being referenced
-    pub base: VarId,
-    /// The key into the collection (None for whole-value refs)
-    pub key: Option<VarId>,
 }
 
 // ============================================================================
