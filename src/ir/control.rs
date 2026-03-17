@@ -691,17 +691,16 @@ impl<'a> Lowerer<'a> {
         result
     }
 
-    /// Lower a for loop using index-based iteration.
+    /// Lower a for loop with type dispatch.
     ///
-    /// Lowers `for x in iterable { body }` to:
-    /// ```text
-    /// iter = iterable
-    /// length = core::len(iter)
-    /// i = 0
-    /// header: if core::lt(i, length) -> body, exit
-    /// body:   elem = iter[i]; bind x = elem; ... body ...; i = core::add(i, 1); jump header
-    /// exit:   undefined
-    /// ```
+    /// Evaluates the iterable, then dispatches on its runtime type:
+    /// - Sequence → SeqNext-based consumption (no counter, Guard on exhaustion)
+    /// - Default (Array, Map, etc.) → index-based iteration (Len + Lt + Index)
+    ///
+    /// Both paths lower the body independently (separate SSA variables).
+    /// Outer variables modified in the body are merged with Phis at the
+    /// shared exit block. When the iterable type is known at compile time,
+    /// the optimizer collapses the Match to a single path.
     pub fn lower_for(
         &mut self,
         binding_is_value: bool,
@@ -710,14 +709,95 @@ impl<'a> Lowerer<'a> {
         body: &[ast::Stmt],
         body_expr: &Option<Box<ast::Expression>>,
     ) -> VarId {
-        // If the iterable is a Range expression, use the sequence path
-        // (SeqNext-based consumption instead of index-based iteration).
-        if matches!(iterable, ast::Expression::Range { .. }) {
-            return self.lower_for_seq(binding_is_value, binding, iterable, body, body_expr);
-        }
-
         let iter_var = self.lower_expression(iterable);
 
+        let seq_bb = self.fresh_block();
+        let idx_bb = self.fresh_block();
+        let join_bb = self.fresh_block();
+
+        // Snapshot outer scope — both paths start from the same bindings,
+        // and we merge their final values at the join block.
+        let outer_snapshot = self.snapshot_scope();
+
+        self.finish_block(Terminator::Match {
+            value: iter_var,
+            arms: vec![(MatchPattern::Type(types::BaseType::Sequence), seq_bb)],
+            default: idx_bb,
+            span: self.current_span,
+        });
+
+        // === Sequence path ===
+        self.current_block = seq_bb;
+        self.current_instructions = Vec::new();
+        self.lower_for_seq(iter_var, binding_is_value, binding, body, body_expr);
+        let seq_exit_bb = self.current_block;
+        let seq_final_vars: Vec<VarId> = outer_snapshot
+            .iter()
+            .map(|(name, pre_var)| self.lookup(name).unwrap_or(*pre_var))
+            .collect();
+        self.finish_block(Terminator::Jump { target: join_bb });
+
+        // === Index path ===
+        // Restore pre-dispatch bindings so this path starts from the same state.
+        self.current_block = idx_bb;
+        self.current_instructions = Vec::new();
+        for (name, var) in &outer_snapshot {
+            self.bind(name, *var);
+        }
+        self.lower_for_idx(iter_var, binding_is_value, binding, body, body_expr);
+        let idx_exit_bb = self.current_block;
+        let idx_final_vars: Vec<VarId> = outer_snapshot
+            .iter()
+            .map(|(name, pre_var)| self.lookup(name).unwrap_or(*pre_var))
+            .collect();
+        self.finish_block(Terminator::Jump { target: join_bb });
+
+        // === Join ===
+        self.current_block = join_bb;
+        self.current_instructions = Vec::new();
+
+        // Merge outer variables from both paths
+        for (i, (name, pre_var)) in outer_snapshot.iter().enumerate() {
+            let seq_var = seq_final_vars[i];
+            let idx_var = idx_final_vars[i];
+            // Skip Phi if both paths left the variable unchanged
+            if seq_var == *pre_var && idx_var == *pre_var {
+                continue;
+            }
+            let phi_var = self.new_temp(TypeSet::all());
+            self.emit(Instruction::Phi {
+                dest: phi_var,
+                sources: vec![(seq_exit_bb, seq_var), (idx_exit_bb, idx_var)],
+            });
+            self.bind(name, phi_var);
+        }
+
+        let result = self.new_temp(TypeSet::empty());
+        self.emit(Instruction::Undefined { dest: result });
+        result
+    }
+
+    /// Lower the index-based iteration path (for Array, Map, Bytes, Text).
+    ///
+    /// ```text
+    /// length = Len(iter)
+    /// i = 0
+    /// header: if Lt(i, length) → body, exit
+    /// body:   elem = iter[i]; bind x; ... body ...; jump latch
+    /// latch:  i = i + 1; jump header
+    /// exit:
+    /// ```
+    ///
+    /// After this returns, `self.current_block` is the exit block and
+    /// outer scope bindings reflect any modifications from the loop body.
+    fn lower_for_idx(
+        &mut self,
+        iter_var: VarId,
+        binding_is_value: bool,
+        binding: &ast::ForBinding,
+        body: &[ast::Stmt],
+        body_expr: &Option<Box<ast::Expression>>,
+    ) {
         // length = Len(iter)
         let length = self.emit_unary_intrinsic(IntrinsicOp::Len, iter_var);
 
@@ -730,10 +810,9 @@ impl<'a> Lowerer<'a> {
 
         let header_bb = self.fresh_block();
         let body_bb = self.fresh_block();
-        let latch_bb = self.fresh_block(); // increment block (continue target)
+        let latch_bb = self.fresh_block();
         let exit_bb = self.fresh_block();
 
-        // Snapshot scope for loop-carried phis (handles variables modified in body)
         let scope_snapshot = self.snapshot_scope();
         let pre_header_bb = self.current_block;
         self.finish_block(Terminator::Jump { target: header_bb });
@@ -741,11 +820,8 @@ impl<'a> Lowerer<'a> {
         // Header: loop-carried phis + index phi, then check i < length
         self.current_block = header_bb;
         self.current_instructions = Vec::new();
-
-        // Create phis for all in-scope variables (handles sum, etc.)
         let loop_phis = self.create_loop_phis(pre_header_bb, &scope_snapshot);
 
-        // Manual phi for the loop counter (not in scope snapshot)
         let i_var = self.new_temp(TypeSet::single(types::BaseType::UInt));
         let i_phi_idx = self.current_instructions.len();
         self.emit(Instruction::Phi {
@@ -761,7 +837,7 @@ impl<'a> Lowerer<'a> {
             span: self.current_span,
         });
 
-        // Body: index into iterable, bind variables, execute body
+        // Body
         self.current_block = body_bb;
         self.current_instructions = Vec::new();
         self.push_scope();
@@ -772,7 +848,6 @@ impl<'a> Lowerer<'a> {
             BindingMode::Reference
         };
 
-        // Read element from iterable — use MakeRef for by-ref binding
         let (elem, elem_origin) = if matches!(mode, BindingMode::Reference) {
             let dest = self.new_temp(TypeSet::all());
             self.emit(Instruction::MakeRef {
@@ -792,7 +867,6 @@ impl<'a> Lowerer<'a> {
             (dest, None)
         };
 
-        // Bind loop variable(s)
         match binding {
             ast::ForBinding::Single(name) => match mode {
                 BindingMode::Value => {
@@ -837,7 +911,6 @@ impl<'a> Lowerer<'a> {
             }
         }
 
-        // continue jumps to latch (increment), not header (avoids skipping i++)
         self.loop_stack.push(LoopContext {
             break_target: exit_bb,
             continue_target: latch_bb,
@@ -853,14 +926,12 @@ impl<'a> Lowerer<'a> {
 
         self.loop_stack.pop();
 
-        // Patch loop-carried phis for scope variables (sum, etc.)
         let body_exit_bb = self.current_block;
         self.patch_loop_phis(header_bb, body_exit_bb, &loop_phis);
-
         self.pop_scope();
         self.finish_block(Terminator::Jump { target: latch_bb });
 
-        // Latch block: increment counter, jump back to header
+        // Latch: increment counter
         self.current_block = latch_bb;
         self.current_instructions = Vec::new();
 
@@ -871,14 +942,12 @@ impl<'a> Lowerer<'a> {
         });
         let i_next = self.emit_binary_intrinsic(IntrinsicOp::Add, i_var, one);
 
-        // Also patch loop-carried phis from the latch block
-        // (continue skips the body exit but still needs phi sources)
         self.patch_loop_phis(header_bb, latch_bb, &loop_phis);
 
         let latch_exit_bb = self.current_block;
         self.finish_block(Terminator::Jump { target: header_bb });
 
-        // Patch the counter phi with sources from pre-header and latch
+        // Patch counter phi
         let header_block = self
             .blocks
             .iter_mut()
@@ -895,53 +964,43 @@ impl<'a> Lowerer<'a> {
             _ => panic!("for-loop instruction at phi index is not a Phi"),
         }
 
-        // Exit
+        // Exit — leave current_block set to exit_bb for the dispatcher
         self.current_block = exit_bb;
         self.current_instructions = Vec::new();
-
-        let result = self.new_temp(TypeSet::empty());
-        self.emit(Instruction::Undefined { dest: result });
-        result
     }
 
-    /// Lower a for loop over a Sequence using SeqNext-based consumption.
+    /// Lower the SeqNext-based iteration path (for Sequence types).
     ///
-    /// Lowers `for x in seq { body }` to:
     /// ```text
-    /// seq = iterable
     /// header: elem = SeqNext(seq)
     ///         Guard elem → body, exit
     /// body:   bind x = elem; ... body ...; jump header
-    /// exit:   undefined
+    /// exit:
     /// ```
     ///
-    /// Unlike index-based iteration, this consumes the sequence in-place
-    /// via SeqNext (mutates the SeqState). No counter or length needed.
+    /// After this returns, `self.current_block` is the exit block and
+    /// outer scope bindings reflect any modifications from the loop body.
     fn lower_for_seq(
         &mut self,
-        binding_is_value: bool,
+        seq_var: VarId,
+        _binding_is_value: bool,
         binding: &ast::ForBinding,
-        iterable: &ast::Expression,
         body: &[ast::Stmt],
         body_expr: &Option<Box<ast::Expression>>,
-    ) -> VarId {
-        let seq_var = self.lower_expression(iterable);
-
+    ) {
         let header_bb = self.fresh_block();
         let body_bb = self.fresh_block();
         let exit_bb = self.fresh_block();
 
-        // Snapshot scope for loop-carried phis
         let scope_snapshot = self.snapshot_scope();
         let pre_header_bb = self.current_block;
         self.finish_block(Terminator::Jump { target: header_bb });
 
-        // Header: create loop-carried phis, then try SeqNext
+        // Header: loop-carried phis, then SeqNext + Guard
         self.current_block = header_bb;
         self.current_instructions = Vec::new();
         let loop_phis = self.create_loop_phis(pre_header_bb, &scope_snapshot);
 
-        // elem = SeqNext(seq) — returns next value or undefined if exhausted
         let elem = self.new_temp(TypeSet::all());
         self.emit(Instruction::Intrinsic {
             dest: elem,
@@ -949,7 +1008,6 @@ impl<'a> Lowerer<'a> {
             args: vec![seq_var],
         });
 
-        // Guard: if elem is defined → body, else → exit
         self.finish_block(Terminator::Guard {
             value: elem,
             defined: body_bb,
@@ -957,20 +1015,12 @@ impl<'a> Lowerer<'a> {
             span: self.current_span,
         });
 
-        // Body: bind variables, execute body
+        // Body
         self.current_block = body_bb;
         self.current_instructions = Vec::new();
         self.push_scope();
 
-        let _mode = if binding_is_value {
-            BindingMode::Value
-        } else {
-            BindingMode::Reference
-        };
-
-        // Bind loop variable(s)
-        // Note: sequences are always by-value (no backing collection to write back to).
-        // The `mode` flag is still passed for consistency but MakeRef is not used.
+        // Sequences are always by-value (no backing collection to write back to).
         match binding {
             ast::ForBinding::Single(name) => {
                 let var = self.new_var(name.clone(), TypeSet::all());
@@ -980,38 +1030,25 @@ impl<'a> Lowerer<'a> {
                 });
                 self.bind(name, var);
             }
-            ast::ForBinding::Pair(_key_name, _val_name) => {
-                // Pair binding on sequences doesn't have a natural key.
-                // For ranges, the "key" would be the iteration count, but
-                // that's not tracked in SeqNext. Bind both to the value for now.
-                // TODO: track iteration index for pair binding on sequences
-                let var = self.new_var(
-                    match binding {
-                        ast::ForBinding::Pair(_, val) => val.clone(),
-                        _ => unreachable!(),
-                    },
-                    TypeSet::all(),
-                );
+            ast::ForBinding::Pair(key_name, val_name) => {
+                let var = self.new_var(val_name.clone(), TypeSet::all());
                 self.emit(Instruction::Copy {
                     dest: var,
                     src: elem,
                 });
-                if let ast::ForBinding::Pair(key_name, val_name) = binding {
-                    self.bind(val_name, var);
-                    // Key is undefined for sequences (no natural index)
-                    let undef = self.new_temp(TypeSet::empty());
-                    self.emit(Instruction::Undefined { dest: undef });
-                    let key_var = self.new_var(key_name.clone(), TypeSet::all());
-                    self.emit(Instruction::Copy {
-                        dest: key_var,
-                        src: undef,
-                    });
-                    self.bind(key_name, key_var);
-                }
+                self.bind(val_name, var);
+                // Key is undefined for sequences (no natural index)
+                let undef = self.new_temp(TypeSet::empty());
+                self.emit(Instruction::Undefined { dest: undef });
+                let key_var = self.new_var(key_name.clone(), TypeSet::all());
+                self.emit(Instruction::Copy {
+                    dest: key_var,
+                    src: undef,
+                });
+                self.bind(key_name, key_var);
             }
         }
 
-        // continue jumps back to header (try next element)
         self.loop_stack.push(LoopContext {
             break_target: exit_bb,
             continue_target: header_bb,
@@ -1027,20 +1064,14 @@ impl<'a> Lowerer<'a> {
 
         self.loop_stack.pop();
 
-        // Patch loop-carried phis with post-body values
         let body_exit_bb = self.current_block;
         self.patch_loop_phis(header_bb, body_exit_bb, &loop_phis);
-
         self.pop_scope();
         self.finish_block(Terminator::Jump { target: header_bb });
 
-        // Exit
+        // Exit — leave current_block set to exit_bb for the dispatcher
         self.current_block = exit_bb;
         self.current_instructions = Vec::new();
-
-        let result = self.new_temp(TypeSet::empty());
-        self.emit(Instruction::Undefined { dest: result });
-        result
     }
 
     /// Lower a match expression

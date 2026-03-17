@@ -459,6 +459,10 @@ impl<'a> Lowerer<'a> {
                 let arg = self.lower_expression(&arguments[0]);
                 Some(self.emit_unary_intrinsic(IntrinsicOp::Len, arg))
             }
+            "collect" if arguments.len() == 1 => {
+                let arg = self.lower_expression(&arguments[0]);
+                Some(self.emit_unary_intrinsic(IntrinsicOp::Collect, arg))
+            }
             _ => None,
         }
     }

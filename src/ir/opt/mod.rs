@@ -12,17 +12,19 @@
 //! 7. Constant Folding (cleanup) - fold constants exposed by earlier passes
 //! 8. Dead Code Elimination - remove unused computations
 
+mod coercion;
 mod const_fold;
 mod definedness;
 mod guard_elim;
 mod ref_elision;
 mod type_refinement;
 
+pub use coercion::{elide_coercions, insert_coercions};
 pub use const_fold::fold_constants;
 pub use definedness::{analyze_definedness, check_definedness};
 pub use guard_elim::{eliminate_guards, simplify_cfg};
 pub use ref_elision::elide_refs;
-pub use type_refinement::analyze_types;
+pub use type_refinement::{TypeAnalysis, analyze_types};
 
 // Import IR types from parent module
 use super::{
@@ -62,6 +64,7 @@ pub fn optimize_function(
     loop {
         let folded = fold_constants(function, builtins, diagnostics);
         let refs = elide_refs(function);
+        let coerce = elide_coercions(function);
 
         let definedness = analyze_definedness(function, Some(builtins));
 
@@ -75,7 +78,7 @@ pub fn optimize_function(
         let guards = eliminate_guards(function, &definedness);
         let blocks = simplify_cfg(function);
 
-        if folded + refs + guards + blocks == 0 {
+        if folded + refs + coerce + guards + blocks == 0 {
             break;
         }
     }
@@ -88,11 +91,27 @@ pub fn optimize_function(
     // Type mismatch diagnostics (W009)
     check_intrinsic_types(function, &types, diagnostics);
 
-    // Future: coercion insertion goes here. It generates Match + Widen +
-    // monomorphic ops, with Undefined for invalid type combinations.
-    // This acts as a fine-grained second definedness pass — the expanded
-    // IR has explicit Undefined for type mismatches. Running the Phase 1
-    // loop again on the expanded IR would exploit this automatically.
+    // Coercion insertion: makes implicit numeric promotion explicit via Widen.
+    // Also replaces provably-incompatible operations with Undefined.
+    let coercions = insert_coercions(function, &types);
+
+    // If coercion insertion changed anything, re-run the Phase 1 fixpoint
+    // loop. The expanded IR has:
+    //   - Widen(Const(42_u64), 2) → const fold collapses to Const(42_i64)
+    //   - Explicit Undefined → definedness sees it, guard elim cleans up
+    if coercions > 0 {
+        loop {
+            let folded = fold_constants(function, builtins, diagnostics);
+            let refs = elide_refs(function);
+            let coerce = elide_coercions(function);
+            let definedness = analyze_definedness(function, Some(builtins));
+            let guards = eliminate_guards(function, &definedness);
+            let blocks = simplify_cfg(function);
+            if folded + refs + coerce + guards + blocks == 0 {
+                break;
+            }
+        }
+    }
 
     // ── Phase 3: Cleanup ───────────────────────────────────────────────
 

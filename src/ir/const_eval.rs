@@ -169,7 +169,36 @@ pub fn eval_intrinsic_const(op: crate::ir::IntrinsicOp, args: &[ConstValue]) -> 
         }
 
         // Sequences are runtime-only (lazy), can't const-eval
-        IntrinsicOp::MakeSeq | IntrinsicOp::ArraySeq | IntrinsicOp::SeqNext => None,
+        IntrinsicOp::MakeSeq
+        | IntrinsicOp::ArraySeq
+        | IntrinsicOp::SeqNext
+        | IntrinsicOp::Collect => None,
+
+        // Widen: numeric coercion along the promotion lattice
+        IntrinsicOp::Widen => {
+            let value = args.first()?;
+            let target = match args.get(1)? {
+                ConstValue::UInt(t) => *t,
+                _ => return None,
+            };
+            match (value, target) {
+                // Target = Int (BaseType::Int = 2)
+                (ConstValue::UInt(n), 2) => {
+                    let n = *n;
+                    if n > i64::MAX as u64 {
+                        None // overflow
+                    } else {
+                        Some(ConstValue::Int(n as i64))
+                    }
+                }
+                (ConstValue::Int(n), 2) => Some(ConstValue::Int(*n)), // identity
+                // Target = Float (BaseType::Float = 3)
+                (ConstValue::UInt(n), 3) => Some(ConstValue::Float(*n as f64)),
+                (ConstValue::Int(n), 3) => Some(ConstValue::Float(*n as f64)),
+                (ConstValue::Float(f), 3) => Some(ConstValue::Float(*f)), // identity
+                _ => None,
+            }
+        }
     }
 }
 

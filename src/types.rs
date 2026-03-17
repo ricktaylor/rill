@@ -5,12 +5,13 @@
 
 /// The base types that a value can have at runtime.
 ///
-/// These correspond to CBOR major types plus our language-specific distinctions:
+/// Duck-typed value system covering common data interchange types:
 /// - Bool, UInt, Int, Float: scalar types
 /// - Text, Bytes: string-like types
 /// - Array, Map: collection types
+/// - Sequence: internal lazy iterator (not user-visible)
 ///
-/// Note: "missing" is not a type - it's tracked orthogonally (Option<Value> at runtime,
+/// Note: "missing" is not a type — it's tracked orthogonally (Option<Value> at runtime,
 /// Definedness lattice at compile time).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum BaseType {

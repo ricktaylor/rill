@@ -237,11 +237,11 @@ pub enum Expression {
         index: Box<Expression>,
     },
 
-    // Member access (CBOR map key): obj.foo => obj[Text("foo")]
+    // Member access (map key): obj.foo => obj[Text("foo")]
     // Returns missing if object or key is missing
     MemberAccess {
         object: Box<Expression>,
-        member: Box<Expression>, // CBOR map key (any CBOR type)
+        member: Box<Expression>, // map key (any value type)
     },
 
     // Block expression: { statements; final_expr }
@@ -381,7 +381,7 @@ pub enum Pattern {
     },
 
     // Map pattern: {key_pattern: value_pattern, ...}
-    // Can match on any CBOR key type: {42: x}, {"name": n}, etc.
+    // Can match on any key type: {42: x}, {"name": n}, etc.
     Map(Vec<(Pat, Pat)>),
 
     // Type pattern with optional binding
@@ -405,8 +405,8 @@ pub enum Literal {
     Float(f64),
     Bytes(Vec<u8>),
     Text(String),
-    Array(Vec<Expression>),             // CBOR array literal
-    Map(Vec<(Expression, Expression)>), // CBOR map literal
+    Array(Vec<Expression>),             // Array literal
+    Map(Vec<(Expression, Expression)>), // Map literal
 }
 
 #[derive(Debug, Clone)]

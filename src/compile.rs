@@ -30,10 +30,12 @@
 use crate::builtins::{BuiltinImpl, BuiltinRegistry, ExecResult};
 use crate::diagnostics::Diagnostics;
 use crate::exec::{ExecError, Float, HeapVal, SeqState, VM, Value};
+use crate::ir::opt::TypeAnalysis;
 use crate::ir::{
     BasicBlock, BlockId, Function, Instruction, IntrinsicOp, IrProgram, Literal, MatchPattern,
     Terminator, VarId,
 };
+use crate::types::BaseType;
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 
@@ -300,6 +302,11 @@ fn compile_function(func: &Function, link_map: &LinkMap) -> Result<CompiledFunct
     // Collect MakeRef metadata for WriteRef resolution
     let ref_map = build_ref_map(&func.blocks);
 
+    // Type analysis for specialization — when both operands of an arithmetic
+    // op are provably the same type, the compiler emits a direct closure
+    // instead of the 10-way type dispatch.
+    let types = crate::ir::opt::analyze_types(func, None);
+
     // First pass: compile all blocks, collecting phi metadata
     let mut blocks = Vec::new();
     #[allow(clippy::type_complexity)]
@@ -329,7 +336,9 @@ fn compile_function(func: &Function, link_map: &LinkMap) -> Result<CompiledFunct
             }
         }
 
-        blocks.push(compile_block(ir_block, &block_map, link_map, &ref_map)?);
+        blocks.push(compile_block(
+            ir_block, &block_map, link_map, &ref_map, &types,
+        )?);
     }
 
     // Second pass: resolve phis by inserting copies into predecessor blocks.
@@ -383,6 +392,7 @@ fn compile_block(
     block_map: &HashMap<BlockId, usize>,
     link_map: &LinkMap,
     ref_map: &HashMap<VarId, RefMeta>,
+    types: &TypeAnalysis,
 ) -> Result<Vec<Step>, ExecError> {
     let mut steps: Vec<Step> = Vec::new();
 
@@ -392,7 +402,9 @@ fn compile_block(
             // copies are inserted into predecessor blocks
             Instruction::Phi { .. } => {}
             inst => {
-                if let Some(step) = compile_instruction(inst, block_map, link_map, ref_map)? {
+                if let Some(step) =
+                    compile_instruction(inst, block_map, link_map, ref_map, types, block.id)?
+                {
                     steps.push(step);
                 }
             }
@@ -410,6 +422,8 @@ fn compile_instruction(
     _block_map: &HashMap<BlockId, usize>,
     link_map: &LinkMap,
     ref_map: &HashMap<VarId, RefMeta>,
+    types: &TypeAnalysis,
+    block_id: BlockId,
 ) -> Result<Option<Step>, ExecError> {
     Ok(Some(match inst {
         Instruction::Const { dest, value } => {
@@ -533,6 +547,16 @@ fn compile_instruction(
             let d = slot(*dest);
             let op = *op;
             let arg_slots: Vec<usize> = args.iter().map(|v| slot(*v)).collect();
+
+            // Try type-specialized compilation for binary arithmetic.
+            // If both operands are provably the same single numeric type,
+            // emit a direct closure that skips the runtime type dispatch.
+            if let Some(specialized) =
+                try_specialize_binary(op, &arg_slots, d, args, types, block_id)
+            {
+                return Ok(Some(specialized));
+            }
+
             Box::new(move |vm: &mut VM, _prog| {
                 let result = exec_intrinsic(op, &arg_slots, vm)?;
                 match result {
@@ -781,6 +805,257 @@ pub fn execute_by_index(
 // ============================================================================
 // Intrinsic Runtime Execution
 // ============================================================================
+
+/// Try to emit a type-specialized closure for a binary arithmetic intrinsic.
+///
+/// Consults TypeAnalysis: if both operands are provably a single numeric type
+/// and they match, emits a direct closure that skips the 10-way runtime
+/// type dispatch. Returns `None` to fall back to the generic `exec_intrinsic`.
+fn try_specialize_binary(
+    op: IntrinsicOp,
+    arg_slots: &[usize],
+    dest_slot: usize,
+    args: &[VarId],
+    types: &TypeAnalysis,
+    block_id: BlockId,
+) -> Option<Step> {
+    // Only specialize binary arithmetic and comparison
+    if args.len() != 2 {
+        return None;
+    }
+    if !matches!(
+        op,
+        IntrinsicOp::Add
+            | IntrinsicOp::Sub
+            | IntrinsicOp::Mul
+            | IntrinsicOp::Div
+            | IntrinsicOp::Mod
+            | IntrinsicOp::Lt
+            | IntrinsicOp::Eq
+    ) {
+        return None;
+    }
+
+    let a_type = types.get_at_exit(block_id, args[0])?;
+    let b_type = types.get_at_exit(block_id, args[1])?;
+
+    // Both must be single and the same type
+    if !a_type.is_single() || !b_type.is_single() || a_type != b_type {
+        return None;
+    }
+
+    let a = arg_slots[0];
+    let b = arg_slots[1];
+    let d = dest_slot;
+
+    // Determine the single type
+    if a_type.contains(BaseType::UInt) {
+        Some(specialize_uint(op, a, b, d))
+    } else if a_type.contains(BaseType::Int) {
+        Some(specialize_int(op, a, b, d))
+    } else if a_type.contains(BaseType::Float) {
+        Some(specialize_float(op, a, b, d))
+    } else {
+        None
+    }
+}
+
+// Type-extraction helpers for specialized closures.
+// These use expect() rather than silent fallback — the type analysis has
+// proven the types, so a mismatch is a compiler bug that should surface
+// immediately during testing.
+
+fn expect_uint(vm: &VM, slot: usize) -> u64 {
+    match vm.local(slot).expect("specialized: slot must be defined") {
+        Value::UInt(n) => *n,
+        other => panic!("specialized: expected UInt, got {:?}", other),
+    }
+}
+
+fn expect_int(vm: &VM, slot: usize) -> i64 {
+    match vm.local(slot).expect("specialized: slot must be defined") {
+        Value::Int(n) => *n,
+        other => panic!("specialized: expected Int, got {:?}", other),
+    }
+}
+
+fn expect_float(vm: &VM, slot: usize) -> f64 {
+    match vm.local(slot).expect("specialized: slot must be defined") {
+        Value::Float(f) => f.get(),
+        other => panic!("specialized: expected Float, got {:?}", other),
+    }
+}
+
+/// Emit a UInt-specialized closure for a binary op.
+fn specialize_uint(op: IntrinsicOp, a: usize, b: usize, d: usize) -> Step {
+    match op {
+        IntrinsicOp::Add => Box::new(move |vm: &mut VM, _| {
+            let (x, y) = (expect_uint(vm, a), expect_uint(vm, b));
+            match x.checked_add(y) {
+                Some(r) => vm.set_local(d, Value::UInt(r)),
+                None => vm.set_local_uninit(d),
+            }
+            Ok(Action::Continue)
+        }),
+        IntrinsicOp::Sub => Box::new(move |vm: &mut VM, _| {
+            let (x, y) = (expect_uint(vm, a), expect_uint(vm, b));
+            match x.checked_sub(y) {
+                Some(r) => vm.set_local(d, Value::UInt(r)),
+                None => vm.set_local_uninit(d),
+            }
+            Ok(Action::Continue)
+        }),
+        IntrinsicOp::Mul => Box::new(move |vm: &mut VM, _| {
+            let (x, y) = (expect_uint(vm, a), expect_uint(vm, b));
+            match x.checked_mul(y) {
+                Some(r) => vm.set_local(d, Value::UInt(r)),
+                None => vm.set_local_uninit(d),
+            }
+            Ok(Action::Continue)
+        }),
+        IntrinsicOp::Div => Box::new(move |vm: &mut VM, _| {
+            let (x, y) = (expect_uint(vm, a), expect_uint(vm, b));
+            match x.checked_div(y) {
+                Some(r) => vm.set_local(d, Value::UInt(r)),
+                None => vm.set_local_uninit(d),
+            }
+            Ok(Action::Continue)
+        }),
+        IntrinsicOp::Mod => Box::new(move |vm: &mut VM, _| {
+            let (x, y) = (expect_uint(vm, a), expect_uint(vm, b));
+            match x.checked_rem(y) {
+                Some(r) => vm.set_local(d, Value::UInt(r)),
+                None => vm.set_local_uninit(d),
+            }
+            Ok(Action::Continue)
+        }),
+        IntrinsicOp::Lt => Box::new(move |vm: &mut VM, _| {
+            let (x, y) = (expect_uint(vm, a), expect_uint(vm, b));
+            vm.set_local(d, Value::Bool(x < y));
+            Ok(Action::Continue)
+        }),
+        IntrinsicOp::Eq => Box::new(move |vm: &mut VM, _| {
+            let (x, y) = (expect_uint(vm, a), expect_uint(vm, b));
+            vm.set_local(d, Value::Bool(x == y));
+            Ok(Action::Continue)
+        }),
+        _ => unreachable!(),
+    }
+}
+
+/// Emit an Int-specialized closure for a binary op.
+fn specialize_int(op: IntrinsicOp, a: usize, b: usize, d: usize) -> Step {
+    match op {
+        IntrinsicOp::Add => Box::new(move |vm: &mut VM, _| {
+            let (x, y) = (expect_int(vm, a), expect_int(vm, b));
+            match x.checked_add(y) {
+                Some(r) => vm.set_local(d, Value::Int(r)),
+                None => vm.set_local_uninit(d),
+            }
+            Ok(Action::Continue)
+        }),
+        IntrinsicOp::Sub => Box::new(move |vm: &mut VM, _| {
+            let (x, y) = (expect_int(vm, a), expect_int(vm, b));
+            match x.checked_sub(y) {
+                Some(r) => vm.set_local(d, Value::Int(r)),
+                None => vm.set_local_uninit(d),
+            }
+            Ok(Action::Continue)
+        }),
+        IntrinsicOp::Mul => Box::new(move |vm: &mut VM, _| {
+            let (x, y) = (expect_int(vm, a), expect_int(vm, b));
+            match x.checked_mul(y) {
+                Some(r) => vm.set_local(d, Value::Int(r)),
+                None => vm.set_local_uninit(d),
+            }
+            Ok(Action::Continue)
+        }),
+        IntrinsicOp::Div => Box::new(move |vm: &mut VM, _| {
+            let (x, y) = (expect_int(vm, a), expect_int(vm, b));
+            match x.checked_div(y) {
+                Some(r) => vm.set_local(d, Value::Int(r)),
+                None => vm.set_local_uninit(d),
+            }
+            Ok(Action::Continue)
+        }),
+        IntrinsicOp::Mod => Box::new(move |vm: &mut VM, _| {
+            let (x, y) = (expect_int(vm, a), expect_int(vm, b));
+            match x.checked_rem(y) {
+                Some(r) => vm.set_local(d, Value::Int(r)),
+                None => vm.set_local_uninit(d),
+            }
+            Ok(Action::Continue)
+        }),
+        IntrinsicOp::Lt => Box::new(move |vm: &mut VM, _| {
+            let (x, y) = (expect_int(vm, a), expect_int(vm, b));
+            vm.set_local(d, Value::Bool(x < y));
+            Ok(Action::Continue)
+        }),
+        IntrinsicOp::Eq => Box::new(move |vm: &mut VM, _| {
+            let (x, y) = (expect_int(vm, a), expect_int(vm, b));
+            vm.set_local(d, Value::Bool(x == y));
+            Ok(Action::Continue)
+        }),
+        _ => unreachable!(),
+    }
+}
+
+/// Emit a Float-specialized closure for a binary op.
+fn specialize_float(op: IntrinsicOp, a: usize, b: usize, d: usize) -> Step {
+    match op {
+        IntrinsicOp::Add => Box::new(move |vm: &mut VM, _| {
+            let (x, y) = (expect_float(vm, a), expect_float(vm, b));
+            match Float::new(x + y) {
+                Some(r) => vm.set_local(d, Value::Float(r)),
+                None => vm.set_local_uninit(d),
+            }
+            Ok(Action::Continue)
+        }),
+        IntrinsicOp::Sub => Box::new(move |vm: &mut VM, _| {
+            let (x, y) = (expect_float(vm, a), expect_float(vm, b));
+            match Float::new(x - y) {
+                Some(r) => vm.set_local(d, Value::Float(r)),
+                None => vm.set_local_uninit(d),
+            }
+            Ok(Action::Continue)
+        }),
+        IntrinsicOp::Mul => Box::new(move |vm: &mut VM, _| {
+            let (x, y) = (expect_float(vm, a), expect_float(vm, b));
+            match Float::new(x * y) {
+                Some(r) => vm.set_local(d, Value::Float(r)),
+                None => vm.set_local_uninit(d),
+            }
+            Ok(Action::Continue)
+        }),
+        IntrinsicOp::Div => Box::new(move |vm: &mut VM, _| {
+            let (x, y) = (expect_float(vm, a), expect_float(vm, b));
+            match Float::new(x / y) {
+                Some(r) => vm.set_local(d, Value::Float(r)),
+                None => vm.set_local_uninit(d),
+            }
+            Ok(Action::Continue)
+        }),
+        IntrinsicOp::Mod => Box::new(move |vm: &mut VM, _| {
+            let (x, y) = (expect_float(vm, a), expect_float(vm, b));
+            match Float::new(x % y) {
+                Some(r) => vm.set_local(d, Value::Float(r)),
+                None => vm.set_local_uninit(d),
+            }
+            Ok(Action::Continue)
+        }),
+        IntrinsicOp::Lt => Box::new(move |vm: &mut VM, _| {
+            let (x, y) = (expect_float(vm, a), expect_float(vm, b));
+            vm.set_local(d, Value::Bool(x < y));
+            Ok(Action::Continue)
+        }),
+        IntrinsicOp::Eq => Box::new(move |vm: &mut VM, _| {
+            let (x, y) = (expect_float(vm, a), expect_float(vm, b));
+            vm.set_local(d, Value::Bool(x == y));
+            Ok(Action::Continue)
+        }),
+        _ => unreachable!(),
+    }
+}
 
 /// Execute an intrinsic operation at runtime.
 ///
@@ -1181,6 +1456,36 @@ fn exec_intrinsic(
             // Mutates the sequence in-place (advances position).
             // Uses VM::seq_next to handle borrow splitting (heap vs stack).
             vm.seq_next(vm.bp() + arg_slots[0])
+        }
+        IntrinsicOp::Collect => {
+            // Collect(seq) → Array: drain all remaining elements from the sequence.
+            vm.seq_collect(vm.bp() + arg_slots[0])
+        }
+
+        // -- Coercion --
+        IntrinsicOp::Widen => {
+            let target = match vm.local(arg_slots[1]) {
+                Some(Value::UInt(t)) => *t,
+                _ => return Ok(None),
+            };
+            let value = vm.local(arg_slots[0]);
+            Ok(match (value, target) {
+                // Target = Int (BaseType discriminant 2)
+                (Some(Value::UInt(n)), 2) => {
+                    let n = *n;
+                    if n > i64::MAX as u64 {
+                        None // overflow
+                    } else {
+                        Some(Value::Int(n as i64))
+                    }
+                }
+                (Some(Value::Int(n)), 2) => Some(Value::Int(*n)),
+                // Target = Float (BaseType discriminant 3)
+                (Some(Value::UInt(n)), 3) => Float::new(*n as f64).map(Value::Float),
+                (Some(Value::Int(n)), 3) => Float::new(*n as f64).map(Value::Float),
+                (Some(Value::Float(f)), 3) => Some(Value::Float(*f)),
+                _ => None,
+            })
         }
     }
 }
@@ -1972,7 +2277,113 @@ mod tests {
         assert_eq!(val, Value::UInt(60));
     }
 
-    // Note: iterating a Sequence stored in a variable (`let r = 1..4; for i in r {}`)
-    // requires for-loop type dispatch (Match on iterable type), which is a separate
-    // TODO. Currently only direct Range expressions in for-loops use the seq path.
+    #[test]
+    fn test_range_as_value() {
+        // Store a range in a variable, then iterate — type dispatch
+        // selects the sequence path at runtime.
+        let val = run_expect(
+            r#"
+            fn test() {
+                let r = 1..4;
+                let sum = 0;
+                for i in r {
+                    sum = sum + i;
+                };
+                return sum;
+            }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::UInt(6));
+    }
+
+    #[test]
+    fn test_for_type_dispatch_array() {
+        // Ensure index-based path still works through type dispatch
+        let val = run_expect(
+            r#"
+            fn test() {
+                let arr = [10, 20, 30];
+                let sum = 0;
+                for x in arr {
+                    sum = sum + x;
+                };
+                return sum;
+            }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::UInt(60));
+    }
+
+    #[test]
+    fn test_for_dispatch_with_accumulator() {
+        // Outer variable modified in loop body — verify Phi merge at join
+        let val = run_expect(
+            r#"
+            fn test() {
+                let count = 0;
+                for i in 0..5 {
+                    count = count + 1;
+                };
+                return count;
+            }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::UInt(5));
+    }
+
+    // ========================================================================
+    // collect() Intrinsic
+    // ========================================================================
+
+    #[test]
+    fn test_collect_range() {
+        // collect(0..5) → [0, 1, 2, 3, 4]
+        let val = run_expect(
+            r#"
+            fn test() {
+                let arr = collect(0..5);
+                return len(arr);
+            }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::UInt(5));
+    }
+
+    #[test]
+    fn test_collect_range_sum() {
+        // collect(0..4) then sum the array
+        let val = run_expect(
+            r#"
+            fn test() {
+                let arr = collect(1..=3);
+                let sum = 0;
+                for x in arr {
+                    sum = sum + x;
+                };
+                return sum;
+            }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::UInt(6));
+    }
+
+    #[test]
+    fn test_collect_empty_range() {
+        // collect(5..3) → empty array
+        let val = run_expect(
+            r#"
+            fn test() {
+                let arr = collect(5..3);
+                return len(arr);
+            }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::UInt(0));
+    }
 }

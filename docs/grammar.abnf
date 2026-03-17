@@ -18,9 +18,9 @@ constant = "const" pattern "=" expression ";"
 
 import-path = stdlib-path / file-path
 
-stdlib-path = identifier *("." identifier)  ; std.bpsec, std.cbor.utils
+stdlib-path = identifier *("." identifier)  ; std.cbor, std.encoding.base64
 
-file-path = string-literal  ; "../common/bundle_age.flt"
+file-path = string-literal  ; "../common/validation.rill"
 
 ; ============================================================================
 ; Functions
@@ -400,9 +400,9 @@ CR = %x0D                  ; Carriage return
 ;       }
 ;
 ; 11. Import paths:
-;    - Unquoted dotted paths (std.bpsec) → standard library modules
+;    - Unquoted dotted paths (std.cbor) → standard library modules
 ;    - Quoted strings ("../path/file.flt") → file system paths
-;    - Default alias: last component for stdlib (bpsec), filename for files
+;    - Default alias: last component for stdlib (cbor), filename for files
 ;
 ; 12. Declaration ordering:
 ;    - Imports, constants, and functions can appear in any order
@@ -455,8 +455,8 @@ CR = %x0D                  ; Carriage return
 ; 17. Variable semantics:
 ;    - `let x = arr[0];` copies the value (x is independent of arr)
 ;    - `with x = arr[0];` references the location (x.field = v mutates arr[0])
-;    - All filter parameters are mutable memory-backed values
-;    - Compiler tracks if parameters were mutated (filter vs rewriter)
+;    - All parameters are mutable memory-backed values by default
+;    - Compiler tracks if parameters were mutated
 ;
 ; 18. For loop binding semantics:
 ;    - Single variable:
@@ -643,9 +643,9 @@ CR = %x0D                  ; Carriage return
 ;    - `with` prefix is explicit by-reference (same as default, for clarity)
 ;    - Both keywords are optional where context is unambiguous
 ;    - Examples:
-;      fn process(bundle) { }           // by-reference (default)
-;      fn process(with bundle) { }      // by-reference (explicit)
-;      fn process(let bundle) { }       // by-value (copy)
+;      fn process(data) { }             // by-reference (default)
+;      fn process(with data) { }        // by-reference (explicit)
+;      fn process(let data) { }         // by-value (copy)
 ;      for x in arr { }                 // by-reference (default)
 ;      for with x in arr { }            // by-reference (explicit)
 ;      for let x in arr { }             // by-value (copy)

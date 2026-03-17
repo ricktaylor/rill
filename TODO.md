@@ -35,7 +35,9 @@ Architecture: Source → Parser (chumsky) → AST → Lower (operators → Intri
 ### Not Yet Started
 - [x] Implement sequence intrinsics at runtime: `MakeSeq`, `ArraySeq`, `SeqNext`
 - [x] For-loop sequence path (SeqNext-based loop for Sequence/Range iterables)
-- [ ] For-loop type dispatch (Match on iterable type for unknown types)
+- [x] For-loop type dispatch — Match on iterable type: Sequence → SeqNext path,
+      default → index path. Both paths lower body independently, outer variables
+      merged with Phis at join. Optimizer collapses Match when type is known.
 - [ ] Dead-store warnings for mutations to non-ref-backed loop variables
 - [ ] Host sequence support (`SeqState::Host` variant)
 - [ ] Public/private function visibility — structural, not declarative:
@@ -218,7 +220,8 @@ Issues identified during code review, ordered by priority.
 - [x] Sequence runtime: `MakeSeq`, `ArraySeq`, `SeqNext` in `exec_intrinsic`
       `Len` extended for Sequence. `VM::seq_next()` for borrow-safe mutation.
 - [x] For-loop sequence path: `lower_for_seq` uses SeqNext + Guard for range iteration
-- [ ] For-loop type dispatch (Match on iterable type for unknown types)
+- [x] For-loop type dispatch: Match(Sequence → seq path, default → idx path),
+      outer vars merged with Phis. Optimizer collapses when type is known.
 - [ ] Host sequence support (`SeqState::Host` variant, defer trait design to embedder API)
 - [ ] Module/import resolution system
 - [ ] Standard library: `std.cbor` (encode/decode)
@@ -295,55 +298,37 @@ with just `v3 = Intrinsic(Add, [v1, v2])` — both args provably UInt, no guards
 
 **Steps:**
 
-- [ ] **Add `Widen` to IntrinsicOp** — explicit numeric type coercion. Only 3
-      edges in the promotion lattice: UInt→Int, UInt→Float, Int→Float. Target
-      type encoded as a Const Bool/UInt arg (avoiding new IR fields). Const-eval
-      and runtime execution are trivial (checked conversion). Coercion is
-      currently implicit inside each arithmetic op's 10-way match; making it
-      explicit enables folding, hoisting, and elimination.
+- [x] **Add `Widen` to IntrinsicOp** — explicit numeric type coercion.
+      `Widen(value, target)` where target is UInt encoding BaseType discriminant
+      (2=Int, 3=Float). Const-eval folds `Widen(Const(42_u64), 2)` → `Const(42_i64)`.
+      Runtime handles UInt→Int (checked, overflow→undefined), UInt→Float, Int→Float.
+      UInt→Int overflow (u64::MAX > i64::MAX) returns undefined. `is_fallible()` = true.
 
-- [ ] **Coercion insertion pass** — new IR pass after type refinement. For each
-      `Intrinsic { op: Add/Sub/Mul/... }`, consult TypeAnalysis for operand types:
-      - **Both same type** (e.g. UInt+UInt): no change needed.
-      - **Mixed known types** (e.g. UInt+Int): insert `Widen` for the narrower
-        operand, rewrite the op to use the widened value.
-      - **Partially known** (e.g. v1: {UInt,Int}, v2: {UInt}): generate a Match
-        on v1's type, with one branch per possible combination. Each branch gets
-        the appropriate Widen + monomorphic op. Join with Phi.
-      - **Incompatible types** (e.g. Text+UInt): emit `Instruction::Undefined`.
-        This is the type-informed definedness determination — the operation
-        provably cannot succeed.
-      - **Fully unknown**: leave as generic (full runtime dispatch).
+- [x] **Coercion insertion pass** (`ir/opt/coercion.rs`) — runs after type
+      refinement. For each binary arithmetic intrinsic (Add/Sub/Mul/Div/Mod/Lt):
+      - Same known type → no change (monomorphic)
+      - Mixed known types → insert Widen for narrower operand
+      - Incompatible types → replace with Undefined
+      - Unknown/multi-type → leave as-is (runtime dispatch)
+      After insertion, re-runs Phase 1 fixpoint loop on the expanded IR:
+      const fold collapses Widen(Const), definedness sees Undefined, guard elim
+      + CFG simplify clean up dead branches.
+      Future: partially-known types (e.g. {UInt,Int}) → generate Match dispatch.
 
-      The coercion pass acts as a **fine-grained second definedness pass**:
-      the expanded IR has explicit `Undefined` instructions for invalid type
-      combinations. Running definedness analysis + guard elimination again
-      on the expanded IR exploits this — guards on provably-undefined results
-      collapse, dead branches are eliminated.
+- [x] **Thread TypeAnalysis to closure compiler** — `compile_function` runs
+      `analyze_types`, passes result through `compile_block` → `compile_instruction`.
+      `try_specialize_binary` checks if both operands are provably same single type,
+      emits direct `u64::checked_add` / `i64::checked_add` / `f64` closures instead
+      of the 10-way `exec_intrinsic` dispatch. Covers Add/Sub/Mul/Div/Mod/Lt/Eq.
 
-      Pipeline position:
-      ```
-      ... → Type Refinement → Coercion Insertion
-          → Definedness (fine) → Guard Elim → CFG Simplify
-          → Cleanup Const Fold → CFG Simplify
-      ```
+- [x] **Const-fold Widen** — `Widen(Const(42_u64))` where target is Int folds
+      to `Const(42_i64)`. Handled by `eval_intrinsic_const`. The Phase 1 re-run
+      after coercion insertion picks this up automatically.
 
-- [ ] **Thread TypeAnalysis to closure compiler** — pass the `TypeAnalysis`
-      result (currently computed but discarded with `let _types = ...`) through
-      to `compile_program`. When compiling `Intrinsic(Add, [v1, v2])`, check
-      the refined types of v1 and v2. If both are proven single-type (e.g.
-      both UInt), emit a specialized closure that skips the type dispatch
-      entirely — just `u64::checked_add` on the raw values.
-
-- [ ] **Const-fold Widen** — `Widen(Const(42_u64))` where target is Int folds
-      to `Const(42_i64)`. Already handled by `eval_intrinsic_const` once Widen
-      is added. The cleanup const fold pass after coercion insertion will pick
-      this up automatically.
-
-- [ ] **Redundant coercion elimination** — after guard elimination collapses
-      branches, a Widen whose input is already the target type is a no-op.
-      DCE or a simple peephole can remove it. Coercion chains (UInt→Int→Float)
-      can be collapsed to UInt→Float by algebraic simplification.
+- [x] **Redundant coercion elimination** (`elide_coercions` in coercion.rs) —
+      runs in Phase 1 fixpoint loop. Chain collapsing: Widen(Widen(x, _), Float)
+      → Widen(x, Float). Identity elimination: Widen(v, T) where v already
+      produced by Widen(_, T) → Copy. No TypeAnalysis needed.
 
 #### IR-Level (SSA)
 
@@ -368,10 +353,30 @@ with just `v3 = Intrinsic(Add, [v1, v2])` — both args provably UInt, no guards
 - [ ] **Loop-Invariant Code Motion (LICM)** — lift pure computations with
       loop-external operands to pre-header. Requires loop detection, dominator tree.
 
+- [ ] **Interprocedural Type Propagation** — analyze call sites and propagate
+      argument types into callee parameter TypeSets. Extends the existing
+      per-function `analyze_types` by seeding parameters from callers instead
+      of defaulting to `all()`. Single pass over the call graph. When every
+      call to `fn process(x)` passes UInt, the analysis proves `x: {UInt}`
+      and the entire function body specializes via `try_specialize_binary`.
+
+- [ ] **Function Monomorphization** — clone functions per call-site type
+      signature. `process(UInt)` and `process(Int)` become two separate
+      compiled functions, each fully specialized. Generates more code but
+      zero runtime dispatch in the clones. Natural companion to inlining:
+      very small functions get inlined directly (avoiding the call overhead),
+      while larger functions get monomorphized (specialized but not inlined).
+      Decision heuristic: below N instructions → inline, above → monomorphize
+      if types are known, otherwise leave generic.
+
 - [ ] **Tail-Call Optimization (TCO)** — rewrite tail calls to parameter overwrite
       + jump to entry. The flat pc-based executor supports this naturally.
 
-- [ ] **Function Inlining** — clone callee IR into call site for small pure functions.
+- [ ] **Function Inlining** — clone callee IR into call site for small pure
+      functions. Works best after monomorphization: the inlined clone is
+      already type-specialized, so the inlined body folds further via
+      const fold + coercion elision. Decision: inline if callee is pure,
+      small (< ~10 instructions), and called with known-type args.
 
 #### Diagnostics
 
@@ -385,15 +390,83 @@ with just `v3 = Intrinsic(Add, [v1, v2])` — both args provably UInt, no guards
 - [ ] Documentation: API docs, embedding guide
 
 ### P3 — Future
-- [ ] **StepKind intermediate for peephole** — optional tagged enum between IR
-      compilation and closure generation. Enables pattern-matching on instruction
-      sequences: copy-to-self elimination, dead store removal, const+use fusion,
-      jump threading. Not needed for type specialization (handled at IR level)
-      but useful for low-level closure optimization.
+
+- [ ] **StepKind intermediate for peephole** — tagged enum between IR
+      compilation and closure generation. Compile IR → `Vec<StepKind>`,
+      run peephole patterns on the Vec, then convert `StepKind` → closures.
+      Unlike opaque closures, StepKind is matchable — enabling multi-instruction
+      fusion that eliminates intermediate slots and closure calls.
+
+      Requires TypeAnalysis (already threaded to compiler) so type-specialized
+      StepKind variants can be emitted (e.g. `AddUU` instead of generic `Add`).
+
+      **StepKind sketch:**
+      ```rust
+      enum StepKind {
+          Const { dest: usize, value: Value },
+          Copy { dest: usize, src: usize },
+          AddUU { dest: usize, a: usize, b: usize },  // UInt + UInt
+          AddII { dest: usize, a: usize, b: usize },  // Int + Int
+          AddFF { dest: usize, a: usize, b: usize },  // Float + Float
+          // ... typed variants for Sub, Mul, Div, Mod, Lt, Eq
+          Generic { dest: usize, op: IntrinsicOp, args: Vec<usize> },
+          Index { dest: usize, base: usize, key: usize },
+          SetIndex { base: usize, key: usize, value: usize },
+          // terminators
+          BranchIf { cond: usize, then_pc: usize, else_pc: usize },
+          Jump { pc: usize },
+          Guard { value: usize, defined_pc: usize, undefined_pc: usize },
+          Return { value: Option<usize> },
+      }
+      ```
+
+      **Common peephole patterns** (ordered by expected frequency):
+
+      _Every loop iteration (highest impact):_
+
+      | Pattern | Source | Steps | Fused | Savings |
+      |---------|--------|-------|-------|---------|
+      | Counter increment | `i = i + 1` | `Const(1)` + `AddUU(i,c)` + `Copy` | `IncUU { slot, imm: 1 }` | 3→1 |
+      | Accumulator update | `sum = sum + x` | `AddUU(sum,x)` + `Copy` | `AddAssignUU { dest, src }` | 2→1 |
+      | Loop condition | `i < len` → branch | `LtUU(i,len)` + `BranchIf` | `BranchLtUU { a, b, t, f }` | 2→1 |
+      | Array element read | `arr[i]` with guard | `Index` + `Guard` | `IndexGuard { dest, base, key, fail }` | 2→1 |
+      | Seq advance | `SeqNext` + guard | `SeqNext` + `Guard` | `SeqNextGuard { dest, seq, fail }` | 2→1 |
+
+      _Most functions (moderate impact):_
+
+      | Pattern | Source | Steps | Fused | Savings |
+      |---------|--------|-------|-------|---------|
+      | Const + binop | `x + 5` | `Const(5)` + `AddUU(x,c)` | `AddImmUU { dest, src, imm: 5 }` | 2→1 |
+      | Compare + branch | `if x == 0` | `EqUU(x,c)` + `BranchIf` | `BranchEqUU { a, b, t, f }` | 2→1 |
+      | Negate + branch | `if !cond` | `Not(c)` + `BranchIf` | `BranchIf` with swapped targets | 2→1 |
+      | Copy-to-self | SSA artifact | `Copy(x, x)` | eliminated | 1→0 |
+
+      _Write-back paths (ref-backed mutations):_
+
+      | Pattern | Source | Steps | Fused | Savings |
+      |---------|--------|-------|-------|---------|
+      | Compute + write-back | `x += 1` (ref) | `AddUU` + `WriteRef` + `Copy` | `AddWriteRefUU { ... }` | 3→1 |
+      | Const array literal | `[1, 2, 3]` | `Const` × 3 + `MakeArray` | `MakeArrayConst { values }` | 4→1 |
+
+      **Decision heuristic:** Only fuse when type-specialized variants exist
+      (TypeAnalysis proves single type). Generic-typed sequences stay as
+      separate steps — fusion with runtime dispatch would be slower than
+      the current closure-per-instruction approach.
+
+      **Implementation order:**
+      1. Define `StepKind` enum with typed variants
+      2. Compile IR → `Vec<StepKind>` (replaces current direct-to-closure)
+      3. Peephole pass: sliding window over adjacent StepKinds, apply fusions
+      4. Convert `StepKind` → closures (final step, same as today but from enum)
+
 - [ ] Compiled bytecode serialization format
-- [ ] REPL / CLI tool
+- [ ] CLI tool (`rill` binary) — compile and execute scripts from the command
+      line. `rill run script.rl func` executes a named function with data from
+      stdin (CBOR/JSON) or `--arg`. `rill check script.rl` for compile-only
+      diagnostics. `rill dump script.rl --function f` for IR inspection.
+      Not a REPL — the language is function-oriented with no top-level state.
 - [ ] LSP support
-- [ ] Domain-specific module examples (DTN/BPSec)
+- [ ] Domain-specific embedding examples
 - [ ] Loop unrolling (small loops with known iteration count)
 - [ ] Escape analysis (stack-allocate non-escaping collections)
 - [ ] Global Value Numbering (GVN) — more powerful CSE across blocks
@@ -425,6 +498,7 @@ src/
       const_fold.rs   — Constant folding pass
       ref_elision.rs  — Ref elision (MakeRef → Copy/Index, chain shortening)
       type_refinement.rs — Type set refinement
+      coercion.rs     — Coercion insertion (Widen for mixed types, Undefined for incompatible)
       guard_elim.rs   — Guard elimination
       definedness.rs  — Definedness analysis
 

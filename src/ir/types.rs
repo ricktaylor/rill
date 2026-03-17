@@ -68,6 +68,23 @@ pub enum IntrinsicOp {
     MakeSeq,
     ArraySeq,
     SeqNext,
+
+    // -- Collection/Sequence --
+    /// Materialize a Sequence into an Array by draining all remaining elements.
+    Collect,
+
+    // -- Coercion --
+    /// Explicit numeric type widening along the promotion lattice.
+    ///
+    /// `Widen(value, target)` where target is a UInt constant encoding a BaseType:
+    /// - `1` (UInt) — no-op (identity)
+    /// - `2` (Int) — UInt→Int
+    /// - `3` (Float) — UInt→Float or Int→Float
+    ///
+    /// Making coercion explicit enables the optimizer to fold, hoist, and
+    /// eliminate widening operations. Currently implicit inside each
+    /// arithmetic op's type dispatch.
+    Widen,
 }
 
 impl IntrinsicOp {
@@ -93,7 +110,10 @@ impl IntrinsicOp {
             Self::MakeMap => true, // odd arg count
             // Sequence
             Self::MakeSeq | Self::ArraySeq => false,
-            Self::SeqNext => true, // exhausted → undefined
+            Self::SeqNext => true,  // exhausted → undefined
+            Self::Collect => false, // always succeeds (empty seq → empty array)
+            // Coercion: UInt→Int can overflow (u64::MAX > i64::MAX)
+            Self::Widen => true,
         }
     }
 
@@ -136,6 +156,12 @@ impl IntrinsicOp {
             Self::MakeSeq => TypeSet::numeric(), // start/end are numeric
             Self::ArraySeq => TypeSet::all(),
             Self::SeqNext => TypeSet::single(BaseType::Sequence), // arg must be Sequence
+            Self::Collect => TypeSet::single(BaseType::Sequence),
+            // Coercion
+            Self::Widen => match index {
+                0 => TypeSet::numeric(), // value to widen
+                _ => TypeSet::uint(),    // target type code
+            },
         }
     }
 
@@ -158,6 +184,8 @@ impl IntrinsicOp {
             Self::MakeMap => TypeSet::single(BaseType::Map),
             Self::MakeSeq | Self::ArraySeq => TypeSet::single(BaseType::Sequence),
             Self::SeqNext => TypeSet::all(), // element could be any type
+            Self::Collect => TypeSet::single(BaseType::Array),
+            Self::Widen => TypeSet::numeric(), // result is Int or Float
         }
     }
 
@@ -272,6 +300,7 @@ fn promote_union(a: TypeSet, b: TypeSet) -> TypeSet {
 pub fn intrinsic_by_name(name: &str) -> Option<IntrinsicOp> {
     match name {
         "len" => Some(IntrinsicOp::Len),
+        "collect" => Some(IntrinsicOp::Collect),
         _ => None,
     }
 }

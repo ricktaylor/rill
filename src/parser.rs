@@ -961,7 +961,7 @@ fn pattern_inner<'a>() -> BoxedParser<'a, Pat> {
 
         // Type pattern with optional binding: UInt, UInt(x), Array([a, b])
         // Type names start with uppercase
-        // Valid CBOR type names for type patterns
+        // Valid type names for type patterns
         const TYPE_NAMES: &[&str] = &[
             "Bool", "UInt", "Int", "Float", "Text", "Bytes", "Array", "Map",
         ];

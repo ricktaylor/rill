@@ -531,7 +531,7 @@ pub enum Value {
 
     // --- Collection types (heap, self-contained, tracked) ---
     Array(HeapVal<Vec<Value>>),
-    /// Map: any value can be a key (CBOR compliant)
+    /// Map: any value can be a key
     Map(HeapVal<IndexMap<Value, Value>>),
 
     // --- Sequence type (single-pass lazy values, e.g. ranges) ---
@@ -909,6 +909,26 @@ impl VM {
             Some(Value::Sequence(seq)) => {
                 let state = seq.make_mut(heap)?;
                 Ok(state.next())
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Drain all remaining elements from a Sequence, returning them as an Array.
+    /// Returns None if the slot is not a Sequence.
+    /// Mutates the sequence in-place (CoW: clones if shared).
+    pub fn seq_collect(&mut self, idx: usize) -> Result<Option<Value>, ExecError> {
+        let resolved = self.resolve(idx);
+        let heap = &*self.heap;
+        match self.stack.get_mut(resolved).and_then(|s| s.as_value_mut()) {
+            Some(Value::Sequence(seq)) => {
+                let state = seq.make_mut(heap)?;
+                let mut elements = Vec::new();
+                while let Some(val) = state.next() {
+                    elements.push(val);
+                }
+                let arr = HeapVal::new(elements, self.heap.clone())?;
+                Ok(Some(Value::Array(arr)))
             }
             _ => Ok(None),
         }

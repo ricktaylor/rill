@@ -4,26 +4,32 @@ This document captures the design of the Rill language.
 
 ## Overview
 
-Rill is a general-purpose embeddable scripting language with first-class
-support for CBOR data. While originally created for DTN bundle processing, it is
-a standalone language suitable for any domain requiring CBOR manipulation, data
-transformation, or policy enforcement.
+Rill is a memory-safe, semi-compiled embeddable scripting language. It compiles
+to closure-threaded code with type-specialized arithmetic — no interpreter loop,
+no bytecode decode overhead. The type system uses practical duck-typed scalars
+and collections (booleans, integers, floats, text, bytes, arrays, maps) —
+similar to what you'd find in Python, Lua, or JSON — making it natural for
+processing structured data without schema declarations.
 
 **Core features:**
 
-- **CBOR-native types**: Full support for the CBOR data model (maps, arrays, bytes, etc.)
-- **Pattern matching**: Rich destructuring with type narrowing
-- **Reference semantics**: `with` bindings for in-place mutation
-- **Embeddable**: Lua-style builtin registration for host integration
-- **Safe**: Resource limits (stack, heap), no undefined behavior
+- **Semi-compiled execution**: Source → SSA IR → optimized closures. No bytecode interpreter.
+- **Type-specialized arithmetic**: Static analysis narrows types; the compiler emits direct
+  `u64::checked_add` instead of runtime type dispatch when types are provably known.
+- **Duck-typed values**: Nine base types covering scalars (Bool, UInt, Int, Float),
+  strings (Text, Bytes), and collections (Array, Map, Sequence). No type annotations
+  in source code — types are inferred by the optimizer.
+- **Pattern matching**: Rich destructuring with type narrowing and reference binding.
+- **Safe embedding**: Resource limits (stack, heap), no undefined behavior, host-provided builtins.
+- **Undefined propagation**: Failed operations produce undefined values that propagate silently —
+  no exceptions, no panics. Scripts can probe data structures without defensive checks.
 
 **Use cases:**
 
-- CBOR document validation and manipulation
-- Data transformation and policy enforcement
-- Embedded scripting for applications
-- Configuration and rule processing
-- Domain-specific applications (e.g., DTN bundle filtering)
+- Embedded scripting for applications (configuration, policy, rules)
+- Structured data validation and transformation
+- Data pipeline processing (filter, transform, enrich)
+- Domain-specific scripting (network protocols, IoT, document processing)
 
 ## Architecture
 
@@ -66,17 +72,17 @@ Source Code
 
 ### Runtime Types
 
-| Type | Rust Representation | CBOR Major Type |
-|------|---------------------|-----------------|
-| `Bool` | `bool` | 7 (simple) |
-| `UInt` | `u64` | 0 |
-| `Int` | `i64` | 1 |
-| `Float` | `Float` wrapper | 7 (float) |
-| `Text` | `HeapVal<String>` | 3 |
-| `Bytes` | `HeapVal<Vec<u8>>` | 2 |
-| `Array` | `HeapVal<Vec<Value>>` | 4 |
-| `Map` | `HeapVal<IndexMap<Value, Value>>` | 5 |
-| `Sequence` | `HeapVal<SeqState>` | — (internal) |
+| Type | Rust Representation | Description |
+|------|---------------------|-------------|
+| `Bool` | `bool` | Boolean |
+| `UInt` | `u64` | Unsigned 64-bit integer |
+| `Int` | `i64` | Signed 64-bit integer |
+| `Float` | `Float` wrapper | 64-bit IEEE 754 (NaN excluded) |
+| `Text` | `HeapVal<String>` | UTF-8 string |
+| `Bytes` | `HeapVal<Vec<u8>>` | Byte string |
+| `Array` | `HeapVal<Vec<Value>>` | Ordered collection |
+| `Map` | `HeapVal<IndexMap<Value, Value>>` | Insertion-ordered key-value map |
+| `Sequence` | `HeapVal<SeqState>` | Lazy single-pass iterator (internal) |
 
 **Note on Sequence:** Sequence is a 9th internal type for lazy, single-pass values
 (e.g., `0..10` creates a Sequence, not an Array). It is not user-visible as a type
@@ -1111,7 +1117,7 @@ only on the first iteration, before guard elimination reshapes the flow.
 
 ### Two-Phase Definedness
 
-The coercion insertion pass (planned) bridges type analysis into definedness:
+The coercion insertion pass bridges type analysis into definedness:
 
 1. **Phase 1** (coarse): Uses `is_fallible()` only. `Add(Text, UInt)` is
    conservatively `MaybeDefined` — Add *can* fail, but we don't know from
@@ -1402,7 +1408,8 @@ src/ir/
 │   ├── ref_elision.rs     # Pass 1.5: Ref elision (MakeRef → Copy/Index)
 │   ├── definedness.rs     # Pass 2: Definedness analysis + diagnostics
 │   ├── guard_elim.rs      # Pass 3: Guard elimination + CFG simplification
-│   └── type_refinement.rs # Pass 4: Type refinement
+│   ├── type_refinement.rs # Pass 4: Type refinement
+│   └── coercion.rs        # Pass 4.75: Coercion insertion (Widen + Undefined)
 ```
 
 ### Fixed-Point Iteration
@@ -1548,7 +1555,7 @@ The compiler warns on mutations to non-ref-backed loop variables (dead stores).
 - **By-reference** (`with` or default): Variable refers to original location; mutations flow back
 - **By-value** (`let`): Variable is a copy; mutations are local only
 
-**Why allow explicit `with`?** Self-documenting code. When you write `fn process(with bundle)`,
+**Why allow explicit `with`?** Self-documenting code. When you write `fn process(with data)`,
 it signals intent: "I will mutate this parameter." The explicit keyword is optional but encouraged
 for clarity.
 
@@ -1616,8 +1623,8 @@ match x { UInt => { }, _ => { } }
 match x { UInt(n) => { use(n) }, _ => { } }
 
 // Type narrowing reference
-if with UInt(n) = bundle.priority {
-    n += 1;  // Mutates bundle.priority
+if with UInt(n) = record.priority {
+    n += 1;  // Mutates record.priority
 }
 ```
 
@@ -1689,7 +1696,8 @@ never write "Sequence" in their code. They write `0..10`, use `for` loops,
 and call `collect()`.
 
 Host builtins can return sequences for lazy data streams (e.g., iterating over
-DTN bundle blocks without materializing them all into an Array).
+records in a database cursor or pages in a document without materializing
+them all into an Array).
 
 ---
 
@@ -1731,9 +1739,9 @@ Imports introduce namespaces using dotted paths (stdlib) or string paths (files)
 
 ```rill
 // Standard library - dotted path, last segment becomes namespace
-import std.bpsec;                    // → namespace `bpsec`
-import std.cbor.utils;               // → namespace `utils`
-import std.status_report.codes as c; // → namespace `c` (explicit alias)
+import std.cbor;                     // → namespace `cbor`
+import std.encoding.base64;          // → namespace `base64`
+import std.time as t;                // → namespace `t` (explicit alias)
 
 // Local files - string path, filename becomes namespace
 import "../common/validation.rill";  // → namespace `validation`
@@ -1746,12 +1754,12 @@ All namespace-qualified access uses `::` separator at call sites:
 
 ```rill
 // Function calls
-bpsec::validate(bundle)         // Function from imported module
-utils::decode(bytes)            // Function from imported module
+cbor::decode(bytes)             // Function from imported module
+base64::encode(data)            // Function from imported module
 console::log("hello")           // Embedding-provided namespace
 
 // Constant access
-codes::LifetimeExpired          // Constant from imported module
+http::STATUS_OK                 // Constant from imported module
 config::MAX_TIMEOUT             // Constant from imported module
 
 // Unqualified names
@@ -1781,13 +1789,13 @@ functions and constants that are implementation details.
 // root.rill — all functions here are public
 import "./helpers.rill";
 
-fn process(bundle) { ... }       // public — embedder can call this
-fn validate(bundle) { ... }      // public — embedder can call this
-const MAX_TTL = 86400;           // public — visible to embedder
+fn process(data) { ... }            // public — embedder can call this
+fn validate(record) { ... }         // public — embedder can call this
+const MAX_TIMEOUT = 30000;          // public — visible to embedder
 
 // helpers.rill — all functions here are private
-fn compute_checksum(data) { ... } // private — only callable from root
-fn internal_helper() { ... }      // private — if unused, eliminated by DCE
+fn compute_checksum(data) { ... }   // private — only callable from root
+fn internal_helper() { ... }        // private — if unused, eliminated by DCE
 ```
 
 This means there is no such thing as an "unused function" in the root file —
@@ -2072,19 +2080,20 @@ struct ParamMeta {
 
 ### Host Driver Binding
 
-The host driver loads compiled modules and selects functions by signature:
+The host driver compiles scripts and resolves function handles by name:
 
 ```rust
-// Find functions matching desired signature
-let handlers: Vec<_> = compiled.functions
-    .iter()
-    .filter(|f| matches_signature(f, &expected_sig))
-    .collect();
+let (program, _) = compile(source, &builtins).unwrap();
 
-// Execute
-for handler in handlers {
-    let result = call(handler, &mut context);
-    // Handle result based on application needs
+// Resolve once, call many times
+let process = program.function("process").unwrap();
+let validate = program.function("validate").unwrap();
+
+// Execute with application data
+let mut vm = VM::new();
+for record in records {
+    validate.call(&mut vm, &[record.clone()])?;
+    process.call(&mut vm, &[record])?;
 }
 ```
 
@@ -2114,91 +2123,105 @@ Tag(0xF1700) Module {
 
 ### Benefits
 
-- **Self-describing**: CBOR is schema-flexible
+- **Self-describing**: Schema-flexible, extensible
 - **Compact**: Efficient binary encoding
 - **Extensible**: Custom tags for future features
 - **Portable**: No platform-specific format dependencies
 
 ---
 
-## Example Use Case: DTN Bundle Filtering
+## Example: Embedding Rill
 
-While Rill is a general-purpose embeddable scripting language, it was originally
-designed for DTN bundle processing. This section demonstrates how Rill can be used
-in that context as an example of embedding the language in a domain-specific application.
+Rill is designed to be embedded in a host application. The host compiles
+scripts, registers domain-specific builtins, and calls script functions
+with application data.
 
-### Filter Functions
+### Validation Pipeline
 
-A bundle filter is a function that takes a `Bundle` parameter (by reference)
-and uses the `exit()` builtin to reject bundles:
+A typical pattern: the host loads a script containing validation functions
+and runs them against incoming data.
 
 ```
-fn check_lifetime(bundle) {
-    if bundle.age > MAX_TTL {
-        exit(LIFETIME_EXPIRED);
+// validation.rill
+const MAX_AGE = 86400;
+
+fn check_age(record) {
+    if record.age > MAX_AGE {
+        exit(1);  // reject — too old
     }
-    // Implicit: bundle continues if exit() not called
 }
 
-fn validate_destination(bundle) {
-    if !is_valid_eid(bundle.destination) {
-        exit(INVALID_DESTINATION);
+fn check_required_fields(record) {
+    if !is_some(record.id) {
+        exit(2);  // reject — missing id
     }
+    if !is_some(record.payload) {
+        exit(3);  // reject — missing payload
+    }
+}
+
+fn transform(with record) {
+    record.processed = true;
+    record.timestamp = time::now();
+}
+```
+
+### Host Driver (Rust)
+
+```rust
+use rill::{compile, standard_builtins, VM, Value};
+
+// Register domain builtins
+let mut builtins = standard_builtins();
+builtins.register(/* time::now, logging, etc. */);
+
+// Compile once, execute many times
+let (program, _warnings) = compile(source, &builtins).unwrap();
+
+// Resolve function handles for hot-path execution
+let check_age = program.function("check_age").unwrap();
+let check_fields = program.function("check_required_fields").unwrap();
+let transform = program.function("transform").unwrap();
+
+// Process incoming records
+let mut vm = VM::new();
+for record in incoming_records {
+    let data = record_to_value(&record);
+
+    // Run validation — exit() returns Err with a disposition code
+    match check_age.call(&mut vm, &[data.clone()]) {
+        Ok(_) => {}  // passed
+        Err(_) => { reject(record); continue; }
+    }
+    match check_fields.call(&mut vm, &[data.clone()]) {
+        Ok(_) => {}
+        Err(_) => { reject(record); continue; }
+    }
+
+    // Transform in-place
+    transform.call(&mut vm, &[data]).unwrap();
 }
 ```
 
 ### The `exit()` Builtin
 
-The `exit(code)` builtin is a diverging function that exits the script
-and returns a disposition to the host driver:
+The `exit(code)` builtin is a diverging function — it exits the script
+immediately and returns a disposition code to the host. This enables
+filter/validation patterns without exceptions or error types.
 
 ```rust
-// Registration
 registry.register(
-    BuiltinDef::new("drop", builtin_drop)
-        .param_optional("reason", TypeSig::uint())
-        .exits(TypeSig::uint())
+    BuiltinDef::new("exit", builtin_exit)
+        .param("code", TypeSet::uint())
+        .exits()
         .purity(Purity::Impure)
 );
 
-// Implementation
-fn builtin_drop(_vm: &mut VM, args: &[Value]) -> Result<ExecResult, ExecError> {
-    let reason = args.first().cloned().unwrap_or(Value::UInt(0));
-    Ok(ExecResult::exit(reason))
+fn builtin_exit(_vm: &mut VM, args: &[Value]) -> Result<ExecResult, ExecError> {
+    let code = args.first().cloned().unwrap_or(Value::UInt(0));
+    Ok(ExecResult::Exit(code))
 }
 ```
-
-### Filter Chain Execution
-
-The host driver runs filters as a chain:
-
-```rust
-// Find filter functions (accept Bundle, may call exit())
-let filters: Vec<_> = compiled.functions
-    .iter()
-    .filter(|f| f.params.get(0).map(|p| p.type_sig == TypeSig::Bundle).unwrap_or(false))
-    .collect();
-
-// Sort by RunAfter dependencies
-let ordered = topo_sort(filters);
-
-// Execute filter chain
-for filter in ordered {
-    match vm.call(filter, &mut bundle) {
-        Ok(_) => continue,  // Filter passed, continue chain
-        Err(ExitValue(reason)) => {
-            // Filter called exit()
-            return FilterResult::Drop(reason);
-        }
-    }
-}
-FilterResult::Continue
-```
-
-### Ordering Dependencies
-
-Filters can declare ordering constraints via the host driver. The driver
-topologically sorts filters to honor dependencies.
 
 ---
 
@@ -2262,11 +2285,11 @@ One `MAX_STACK_SIZE` check catches both value overflow and deep recursion. Simpl
 
 ### Why Undefined instead of errors?
 
-Duck typing philosophy. Scripts can probe values without try/catch. Failed operations naturally propagate. Matches CBOR's flexible type model.
+Duck typing philosophy. Scripts can probe values without try/catch. Failed operations naturally propagate — no exceptions, no error types. This matches the duck-typed, schema-free nature of the language: any value can be probed for any field, and missing data is simply undefined rather than an error.
 
 ### Why IndexMap for maps?
 
-Preserves insertion order (important for CBOR), provides O(1) lookup, and can be hashed for use as map keys (manual Hash impl iterates in order).
+Preserves insertion order (important for serialization and deterministic output), provides O(1) lookup, and can be hashed for use as map keys (manual Hash impl iterates in order).
 
 ### Why Float wrapper?
 
@@ -2311,26 +2334,23 @@ It's a hierarchy: Const ⊂ Pure ⊂ Impure. Using an enum makes the hierarchy e
 
 A function either returns to its caller or exits to the driver - never both. An enum prevents invalid states and makes the compiler's job easier: match on behavior, emit appropriate terminator.
 
-### Why no special `filter` keyword?
+### Why uniform function syntax (no special keywords for entry points)?
 
-The language is general-purpose. Making all functions uniform and using metadata
-for driver binding enables:
-
-- Multiple use cases (filtering, transforms, validation, etc.)
-- Driver flexibility (select by signature, not syntax)
-- Cleaner language (fewer keywords, uniform semantics)
+All functions use the same `fn` syntax. The host driver selects entry points
+by name or convention, not by keyword. This keeps the language simple and
+enables multiple use cases (validation, transforms, queries) without
+domain-specific syntax.
 - `exit()` as a builtin rather than special syntax
 
 ### Why CBOR for compiled binary format?
 
-The language has first-class CBOR support, so using CBOR for the compiled format
-is natural:
+CBOR is a good fit for the compiled format:
 
-- Same tooling for inspection
-- Natural representation of constants (already CBOR values)
-- Extensible via custom tags
+- Binary, compact, no text-parsing overhead
+- Self-describing — schema-flexible, extensible via custom tags
+- Natural representation of the language's value types
 - No dependency on platform-specific formats
-- Self-describing format consistent with language philosophy
+- Well-specified (RFC 8949), widely supported
 
 ### Why separate Definedness and Type analysis passes?
 
