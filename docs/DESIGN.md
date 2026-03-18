@@ -1203,14 +1203,19 @@ IR (per-function optimized)
     │  ── Phase B: Interprocedural ──
     ▼
 ┌─────────────────────┐
-│ Return Type Infer   │  Iterate until stable: infer return TypeSets
-│                     │  from Return terminators across all functions.
+│ B1: Interprocedural │  Collect arg types + definedness from all call
+│     Analysis        │  sites. Infer function purity (optimistic fixpoint).
+└──────────┬──────────┘
+           ▼
+┌─────────────────────┐
+│ B2: Return Type Inf │  Iterate until stable with narrowed params.
+│                     │  Infer return TypeSets from Return terminators.
 │                     │  Handles forward refs, recursion, mutual recursion.
 └──────────┬──────────┘
            ▼
 ┌─────────────────────┐
-│ Re-optimize callers │  Re-run Phase 2 + Phase 1 fixpoint on functions
-│                     │  that call user functions, with narrowed return types.
+│ B3: Re-optimize     │  Re-run Phase 2 + Phase 1 fixpoint on functions
+│                     │  with narrowed params/returns. Purity-aware DCE.
 └──────────┬──────────┘
            ▼
 IR (optimized)

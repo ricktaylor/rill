@@ -345,12 +345,19 @@ with just `v3 = Intrinsic(Add, [v1, v2])` — both args provably UInt, no guards
 
 - [x] **Dead Code Elimination (DCE)** (`eliminate_dead_code` in dce.rs) — removes
       instructions whose dest is never used. Iterates until stable (cascading).
-      Respects purity: keeps Calls even if result unused. Runs in Phase 1 fixpoint
-      after copy propagation.
+      Purity-aware: pure Calls (builtins with `is_pure()`, user functions proven
+      pure by `collect_pure_functions`) can be removed if result unused. Impure
+      Calls always kept. `collect_pure_functions` iterates until stable using
+      optimistic analysis (handles mutual recursion).
 
 - [x] **Copy Propagation** (`propagate_copies` in copy_prop.rs) — replaces all
       uses of `Copy(dest, src)` dest with src, resolves chains, removes dead Copies.
       Runs in Phase 1 fixpoint loop after const fold.
+
+- [ ] **Builtin param type validation** — `check_intrinsic_types` validates intrinsic
+      arg types (W009) but doesn't check builtin Call args against `ParamSpec.type_sig`.
+      Thread `BuiltinRegistry` into the check and validate that actual arg types
+      intersect with declared param types. Emit W009 for mismatches.
 
 - [ ] **Common Subexpression Elimination (CSE)** — reuse results of identical pure
       operations. Purity checking via `IntrinsicOp::is_fallible()` and
@@ -370,12 +377,12 @@ with just `v3 = Intrinsic(Add, [v1, v2])` — both args provably UInt, no guards
       Callers see narrowed return types instead of `{all}`. Re-runs Phase 2
       optimizations on functions with user calls. ~60 lines.
 
-- [ ] **Interprocedural Argument Type Propagation** — analyze call sites and
-      propagate argument types into callee parameter TypeSets. Extends the existing
-      per-function `analyze_types` by seeding parameters from callers instead
-      of defaulting to `all()`. Single pass over the call graph. When every
-      call to `fn process(x)` passes UInt, the analysis proves `x: {UInt}`
-      and the entire function body specializes via `try_specialize_binary`.
+- [x] **Interprocedural Argument Type + Definedness Propagation** (`collect_param_info`
+      in mod.rs) — scans all call sites, unions argument TypeSets and meets
+      argument Definedness per callee parameter. Seeds `analyze_types_full` and
+      `analyze_definedness_full` with narrowed param info instead of `{all}` /
+      `MaybeDefined`. When every caller passes Defined UInt, the callee sees
+      `x: {UInt}, Defined` — enabling full specialization and Guard elimination.
 
 - [ ] **Function Monomorphization** — clone functions per call-site type
       signature. `process(UInt)` and `process(Int)` become two separate

@@ -29,10 +29,15 @@ pub use coercion::{elide_coercions, insert_coercions};
 pub use const_fold::fold_constants;
 pub use copy_prop::propagate_copies;
 pub use dce::eliminate_dead_code;
-pub use definedness::{Definedness, DefinednessAnalysis, analyze_definedness, check_definedness};
+pub use definedness::{
+    Definedness, DefinednessAnalysis, analyze_definedness, analyze_definedness_full,
+    check_definedness,
+};
 pub use guard_elim::{eliminate_guards, simplify_cfg};
 pub use ref_elision::elide_refs;
-pub use type_refinement::{ReturnTypes, TypeAnalysis, analyze_types, infer_return_type};
+pub use type_refinement::{
+    ParamDefinedness, ParamTypes, ReturnTypes, TypeAnalysis, analyze_types, infer_return_type,
+};
 
 // Import IR types from parent module
 use super::{
@@ -55,19 +60,24 @@ pub fn optimize(
         optimize_function(function, builtins, diagnostics);
     }
 
-    // Phase B: interprocedural return type inference
+    // Phase B: interprocedural analysis
     //
-    // Iterate until stable: each pass may refine return types, which narrows
-    // callers' return types in turn. Handles:
-    // - Forward references (fn a calls fn b defined later)
-    // - Recursive functions (return type depends on itself)
-    // - Mutual recursion (fn a calls fn b calls fn a)
-    // Typically converges in 2-3 iterations.
+    // B1: Argument type + definedness + purity propagation
+    // B2: Return type inference — with narrowed params, infer tighter return types.
+    // B3: Re-optimize with full interprocedural info.
+    //
+    // B1 and B2 iterate until stable (handles forward refs, recursion, mutual recursion).
+
+    // B1: Collect argument types, definedness, and purity from call sites
+    let (param_types, param_defs) = collect_param_info(program, Some(builtins));
+    let pure_functions = collect_pure_functions(program, Some(builtins));
+
+    // B2: Return type inference (uses narrowed param types)
     let mut return_types = ReturnTypes::new();
     loop {
         let mut changed = false;
         for function in &program.functions {
-            let rt = infer_return_type(function, Some(builtins), &return_types);
+            let rt = infer_return_type(function, Some(builtins), &return_types, &param_types);
             let name = function.name.to_string();
             let old = return_types
                 .get(&name)
@@ -83,11 +93,14 @@ pub fn optimize(
         }
     }
 
-    // Re-optimize functions that have user function calls, now with narrowed
-    // return types feeding into type analysis.
-    if !return_types.is_empty() {
+    // B3: Re-optimize functions with interprocedural type + definedness info.
+    // Functions with narrowed params or that call functions with known return types
+    // benefit from re-running type-dependent optimizations.
+    if !return_types.is_empty() || !param_types.is_empty() {
         for function in &mut program.functions {
-            // Check if this function calls any user function
+            let name = function.name.to_string();
+            let has_narrowed_params =
+                param_types.contains_key(name.as_str()) || param_defs.contains_key(name.as_str());
             let has_user_calls = function.blocks.iter().any(|block| {
                 block.instructions.iter().any(|inst| {
                     if let Instruction::Call {
@@ -101,12 +114,13 @@ pub fn optimize(
                 })
             });
 
-            if has_user_calls {
-                // Re-run Phase 2 with return type info
-                let types = type_refinement::analyze_types_with_returns(
+            if has_narrowed_params || has_user_calls {
+                // Re-run Phase 2 with full interprocedural type info
+                let types = type_refinement::analyze_types_full(
                     function,
                     Some(builtins),
                     &return_types,
+                    &param_types,
                 );
                 let coercions = insert_coercions(function, &types);
                 let cast_elisions = elide_identity_casts(function, &types);
@@ -115,13 +129,19 @@ pub fn optimize(
                 let dead_arms = eliminate_dead_match_arms(function, &types);
 
                 if coercions + cast_elisions + algebra + condition_folds + dead_arms > 0 {
+                    // Use interprocedural param definedness + purity in the fixpoint loop
+                    let pd = param_defs.get(name.as_str()).map(|v| v.as_slice());
                     loop {
                         let folded = fold_constants(function, builtins, diagnostics);
                         let copies = propagate_copies(function);
-                        let dead = eliminate_dead_code(function);
+                        let dead = dce::eliminate_dead_code_with_purity(
+                            function,
+                            Some(builtins),
+                            &pure_functions,
+                        );
                         let refs = elide_refs(function);
                         let coerce = elide_coercions(function);
-                        let definedness = analyze_definedness(function, Some(builtins));
+                        let definedness = analyze_definedness_full(function, Some(builtins), pd);
                         let guards = eliminate_guards(function, &definedness);
                         let blocks = simplify_cfg(function);
                         if folded + copies + dead + refs + coerce + guards + blocks == 0 {
@@ -132,6 +152,133 @@ pub fn optimize(
             }
         }
     }
+}
+
+/// Infer which user functions are pure (no side effects).
+///
+/// A function is pure if it contains no SetIndex, WriteRef, or calls to
+/// impure functions. Iterates until stable for mutual recursion.
+fn collect_pure_functions(
+    program: &IrProgram,
+    builtins: Option<&BuiltinRegistry>,
+) -> std::collections::HashSet<String> {
+    let all_names: std::collections::HashSet<String> = program
+        .functions
+        .iter()
+        .map(|f| f.name.to_string())
+        .collect();
+
+    // Start optimistic: assume all user functions are pure
+    let mut pure: std::collections::HashSet<String> = all_names.clone();
+
+    loop {
+        let mut changed = false;
+        for function in &program.functions {
+            let name = function.name.to_string();
+            if !pure.contains(&name) {
+                continue; // already marked impure
+            }
+
+            let is_pure = function.blocks.iter().all(|block| {
+                block.instructions.iter().all(|inst| match &inst.node {
+                    // Side effects → impure
+                    Instruction::SetIndex { .. } | Instruction::WriteRef { .. } => false,
+                    // Call to impure function → impure
+                    Instruction::Call {
+                        function: func_ref, ..
+                    } => {
+                        let callee = func_ref.qualified_name();
+                        if let Some(registry) = builtins
+                            && let Some(def) = registry.get(&callee) {
+                                return def.meta.purity.is_pure();
+                            }
+                        // User function: pure only if callee is in our pure set
+                        pure.contains(&callee)
+                    }
+                    _ => true,
+                })
+            });
+
+            if !is_pure {
+                pure.remove(&name);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    pure
+}
+
+/// Collect parameter types and definedness from all call sites across the program.
+///
+/// For each user function, unions the argument TypeSets and meets the argument
+/// Definedness from all callers. If all callers pass Defined UInt for param 0,
+/// then param 0 narrows to `{UInt}` + `Defined`.
+fn collect_param_info(
+    program: &IrProgram,
+    builtins: Option<&BuiltinRegistry>,
+) -> (ParamTypes, ParamDefinedness) {
+    // Build function name → param count map
+    let func_param_counts: std::collections::HashMap<String, usize> = program
+        .functions
+        .iter()
+        .map(|f| (f.name.to_string(), f.params.len()))
+        .collect();
+
+    let mut param_types = ParamTypes::new();
+    let mut param_defs = ParamDefinedness::new();
+
+    for function in &program.functions {
+        // Run type + definedness analysis on this function
+        let types = analyze_types(function, builtins);
+        let defs = analyze_definedness(function, builtins);
+
+        for block in &function.blocks {
+            for inst in &block.instructions {
+                if let Instruction::Call {
+                    function: func_ref,
+                    args,
+                    ..
+                } = &inst.node
+                {
+                    let callee_name = func_ref.qualified_name();
+
+                    // Only process calls to user functions
+                    let Some(&param_count) = func_param_counts.get(&callee_name) else {
+                        continue;
+                    };
+
+                    let type_entry = param_types
+                        .entry(callee_name.clone())
+                        .or_insert_with(|| vec![crate::types::TypeSet::empty(); param_count]);
+
+                    let def_entry = param_defs
+                        .entry(callee_name)
+                        .or_insert_with(|| vec![Definedness::Defined; param_count]);
+
+                    for (i, arg) in args.iter().enumerate() {
+                        if i < param_count {
+                            // Union types
+                            let arg_type = types
+                                .get_at_exit(block.id, arg.value)
+                                .copied()
+                                .unwrap_or_else(type_refinement::all_types);
+                            type_entry[i] = type_entry[i].union(&arg_type);
+
+                            // Meet definedness (most conservative across callers)
+                            let arg_def = defs.get_at_exit(block.id, arg.value);
+                            def_entry[i] = def_entry[i].meet(arg_def);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    (param_types, param_defs)
 }
 
 /// Run all optimization passes on a single function
@@ -267,7 +414,7 @@ fn check_intrinsic_types(
                             function.name, op, required, actual,
                         ),
                     );
-                    break; // one warning per instruction is enough
+                    break;
                 }
             }
         }
@@ -457,7 +604,7 @@ fn check_condition_types(
 mod tests {
     use super::*;
     use crate::ast;
-    use crate::ir::{BasicBlock, Literal, Var};
+    use crate::ir::{BasicBlock, Import, Literal, Var};
     use crate::types::TypeSet;
 
     fn var(id: u32) -> VarId {
@@ -687,5 +834,100 @@ mod tests {
         let changes = fold_non_bool_conditions(&mut func, &types);
 
         assert_eq!(changes, 0);
+    }
+
+    // ================================================================
+    // Interprocedural param propagation
+    // ================================================================
+
+    #[test]
+    fn test_collect_param_info_single_caller() {
+        // fn callee(x) { x + 1 }
+        // fn caller() { callee(42) }
+        // → callee param x should be {UInt}, Defined
+        let callee = Function {
+            name: ast::Identifier("callee".into()),
+            params: vec![crate::ir::Param {
+                var: var(0),
+                by_ref: false,
+            }],
+            rest_param: None,
+            locals: vec![
+                Var::new(var(0), ast::Identifier("x".into()), TypeSet::all()),
+                Var::new(var(1), ast::Identifier("one".into()), TypeSet::uint()),
+                Var::new(var(2), ast::Identifier("r".into()), TypeSet::all()),
+            ],
+            blocks: vec![BasicBlock {
+                id: block(0),
+                instructions: vec![
+                    si(Instruction::Const {
+                        dest: var(1),
+                        value: Literal::UInt(1),
+                    }),
+                    si(Instruction::Intrinsic {
+                        dest: var(2),
+                        op: IntrinsicOp::Add,
+                        args: vec![var(0), var(1)],
+                    }),
+                ],
+                terminator: Terminator::Return {
+                    value: Some(var(2)),
+                },
+            }],
+            entry_block: block(0),
+        };
+
+        let caller = Function {
+            name: ast::Identifier("caller".into()),
+            params: vec![],
+            rest_param: None,
+            locals: vec![
+                Var::new(var(10), ast::Identifier("arg".into()), TypeSet::uint()),
+                Var::new(var(11), ast::Identifier("result".into()), TypeSet::all()),
+            ],
+            blocks: vec![BasicBlock {
+                id: block(0),
+                instructions: vec![
+                    si(Instruction::Const {
+                        dest: var(10),
+                        value: Literal::UInt(42),
+                    }),
+                    si(Instruction::Call {
+                        dest: var(11),
+                        function: crate::ir::FunctionRef {
+                            namespace: None,
+                            name: ast::Identifier("callee".into()),
+                        },
+                        args: vec![crate::ir::CallArg {
+                            value: var(10),
+                            by_ref: false,
+                        }],
+                    }),
+                ],
+                terminator: Terminator::Return {
+                    value: Some(var(11)),
+                },
+            }],
+            entry_block: block(0),
+        };
+
+        let program = IrProgram {
+            functions: vec![callee, caller],
+            constants: vec![],
+            imports: vec![],
+        };
+
+        let (param_types, param_defs) = collect_param_info(&program, None);
+
+        // callee's param x should be {UInt}
+        let callee_types = param_types.get("callee").unwrap();
+        assert_eq!(callee_types.len(), 1);
+        assert!(callee_types[0].is_single());
+        assert!(callee_types[0].contains(crate::types::BaseType::UInt));
+
+        // callee's param x should be Defined
+        let callee_defs = param_defs.get("callee").unwrap();
+        assert_eq!(callee_defs.len(), 1);
+        assert_eq!(callee_defs[0], Definedness::Defined);
     }
 }

@@ -323,7 +323,7 @@ fn apply_guard_refinement(
 // ============================================================================
 
 /// Create a TypeSet containing all base types
-fn all_types() -> TypeSet {
+pub(super) fn all_types() -> TypeSet {
     TypeSet::all()
 }
 
@@ -334,6 +334,14 @@ fn all_types() -> TypeSet {
 /// Inferred return types for user-defined functions.
 pub type ReturnTypes = std::collections::HashMap<String, TypeSet>;
 
+/// Inferred parameter types for user-defined functions.
+/// Maps function name → Vec of TypeSets (one per parameter, positional).
+pub type ParamTypes = std::collections::HashMap<String, Vec<TypeSet>>;
+
+/// Inferred parameter definedness for user-defined functions.
+/// Maps function name → Vec of Definedness (one per parameter, positional).
+pub type ParamDefinedness = std::collections::HashMap<String, Vec<crate::ir::opt::Definedness>>;
+
 /// Infer the return type of a function from its Return terminators.
 ///
 /// Runs type analysis, then unions the TypeSets of all Return values.
@@ -342,8 +350,9 @@ pub fn infer_return_type(
     function: &Function,
     builtins: Option<&BuiltinRegistry>,
     return_types: &ReturnTypes,
+    param_types: &ParamTypes,
 ) -> TypeSet {
-    let types = analyze_types_with_returns(function, builtins, return_types);
+    let types = analyze_types_full(function, builtins, return_types, param_types);
 
     let mut result = TypeSet::empty();
     for block in &function.blocks {
@@ -361,14 +370,15 @@ pub fn infer_return_type(
 /// Returns a TypeAnalysis containing the TypeSet at each block's entry
 /// and exit points.
 pub fn analyze_types(function: &Function, builtins: Option<&BuiltinRegistry>) -> TypeAnalysis {
-    analyze_types_with_returns(function, builtins, &ReturnTypes::new())
+    analyze_types_full(function, builtins, &ReturnTypes::new(), &ParamTypes::new())
 }
 
-/// Analyze types with interprocedural return type information.
-pub fn analyze_types_with_returns(
+/// Analyze types with full interprocedural information.
+pub fn analyze_types_full(
     function: &Function,
     builtins: Option<&BuiltinRegistry>,
     return_types: &ReturnTypes,
+    param_types: &ParamTypes,
 ) -> TypeAnalysis {
     let block_index = build_block_index_map(function);
 
@@ -378,9 +388,14 @@ pub fn analyze_types_with_returns(
 
     // Initialize entry block with parameter types
     let mut initial_state = HashMap::new();
-    for param in &function.params {
-        // Parameters can be any type (caller decides)
-        initial_state.insert(param.var, all_types());
+    let propagated = param_types.get(function.name.0.as_str());
+    for (i, param) in function.params.iter().enumerate() {
+        // Use propagated type from call sites if available, else all types
+        let ty = propagated
+            .and_then(|pts| pts.get(i).copied())
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(all_types);
+        initial_state.insert(param.var, ty);
     }
     if let Some(ref rest_param) = function.rest_param {
         // Rest param is always an array

@@ -5,22 +5,37 @@
 //! instruction may make its operands' definitions dead too).
 //!
 //! Respects side effects:
-//! - `Call` is always kept (host builtins may be impure)
+//! - Impure `Call` is always kept (side effects)
+//! - Pure `Call` (builtin with `is_pure()`, or user function proven pure)
+//!   can be removed if result is unused
 //! - `SetIndex`, `WriteRef`, `Drop` have no dest — always kept
 //! - Everything else (Const, Copy, Undefined, Index, Intrinsic, Phi, MakeRef)
 //!   is removed if its dest is unused
 
 use super::{Function, Instruction, Terminator, VarId};
+use crate::builtins::BuiltinRegistry;
 use std::collections::HashSet;
 
 /// Eliminate dead instructions. Returns the number removed.
+///
+/// `pure_functions` is a set of user function names known to be pure
+/// (no side effects). Pure function calls can be removed if unused.
 pub fn eliminate_dead_code(function: &mut Function) -> usize {
+    eliminate_dead_code_with_purity(function, None, &HashSet::new())
+}
+
+/// Eliminate dead code with purity information for interprocedural DCE.
+pub fn eliminate_dead_code_with_purity(
+    function: &mut Function,
+    builtins: Option<&BuiltinRegistry>,
+    pure_functions: &HashSet<String>,
+) -> usize {
     let mut total = 0;
 
     // Iterate until stable — removing dead instructions may expose more
     loop {
         let used = collect_used_vars(function);
-        let removed = remove_dead(function, &used);
+        let removed = remove_dead(function, &used, builtins, pure_functions);
         if removed == 0 {
             break;
         }
@@ -125,7 +140,11 @@ fn collect_terminator_reads(term: &Terminator, used: &mut HashSet<VarId>) {
 }
 
 /// Is this instruction safe to remove when its dest is unused?
-fn is_removable(inst: &Instruction) -> bool {
+fn is_removable(
+    inst: &Instruction,
+    builtins: Option<&BuiltinRegistry>,
+    pure_functions: &HashSet<String>,
+) -> bool {
     match inst {
         // Pure instructions with a dest — safe to remove
         Instruction::Const { .. }
@@ -136,8 +155,16 @@ fn is_removable(inst: &Instruction) -> bool {
         | Instruction::Phi { .. }
         | Instruction::MakeRef { .. } => true,
 
-        // Call may have side effects — always keep
-        Instruction::Call { .. } => false,
+        // Call: removable only if the callee is proven pure
+        Instruction::Call { function, .. } => {
+            // Check builtins for purity metadata
+            if let Some(registry) = builtins
+                && let Some(def) = registry.get(&function.qualified_name()) {
+                    return def.meta.purity.is_pure();
+                }
+            // Check user functions proven pure by interprocedural analysis
+            pure_functions.contains(&function.qualified_name())
+        }
 
         // No dest — always keep (side effects)
         Instruction::SetIndex { .. } | Instruction::WriteRef { .. } | Instruction::Drop { .. } => {
@@ -165,13 +192,18 @@ fn get_dest(inst: &Instruction) -> Option<VarId> {
 }
 
 /// Remove dead instructions from all blocks. Returns count removed.
-fn remove_dead(function: &mut Function, used: &HashSet<VarId>) -> usize {
+fn remove_dead(
+    function: &mut Function,
+    used: &HashSet<VarId>,
+    builtins: Option<&BuiltinRegistry>,
+    pure_functions: &HashSet<String>,
+) -> usize {
     let mut removed = 0;
 
     for block in &mut function.blocks {
         let before = block.instructions.len();
         block.instructions.retain(|inst| {
-            if !is_removable(&inst.node) {
+            if !is_removable(&inst.node, builtins, pure_functions) {
                 return true; // side-effectful — keep
             }
             match get_dest(&inst.node) {

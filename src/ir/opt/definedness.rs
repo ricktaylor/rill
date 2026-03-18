@@ -601,9 +601,20 @@ fn collect_guarded_indices(function: &Function) -> (GuardedIndices, HashMap<VarI
 ///
 /// If `builtins` is provided, function call results will use the metadata
 /// from the builtin registry to determine definedness more precisely.
+/// If `param_defs` is provided, parameter definedness is seeded from
+/// interprocedural analysis instead of defaulting to MaybeDefined.
 pub fn analyze_definedness(
     function: &Function,
     builtins: Option<&BuiltinRegistry>,
+) -> DefinednessAnalysis {
+    analyze_definedness_full(function, builtins, None)
+}
+
+/// Analyze definedness with interprocedural parameter definedness.
+pub fn analyze_definedness_full(
+    function: &Function,
+    builtins: Option<&BuiltinRegistry>,
+    param_defs: Option<&[Definedness]>,
 ) -> DefinednessAnalysis {
     let block_index = build_block_index_map(function);
     let _predecessors = build_predecessors(function);
@@ -620,9 +631,12 @@ pub fn analyze_definedness(
 
     // Initialize entry block with parameter definedness
     let mut initial_state = HashMap::new();
-    for param in &function.params {
-        // Parameters are MaybeDefined - caller might pass undefined
-        initial_state.insert(param.var, Definedness::MaybeDefined);
+    for (i, param) in function.params.iter().enumerate() {
+        // Use propagated definedness from call sites if available
+        let def = param_defs
+            .and_then(|pd| pd.get(i).copied())
+            .unwrap_or(Definedness::MaybeDefined);
+        initial_state.insert(param.var, def);
     }
     if let Some(ref rest_param) = function.rest_param {
         // Rest params collect all remaining args, might include undefined

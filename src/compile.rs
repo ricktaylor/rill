@@ -3574,4 +3574,97 @@ mod tests {
         );
         assert_eq!(val, Value::UInt(42));
     }
+
+    #[test]
+    fn test_arg_type_propagation() {
+        // All callers pass UInt → param narrows to {UInt} → return narrows to {UInt}
+        let val = run_expect(
+            r#"
+            fn square(x) { x * x }
+            fn test() { square(7) }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::UInt(49));
+    }
+
+    #[test]
+    fn test_arg_type_mixed_callers() {
+        // Multiple callers with different types → param is union
+        let val = run_expect(
+            r#"
+            fn identity(x) { x }
+            fn test() {
+                let a = identity(42);
+                let b = identity(true);
+                a
+            }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::UInt(42));
+    }
+
+    // ================================================================
+    // Interprocedural definedness propagation
+    // ================================================================
+
+    #[test]
+    fn test_interprocedural_definedness() {
+        // All callers pass Defined → callee param is Defined
+        // → callee body uses Defined values → no spurious warnings
+        let val = run_expect(
+            r#"
+            fn add(a, b) { a + b }
+            fn test() { add(10, 20) }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::UInt(30));
+    }
+
+    #[test]
+    fn test_interprocedural_type_and_def_chain() {
+        // Type + definedness flow through a chain:
+        // test → process(42) → double(x) → x * 2
+        // All args Defined UInt at every level
+        let val = run_expect(
+            r#"
+            fn double(x) { x * 2 }
+            fn process(x) { double(x) + 1 }
+            fn test() { process(20) }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::UInt(41));
+    }
+
+    #[test]
+    fn test_recursive_return_type() {
+        // Recursive function: return type inferred across iterations
+        let val = run_expect(
+            r#"
+            fn factorial(n) {
+                if n <= 1 { return 1; }
+                return n * factorial(n - 1);
+            }
+            fn test() { factorial(5) }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::UInt(120));
+    }
+
+    #[test]
+    fn test_forward_reference_return_type() {
+        // fn test calls fn helper defined later — return type still inferred
+        let val = run_expect(
+            r#"
+            fn test() { helper(10) }
+            fn helper(x) { x + 5 }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::UInt(15));
+    }
 }
