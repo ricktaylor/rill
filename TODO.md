@@ -364,8 +364,14 @@ with just `v3 = Intrinsic(Add, [v1, v2])` — both args provably UInt, no guards
 - [ ] **Loop-Invariant Code Motion (LICM)** — lift pure computations with
       loop-external operands to pre-header. Requires loop detection, dominator tree.
 
-- [ ] **Interprocedural Type Propagation** — analyze call sites and propagate
-      argument types into callee parameter TypeSets. Extends the existing
+- [x] **Interprocedural Return Type Inference** (`infer_return_type` in type_refinement.rs) —
+      after per-function optimization, infer return types from Return terminators.
+      Iterates until stable (handles forward references, recursion, mutual recursion).
+      Callers see narrowed return types instead of `{all}`. Re-runs Phase 2
+      optimizations on functions with user calls. ~60 lines.
+
+- [ ] **Interprocedural Argument Type Propagation** — analyze call sites and
+      propagate argument types into callee parameter TypeSets. Extends the existing
       per-function `analyze_types` by seeding parameters from callers instead
       of defaulting to `all()`. Single pass over the call graph. When every
       call to `fn process(x)` passes UInt, the analysis proves `x: {UInt}`

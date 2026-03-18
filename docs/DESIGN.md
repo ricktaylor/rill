@@ -1198,14 +1198,29 @@ IR (lowered)
            ▼
   Phase 1 fixpoint       (re-run if Phase 2 changed anything)
            ▼
+IR (per-function optimized)
+    │
+    │  ── Phase B: Interprocedural ──
+    ▼
+┌─────────────────────┐
+│ Return Type Infer   │  Iterate until stable: infer return TypeSets
+│                     │  from Return terminators across all functions.
+│                     │  Handles forward refs, recursion, mutual recursion.
+└──────────┬──────────┘
+           ▼
+┌─────────────────────┐
+│ Re-optimize callers │  Re-run Phase 2 + Phase 1 fixpoint on functions
+│                     │  that call user functions, with narrowed return types.
+└──────────┬──────────┘
+           ▼
 IR (optimized)
 ```
 
 ### Fixpoint Iteration
 
-The Phase 1 passes (const fold, ref elision, definedness, guard elim, CFG
-simplify) run in a loop until no pass makes changes. This handles cascading
-effects:
+The Phase 1 passes (const fold, copy prop, DCE, ref elision, coercion elision,
+definedness, guard elim, CFG simplify) run in a loop until no pass makes
+changes. This handles cascading effects:
 
 - Const fold may turn a Phi into a constant → definedness sees Defined
 - Ref elision demotes read-only MakeRefs → exposes Copy/Index for const fold

@@ -32,7 +32,7 @@ pub use dce::eliminate_dead_code;
 pub use definedness::{Definedness, DefinednessAnalysis, analyze_definedness, check_definedness};
 pub use guard_elim::{eliminate_guards, simplify_cfg};
 pub use ref_elision::elide_refs;
-pub use type_refinement::{TypeAnalysis, analyze_types};
+pub use type_refinement::{ReturnTypes, TypeAnalysis, analyze_types, infer_return_type};
 
 // Import IR types from parent module
 use super::{
@@ -50,8 +50,87 @@ pub fn optimize(
     builtins: &BuiltinRegistry,
     diagnostics: &mut Diagnostics,
 ) {
+    // Phase A: per-function optimization (intraprocedural)
     for function in &mut program.functions {
         optimize_function(function, builtins, diagnostics);
+    }
+
+    // Phase B: interprocedural return type inference
+    //
+    // Iterate until stable: each pass may refine return types, which narrows
+    // callers' return types in turn. Handles:
+    // - Forward references (fn a calls fn b defined later)
+    // - Recursive functions (return type depends on itself)
+    // - Mutual recursion (fn a calls fn b calls fn a)
+    // Typically converges in 2-3 iterations.
+    let mut return_types = ReturnTypes::new();
+    loop {
+        let mut changed = false;
+        for function in &program.functions {
+            let rt = infer_return_type(function, Some(builtins), &return_types);
+            let name = function.name.to_string();
+            let old = return_types
+                .get(&name)
+                .copied()
+                .unwrap_or(crate::types::TypeSet::empty());
+            if rt != old {
+                return_types.insert(name, rt);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // Re-optimize functions that have user function calls, now with narrowed
+    // return types feeding into type analysis.
+    if !return_types.is_empty() {
+        for function in &mut program.functions {
+            // Check if this function calls any user function
+            let has_user_calls = function.blocks.iter().any(|block| {
+                block.instructions.iter().any(|inst| {
+                    if let Instruction::Call {
+                        function: func_ref, ..
+                    } = &inst.node
+                    {
+                        return_types.contains_key(&func_ref.qualified_name())
+                    } else {
+                        false
+                    }
+                })
+            });
+
+            if has_user_calls {
+                // Re-run Phase 2 with return type info
+                let types = type_refinement::analyze_types_with_returns(
+                    function,
+                    Some(builtins),
+                    &return_types,
+                );
+                let coercions = insert_coercions(function, &types);
+                let cast_elisions = elide_identity_casts(function, &types);
+                let algebra = simplify_algebra(function, &types);
+                let condition_folds = fold_non_bool_conditions(function, &types);
+                let dead_arms = eliminate_dead_match_arms(function, &types);
+
+                if coercions + cast_elisions + algebra + condition_folds + dead_arms > 0 {
+                    loop {
+                        let folded = fold_constants(function, builtins, diagnostics);
+                        let copies = propagate_copies(function);
+                        let dead = eliminate_dead_code(function);
+                        let refs = elide_refs(function);
+                        let coerce = elide_coercions(function);
+                        let definedness = analyze_definedness(function, Some(builtins));
+                        let guards = eliminate_guards(function, &definedness);
+                        let blocks = simplify_cfg(function);
+                        if folded + copies + dead + refs + coerce + guards + blocks == 0 {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

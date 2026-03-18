@@ -70,6 +70,7 @@ fn transfer_instruction(
     instruction: &Instruction,
     state: &mut HashMap<VarId, TypeSet>,
     builtins: Option<&BuiltinRegistry>,
+    return_types: &ReturnTypes,
 ) {
     match instruction {
         // Constants have known single types
@@ -145,7 +146,7 @@ fn transfer_instruction(
             function,
             args,
         } => {
-            let type_set = compute_call_type(function, args, state, builtins);
+            let type_set = compute_call_type(function, args, state, builtins, return_types);
             state.insert(*dest, type_set);
         }
 
@@ -187,9 +188,21 @@ fn compute_call_type(
     _args: &[CallArg],
     _state: &HashMap<VarId, TypeSet>,
     builtins: Option<&BuiltinRegistry>,
+    return_types: &ReturnTypes,
 ) -> TypeSet {
     let Some(builtin) = builtins.and_then(|r| r.lookup(function)) else {
-        // Unknown function or no registry - conservatively return all types
+        // Not a builtin — check inferred return types for user functions
+        let name = function.qualified_name();
+        if let Some(rt) = return_types.get(&name)
+            && !rt.is_empty()
+        {
+            return *rt;
+        }
+        // Not a builtin and no inferred return type yet.
+        // During Phase A (per-function): return types haven't been collected.
+        // During Phase B (interprocedural): recursive calls or functions
+        // analyzed later in the iteration — conservatively return all types.
+        // Truly undefined functions are caught by the link phase (E500).
         return all_types();
     };
 
@@ -318,11 +331,45 @@ fn all_types() -> TypeSet {
 // Main Analysis
 // ============================================================================
 
+/// Inferred return types for user-defined functions.
+pub type ReturnTypes = std::collections::HashMap<String, TypeSet>;
+
+/// Infer the return type of a function from its Return terminators.
+///
+/// Runs type analysis, then unions the TypeSets of all Return values.
+/// Functions with no return value (all returns are `None`) produce `TypeSet::empty()`.
+pub fn infer_return_type(
+    function: &Function,
+    builtins: Option<&BuiltinRegistry>,
+    return_types: &ReturnTypes,
+) -> TypeSet {
+    let types = analyze_types_with_returns(function, builtins, return_types);
+
+    let mut result = TypeSet::empty();
+    for block in &function.blocks {
+        if let Terminator::Return { value: Some(v) } = &block.terminator
+            && let Some(ts) = types.get_at_exit(block.id, *v)
+        {
+            result = result.union(ts);
+        }
+    }
+    result
+}
+
 /// Analyze types for all variables in a function
 ///
 /// Returns a TypeAnalysis containing the TypeSet at each block's entry
 /// and exit points.
 pub fn analyze_types(function: &Function, builtins: Option<&BuiltinRegistry>) -> TypeAnalysis {
+    analyze_types_with_returns(function, builtins, &ReturnTypes::new())
+}
+
+/// Analyze types with interprocedural return type information.
+pub fn analyze_types_with_returns(
+    function: &Function,
+    builtins: Option<&BuiltinRegistry>,
+    return_types: &ReturnTypes,
+) -> TypeAnalysis {
     let block_index = build_block_index_map(function);
 
     // State at entry and exit of each block
@@ -362,7 +409,7 @@ pub fn analyze_types(function: &Function, builtins: Option<&BuiltinRegistry>) ->
 
         // Apply transfer function for each instruction
         for spanned_inst in &block.instructions {
-            transfer_instruction(&spanned_inst.node, &mut state, builtins);
+            transfer_instruction(&spanned_inst.node, &mut state, builtins, return_types);
         }
 
         // Check if exit state changed

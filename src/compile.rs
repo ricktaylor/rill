@@ -3539,4 +3539,39 @@ mod tests {
         );
         assert_eq!(val, Value::UInt(2)); // "Hi" = 2 chars
     }
+
+    // ================================================================
+    // Return type inference (interprocedural)
+    // ================================================================
+
+    #[test]
+    fn test_return_type_inference() {
+        // double() always returns a numeric result from multiplication
+        // The caller should be able to use it in arithmetic without warnings
+        let val = run_expect(
+            r#"
+            fn double(x) { x * 2 }
+            fn test() {
+                let y = double(21);
+                y
+            }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::UInt(42));
+    }
+
+    #[test]
+    fn test_return_type_chains() {
+        // Return type flows through a chain of calls
+        let val = run_expect(
+            r#"
+            fn add_one(x) { x + 1 }
+            fn add_two(x) { add_one(add_one(x)) }
+            fn test() { add_two(40) }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::UInt(42));
+    }
 }
