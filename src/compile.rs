@@ -510,38 +510,129 @@ fn compile_instruction(
             let d = slot(*dest);
             let b = slot(*base);
             let k = slot(*key);
-            Box::new(move |vm: &mut VM, _prog| {
-                let result = match (vm.local(b), vm.local(k)) {
-                    (Some(base_val), Some(key_val)) => index_value(base_val, key_val),
-                    _ => None,
-                };
-                match result {
-                    Some(val) => vm.set_local(d, val),
-                    None => vm.set_local_uninit(d),
-                }
-                Ok(Action::Continue)
-            })
+
+            // Specialize based on known base type
+            let base_type = types.get_at_exit(block_id, *base).filter(|t| t.is_single());
+
+            if base_type.is_some_and(|t| t.contains(BaseType::Array)) {
+                Box::new(move |vm: &mut VM, _prog| {
+                    let result = match (vm.local(b), vm.local(k)) {
+                        (Some(Value::Array(arr)), Some(Value::UInt(idx))) => {
+                            arr.get(*idx as usize).cloned()
+                        }
+                        (Some(Value::Array(arr)), Some(Value::Int(idx))) if *idx >= 0 => {
+                            arr.get(*idx as usize).cloned()
+                        }
+                        _ => None,
+                    };
+                    match result {
+                        Some(val) => vm.set_local(d, val),
+                        None => vm.set_local_uninit(d),
+                    }
+                    Ok(Action::Continue)
+                })
+            } else if base_type.is_some_and(|t| t.contains(BaseType::Map)) {
+                Box::new(move |vm: &mut VM, _prog| {
+                    let result = match (vm.local(b), vm.local(k)) {
+                        (Some(Value::Map(map)), Some(key_val)) => map.get(key_val).cloned(),
+                        _ => None,
+                    };
+                    match result {
+                        Some(val) => vm.set_local(d, val),
+                        None => vm.set_local_uninit(d),
+                    }
+                    Ok(Action::Continue)
+                })
+            } else if base_type.is_some_and(|t| t.contains(BaseType::Text)) {
+                Box::new(move |vm: &mut VM, _prog| {
+                    let result = match (vm.local(b), vm.local(k)) {
+                        (Some(Value::Text(s)), Some(Value::UInt(idx))) => {
+                            s.chars().nth(*idx as usize).map(|c| Value::UInt(c as u64))
+                        }
+                        _ => None,
+                    };
+                    match result {
+                        Some(val) => vm.set_local(d, val),
+                        None => vm.set_local_uninit(d),
+                    }
+                    Ok(Action::Continue)
+                })
+            } else if base_type.is_some_and(|t| t.contains(BaseType::Bytes)) {
+                Box::new(move |vm: &mut VM, _prog| {
+                    let result = match (vm.local(b), vm.local(k)) {
+                        (Some(Value::Bytes(bytes)), Some(Value::UInt(idx))) => bytes
+                            .get(*idx as usize)
+                            .map(|byte| Value::UInt(*byte as u64)),
+                        _ => None,
+                    };
+                    match result {
+                        Some(val) => vm.set_local(d, val),
+                        None => vm.set_local_uninit(d),
+                    }
+                    Ok(Action::Continue)
+                })
+            } else {
+                // Unknown base: full runtime dispatch
+                Box::new(move |vm: &mut VM, _prog| {
+                    let result = match (vm.local(b), vm.local(k)) {
+                        (Some(base_val), Some(key_val)) => index_value(base_val, key_val),
+                        _ => None,
+                    };
+                    match result {
+                        Some(val) => vm.set_local(d, val),
+                        None => vm.set_local_uninit(d),
+                    }
+                    Ok(Action::Continue)
+                })
+            }
         }
 
         Instruction::SetIndex { base, key, value } => {
             let b = slot(*base);
             let k = slot(*key);
             let v = slot(*value);
-            Box::new(move |vm: &mut VM, _prog| {
-                if let (Some(key_val), Some(new_val)) = (vm.local(k).cloned(), vm.local(v).cloned())
-                {
-                    // Use the VM's collection mutation methods
-                    match &key_val {
-                        Value::UInt(idx) => {
-                            let _ = vm.set_array_elem(vm.bp() + b, *idx as usize, new_val);
-                        }
-                        _ => {
-                            let _ = vm.set_map_entry(vm.bp() + b, key_val, new_val);
+
+            // Specialize based on known base type
+            let base_type = types.get_at_exit(block_id, *base).filter(|t| t.is_single());
+
+            if base_type.is_some_and(|t| t.contains(BaseType::Array)) {
+                // Array: key is UInt index
+                Box::new(move |vm: &mut VM, _prog| {
+                    if let (Some(Value::UInt(idx)), Some(new_val)) =
+                        (vm.local(k), vm.local(v).cloned())
+                    {
+                        let _ = vm.set_array_elem(vm.bp() + b, *idx as usize, new_val);
+                    }
+                    Ok(Action::Continue)
+                })
+            } else if base_type.is_some_and(|t| t.contains(BaseType::Map)) {
+                // Map: any key type
+                Box::new(move |vm: &mut VM, _prog| {
+                    if let (Some(key_val), Some(new_val)) =
+                        (vm.local(k).cloned(), vm.local(v).cloned())
+                    {
+                        let _ = vm.set_map_entry(vm.bp() + b, key_val, new_val);
+                    }
+                    Ok(Action::Continue)
+                })
+            } else {
+                // Unknown base: dispatch on key type at runtime
+                Box::new(move |vm: &mut VM, _prog| {
+                    if let (Some(key_val), Some(new_val)) =
+                        (vm.local(k).cloned(), vm.local(v).cloned())
+                    {
+                        match &key_val {
+                            Value::UInt(idx) => {
+                                let _ = vm.set_array_elem(vm.bp() + b, *idx as usize, new_val);
+                            }
+                            _ => {
+                                let _ = vm.set_map_entry(vm.bp() + b, key_val, new_val);
+                            }
                         }
                     }
-                }
-                Ok(Action::Continue)
-            })
+                    Ok(Action::Continue)
+                })
+            }
         }
 
         Instruction::Call {
