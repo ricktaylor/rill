@@ -50,6 +50,7 @@ use super::{
 // Import builtins for metadata lookup
 use crate::builtins::BuiltinRegistry;
 use crate::diagnostics::Diagnostics;
+use std::collections::HashMap;
 
 /// Run all optimization passes on a program
 pub fn optimize(
@@ -61,6 +62,13 @@ pub fn optimize(
     for function in &mut program.functions {
         optimize_function(function, builtins, diagnostics);
     }
+
+    // Phase M: Function monomorphization
+    //
+    // When a function is called with different type signatures at different
+    // sites, clone it per signature. Each clone gets fully narrowed params
+    // in Phase B. Skip recursive functions and limit clones to avoid explosion.
+    monomorphize(program, builtins);
 
     // Phase B: interprocedural analysis
     //
@@ -220,6 +228,175 @@ fn collect_pure_functions(
     pure
 }
 
+/// Monomorphize functions called with multiple distinct type signatures.
+///
+/// For each user function with >1 distinct call-site type signature, clone
+/// the function per signature and rewrite callers to target their matching clone.
+/// Phase B then narrows each clone's params to its specific signature.
+///
+/// Limits: max 4 variants per function, skip recursive functions.
+fn monomorphize(program: &mut IrProgram, builtins: &BuiltinRegistry) {
+    const MAX_VARIANTS: usize = 4;
+
+    // Collect type signatures at each call site: (caller_func_idx, block_idx, inst_idx) → arg types
+    #[allow(clippy::type_complexity)]
+    let mut call_sites: HashMap<
+        String,
+        Vec<(usize, BlockId, usize, Vec<crate::types::TypeSet>)>,
+    > = HashMap::new();
+
+    // Build function name set for detecting user functions
+    let user_functions: std::collections::HashSet<String> = program
+        .functions
+        .iter()
+        .map(|f| f.name.to_string())
+        .collect();
+
+    // Collect call-site signatures using type analysis
+    for (func_idx, function) in program.functions.iter().enumerate() {
+        let types = analyze_types(function, Some(builtins));
+
+        for block in &function.blocks {
+            for (inst_idx, inst) in block.instructions.iter().enumerate() {
+                if let Instruction::Call {
+                    function: func_ref,
+                    args,
+                    ..
+                } = &inst.node
+                {
+                    let callee_name = func_ref.qualified_name();
+                    if !user_functions.contains(&callee_name) {
+                        continue; // skip builtins
+                    }
+
+                    let arg_types: Vec<crate::types::TypeSet> = args
+                        .iter()
+                        .map(|a| {
+                            types
+                                .get_at_exit(block.id, a.value)
+                                .copied()
+                                .unwrap_or(crate::types::TypeSet::all())
+                        })
+                        .collect();
+
+                    call_sites
+                        .entry(callee_name)
+                        .or_default()
+                        .push((func_idx, block.id, inst_idx, arg_types));
+                }
+            }
+        }
+    }
+
+    // Detect recursive functions (call themselves — skip monomorphization)
+    let recursive: std::collections::HashSet<String> = program
+        .functions
+        .iter()
+        .filter(|f| {
+            let name = f.name.to_string();
+            f.blocks.iter().any(|block| {
+                block.instructions.iter().any(|inst| {
+                    matches!(&inst.node, Instruction::Call { function: func_ref, .. }
+                        if func_ref.qualified_name() == name)
+                })
+            })
+        })
+        .map(|f| f.name.to_string())
+        .collect();
+
+    // For each function with multiple distinct signatures, create clones
+    let mut new_functions: Vec<Function> = Vec::new();
+    // Map: (original_name, signature_index) → clone_name
+    let mut clone_map: HashMap<(String, usize), String> = HashMap::new();
+    // Map: (caller_func_idx, block_id, inst_idx) → clone_name to rewrite
+    let mut rewrites: Vec<(usize, BlockId, usize, String)> = Vec::new();
+
+    for (callee_name, sites) in &call_sites {
+        if recursive.contains(callee_name) {
+            continue;
+        }
+
+        // Deduplicate signatures
+        let mut unique_sigs: Vec<Vec<crate::types::TypeSet>> = Vec::new();
+        let mut site_to_sig: Vec<usize> = Vec::new(); // index into unique_sigs for each site
+
+        for (_, _, _, arg_types) in sites {
+            let sig_idx = unique_sigs
+                .iter()
+                .position(|s| s == arg_types)
+                .unwrap_or_else(|| {
+                    unique_sigs.push(arg_types.clone());
+                    unique_sigs.len() - 1
+                });
+            site_to_sig.push(sig_idx);
+        }
+
+        // Only monomorphize if there are multiple distinct signatures
+        if unique_sigs.len() <= 1 || unique_sigs.len() > MAX_VARIANTS {
+            continue;
+        }
+
+        // Find the original function
+        let original = match program
+            .functions
+            .iter()
+            .find(|f| f.name.to_string() == *callee_name)
+        {
+            Some(f) => f,
+            None => continue,
+        };
+
+        // Create clones for signatures 1..N (signature 0 keeps the original name)
+        for (sig_idx, _sig) in unique_sigs.iter().enumerate().skip(1) {
+            let clone_name = format!("{}__mono{}", callee_name, sig_idx);
+            let mut clone = original.clone();
+            clone.name = crate::ast::Identifier(clone_name.clone());
+            clone_map.insert((callee_name.clone(), sig_idx), clone_name);
+            new_functions.push(clone);
+        }
+
+        // Record which call sites need rewriting (only those targeting non-0 signatures)
+        for (site_idx, (func_idx, block_id, inst_idx, _)) in sites.iter().enumerate() {
+            let sig_idx = site_to_sig[site_idx];
+            if sig_idx > 0
+                && let Some(clone_name) = clone_map.get(&(callee_name.clone(), sig_idx))
+            {
+                rewrites.push((*func_idx, *block_id, *inst_idx, clone_name.clone()));
+            }
+        }
+    }
+
+    if new_functions.is_empty() {
+        return; // nothing to monomorphize
+    }
+
+    // Add clones to the program
+    program.functions.extend(new_functions);
+
+    // Rewrite call sites to target their matching clone
+    for (func_idx, block_id, inst_idx, clone_name) in rewrites {
+        if func_idx < program.functions.len() {
+            let function = &mut program.functions[func_idx];
+            if let Some(block) = function.blocks.iter_mut().find(|b| b.id == block_id)
+                && inst_idx < block.instructions.len()
+                && let Instruction::Call {
+                    function: func_ref, ..
+                } = &mut block.instructions[inst_idx].node
+            {
+                func_ref.name = crate::ast::Identifier(clone_name);
+                func_ref.namespace = None;
+            }
+        }
+    }
+
+    // Re-optimize the new clones
+    let clone_start = program.functions.len() - clone_map.len();
+    for function in &mut program.functions[clone_start..] {
+        let mut diags = Diagnostics::new();
+        optimize_function(function, builtins, &mut diags);
+    }
+}
+
 /// Collect parameter types and definedness from all call sites across the program.
 ///
 /// For each user function, unions the argument TypeSets and meets the argument
@@ -230,7 +407,7 @@ fn collect_param_info(
     builtins: Option<&BuiltinRegistry>,
 ) -> (ParamTypes, ParamDefinedness) {
     // Build function name → param count map
-    let func_param_counts: std::collections::HashMap<String, usize> = program
+    let func_param_counts: HashMap<String, usize> = program
         .functions
         .iter()
         .map(|f| (f.name.to_string(), f.params.len()))

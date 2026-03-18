@@ -1203,6 +1203,11 @@ IR (per-function optimized)
     │  ── Phase B: Interprocedural ──
     ▼
 ┌─────────────────────┐
+│ M: Monomorphization │  Clone functions with >1 distinct call-site type
+│                     │  signature. Max 4 variants, skip recursive fns.
+└──────────┬──────────┘
+           ▼
+┌─────────────────────┐
 │ B1: Interprocedural │  Collect arg types + definedness from all call
 │     Analysis        │  sites. Infer function purity (optimistic fixpoint).
 └──────────┬──────────┘

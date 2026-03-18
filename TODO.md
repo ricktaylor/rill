@@ -394,14 +394,11 @@ with just `v3 = Intrinsic(Add, [v1, v2])` — both args provably UInt, no guards
       `MaybeDefined`. When every caller passes Defined UInt, the callee sees
       `x: {UInt}, Defined` — enabling full specialization and Guard elimination.
 
-- [ ] **Function Monomorphization** — clone functions per call-site type
-      signature. `process(UInt)` and `process(Int)` become two separate
-      compiled functions, each fully specialized. Generates more code but
-      zero runtime dispatch in the clones. Natural companion to inlining:
-      very small functions get inlined directly (avoiding the call overhead),
-      while larger functions get monomorphized (specialized but not inlined).
-      Decision heuristic: below N instructions → inline, above → monomorphize
-      if types are known, otherwise leave generic.
+- [x] **Function Monomorphization** (`monomorphize` in mod.rs) — when a function
+      is called with multiple distinct type signatures, clones it per signature.
+      Each clone is re-optimized with narrowed param types (Phase B narrows
+      further). Skips recursive functions, max 4 variants per function.
+      Runs between Phase A and Phase B.
 
 - [ ] **Tail-Call Optimization (TCO)** — rewrite tail calls to parameter overwrite
       + jump to entry. The flat pc-based executor supports this naturally.
