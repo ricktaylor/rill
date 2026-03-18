@@ -427,11 +427,18 @@ fn compile_block(
     }
 
     // Terminator is the last step in the block
-    steps.push(compile_terminator(&block.terminator, block_map)?);
+    steps.push(compile_terminator(
+        &block.terminator,
+        block_map,
+        types,
+        defs,
+        block.id,
+    )?);
 
     Ok(steps)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compile_instruction(
     inst: &Instruction,
     _block_map: &HashMap<BlockId, usize>,
@@ -502,12 +509,20 @@ fn compile_instruction(
         Instruction::Copy { dest, src } => {
             let d = slot(*dest);
             let s = slot(*src);
-            Box::new(move |vm: &mut VM, _prog| {
-                if let Some(val) = vm.local(s).cloned() {
+            if defs.get_at_exit(block_id, *src) == crate::ir::opt::Definedness::Defined {
+                Box::new(move |vm: &mut VM, _prog| {
+                    let val = vm.local(s).unwrap().clone();
                     vm.set_local(d, val);
-                }
-                Ok(Action::Continue)
-            })
+                    Ok(Action::Continue)
+                })
+            } else {
+                Box::new(move |vm: &mut VM, _prog| {
+                    if let Some(val) = vm.local(s).cloned() {
+                        vm.set_local(d, val);
+                    }
+                    Ok(Action::Continue)
+                })
+            }
         }
 
         Instruction::Undefined { dest } => {
@@ -931,6 +946,9 @@ fn compile_instruction(
 fn compile_terminator(
     term: &Terminator,
     block_map: &HashMap<BlockId, usize>,
+    types: &TypeAnalysis,
+    defs: &crate::ir::opt::DefinednessAnalysis,
+    block_id: BlockId,
 ) -> Result<Step, ExecError> {
     Ok(match term {
         Terminator::Jump { target } => {
@@ -947,6 +965,35 @@ fn compile_terminator(
             let cond_slot = slot(*condition);
             let then_idx = block_map[then_target];
             let else_idx = block_map[else_target];
+
+            let cond_type = types
+                .get_at_exit(block_id, *condition)
+                .copied()
+                .unwrap_or(crate::types::TypeSet::all());
+            let cond_def = defs.get_at_exit(block_id, *condition);
+
+            // Non-Bool conditions should have been folded to Jump(else) by the
+            // optimizer's fold_non_bool_conditions pass.
+            debug_assert!(
+                cond_type.contains(BaseType::Bool) || cond_type.is_empty(),
+                "If condition with non-Bool type {:?} should have been folded by optimizer",
+                cond_type
+            );
+
+            // Provably Bool and Defined → skip null + type checks
+            if cond_type.is_single()
+                && cond_type.contains(BaseType::Bool)
+                && cond_def == crate::ir::opt::Definedness::Defined
+            {
+                return Ok(Box::new(move |vm: &mut VM, _prog| {
+                    let is_true = match vm.local(cond_slot).unwrap() {
+                        Value::Bool(b) => *b,
+                        _ => unreachable!(),
+                    };
+                    Ok(Action::NextBlock(if is_true { then_idx } else { else_idx }))
+                }));
+            }
+
             Box::new(move |vm: &mut VM, _prog| {
                 let is_true = vm
                     .local(cond_slot)
@@ -973,6 +1020,15 @@ fn compile_terminator(
             undefined,
             ..
         } => {
+            // Guards with known definedness should have been folded to Jump
+            // by the optimizer's eliminate_guards pass.
+            debug_assert!(
+                defs.get_at_exit(block_id, *value) == crate::ir::opt::Definedness::MaybeDefined,
+                "Guard on {:?} with definedness {:?} should have been eliminated by optimizer",
+                value,
+                defs.get_at_exit(block_id, *value)
+            );
+
             let val_slot = slot(*value);
             let def_idx = block_map[defined];
             let undef_idx = block_map[undefined];
@@ -1336,16 +1392,14 @@ fn try_specialize_cast(
     if let Some(src_code) = src_code {
         // === Level 1: both source type and target known ===
 
-        // Identity cast → slot copy
-        if src_code == target {
-            return Some(Box::new(move |vm: &mut VM, _| {
-                match vm.local(src) {
-                    Some(v) => vm.set_local(d, v.clone()),
-                    None => vm.set_local_uninit(d),
-                }
-                Ok(Action::Continue)
-            }));
-        }
+        // Identity casts should have been replaced with Copy by the
+        // optimizer's elide_identity_casts pass.
+        debug_assert!(
+            src_code != target,
+            "Identity Cast (src={}, target={}) should have been elided by optimizer",
+            src_code,
+            target
+        );
 
         // Fully specialized conversion — no dispatch at runtime
         return match (src_code, target) {
@@ -1469,16 +1523,14 @@ fn try_specialize_widen(
     if let Some(src_code) = src_code {
         // === Fully specialized: source type + target both known ===
 
-        // Identity widen → slot copy
-        if src_code == target {
-            return Some(Box::new(move |vm: &mut VM, _| {
-                match vm.local(src) {
-                    Some(v) => vm.set_local(d, v.clone()),
-                    None => vm.set_local_uninit(d),
-                }
-                Ok(Action::Continue)
-            }));
-        }
+        // Identity widens should have been replaced with Copy by the
+        // optimizer's elide_identity_casts pass.
+        debug_assert!(
+            src_code != target,
+            "Identity Widen (src={}, target={}) should have been elided by optimizer",
+            src_code,
+            target
+        );
 
         return match (src_code, target) {
             // UInt → Int: overflow-checked

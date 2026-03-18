@@ -92,6 +92,7 @@ pub fn optimize_function(
 
     // Type mismatch diagnostics (W009)
     check_intrinsic_types(function, &types, diagnostics);
+    check_condition_types(function, &types, diagnostics);
 
     // Coercion insertion: makes implicit numeric promotion explicit via Widen.
     // Also replaces provably-incompatible operations with Undefined.
@@ -103,12 +104,13 @@ pub fn optimize_function(
     // became identity after type narrowing.
     let cast_elisions = elide_identity_casts(function, &types);
 
-    // If coercion insertion or cast elision changed anything, re-run the
-    // Phase 1 fixpoint loop. The expanded IR has:
-    //   - Widen(Const(42_u64), 2) → const fold collapses to Const(42_i64)
-    //   - Explicit Undefined → definedness sees it, guard elim cleans up
-    //   - Identity casts → Copy → const fold may propagate further
-    if coercions + cast_elisions > 0 {
+    // Fold If terminators whose condition is provably not Bool → Jump(else).
+    // The then-branch becomes unreachable and is cleaned up by simplify_cfg
+    // in the fixpoint re-run below.
+    let condition_folds = fold_non_bool_conditions(function, &types);
+
+    // If any Phase 2 pass changed the IR, re-run Phase 1 fixpoint.
+    if coercions + cast_elisions + condition_folds > 0 {
         loop {
             let folded = fold_constants(function, builtins, diagnostics);
             let refs = elide_refs(function);
@@ -171,6 +173,83 @@ fn check_intrinsic_types(
                     break; // one warning per instruction is enough
                 }
             }
+        }
+    }
+}
+
+/// Fold If terminators whose condition is provably not Bool into Jump(else).
+///
+/// When type analysis proves the condition can never be Bool, the If always
+/// takes the else branch. Replacing with Jump makes the then-branch unreachable,
+/// allowing simplify_cfg to eliminate it.
+fn fold_non_bool_conditions(
+    function: &mut Function,
+    types: &type_refinement::TypeAnalysis,
+) -> usize {
+    let mut changes = 0;
+    for block in &mut function.blocks {
+        let (else_target, span) = match &block.terminator {
+            Terminator::If {
+                condition,
+                else_target,
+                span,
+                ..
+            } => {
+                let cond_type = types
+                    .get_at_exit(block.id, *condition)
+                    .copied()
+                    .unwrap_or(crate::types::TypeSet::all());
+
+                if !cond_type.contains(crate::types::BaseType::Bool) && !cond_type.is_empty() {
+                    (*else_target, *span)
+                } else {
+                    continue;
+                }
+            }
+            _ => continue,
+        };
+
+        block.terminator = Terminator::Jump {
+            target: else_target,
+        };
+        // Preserve span for diagnostics by wrapping in Jump
+        let _ = span; // span is consumed by the warning in check_condition_types
+        changes += 1;
+    }
+    changes
+}
+
+/// Warn when an If/While condition is provably not Bool.
+///
+/// Rill has strict boolean typing — no truthiness. A non-Bool condition
+/// always evaluates to false, which is almost certainly a bug.
+fn check_condition_types(
+    function: &Function,
+    types: &type_refinement::TypeAnalysis,
+    diagnostics: &mut crate::diagnostics::Diagnostics,
+) {
+    for block in &function.blocks {
+        let (cond_var, span) = match &block.terminator {
+            Terminator::If {
+                condition, span, ..
+            } => (*condition, *span),
+            _ => continue,
+        };
+
+        let actual = types
+            .get_at_exit(block.id, cond_var)
+            .copied()
+            .unwrap_or(crate::types::TypeSet::all());
+
+        if !actual.contains(crate::types::BaseType::Bool) && !actual.is_empty() {
+            diagnostics.warning(
+                crate::diagnostics::DiagnosticCode::W009_TypeMismatch,
+                span,
+                format!(
+                    "in function `{}`: condition has type {:?} but Bool required — branch always takes else",
+                    function.name, actual,
+                ),
+            );
         }
     }
 }
