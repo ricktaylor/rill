@@ -249,8 +249,14 @@ fn link_functions(
 /// Metadata for a reference created by MakeRef — used by WriteRef at compile time
 /// to determine how to emit the write-back.
 struct RefMeta {
-    base_slot: usize,
+    base_var: VarId,
     key_slot: Option<usize>,
+}
+
+impl RefMeta {
+    fn base_slot(&self) -> usize {
+        slot(self.base_var)
+    }
 }
 
 /// Build a map from MakeRef dest VarId → RefMeta for WriteRef resolution.
@@ -262,7 +268,7 @@ fn build_ref_map(blocks: &[BasicBlock]) -> HashMap<VarId, RefMeta> {
                 map.insert(
                     *dest,
                     RefMeta {
-                        base_slot: slot(*base),
+                        base_var: *base,
                         key_slot: key.map(slot),
                     },
                 );
@@ -302,6 +308,9 @@ fn compile_function(func: &Function, link_map: &LinkMap) -> Result<CompiledFunct
     // instead of the 10-way type dispatch.
     let types = crate::ir::opt::analyze_types(func, None);
 
+    // Definedness analysis for skipping None checks on provably-defined args
+    let defs = crate::ir::opt::analyze_definedness(func, None);
+
     // Collect constant UInt values for Cast/Widen target resolution at compile time
     let const_uint_map = build_const_uint_map(&func.blocks);
 
@@ -340,6 +349,7 @@ fn compile_function(func: &Function, link_map: &LinkMap) -> Result<CompiledFunct
             link_map,
             &ref_map,
             &types,
+            &defs,
             &const_uint_map,
         )?);
     }
@@ -396,6 +406,7 @@ fn compile_block(
     link_map: &LinkMap,
     ref_map: &HashMap<VarId, RefMeta>,
     types: &TypeAnalysis,
+    defs: &crate::ir::opt::DefinednessAnalysis,
     consts: &HashMap<VarId, u64>,
 ) -> Result<Vec<Step>, ExecError> {
     let mut steps: Vec<Step> = Vec::new();
@@ -407,7 +418,7 @@ fn compile_block(
             Instruction::Phi { .. } => {}
             inst => {
                 if let Some(step) = compile_instruction(
-                    inst, block_map, link_map, ref_map, types, block.id, consts,
+                    inst, block_map, link_map, ref_map, types, defs, block.id, consts,
                 )? {
                     steps.push(step);
                 }
@@ -427,6 +438,7 @@ fn compile_instruction(
     link_map: &LinkMap,
     ref_map: &HashMap<VarId, RefMeta>,
     types: &TypeAnalysis,
+    defs: &crate::ir::opt::DefinednessAnalysis,
     block_id: BlockId,
     consts: &HashMap<VarId, u64>,
 ) -> Result<Option<Step>, ExecError> {
@@ -754,7 +766,11 @@ fn compile_instruction(
 
             // Dispatch on op at compile time so each closure goes directly
             // to its operation's code — no runtime `match op` in exec_intrinsic.
-            compile_intrinsic_dispatch(op, arg_slots, d)
+            // If all args are provably defined, skip Option unwraps at runtime.
+            let all_defined = args
+                .iter()
+                .all(|v| defs.get_at_exit(block_id, *v) == crate::ir::opt::Definedness::Defined);
+            compile_intrinsic_dispatch(op, arg_slots, d, all_defined)
         }
 
         Instruction::MakeRef { dest, base, key } => {
@@ -763,18 +779,53 @@ fn compile_instruction(
             match key {
                 Some(k) => {
                     // Element reference: read base[key] into dest
-                    let k = slot(*k);
-                    Box::new(move |vm: &mut VM, _prog| {
-                        let result = match (vm.local(b), vm.local(k)) {
-                            (Some(base_val), Some(key_val)) => index_value(base_val, key_val),
-                            _ => None,
-                        };
-                        match result {
-                            Some(val) => vm.set_local(d, val),
-                            None => vm.set_local_uninit(d),
-                        }
-                        Ok(Action::Continue)
-                    })
+                    // Specialize based on known base type (same as Index)
+                    let k_slot = slot(*k);
+                    let base_type = types.get_at_exit(block_id, *base).filter(|t| t.is_single());
+
+                    if base_type.is_some_and(|t| t.contains(BaseType::Array)) {
+                        Box::new(move |vm: &mut VM, _prog| {
+                            let result = match (vm.local(b), vm.local(k_slot)) {
+                                (Some(Value::Array(arr)), Some(Value::UInt(idx))) => {
+                                    arr.get(*idx as usize).cloned()
+                                }
+                                (Some(Value::Array(arr)), Some(Value::Int(idx))) if *idx >= 0 => {
+                                    arr.get(*idx as usize).cloned()
+                                }
+                                _ => None,
+                            };
+                            match result {
+                                Some(val) => vm.set_local(d, val),
+                                None => vm.set_local_uninit(d),
+                            }
+                            Ok(Action::Continue)
+                        })
+                    } else if base_type.is_some_and(|t| t.contains(BaseType::Map)) {
+                        Box::new(move |vm: &mut VM, _prog| {
+                            let result = match (vm.local(b), vm.local(k_slot)) {
+                                (Some(Value::Map(map)), Some(key_val)) => map.get(key_val).cloned(),
+                                _ => None,
+                            };
+                            match result {
+                                Some(val) => vm.set_local(d, val),
+                                None => vm.set_local_uninit(d),
+                            }
+                            Ok(Action::Continue)
+                        })
+                    } else {
+                        // Unknown base: full runtime dispatch
+                        Box::new(move |vm: &mut VM, _prog| {
+                            let result = match (vm.local(b), vm.local(k_slot)) {
+                                (Some(base_val), Some(key_val)) => index_value(base_val, key_val),
+                                _ => None,
+                            };
+                            match result {
+                                Some(val) => vm.set_local(d, val),
+                                None => vm.set_local_uninit(d),
+                            }
+                            Ok(Action::Continue)
+                        })
+                    }
                 }
                 None => {
                     // Whole-value reference: create a Slot::Ref to base's slot
@@ -791,30 +842,64 @@ fn compile_instruction(
             // Look up the MakeRef that created this ref_var to find
             // the base and key slots for write-back.
             if let Some(meta) = ref_map.get(ref_var) {
-                let base_slot = meta.base_slot;
+                let base_slot = meta.base_slot();
                 match meta.key_slot {
                     Some(key_slot) => {
-                        // Element write-back: SetIndex(base, key, value)
-                        Box::new(move |vm: &mut VM, _prog| {
-                            if let (Some(key_val), Some(new_val)) =
-                                (vm.local(key_slot).cloned(), vm.local(v).cloned())
-                            {
-                                match &key_val {
-                                    Value::UInt(idx) => {
-                                        let _ = vm.set_array_elem(
-                                            vm.bp() + base_slot,
-                                            *idx as usize,
-                                            new_val,
-                                        );
-                                    }
-                                    _ => {
-                                        let _ =
-                                            vm.set_map_entry(vm.bp() + base_slot, key_val, new_val);
+                        // Element write-back: specialize based on known base type
+                        let base_type = types
+                            .get_at_exit(block_id, meta.base_var)
+                            .filter(|t| t.is_single());
+
+                        if base_type.is_some_and(|t| t.contains(BaseType::Array)) {
+                            // Array: key is UInt index
+                            Box::new(move |vm: &mut VM, _prog| {
+                                if let (Some(Value::UInt(idx)), Some(new_val)) =
+                                    (vm.local(key_slot), vm.local(v).cloned())
+                                {
+                                    let _ = vm.set_array_elem(
+                                        vm.bp() + base_slot,
+                                        *idx as usize,
+                                        new_val,
+                                    );
+                                }
+                                Ok(Action::Continue)
+                            })
+                        } else if base_type.is_some_and(|t| t.contains(BaseType::Map)) {
+                            // Map: any key type
+                            Box::new(move |vm: &mut VM, _prog| {
+                                if let (Some(key_val), Some(new_val)) =
+                                    (vm.local(key_slot).cloned(), vm.local(v).cloned())
+                                {
+                                    let _ = vm.set_map_entry(vm.bp() + base_slot, key_val, new_val);
+                                }
+                                Ok(Action::Continue)
+                            })
+                        } else {
+                            // Unknown base: dispatch on key type at runtime
+                            Box::new(move |vm: &mut VM, _prog| {
+                                if let (Some(key_val), Some(new_val)) =
+                                    (vm.local(key_slot).cloned(), vm.local(v).cloned())
+                                {
+                                    match &key_val {
+                                        Value::UInt(idx) => {
+                                            let _ = vm.set_array_elem(
+                                                vm.bp() + base_slot,
+                                                *idx as usize,
+                                                new_val,
+                                            );
+                                        }
+                                        _ => {
+                                            let _ = vm.set_map_entry(
+                                                vm.bp() + base_slot,
+                                                key_val,
+                                                new_val,
+                                            );
+                                        }
                                     }
                                 }
-                            }
-                            Ok(Action::Continue)
-                        })
+                                Ok(Action::Continue)
+                            })
+                        }
                     }
                     None => {
                         // Whole-value write-back: write to base's slot directly
@@ -1668,7 +1753,12 @@ fn specialize_float(op: IntrinsicOp, a: usize, b: usize, d: usize) -> Step {
 /// Compile-time dispatch: match on the IntrinsicOp and return a closure
 /// specific to that operation. Eliminates the runtime `match op` that
 /// `exec_intrinsic` would perform on every execution.
-fn compile_intrinsic_dispatch(op: IntrinsicOp, arg_slots: Vec<usize>, d: usize) -> Step {
+fn compile_intrinsic_dispatch(
+    op: IntrinsicOp,
+    arg_slots: Vec<usize>,
+    d: usize,
+    all_defined: bool,
+) -> Step {
     // Helper: wrap exec body in the standard result-to-slot pattern
     macro_rules! emit {
         ($body:expr) => {
@@ -1686,8 +1776,7 @@ fn compile_intrinsic_dispatch(op: IntrinsicOp, arg_slots: Vec<usize>, d: usize) 
     macro_rules! emit_try {
         ($body:expr) => {
             Box::new(move |vm: &mut VM, _prog| {
-                let result: Result<Option<Value>, ExecError> = $body(vm);
-                match result? {
+                match $body(vm)? {
                     Some(val) => vm.set_local(d, val),
                     None => vm.set_local_uninit(d),
                 }
@@ -1696,83 +1785,83 @@ fn compile_intrinsic_dispatch(op: IntrinsicOp, arg_slots: Vec<usize>, d: usize) 
         };
     }
 
+    // Helpers for binary/unary ops: when all_defined, skip the Option unwrap
+    // and pass &Value directly; otherwise gate on Some first.
+    macro_rules! emit_binary {
+        ($op_fn:ident) => {
+            if all_defined {
+                emit!(|vm: &mut VM| {
+                    let a = vm.local(arg_slots[0]).unwrap();
+                    let b = vm.local(arg_slots[1]).unwrap();
+                    $op_fn(a, b)
+                })
+            } else {
+                emit!(|vm: &mut VM| {
+                    match (vm.local(arg_slots[0]), vm.local(arg_slots[1])) {
+                        (Some(a), Some(b)) => $op_fn(a, b),
+                        _ => None,
+                    }
+                })
+            }
+        };
+    }
+    macro_rules! emit_unary {
+        ($op_fn:ident) => {
+            if all_defined {
+                emit!(|vm: &mut VM| {
+                    let a = vm.local(arg_slots[0]).unwrap();
+                    $op_fn(a)
+                })
+            } else {
+                emit!(|vm: &mut VM| {
+                    match vm.local(arg_slots[0]) {
+                        Some(a) => $op_fn(a),
+                        None => None,
+                    }
+                })
+            }
+        };
+    }
+
     match op {
-        IntrinsicOp::Add => emit!(|vm: &mut VM| {
-            let (a, b) = (vm.local(arg_slots[0]), vm.local(arg_slots[1]));
-            exec_add(a, b)
-        }),
-        IntrinsicOp::Sub => emit!(|vm: &mut VM| {
-            let (a, b) = (vm.local(arg_slots[0]), vm.local(arg_slots[1]));
-            exec_sub(a, b)
-        }),
-        IntrinsicOp::Mul => emit!(|vm: &mut VM| {
-            let (a, b) = (vm.local(arg_slots[0]), vm.local(arg_slots[1]));
-            exec_mul(a, b)
-        }),
-        IntrinsicOp::Div => emit!(|vm: &mut VM| {
-            let (a, b) = (vm.local(arg_slots[0]), vm.local(arg_slots[1]));
-            exec_div(a, b)
-        }),
-        IntrinsicOp::Mod => emit!(|vm: &mut VM| {
-            let (a, b) = (vm.local(arg_slots[0]), vm.local(arg_slots[1]));
-            exec_mod(a, b)
-        }),
-        IntrinsicOp::Neg => emit!(|vm: &mut VM| {
-            let a = vm.local(arg_slots[0]);
-            exec_neg(a)
-        }),
-        IntrinsicOp::Eq => emit!(|vm: &mut VM| {
-            let (a, b) = (vm.local(arg_slots[0]), vm.local(arg_slots[1]));
-            exec_eq(a, b)
-        }),
-        IntrinsicOp::Lt => emit!(|vm: &mut VM| {
-            let (a, b) = (vm.local(arg_slots[0]), vm.local(arg_slots[1]));
-            exec_lt(a, b)
-        }),
-        IntrinsicOp::Not => emit!(|vm: &mut VM| {
-            let a = vm.local(arg_slots[0]);
-            exec_not(a)
-        }),
-        IntrinsicOp::BitAnd => emit!(|vm: &mut VM| {
-            let (a, b) = (vm.local(arg_slots[0]), vm.local(arg_slots[1]));
-            exec_bitand(a, b)
-        }),
-        IntrinsicOp::BitOr => emit!(|vm: &mut VM| {
-            let (a, b) = (vm.local(arg_slots[0]), vm.local(arg_slots[1]));
-            exec_bitor(a, b)
-        }),
-        IntrinsicOp::BitXor => emit!(|vm: &mut VM| {
-            let (a, b) = (vm.local(arg_slots[0]), vm.local(arg_slots[1]));
-            exec_bitxor(a, b)
-        }),
-        IntrinsicOp::BitNot => emit!(|vm: &mut VM| {
-            let a = vm.local(arg_slots[0]);
-            exec_bitnot(a)
-        }),
-        IntrinsicOp::Shl => emit!(|vm: &mut VM| {
-            let (a, b) = (vm.local(arg_slots[0]), vm.local(arg_slots[1]));
-            exec_shl(a, b)
-        }),
-        IntrinsicOp::Shr => emit!(|vm: &mut VM| {
-            let (a, b) = (vm.local(arg_slots[0]), vm.local(arg_slots[1]));
-            exec_shr(a, b)
-        }),
-        IntrinsicOp::BitTest => emit!(|vm: &mut VM| {
-            let (x, b) = (vm.local(arg_slots[0]), vm.local(arg_slots[1]));
-            exec_bittest(x, b)
-        }),
-        IntrinsicOp::BitSet => emit!(|vm: &mut VM| {
-            let (x, b, v) = (
-                vm.local(arg_slots[0]),
-                vm.local(arg_slots[1]),
-                vm.local(arg_slots[2]),
-            );
-            exec_bitset(x, b, v)
-        }),
-        IntrinsicOp::Len => emit!(|vm: &mut VM| {
-            let a = vm.local(arg_slots[0]);
-            exec_len(a)
-        }),
+        IntrinsicOp::Add => emit_binary!(exec_add),
+        IntrinsicOp::Sub => emit_binary!(exec_sub),
+        IntrinsicOp::Mul => emit_binary!(exec_mul),
+        IntrinsicOp::Div => emit_binary!(exec_div),
+        IntrinsicOp::Mod => emit_binary!(exec_mod),
+        IntrinsicOp::Neg => emit_unary!(exec_neg),
+        IntrinsicOp::Eq => emit_binary!(exec_eq),
+        IntrinsicOp::Lt => emit_binary!(exec_lt),
+        IntrinsicOp::Not => emit_unary!(exec_not),
+        IntrinsicOp::BitAnd => emit_binary!(exec_bitand),
+        IntrinsicOp::BitOr => emit_binary!(exec_bitor),
+        IntrinsicOp::BitXor => emit_binary!(exec_bitxor),
+        IntrinsicOp::BitNot => emit_unary!(exec_bitnot),
+        IntrinsicOp::Shl => emit_binary!(exec_shl),
+        IntrinsicOp::Shr => emit_binary!(exec_shr),
+        IntrinsicOp::BitTest => emit_binary!(exec_bittest),
+        IntrinsicOp::BitSet => {
+            if all_defined {
+                emit!(|vm: &mut VM| {
+                    let x = vm.local(arg_slots[0]).unwrap();
+                    let b = vm.local(arg_slots[1]).unwrap();
+                    let v = vm.local(arg_slots[2]).unwrap();
+                    exec_bitset(x, b, v)
+                })
+            } else {
+                emit!(|vm: &mut VM| {
+                    match (
+                        vm.local(arg_slots[0]),
+                        vm.local(arg_slots[1]),
+                        vm.local(arg_slots[2]),
+                    ) {
+                        (Some(x), Some(b), Some(v)) => exec_bitset(x, b, v),
+                        _ => None,
+                    }
+                })
+            }
+        }
+        IntrinsicOp::Len => emit_unary!(exec_len),
         IntrinsicOp::MakeArray => emit_try!(|vm: &mut VM| { exec_make_array(&arg_slots, vm) }),
         IntrinsicOp::MakeMap => emit_try!(|vm: &mut VM| { exec_make_map(&arg_slots, vm) }),
         IntrinsicOp::MakeSeq => emit!(|vm: &mut VM| { exec_make_seq(&arg_slots, vm) }),
@@ -1798,145 +1887,106 @@ fn compile_intrinsic_dispatch(op: IntrinsicOp, arg_slots: Vec<usize>, d: usize) 
 
 // ========================================================================
 // Per-operation functions for compile-time dispatch
-// Each takes value references directly (no slot lookup, no op dispatch).
+// Each takes &Value directly (no Option wrapper, no slot lookup, no op dispatch).
+// The Option handling is done at the call site in compile_intrinsic_dispatch:
+// - all_defined=true: unwrap() then call (skips None check entirely)
+// - all_defined=false: gate on Some first, call only if all present
 // ========================================================================
 
-fn exec_add(a: Option<&Value>, b: Option<&Value>) -> Option<Value> {
+fn exec_add(a: &Value, b: &Value) -> Option<Value> {
     match (a, b) {
-        (Some(Value::UInt(a)), Some(Value::UInt(b))) => a.checked_add(*b).map(Value::UInt),
-        (Some(Value::Int(a)), Some(Value::Int(b))) => a.checked_add(*b).map(Value::Int),
-        (Some(Value::Float(a)), Some(Value::Float(b))) => {
-            Float::new(a.get() + b.get()).map(Value::Float)
-        }
-        (Some(Value::UInt(a)), Some(Value::Int(b))) => i64::try_from(*a)
+        (Value::UInt(a), Value::UInt(b)) => a.checked_add(*b).map(Value::UInt),
+        (Value::Int(a), Value::Int(b)) => a.checked_add(*b).map(Value::Int),
+        (Value::Float(a), Value::Float(b)) => Float::new(a.get() + b.get()).map(Value::Float),
+        (Value::UInt(a), Value::Int(b)) => i64::try_from(*a)
             .ok()
             .and_then(|a| a.checked_add(*b))
             .map(Value::Int),
-        (Some(Value::Int(a)), Some(Value::UInt(b))) => i64::try_from(*b)
+        (Value::Int(a), Value::UInt(b)) => i64::try_from(*b)
             .ok()
             .and_then(|b| a.checked_add(b))
             .map(Value::Int),
-        (Some(Value::UInt(a)), Some(Value::Float(b))) => {
-            Float::new(*a as f64 + b.get()).map(Value::Float)
-        }
-        (Some(Value::Float(a)), Some(Value::UInt(b))) => {
-            Float::new(a.get() + *b as f64).map(Value::Float)
-        }
-        (Some(Value::Int(a)), Some(Value::Float(b))) => {
-            Float::new(*a as f64 + b.get()).map(Value::Float)
-        }
-        (Some(Value::Float(a)), Some(Value::Int(b))) => {
-            Float::new(a.get() + *b as f64).map(Value::Float)
-        }
+        (Value::UInt(a), Value::Float(b)) => Float::new(*a as f64 + b.get()).map(Value::Float),
+        (Value::Float(a), Value::UInt(b)) => Float::new(a.get() + *b as f64).map(Value::Float),
+        (Value::Int(a), Value::Float(b)) => Float::new(*a as f64 + b.get()).map(Value::Float),
+        (Value::Float(a), Value::Int(b)) => Float::new(a.get() + *b as f64).map(Value::Float),
         _ => None,
     }
 }
 
-fn exec_sub(a: Option<&Value>, b: Option<&Value>) -> Option<Value> {
+fn exec_sub(a: &Value, b: &Value) -> Option<Value> {
     match (a, b) {
-        (Some(Value::UInt(a)), Some(Value::UInt(b))) => a.checked_sub(*b).map(Value::UInt),
-        (Some(Value::Int(a)), Some(Value::Int(b))) => a.checked_sub(*b).map(Value::Int),
-        (Some(Value::Float(a)), Some(Value::Float(b))) => {
-            Float::new(a.get() - b.get()).map(Value::Float)
-        }
-        (Some(Value::UInt(a)), Some(Value::Int(b))) => i64::try_from(*a)
+        (Value::UInt(a), Value::UInt(b)) => a.checked_sub(*b).map(Value::UInt),
+        (Value::Int(a), Value::Int(b)) => a.checked_sub(*b).map(Value::Int),
+        (Value::Float(a), Value::Float(b)) => Float::new(a.get() - b.get()).map(Value::Float),
+        (Value::UInt(a), Value::Int(b)) => i64::try_from(*a)
             .ok()
             .and_then(|a| a.checked_sub(*b))
             .map(Value::Int),
-        (Some(Value::Int(a)), Some(Value::UInt(b))) => i64::try_from(*b)
+        (Value::Int(a), Value::UInt(b)) => i64::try_from(*b)
             .ok()
             .and_then(|b| a.checked_sub(b))
             .map(Value::Int),
-        (Some(Value::UInt(a)), Some(Value::Float(b))) => {
-            Float::new(*a as f64 - b.get()).map(Value::Float)
-        }
-        (Some(Value::Float(a)), Some(Value::UInt(b))) => {
-            Float::new(a.get() - *b as f64).map(Value::Float)
-        }
-        (Some(Value::Int(a)), Some(Value::Float(b))) => {
-            Float::new(*a as f64 - b.get()).map(Value::Float)
-        }
-        (Some(Value::Float(a)), Some(Value::Int(b))) => {
-            Float::new(a.get() - *b as f64).map(Value::Float)
-        }
+        (Value::UInt(a), Value::Float(b)) => Float::new(*a as f64 - b.get()).map(Value::Float),
+        (Value::Float(a), Value::UInt(b)) => Float::new(a.get() - *b as f64).map(Value::Float),
+        (Value::Int(a), Value::Float(b)) => Float::new(*a as f64 - b.get()).map(Value::Float),
+        (Value::Float(a), Value::Int(b)) => Float::new(a.get() - *b as f64).map(Value::Float),
         _ => None,
     }
 }
 
-fn exec_mul(a: Option<&Value>, b: Option<&Value>) -> Option<Value> {
+fn exec_mul(a: &Value, b: &Value) -> Option<Value> {
     match (a, b) {
-        (Some(Value::UInt(a)), Some(Value::UInt(b))) => a.checked_mul(*b).map(Value::UInt),
-        (Some(Value::Int(a)), Some(Value::Int(b))) => a.checked_mul(*b).map(Value::Int),
-        (Some(Value::Float(a)), Some(Value::Float(b))) => {
-            Float::new(a.get() * b.get()).map(Value::Float)
-        }
-        (Some(Value::UInt(a)), Some(Value::Int(b))) => i64::try_from(*a)
+        (Value::UInt(a), Value::UInt(b)) => a.checked_mul(*b).map(Value::UInt),
+        (Value::Int(a), Value::Int(b)) => a.checked_mul(*b).map(Value::Int),
+        (Value::Float(a), Value::Float(b)) => Float::new(a.get() * b.get()).map(Value::Float),
+        (Value::UInt(a), Value::Int(b)) => i64::try_from(*a)
             .ok()
             .and_then(|a| a.checked_mul(*b))
             .map(Value::Int),
-        (Some(Value::Int(a)), Some(Value::UInt(b))) => i64::try_from(*b)
+        (Value::Int(a), Value::UInt(b)) => i64::try_from(*b)
             .ok()
             .and_then(|b| a.checked_mul(b))
             .map(Value::Int),
-        (Some(Value::UInt(a)), Some(Value::Float(b))) => {
-            Float::new(*a as f64 * b.get()).map(Value::Float)
-        }
-        (Some(Value::Float(a)), Some(Value::UInt(b))) => {
-            Float::new(a.get() * *b as f64).map(Value::Float)
-        }
-        (Some(Value::Int(a)), Some(Value::Float(b))) => {
-            Float::new(*a as f64 * b.get()).map(Value::Float)
-        }
-        (Some(Value::Float(a)), Some(Value::Int(b))) => {
-            Float::new(a.get() * *b as f64).map(Value::Float)
-        }
+        (Value::UInt(a), Value::Float(b)) => Float::new(*a as f64 * b.get()).map(Value::Float),
+        (Value::Float(a), Value::UInt(b)) => Float::new(a.get() * *b as f64).map(Value::Float),
+        (Value::Int(a), Value::Float(b)) => Float::new(*a as f64 * b.get()).map(Value::Float),
+        (Value::Float(a), Value::Int(b)) => Float::new(a.get() * *b as f64).map(Value::Float),
         _ => None,
     }
 }
 
-fn exec_div(a: Option<&Value>, b: Option<&Value>) -> Option<Value> {
+fn exec_div(a: &Value, b: &Value) -> Option<Value> {
     match (a, b) {
-        (Some(Value::UInt(a)), Some(Value::UInt(b))) => a.checked_div(*b).map(Value::UInt),
-        (Some(Value::Int(a)), Some(Value::Int(b))) => a.checked_div(*b).map(Value::Int),
-        (Some(Value::Float(a)), Some(Value::Float(b))) => {
-            Float::new(a.get() / b.get()).map(Value::Float)
-        }
-        (Some(Value::UInt(a)), Some(Value::Int(b))) => i64::try_from(*a)
+        (Value::UInt(a), Value::UInt(b)) => a.checked_div(*b).map(Value::UInt),
+        (Value::Int(a), Value::Int(b)) => a.checked_div(*b).map(Value::Int),
+        (Value::Float(a), Value::Float(b)) => Float::new(a.get() / b.get()).map(Value::Float),
+        (Value::UInt(a), Value::Int(b)) => i64::try_from(*a)
             .ok()
             .and_then(|a| a.checked_div(*b))
             .map(Value::Int),
-        (Some(Value::Int(a)), Some(Value::UInt(b))) => i64::try_from(*b)
+        (Value::Int(a), Value::UInt(b)) => i64::try_from(*b)
             .ok()
             .and_then(|b| a.checked_div(b))
             .map(Value::Int),
-        (Some(Value::UInt(a)), Some(Value::Float(b))) => {
-            Float::new(*a as f64 / b.get()).map(Value::Float)
-        }
-        (Some(Value::Float(a)), Some(Value::UInt(b))) => {
-            Float::new(a.get() / *b as f64).map(Value::Float)
-        }
-        (Some(Value::Int(a)), Some(Value::Float(b))) => {
-            Float::new(*a as f64 / b.get()).map(Value::Float)
-        }
-        (Some(Value::Float(a)), Some(Value::Int(b))) => {
-            Float::new(a.get() / *b as f64).map(Value::Float)
-        }
+        (Value::UInt(a), Value::Float(b)) => Float::new(*a as f64 / b.get()).map(Value::Float),
+        (Value::Float(a), Value::UInt(b)) => Float::new(a.get() / *b as f64).map(Value::Float),
+        (Value::Int(a), Value::Float(b)) => Float::new(*a as f64 / b.get()).map(Value::Float),
+        (Value::Float(a), Value::Int(b)) => Float::new(a.get() / *b as f64).map(Value::Float),
         _ => None,
     }
 }
 
-fn exec_mod(a: Option<&Value>, b: Option<&Value>) -> Option<Value> {
+fn exec_mod(a: &Value, b: &Value) -> Option<Value> {
     match (a, b) {
-        (Some(Value::UInt(a)), Some(Value::UInt(b))) => a.checked_rem(*b).map(Value::UInt),
-        (Some(Value::Int(a)), Some(Value::Int(b))) => a.checked_rem(*b).map(Value::Int),
-        (Some(Value::Float(a)), Some(Value::Float(b))) => {
-            Float::new(a.get() % b.get()).map(Value::Float)
-        }
-        (Some(Value::UInt(a)), Some(Value::Int(b))) => i64::try_from(*a)
+        (Value::UInt(a), Value::UInt(b)) => a.checked_rem(*b).map(Value::UInt),
+        (Value::Int(a), Value::Int(b)) => a.checked_rem(*b).map(Value::Int),
+        (Value::Float(a), Value::Float(b)) => Float::new(a.get() % b.get()).map(Value::Float),
+        (Value::UInt(a), Value::Int(b)) => i64::try_from(*a)
             .ok()
             .and_then(|a| a.checked_rem(*b))
             .map(Value::Int),
-        (Some(Value::Int(a)), Some(Value::UInt(b))) => i64::try_from(*b)
+        (Value::Int(a), Value::UInt(b)) => i64::try_from(*b)
             .ok()
             .and_then(|b| a.checked_rem(b))
             .map(Value::Int),
@@ -1944,11 +1994,11 @@ fn exec_mod(a: Option<&Value>, b: Option<&Value>) -> Option<Value> {
     }
 }
 
-fn exec_neg(a: Option<&Value>) -> Option<Value> {
+fn exec_neg(a: &Value) -> Option<Value> {
     match a {
-        Some(Value::Int(a)) => a.checked_neg().map(Value::Int),
-        Some(Value::Float(a)) => Float::new(-a.get()).map(Value::Float),
-        Some(Value::UInt(a)) => i64::try_from(*a)
+        Value::Int(a) => a.checked_neg().map(Value::Int),
+        Value::Float(a) => Float::new(-a.get()).map(Value::Float),
+        Value::UInt(a) => i64::try_from(*a)
             .ok()
             .and_then(|v| v.checked_neg())
             .map(Value::Int),
@@ -1956,88 +2006,77 @@ fn exec_neg(a: Option<&Value>) -> Option<Value> {
     }
 }
 
-fn exec_eq(a: Option<&Value>, b: Option<&Value>) -> Option<Value> {
+fn exec_eq(a: &Value, b: &Value) -> Option<Value> {
+    Some(Value::Bool(a == b))
+}
+
+fn exec_lt(a: &Value, b: &Value) -> Option<Value> {
     match (a, b) {
-        (Some(a), Some(b)) => Some(Value::Bool(a == b)),
+        (Value::UInt(a), Value::UInt(b)) => Some(Value::Bool(a < b)),
+        (Value::Int(a), Value::Int(b)) => Some(Value::Bool(a < b)),
+        (Value::Float(a), Value::Float(b)) => Some(Value::Bool(a.get() < b.get())),
+        (Value::UInt(a), Value::Int(b)) => Some(Value::Bool((*a as i128) < (*b as i128))),
+        (Value::Int(a), Value::UInt(b)) => Some(Value::Bool((*a as i128) < (*b as i128))),
+        (Value::UInt(a), Value::Float(b)) => Some(Value::Bool((*a as f64) < b.get())),
+        (Value::Float(a), Value::UInt(b)) => Some(Value::Bool(a.get() < (*b as f64))),
+        (Value::Int(a), Value::Float(b)) => Some(Value::Bool((*a as f64) < b.get())),
+        (Value::Float(a), Value::Int(b)) => Some(Value::Bool(a.get() < (*b as f64))),
         _ => None,
     }
 }
 
-fn exec_lt(a: Option<&Value>, b: Option<&Value>) -> Option<Value> {
-    match (a, b) {
-        (Some(Value::UInt(a)), Some(Value::UInt(b))) => Some(Value::Bool(a < b)),
-        (Some(Value::Int(a)), Some(Value::Int(b))) => Some(Value::Bool(a < b)),
-        (Some(Value::Float(a)), Some(Value::Float(b))) => Some(Value::Bool(a.get() < b.get())),
-        (Some(Value::UInt(a)), Some(Value::Int(b))) => {
-            Some(Value::Bool((*a as i128) < (*b as i128)))
-        }
-        (Some(Value::Int(a)), Some(Value::UInt(b))) => {
-            Some(Value::Bool((*a as i128) < (*b as i128)))
-        }
-        (Some(Value::UInt(a)), Some(Value::Float(b))) => Some(Value::Bool((*a as f64) < b.get())),
-        (Some(Value::Float(a)), Some(Value::UInt(b))) => Some(Value::Bool(a.get() < (*b as f64))),
-        (Some(Value::Int(a)), Some(Value::Float(b))) => Some(Value::Bool((*a as f64) < b.get())),
-        (Some(Value::Float(a)), Some(Value::Int(b))) => Some(Value::Bool(a.get() < (*b as f64))),
-        _ => None,
-    }
-}
-
-fn exec_not(a: Option<&Value>) -> Option<Value> {
+fn exec_not(a: &Value) -> Option<Value> {
     match a {
-        Some(Value::Bool(b)) => Some(Value::Bool(!b)),
+        Value::Bool(b) => Some(Value::Bool(!b)),
         _ => None,
     }
 }
 
-fn exec_bitand(a: Option<&Value>, b: Option<&Value>) -> Option<Value> {
+fn exec_bitand(a: &Value, b: &Value) -> Option<Value> {
     match (a, b) {
-        (Some(Value::UInt(a)), Some(Value::UInt(b))) => Some(Value::UInt(a & b)),
+        (Value::UInt(a), Value::UInt(b)) => Some(Value::UInt(a & b)),
         _ => None,
     }
 }
 
-fn exec_bitor(a: Option<&Value>, b: Option<&Value>) -> Option<Value> {
+fn exec_bitor(a: &Value, b: &Value) -> Option<Value> {
     match (a, b) {
-        (Some(Value::UInt(a)), Some(Value::UInt(b))) => Some(Value::UInt(a | b)),
+        (Value::UInt(a), Value::UInt(b)) => Some(Value::UInt(a | b)),
         _ => None,
     }
 }
 
-fn exec_bitxor(a: Option<&Value>, b: Option<&Value>) -> Option<Value> {
+fn exec_bitxor(a: &Value, b: &Value) -> Option<Value> {
     match (a, b) {
-        (Some(Value::UInt(a)), Some(Value::UInt(b))) => Some(Value::UInt(a ^ b)),
+        (Value::UInt(a), Value::UInt(b)) => Some(Value::UInt(a ^ b)),
         _ => None,
     }
 }
 
-fn exec_bitnot(a: Option<&Value>) -> Option<Value> {
+fn exec_bitnot(a: &Value) -> Option<Value> {
     match a {
-        Some(Value::UInt(a)) => Some(Value::UInt(!a)),
+        Value::UInt(a) => Some(Value::UInt(!a)),
         _ => None,
     }
 }
 
-fn exec_shl(a: Option<&Value>, b: Option<&Value>) -> Option<Value> {
+fn exec_shl(a: &Value, b: &Value) -> Option<Value> {
     match (a, b) {
-        (Some(Value::UInt(a)), Some(Value::UInt(b))) => {
-            Some(Value::UInt(a.wrapping_shl(*b as u32)))
-        }
+        (Value::UInt(a), Value::UInt(b)) => Some(Value::UInt(a.wrapping_shl(*b as u32))),
         _ => None,
     }
 }
 
-fn exec_shr(a: Option<&Value>, b: Option<&Value>) -> Option<Value> {
+fn exec_shr(a: &Value, b: &Value) -> Option<Value> {
     match (a, b) {
-        (Some(Value::UInt(a)), Some(Value::UInt(b))) => {
-            Some(Value::UInt(a.wrapping_shr(*b as u32)))
-        }
+        (Value::UInt(a), Value::UInt(b)) => Some(Value::UInt(a.wrapping_shr(*b as u32))),
         _ => None,
     }
 }
 
-fn exec_bittest(x: Option<&Value>, b: Option<&Value>) -> Option<Value> {
+fn exec_bittest(x: &Value, b: &Value) -> Option<Value> {
     match (x, b) {
-        (Some(Value::UInt(x)), Some(Value::UInt(b))) => {
+        (Value::UInt(x), Value::UInt(b)) => {
             if *b >= 64 {
                 None
             } else {
@@ -2048,9 +2087,9 @@ fn exec_bittest(x: Option<&Value>, b: Option<&Value>) -> Option<Value> {
     }
 }
 
-fn exec_bitset(x: Option<&Value>, b: Option<&Value>, v: Option<&Value>) -> Option<Value> {
+fn exec_bitset(x: &Value, b: &Value, v: &Value) -> Option<Value> {
     match (x, b, v) {
-        (Some(Value::UInt(x)), Some(Value::UInt(b)), Some(Value::Bool(v))) => {
+        (Value::UInt(x), Value::UInt(b), Value::Bool(v)) => {
             if *b >= 64 {
                 None
             } else if *v {
@@ -2063,13 +2102,13 @@ fn exec_bitset(x: Option<&Value>, b: Option<&Value>, v: Option<&Value>) -> Optio
     }
 }
 
-fn exec_len(a: Option<&Value>) -> Option<Value> {
+fn exec_len(a: &Value) -> Option<Value> {
     match a {
-        Some(Value::Text(s)) => Some(Value::UInt(s.chars().count() as u64)),
-        Some(Value::Bytes(b)) => Some(Value::UInt(b.len() as u64)),
-        Some(Value::Array(arr)) => Some(Value::UInt(arr.len() as u64)),
-        Some(Value::Map(map)) => Some(Value::UInt(map.len() as u64)),
-        Some(Value::Sequence(seq)) => seq.remaining().map(|n| Value::UInt(n as u64)),
+        Value::Text(s) => Some(Value::UInt(s.chars().count() as u64)),
+        Value::Bytes(b) => Some(Value::UInt(b.len() as u64)),
+        Value::Array(arr) => Some(Value::UInt(arr.len() as u64)),
+        Value::Map(map) => Some(Value::UInt(map.len() as u64)),
+        Value::Sequence(seq) => seq.remaining().map(|n| Value::UInt(n as u64)),
         _ => None,
     }
 }

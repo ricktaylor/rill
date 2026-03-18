@@ -23,7 +23,7 @@ mod type_refinement;
 pub use cast_elision::elide_identity_casts;
 pub use coercion::{elide_coercions, insert_coercions};
 pub use const_fold::fold_constants;
-pub use definedness::{analyze_definedness, check_definedness};
+pub use definedness::{Definedness, DefinednessAnalysis, analyze_definedness, check_definedness};
 pub use guard_elim::{eliminate_guards, simplify_cfg};
 pub use ref_elision::elide_refs;
 pub use type_refinement::{TypeAnalysis, analyze_types};
