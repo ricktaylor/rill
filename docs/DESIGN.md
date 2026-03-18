@@ -1136,11 +1136,23 @@ IR (lowered)
 │  └──────────┬──────────┘            │
 │             ▼                       │
 │  ┌─────────────────────┐            │
+│  │ Copy Propagation    │            │
+│  └──────────┬──────────┘            │
+│             ▼                       │
+│  ┌─────────────────────┐            │
+│  │ Dead Code Elim.     │            │
+│  └──────────┬──────────┘            │
+│             ▼                       │
+│  ┌─────────────────────┐            │
 │  │ Ref Elision         │            │
 │  └──────────┬──────────┘            │
 │             ▼                       │
 │  ┌─────────────────────┐            │
-│  │ Definedness Analysis│            │
+│  │ Coercion Elision    │            │
+│  └──────────┬──────────┘            │
+│             ▼                       │
+│  ┌─────────────────────┐            │
+│  │ Definedness Analysis│  (guarded index, Match scrutinee)
 │  │ + Diagnostics (1st) │            │
 │  └──────────┬──────────┘            │
 │             ▼                       │
@@ -1173,15 +1185,18 @@ IR (lowered)
 └──────────┬──────────┘
            ▼
 ┌─────────────────────┐
+│ Algebraic Simplify  │  x+0→x, x*1→x, x*0→0, x*2→x+x, !!x→x
+└──────────┬──────────┘
+           ▼
+┌─────────────────────┐
 │ Condition Folding   │  Non-Bool If condition → Jump(else)
-│                     │  Then-branch becomes dead → cleaned by Phase 1
+└──────────┬──────────┘
+           ▼
+┌─────────────────────┐
+│ Dead Arm Elimination│  Prune Match arms by TypeSet, collapse to Jump
 └──────────┬──────────┘
            ▼
   Phase 1 fixpoint       (re-run if Phase 2 changed anything)
-           ▼
-┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐
-  Dead Code Elimination  (planned)
-└ ─ ─ ─ ─ ┬ ─ ─ ─ ─ ┘
            ▼
 IR (optimized)
 ```
@@ -1302,8 +1317,9 @@ without knowing its concrete type, and vice versa. Definedness flows from source
 | `Const { dest, .. }` | `Defined` |
 | `Undefined { dest }` | `Undefined` |
 | `Copy { dest, src }` | inherits from `src` |
-| `Index { dest, .. }` | `MaybeDefined` (OOB possible) |
-| `MakeRef { dest, .. }` | `MaybeDefined` (target may not exist) |
+| `Index { dest, base, key }` | `Defined` if guarded, else `MaybeDefined` |
+| `MakeRef { dest, base, Some(key) }` | `Defined` if guarded, else `MaybeDefined` |
+| `MakeRef { dest, base, None }` | inherits from `base` |
 | `WriteRef { .. }` | no dest (side effect only) |
 | `Intrinsic { op, .. }` infallible, all args Defined | `Defined` |
 | `Intrinsic { op, .. }` fallible or args MaybeDefined | `MaybeDefined` |
@@ -1315,6 +1331,24 @@ without knowing its concrete type, and vice versa. Definedness flows from source
 At a `Guard` terminator:
 - In the `defined` branch: guarded value becomes `Defined`
 - In the `undefined` branch: guarded value becomes `Undefined`
+
+At a `Match` terminator:
+- In each arm block: scrutinee is `Defined` (it matched a pattern)
+- In the default block: no refinement (value may be undefined)
+
+**Guarded index analysis** (`collect_guarded_indices` pre-pass):
+
+Index and element MakeRef operations are marked `Defined` (not OOB) when
+protected by a bounds check in the predecessor block:
+
+| Guard pattern | What's safe |
+|---|---|
+| `If(Lt(i, Len(base)), body)` | `Index(base, i)` in body — for-loop pattern |
+| `If(Not(Lt(Len(base), N)), body)` | `Index(base, const<N)` in body — `len >= N` |
+| `If(Lt(N-1, Len(base)), body)` | `Index(base, const<N)` in body — `len > N-1` |
+
+This eliminates spurious E201 warnings for guarded array access, including
+packet processing patterns like `if len(packet) >= 4 { packet[0] ... packet[3] }`.
 
 **Why flow-sensitive analysis in SSA form?**
 

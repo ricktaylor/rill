@@ -393,12 +393,13 @@ with just `v3 = Intrinsic(Add, [v1, v2])` — both args provably UInt, no guards
 
 - [ ] Dead-store warnings for non-ref-backed loop variable mutations
 - [ ] Unused variable warnings (from DCE liveness data)
-- [ ] Suppress spurious E201 warnings for guarded index access in for-loops.
-      The for-loop lowers `arr[i]` guarded by `i < len(arr)`, but the definedness
-      analysis doesn't track that the guard makes the index in-bounds. The loop
-      counter phi shows as MaybeDefined, causing cascading E201 warnings. Fix:
-      teach definedness that `If(Lt(i, Len(arr)), then)` implies `Index(arr, i)`
-      is Defined in the then-branch.
+- [x] Suppress spurious E201 warnings for guarded index access.
+      `collect_guarded_indices` pre-pass detects two patterns:
+      1. Loop guard: `If(Lt(i, Len(base)))` → `Index(base, i)` Defined in body
+      2. Length check: `If(Len(base) >= N)` → `Index(base, const<N)` Defined in body
+         (covers `Not(Lt(Len(base), N))` and `Lt(N-1, Len(base))` forms)
+      Also: Match scrutinee marked Defined in arm blocks.
+      Remaining phi/counter warnings are a separate issue.
 
 ### P2 — Quality
 

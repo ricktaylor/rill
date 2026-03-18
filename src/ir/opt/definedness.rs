@@ -17,7 +17,7 @@
 //! This is sufficient because the actual error is at the use site, not the call
 //! site - passing undefined to a function that ignores the argument is harmless.
 
-use super::{BlockId, CallArg, Function, FunctionRef, Instruction, Terminator, VarId};
+use super::{BlockId, CallArg, Function, FunctionRef, Instruction, IntrinsicOp, Terminator, VarId};
 use crate::builtins::BuiltinRegistry;
 use crate::diagnostics::{DiagnosticCode, Diagnostics};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -180,6 +180,8 @@ fn transfer_instruction(
     state: &mut HashMap<VarId, Definedness>,
     provenance: &mut ProvenanceMap,
     builtins: Option<&BuiltinRegistry>,
+    guarded: Option<&Vec<IndexGuard>>,
+    const_uints: &HashMap<VarId, u64>,
 ) {
     match instruction {
         // Constants are always defined
@@ -204,10 +206,15 @@ fn transfer_instruction(
             }
         }
 
-        // Index may fail (OOB), so result is MaybeDefined
-        Instruction::Index { dest, .. } => {
-            state.insert(*dest, Definedness::MaybeDefined);
-            provenance.insert(*dest, UndefinedSource::Index);
+        // Index may fail (OOB), so result is MaybeDefined — unless the index
+        // is guarded by a bounds check in this block's predecessor.
+        Instruction::Index { dest, base, key } => {
+            if is_index_guarded(base, key, guarded, const_uints) {
+                state.insert(*dest, Definedness::Defined);
+            } else {
+                state.insert(*dest, Definedness::MaybeDefined);
+                provenance.insert(*dest, UndefinedSource::Index);
+            }
         }
 
         // SetIndex doesn't define a new variable
@@ -280,25 +287,27 @@ fn transfer_instruction(
             }
         }
 
-        // MakeRef creates a reference, which is defined if base (and key, if present) are defined
+        // MakeRef creates a reference — element refs may be OOB (like Index),
+        // unless guarded by i < Len(base). Whole-value refs inherit base definedness.
         Instruction::MakeRef { dest, base, key } => {
-            let base_def = state
-                .get(base)
-                .copied()
-                .unwrap_or(Definedness::MaybeDefined);
-            let key_def = key
-                .map(|k| state.get(&k).copied().unwrap_or(Definedness::MaybeDefined))
-                .unwrap_or(Definedness::Defined);
-            // Reference creation itself succeeds, but the referenced slot may be undefined
-            // The reference is defined, but dereferencing it may yield undefined
-            state.insert(*dest, Definedness::MaybeDefined); // Target may not exist
-            // Track provenance from base or key if undefined
-            if base_def != Definedness::Defined {
-                provenance.insert(*dest, UndefinedSource::Propagated { from: *base });
-            } else if let Some(k) = key
-                && key_def != Definedness::Defined
-            {
-                provenance.insert(*dest, UndefinedSource::Propagated { from: *k });
+            if let Some(k) = key {
+                // Element ref: same OOB risk as Index, same guard check
+                if is_index_guarded(base, k, guarded, const_uints) {
+                    state.insert(*dest, Definedness::Defined);
+                } else {
+                    state.insert(*dest, Definedness::MaybeDefined);
+                    provenance.insert(*dest, UndefinedSource::Index);
+                }
+            } else {
+                // Whole-value ref: inherits base definedness
+                let base_def = state
+                    .get(base)
+                    .copied()
+                    .unwrap_or(Definedness::MaybeDefined);
+                state.insert(*dest, base_def);
+                if base_def != Definedness::Defined {
+                    provenance.insert(*dest, UndefinedSource::Propagated { from: *base });
+                }
             }
         }
 
@@ -357,32 +366,47 @@ fn compute_call_definedness(
     }
 }
 
-/// Apply control flow refinement at a Guard terminator
+/// Apply control flow refinement at Guard and Match terminators.
 ///
-/// In the defined branch, the guarded value is known to be Defined.
-/// In the undefined branch, the guarded value is known to be Undefined.
+/// Guard: defined branch → value is Defined, undefined branch → Undefined.
+/// Match: every arm → scrutinee is Defined (it matched a pattern, so it exists).
 fn apply_guard_refinement(
     terminator: &Terminator,
     state: &HashMap<VarId, Definedness>,
 ) -> HashMap<BlockId, HashMap<VarId, Definedness>> {
     let mut refined = HashMap::new();
 
-    if let Terminator::Guard {
-        value,
-        defined,
-        undefined,
-        ..
-    } = terminator
-    {
-        // Defined branch: value is Defined
-        let mut defined_state = state.clone();
-        defined_state.insert(*value, Definedness::Defined);
-        refined.insert(*defined, defined_state);
+    match terminator {
+        Terminator::Guard {
+            value,
+            defined,
+            undefined,
+            ..
+        } => {
+            // Defined branch: value is Defined
+            let mut defined_state = state.clone();
+            defined_state.insert(*value, Definedness::Defined);
+            refined.insert(*defined, defined_state);
 
-        // Undefined branch: value is Undefined
-        let mut undefined_state = state.clone();
-        undefined_state.insert(*value, Definedness::Undefined);
-        refined.insert(*undefined, undefined_state);
+            // Undefined branch: value is Undefined
+            let mut undefined_state = state.clone();
+            undefined_state.insert(*value, Definedness::Undefined);
+            refined.insert(*undefined, undefined_state);
+        }
+
+        Terminator::Match { value, arms, .. } => {
+            // Every arm: the scrutinee matched, so it's Defined.
+            // (Undefined values don't match any pattern — they fall to default.)
+            for (_, target) in arms {
+                let mut arm_state = state.clone();
+                arm_state.insert(*value, Definedness::Defined);
+                refined.insert(*target, arm_state);
+            }
+            // Default: scrutinee might be undefined (didn't match any arm)
+            // — no refinement, use normal state propagation.
+        }
+
+        _ => {}
     }
 
     refined
@@ -391,6 +415,184 @@ fn apply_guard_refinement(
 // ============================================================================
 // Main Analysis
 // ============================================================================
+
+/// Guard information for a block: what index operations are known safe.
+enum IndexGuard {
+    /// Specific (base, index) pair: `i < Len(base)` was checked.
+    /// Exact match: Index(base, index) is safe.
+    Pair(VarId, VarId),
+
+    /// Length lower-bound: `Len(base) >= N` or `N <= Len(base)` was checked.
+    /// Any constant index < N into base is safe.
+    LengthBound(VarId, u64),
+}
+
+type GuardedIndices = HashMap<BlockId, Vec<IndexGuard>>;
+
+/// Check if an Index(base, key) is guarded in the current block.
+fn is_index_guarded(
+    base: &VarId,
+    key: &VarId,
+    guarded: Option<&Vec<IndexGuard>>,
+    constants: &HashMap<VarId, u64>,
+) -> bool {
+    let guards = match guarded {
+        Some(g) => g,
+        None => return false,
+    };
+    for guard in guards {
+        match guard {
+            IndexGuard::Pair(g_base, g_idx) => {
+                if g_base == base && g_idx == key {
+                    return true;
+                }
+            }
+            IndexGuard::LengthBound(g_base, bound) => {
+                if g_base == base {
+                    // Check if key is a constant < bound
+                    if let Some(&idx_val) = constants.get(key)
+                        && idx_val < *bound
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Pre-pass: identify blocks where Index operations are guarded.
+///
+/// Detects two patterns:
+///
+/// 1. **Loop guard**: `Lt(i, Len(base))` → `Index(base, i)` is safe in then-block.
+///    Pattern: `v_len = Len(base); v_cond = Lt(i, v_len); If(v_cond, body, exit)`
+///
+/// 2. **Length check**: `Len(base) >= N` or `N <= Len(base)` → constant indices < N
+///    are safe in then-block. Covers `Not(Lt(Len(base), N))` which is `>=`.
+///    Pattern: `v_len = Len(base); v_lt = Lt(v_len, N); v_cond = Not(v_lt); If(v_cond, body, exit)`
+///    Also: `v_len = Len(base); v_cond = Lt(N-1, v_len); If(v_cond, body, exit)` for `len > N-1`
+fn collect_guarded_indices(function: &Function) -> (GuardedIndices, HashMap<VarId, u64>) {
+    // Build instruction map: VarId → producing instruction
+    let mut producers: HashMap<VarId, &Instruction> = HashMap::new();
+    // Collect UInt constants for length bound resolution
+    let mut constants: HashMap<VarId, u64> = HashMap::new();
+
+    for block in &function.blocks {
+        for inst in &block.instructions {
+            match &inst.node {
+                Instruction::Const {
+                    dest,
+                    value: crate::ir::Literal::UInt(n),
+                } => {
+                    constants.insert(*dest, *n);
+                    producers.insert(*dest, &inst.node);
+                }
+                Instruction::Intrinsic { dest, .. }
+                | Instruction::Const { dest, .. }
+                | Instruction::Copy { dest, .. }
+                | Instruction::Index { dest, .. }
+                | Instruction::MakeRef { dest, .. }
+                | Instruction::Call { dest, .. }
+                | Instruction::Phi { dest, .. }
+                | Instruction::Undefined { dest } => {
+                    producers.insert(*dest, &inst.node);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut guarded = GuardedIndices::new();
+
+    for block in &function.blocks {
+        let (cond_var, then_bb) = match &block.terminator {
+            Terminator::If {
+                condition,
+                then_target,
+                ..
+            } => (*condition, *then_target),
+            _ => continue,
+        };
+
+        // --- Pattern 1: Lt(i, Len(base)) → Index(base, i) is safe ---
+        if let Some(Instruction::Intrinsic {
+            op: IntrinsicOp::Lt,
+            args,
+            ..
+        }) = producers.get(&cond_var)
+            && args.len() == 2
+        {
+            let (index_var, len_var) = (args[0], args[1]);
+
+            if let Some(Instruction::Intrinsic {
+                op: IntrinsicOp::Len,
+                args: len_args,
+                ..
+            }) = producers.get(&len_var)
+                && len_args.len() == 1
+            {
+                guarded
+                    .entry(then_bb)
+                    .or_default()
+                    .push(IndexGuard::Pair(len_args[0], index_var));
+                continue;
+            }
+
+            // --- Pattern 2a: Lt(const_N_minus_1, Len(base)) → len > N-1 → len >= N ---
+            // Indices 0..N-1 are safe. Bound = N = const + 1.
+            if let Some(&const_val) = constants.get(&index_var)
+                && let Some(Instruction::Intrinsic {
+                    op: IntrinsicOp::Len,
+                    args: len_args,
+                    ..
+                }) = producers.get(&len_var)
+                && len_args.len() == 1
+            {
+                guarded
+                    .entry(then_bb)
+                    .or_default()
+                    .push(IndexGuard::LengthBound(len_args[0], const_val + 1));
+                continue;
+            }
+        }
+
+        // --- Pattern 2b: Not(Lt(Len(base), N)) → len >= N ---
+        // Indices 0..N-1 are safe.
+        if let Some(Instruction::Intrinsic {
+            op: IntrinsicOp::Not,
+            args: not_args,
+            ..
+        }) = producers.get(&cond_var)
+            && not_args.len() == 1
+            && let Some(Instruction::Intrinsic {
+                op: IntrinsicOp::Lt,
+                args: lt_args,
+                ..
+            }) = producers.get(&not_args[0])
+            && lt_args.len() == 2
+        {
+            let (len_var, bound_var) = (lt_args[0], lt_args[1]);
+
+            if let Some(&bound) = constants.get(&bound_var)
+                && let Some(Instruction::Intrinsic {
+                    op: IntrinsicOp::Len,
+                    args: len_args,
+                    ..
+                }) = producers.get(&len_var)
+                && len_args.len() == 1
+            {
+                guarded
+                    .entry(then_bb)
+                    .or_default()
+                    .push(IndexGuard::LengthBound(len_args[0], bound));
+            }
+        }
+    }
+
+    (guarded, constants)
+}
 
 /// Analyze definedness for all variables in a function
 ///
@@ -405,6 +607,9 @@ pub fn analyze_definedness(
 ) -> DefinednessAnalysis {
     let block_index = build_block_index_map(function);
     let _predecessors = build_predecessors(function);
+
+    // Pre-pass: find blocks where Index is guarded by i < Len(base) or len >= N
+    let (guarded_indices, const_uints) = collect_guarded_indices(function);
 
     // State at entry and exit of each block
     let mut entry_states: HashMap<BlockId, HashMap<VarId, Definedness>> = HashMap::new();
@@ -445,9 +650,19 @@ pub fn analyze_definedness(
         // Get entry state for this block
         let mut state = entry_states.get(&block_id).cloned().unwrap_or_default();
 
+        // Get guarded index pairs for this block (if any)
+        let guarded = guarded_indices.get(&block_id);
+
         // Apply transfer function for each instruction
         for spanned_inst in &block.instructions {
-            transfer_instruction(&spanned_inst.node, &mut state, &mut provenance, builtins);
+            transfer_instruction(
+                &spanned_inst.node,
+                &mut state,
+                &mut provenance,
+                builtins,
+                guarded,
+                &const_uints,
+            );
         }
 
         // Check if exit state changed
@@ -576,6 +791,8 @@ pub fn check_definedness(
                 &mut state,
                 &mut dummy_provenance,
                 builtins,
+                None, // no guard info needed for diagnostics pass
+                &HashMap::new(),
             );
         }
 
