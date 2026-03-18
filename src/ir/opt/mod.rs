@@ -12,6 +12,7 @@
 //! 7. Constant Folding (cleanup) - fold constants exposed by earlier passes
 //! 8. Dead Code Elimination - remove unused computations
 
+mod algebra;
 mod cast_elision;
 mod coercion;
 mod const_fold;
@@ -21,6 +22,7 @@ mod guard_elim;
 mod ref_elision;
 mod type_refinement;
 
+pub use algebra::simplify_algebra;
 pub use cast_elision::elide_identity_casts;
 pub use coercion::{elide_coercions, insert_coercions};
 pub use const_fold::fold_constants;
@@ -108,6 +110,10 @@ pub fn optimize_function(
     // became identity after type narrowing.
     let cast_elisions = elide_identity_casts(function, &types);
 
+    // Algebraic simplification: x+0→x, x*1→x, x*0→0, x-x→0, x==x→true,
+    // x*2→x+x, x*pow2→x<<log2 (UInt only).
+    let algebra = simplify_algebra(function, &types);
+
     // Fold If terminators whose condition is provably not Bool → Jump(else).
     // The then-branch becomes unreachable and is cleaned up by simplify_cfg
     // in the fixpoint re-run below.
@@ -119,7 +125,7 @@ pub fn optimize_function(
     let dead_arms = eliminate_dead_match_arms(function, &types);
 
     // If any Phase 2 pass changed the IR, re-run Phase 1 fixpoint.
-    if coercions + cast_elisions + condition_folds + dead_arms > 0 {
+    if coercions + cast_elisions + algebra + condition_folds + dead_arms > 0 {
         loop {
             let folded = fold_constants(function, builtins, diagnostics);
             let copies = propagate_copies(function);

@@ -154,10 +154,11 @@ fn replace_vars_in_instruction(inst: &mut Instruction, map: &HashMap<VarId, VarI
                 count += 1;
             }
             if let Some(k) = key
-                && let Some(&new) = map.get(k) {
-                    *k = new;
-                    count += 1;
-                }
+                && let Some(&new) = map.get(k)
+            {
+                *k = new;
+                count += 1;
+            }
         }
 
         Instruction::WriteRef { ref_var, value } => {

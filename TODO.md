@@ -338,23 +338,27 @@ with just `v3 = Intrinsic(Add, [v1, v2])` — both args provably UInt, no guards
 
 #### IR-Level (SSA)
 
-- [ ] **Type-Driven Dead Arm Elimination** — use `TypeAnalysis` to prune Match
-      arms where `TypeSet ∩ arm_type = ∅`. A Match with one surviving arm becomes
-      a Jump. Feeds into CFG simplification → DCE. ~30 lines.
+- [x] **Type-Driven Dead Arm Elimination** (`eliminate_dead_match_arms` in mod.rs) —
+      uses `TypeAnalysis` to prune Match arms where `TypeSet ∩ arm_type = ∅`.
+      A Match with one surviving arm becomes a Jump. Also folds non-Bool If
+      conditions to Jump(else). Feeds into CFG simplification → DCE.
 
 - [ ] **Dead Code Elimination (DCE)** — remove instructions whose dest VarId is
       never used. Iterate until stable. Respect purity: keep impure Calls even if
       result unused. ~50-80 lines.
 
-- [ ] **Copy Propagation** — if `x = Copy(y)`, replace all uses of `x` with `y`.
-      Straightforward in SSA.
+- [x] **Copy Propagation** (`propagate_copies` in copy_prop.rs) — replaces all
+      uses of `Copy(dest, src)` dest with src, resolves chains, removes dead Copies.
+      Runs in Phase 1 fixpoint loop after const fold.
 
 - [ ] **Common Subexpression Elimination (CSE)** — reuse results of identical pure
       operations. Purity checking via `IntrinsicOp::is_fallible()` and
       `BuiltinMeta.purity`.
 
-- [ ] **Algebraic Simplification** — `x + 0 → x`, `x * 1 → x`, `x * 0 → 0`,
-      `x - x → 0`, `!!x → x`, `x && true → x`, `x || false → x`.
+- [x] **Algebraic Simplification** (`simplify_algebra` in algebra.rs) — identity
+      rewrites: `x+0→x`, `x*1→x`, `x*0→0`, `x-x→0`, `x==x→true`, `x/1→x`.
+      Type-aware strength reduction: `x*2→x+x`, `x*pow2→x<<log2` (UInt).
+      Runs in Phase 2 after type refinement.
 
 - [ ] **Loop-Invariant Code Motion (LICM)** — lift pure computations with
       loop-external operands to pre-header. Requires loop detection, dominator tree.
@@ -489,11 +493,11 @@ with just `v3 = Intrinsic(Add, [v1, v2])` — both args provably UInt, no guards
 ```
 src/
   lib.rs              — Public API: compile(), Program::call(), re-exports
-  compile.rs          — Link phase, closure compilation, exec_intrinsic, phi elimination, flat pc executor
+  compile.rs          — Link phase, closure compilation, type/definedness-specialized dispatch, phi elimination, flat pc executor
   ast.rs              — AST node types, Span, Spanned
   types.rs            — BaseType, TypeSet
   parser.rs           — Chumsky-based parser -> AST
-  builtins.rs         — BuiltinRegistry for host-provided extern functions (empty by default)
+  builtins.rs         — BuiltinRegistry, Lua-style builtin API: fn(&mut VM, usize)
   diagnostics.rs      — Error/warning accumulator with codes
   exec.rs             — VM, Heap, HeapVal, Value, Slot, Float
   ir/
@@ -512,8 +516,11 @@ src/
       ref_elision.rs  — Ref elision (MakeRef → Copy/Index, chain shortening)
       type_refinement.rs — Type set refinement
       coercion.rs     — Coercion insertion (Widen for mixed types, Undefined for incompatible)
-      guard_elim.rs   — Guard elimination
+      guard_elim.rs   — Guard elimination + CFG simplification
       definedness.rs  — Definedness analysis
+      cast_elision.rs — Identity Cast/Widen → Copy
+      copy_prop.rs    — Copy propagation (replace uses, remove dead Copies)
+      algebra.rs      — Algebraic simplification (identity, annihilation, strength reduction)
 
 docs/
   DESIGN.md           — Comprehensive design document (65k)
