@@ -101,26 +101,6 @@ fn build_block_map(blocks: &[BasicBlock]) -> HashMap<BlockId, usize> {
 }
 
 // ============================================================================
-// Literal → Value Conversion
-// ============================================================================
-
-fn literal_to_value(lit: &Literal, heap: &crate::exec::HeapRef) -> Result<Value, ExecError> {
-    Ok(match lit {
-        Literal::Bool(b) => Value::Bool(*b),
-        Literal::UInt(n) => Value::UInt(*n),
-        Literal::Int(n) => Value::Int(*n),
-        Literal::Float(f) => {
-            match crate::exec::Float::new(*f) {
-                Some(float) => Value::Float(float),
-                None => return Ok(Value::Bool(false)), // NaN → treat as undefined
-            }
-        }
-        Literal::Text(s) => Value::Text(HeapVal::new(s.clone(), heap.clone())?),
-        Literal::Bytes(b) => Value::Bytes(HeapVal::new(b.clone(), heap.clone())?),
-    })
-}
-
-// ============================================================================
 // Compilation: IR → Closures
 // ============================================================================
 
@@ -494,11 +474,29 @@ fn compile_instruction(
                         }
                     }
                 }
-                Literal::Text(_) | Literal::Bytes(_) => {
-                    // Heap types: must allocate at runtime
-                    let lit = value.clone();
+                Literal::Text(s) => {
+                    // Intern: allocate on first execution, reuse Rc clone after.
+                    let text = s.clone();
+                    let cache = std::cell::RefCell::new(None);
                     Box::new(move |vm: &mut VM, _prog| {
-                        let val = literal_to_value(&lit, &vm.heap())?;
+                        if cache.borrow().is_none() {
+                            let v = Value::Text(HeapVal::new(text.clone(), vm.heap())?);
+                            *cache.borrow_mut() = Some(v);
+                        }
+                        let val = cache.borrow().as_ref().unwrap().clone();
+                        vm.set_local(d, val);
+                        Ok(Action::Continue)
+                    })
+                }
+                Literal::Bytes(b) => {
+                    let bytes = b.clone();
+                    let cache = std::cell::RefCell::new(None);
+                    Box::new(move |vm: &mut VM, _prog| {
+                        if cache.borrow().is_none() {
+                            let v = Value::Bytes(HeapVal::new(bytes.clone(), vm.heap())?);
+                            *cache.borrow_mut() = Some(v);
+                        }
+                        let val = cache.borrow().as_ref().unwrap().clone();
                         vm.set_local(d, val);
                         Ok(Action::Continue)
                     })

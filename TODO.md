@@ -60,9 +60,15 @@ Architecture: Source → Parser (chumsky) → AST → Lower (operators → Intri
       - Read-only element refs demoted to Index (no WriteRef → no ref needed)
       - Read-only whole-value refs demoted to Copy (base never written → no Slot::Ref needed)
       - Ref chain shortening (MakeRef through MakeRef → skip to resolved base)
-- [ ] `with` reference semantics — future:
-      - Dead write-back elimination (optimizer can see WriteRef, remove when unused)
-      - Ref-backed loop variable dead-store warnings
+- [ ] Dead write-back elimination — a WriteRef exists but the base value is never
+      read after the write-back point. The write is wasted work. Requires liveness
+      analysis: does anything read the base after this WriteRef? If not, the
+      WriteRef (and potentially its MakeRef) can be removed entirely.
+- [ ] Dead-store warnings for non-ref-backed loop variables — `for x in 0..10 { x += 1; }`
+      iterates a sequence by value (no backing store), so `x += 1` mutates a local
+      copy that is discarded each iteration. The compiler should emit a warning that
+      the mutation has no effect. Requires distinguishing ref-backed loop vars
+      (where mutations flow back to the source) from value-backed ones.
 - [ ] Optimizer: dead code elimination pass
 
 ## Code Review Fixes
@@ -466,6 +472,13 @@ with just `v3 = Intrinsic(Add, [v1, v2])` — both args provably UInt, no guards
       diagnostics. `rill dump script.rl --function f` for IR inspection.
       Not a REPL — the language is function-oriented with no top-level state.
 - [ ] LSP support
+- [ ] Performance benchmarks against other duck-typed languages (Lua, Python)
+      using an established benchmark suite (e.g. Computer Language Benchmarks Game,
+      Are We Fast Yet, or a custom suite of representative workloads: fibonacci,
+      n-body, binary trees, spectral norm, mandelbrot). Measure: execution time,
+      compilation time, memory usage. Expected performance tier: 10-50x faster
+      than CPython, competitive with Lua 5.4 for type-specializable workloads,
+      2-5x slower than LuaJIT interpreter (hand-written asm) without a JIT.
 - [ ] Domain-specific embedding examples
 - [ ] Loop unrolling (small loops with known iteration count)
 - [ ] Escape analysis (stack-allocate non-escaping collections)

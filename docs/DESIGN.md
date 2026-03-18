@@ -420,28 +420,57 @@ Identity phis (all sources are the same slot as dest) are dropped entirely.
 |------------|------------------------|
 | `VarId(n)` | Stack slot offset `n + 1` |
 | `FunctionRef("core::add")` | Native function pointer (Copy) |
-| `Literal::UInt(42)` | Cloned into the closure |
+| `Literal::UInt(42)` | Pre-computed `Value` captured directly |
+| `Literal::Text("key")` | Interned on first execution (Rc clone after) |
 | `BlockId` | Index into `block_starts` |
+| `IntrinsicOp` | Resolved at compile time — per-op closure, no runtime dispatch |
+
+### Compile-Time Specialization
+
+The compiler uses TypeAnalysis and DefinednessAnalysis to emit optimized
+closures, eliminating runtime dispatches when static information is sufficient:
+
+| Specialization | Condition | Effect |
+|---|---|---|
+| Scalar Const | Bool/UInt/Int/Float literal | Value pre-computed, zero runtime work |
+| String/Bytes Const | Text/Bytes literal | Interned: allocates once, Rc clone after |
+| Intrinsic op dispatch | Always | Per-op closure (no `match op` at runtime) |
+| Binary arithmetic | Both args same single type | Direct typed operation (e.g. `u64::checked_add`) |
+| Cast/Widen target | Target always a constant | Target resolved at compile time, source-only dispatch |
+| Index/MakeRef | Base type known | Type-specific indexing (no 5-way dispatch) |
+| SetIndex/WriteRef | Base type known | Direct `set_array_elem` or `set_map_entry` |
+| Match (single-arm) | From `if let` patterns | Inlined type/literal/length test |
+| Match (multi-arm) | From `match` expressions | Pre-compiled predicate closures |
+| Copy | Source provably Defined | Direct `.unwrap()` (no None check) |
+| If condition | Provably Bool + Defined | Direct bool read (no null/type check) |
+| Intrinsic args | All args provably Defined | `.unwrap()` then call (skip Option gate) |
+| Non-Bool condition | Optimizer folds to Jump | `debug_assert!` in compiler |
+| Identity Cast/Widen | Optimizer elides to Copy | `debug_assert!` in compiler |
+| Guard definedness | Optimizer folds to Jump | `debug_assert!(MaybeDefined)` in compiler |
+
+### Calling Convention
+
+All function calls (user and builtin) use frame-based argument passing — no
+intermediate `Vec` allocation:
+
+- **User calls**: caller copies args slot-to-slot into callee's frame, executes
+  callee body inline (same loop, no `execute_function` indirection)
+- **Builtin calls**: frame set up with `call_with_args` (Lua-style: pre-pushed
+  args adopted into frame via `rotate_right`). Builtins read args via `vm.arg(i)`
+- **Entry point**: embedder pushes args with `vm.push()`, calls with `argc`
 
 ### Execution Loop
 
 The executor is a single flat loop with a program counter:
 
 ```rust
-fn execute_function(program, vm, func_idx, args) -> Action {
-    let func = &program.functions[func_idx];
-    vm.call(func.frame_size, None)?;
-    bind_params(vm, args);
-
-    let mut pc = func.block_starts[func.entry];
-
-    loop {
-        match (func.steps[pc])(vm, program)? {
-            Action::Continue    => pc += 1,
-            Action::NextBlock(i) => pc = func.block_starts[i],
-            Action::Return(val) => { vm.ret(); return Return(val); }
-            Action::Exit(val)   => { vm.ret(); return Exit(val); }
-        }
+let mut pc = func.block_starts[func.entry];
+loop {
+    match (func.steps[pc])(vm, program)? {
+        Action::Continue    => pc += 1,
+        Action::NextBlock(i) => pc = func.block_starts[i],
+        Action::Return(val) => { vm.ret(); return Ok(val); }
+        Action::Exit(val)   => { vm.ret(); return Ok(None); }
     }
 }
 ```
@@ -456,8 +485,10 @@ fn execute_function(program, vm, func_idx, args) -> Action {
 - **No phi overhead at runtime**: All phis resolved to copies in predecessors
   during compilation. No `prev_block` tracking.
 - **No Rust stack growth for loops**: Back-edges set `pc` to an earlier offset.
-- **User function calls are recursive**: `execute_function` calls itself, bounded
-  by the VM's `MAX_STACK_SIZE` (65K slots, ~3000-6000 call levels).
+- **User function calls inline**: Caller sets up frame and runs callee loop
+  directly, bounded by VM's `MAX_STACK_SIZE` (65K slots, ~3000-6000 levels).
+- **Zero allocation per call**: Args copied slot-to-slot, no Vec. Builtins
+  use frame-based `vm.arg(i)` access.
 - **Linear blocks are merged**: CFG simplification (runs twice in optimizer)
   concatenates chains of single-predecessor/single-successor blocks. The
   closure compiler only emits `NextBlock` for genuine runtime branches.
@@ -1129,12 +1160,24 @@ IR (lowered)
            ▼
 ┌─────────────────────┐
 │ Type Diagnostics    │  W009: type mismatch → always undefined
+│                     │  W009: non-Bool If condition → always else
 └──────────┬──────────┘
            ▼
-┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐
-  Coercion Insertion     (planned) Match + Widen + Undefined
-  + Phase 1 loop again   (re-run fixpoint on expanded IR)
-└ ─ ─ ─ ─ ┬ ─ ─ ─ ─ ┘
+┌─────────────────────┐
+│ Coercion Insertion  │  Insert Widen for mixed-type arithmetic
+│                     │  Replace incompatible ops with Undefined
+└──────────┬──────────┘
+           ▼
+┌─────────────────────┐
+│ Cast/Widen Elision  │  Identity Cast/Widen (src==target) → Copy
+└──────────┬──────────┘
+           ▼
+┌─────────────────────┐
+│ Condition Folding   │  Non-Bool If condition → Jump(else)
+│                     │  Then-branch becomes dead → cleaned by Phase 1
+└──────────┬──────────┘
+           ▼
+  Phase 1 fixpoint       (re-run if Phase 2 changed anything)
            ▼
 ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐
   Dead Code Elimination  (planned)
@@ -1452,7 +1495,8 @@ src/ir/
 │   ├── definedness.rs     # Pass 2: Definedness analysis + diagnostics
 │   ├── guard_elim.rs      # Pass 3: Guard elimination + CFG simplification
 │   ├── type_refinement.rs # Pass 4: Type refinement
-│   └── coercion.rs        # Pass 4.75: Coercion insertion (Widen + Undefined)
+│   ├── coercion.rs        # Pass 4.75: Coercion insertion (Widen + Undefined)
+│   └── cast_elision.rs    # Pass 4.8: Identity Cast/Widen → Copy
 ```
 
 ### Fixed-Point Iteration
