@@ -275,12 +275,19 @@ literal = bool-literal
         / uint-literal
         / int-literal
         / float-literal
+        / char-literal
         / bytes-literal
         / text-literal
         / array-literal
         / map-literal
 
 bool-literal = "true" / "false"
+
+; Character literal: syntactic sugar for UInt code point (no Char type)
+; 'A' → UInt(65), '\n' → UInt(10), '\u{E9}' → UInt(233), '\u{1F600}' → UInt(128512)
+char-literal = "'" (char-content / char-escape) "'"
+char-content = %x20-26 / %x28-5B / %x5D-10FFFF  ; Any char except ' and \
+char-escape = "\\" ("'" / "\\" / "n" / "r" / "t" / unicode-escape)
 
 uint-literal = 1*DIGIT
 
@@ -302,8 +309,11 @@ char = %x20-21 / %x23-5B / %x5D-10FFFF  ; Any char except " and \
      / "\\" escape-sequence
 
 escape-sequence = DQUOTE / "\\" / "n" / "r" / "t"
-                / "u" 4HEXDIG
-                / "U" 8HEXDIG
+                / unicode-escape
+
+; Unicode escape: \u{XXXX} — 1-6 hex digits, covers full Unicode range (U+0000 to U+10FFFF)
+; Examples: \u{41} = 'A', \u{E9} = 'é', \u{1F600} = '😀'
+unicode-escape = "u" "{" 1*6HEXDIG "}"
 
 array-literal = "[" [expr-list] "]"
 

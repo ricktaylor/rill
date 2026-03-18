@@ -103,22 +103,14 @@ fn transfer_instruction(
         // Index result: element type of base
         // Note: definedness (OOB) is tracked by definedness analysis, not here
         Instruction::Index { dest, base, .. } => {
-            if let Some(base_type) = state.get(base) {
-                // If we know the base can only be certain types, narrow result
-                if base_type.is_single() {
-                    if base_type.contains(BaseType::Text) {
-                        // text[i] returns text (single char)
-                        state.insert(*dest, TypeSet::single(BaseType::Text));
-                        return;
-                    } else if base_type.contains(BaseType::Bytes) {
-                        // bytes[i] returns uint
-                        state.insert(*dest, TypeSet::single(BaseType::UInt));
-                        return;
-                    }
-                }
-                // For Array/Map, result could be any type
-                state.insert(*dest, all_types());
+            if let Some(base_type) = state.get(base)
+                && base_type.is_single()
+                && (base_type.contains(BaseType::Text) || base_type.contains(BaseType::Bytes))
+            {
+                // text[i] and bytes[i] both return UInt (code point / byte value)
+                state.insert(*dest, TypeSet::single(BaseType::UInt));
             } else {
+                // Array/Map/unknown: result could be any type
                 state.insert(*dest, all_types());
             }
         }
@@ -157,10 +149,28 @@ fn transfer_instruction(
             state.insert(*dest, type_set);
         }
 
-        // MakeRef: produces a reference (internal type, not user-visible)
-        // For analysis purposes, track as all types optional
-        Instruction::MakeRef { dest, .. } => {
-            state.insert(*dest, all_types());
+        // MakeRef: element ref reads base[key], same type rules as Index.
+        // Whole-value ref has the same type as its base.
+        Instruction::MakeRef { dest, base, key } => {
+            if key.is_some() {
+                // Element ref: same type narrowing as Index
+                if let Some(base_type) = state.get(base)
+                    && base_type.is_single()
+                    && (base_type.contains(BaseType::Text) || base_type.contains(BaseType::Bytes))
+                {
+                    // text[i] and bytes[i] both return UInt (code point / byte value)
+                    state.insert(*dest, TypeSet::single(BaseType::UInt));
+                    return;
+                }
+                state.insert(*dest, all_types());
+            } else {
+                // Whole-value ref: same type as base
+                if let Some(base_type) = state.get(base) {
+                    state.insert(*dest, *base_type);
+                } else {
+                    state.insert(*dest, all_types());
+                }
+            }
         }
 
         // WriteRef: side effect only (writes through a reference), no dest

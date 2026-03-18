@@ -1216,11 +1216,9 @@ fn index_value(base: &Value, key: &Value) -> Option<Value> {
         (Value::Array(arr), Value::Int(idx)) if *idx >= 0 => arr.get(*idx as usize).cloned(),
         (Value::Map(map), key) => map.get(key).cloned(),
         (Value::Text(s), Value::UInt(idx)) => {
-            s.chars().nth(*idx as usize).map(|c| {
-                // Text indexing returns a single-char string — but we need HeapVal.
-                // For now, return UInt of the char code. TODO: return Text properly.
-                Value::UInt(c as u64)
-            })
+            // Text indexing returns UInt (Unicode code point). No Char type —
+            // UInt serves as the character representation, keeping the type system small.
+            s.chars().nth(*idx as usize).map(|c| Value::UInt(c as u64))
         }
         (Value::Bytes(b), Value::UInt(idx)) => {
             b.get(*idx as usize).map(|byte| Value::UInt(*byte as u64))
@@ -3289,5 +3287,256 @@ mod tests {
             "test",
         );
         assert_eq!(val, Value::UInt(99));
+    }
+
+    // ================================================================
+    // Dead Code Elimination (end-to-end)
+    // ================================================================
+
+    #[test]
+    fn test_dce_unused_computation() {
+        // Dead computation should be eliminated — no runtime cost
+        let val = run_expect(
+            r#"
+            fn test() {
+                let x = 42;
+                let unused = x * 2 + 1;
+                x
+            }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::UInt(42));
+    }
+
+    #[test]
+    fn test_dce_after_algebra() {
+        // x * 1 → Copy(x), then the Const(1) becomes dead
+        let val = run_expect(
+            r#"
+            fn test() {
+                let x = 7;
+                let y = x * 1;
+                y
+            }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::UInt(7));
+    }
+
+    #[test]
+    fn test_dce_preserves_side_effects() {
+        // Recursive call has side effects (stack usage) — must not be removed
+        // even if result is unused
+        let val = run_expect(
+            r#"
+            fn countdown(n) {
+                if n <= 0 { return 0; }
+                countdown(n - 1);
+                n
+            }
+            fn test() { countdown(5) }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::UInt(5));
+    }
+
+    #[test]
+    fn test_dce_chain_elimination() {
+        // a = 1, b = a + 1, c = b + 1 — only c used
+        // After const folding, all become constants.
+        // DCE doesn't need to fire because const fold handles it.
+        // But if we use a non-constant chain:
+        let val = run_expect(
+            r#"
+            fn test() {
+                let a = 10;
+                let b = a + a;
+                b
+            }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::UInt(20));
+    }
+
+    // ================================================================
+    // Text and Bytes iteration (no Char type — yields UInt)
+    // ================================================================
+
+    #[test]
+    fn test_text_indexing_returns_uint() {
+        // "A"[0] → 65 (Unicode code point)
+        let val = run_expect(
+            r#"
+            fn test() {
+                let s = "A";
+                s[0]
+            }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::UInt(65)); // 'A' = 65
+    }
+
+    #[test]
+    fn test_text_iteration_sum() {
+        // Sum of code points: "AB" → 65 + 66 = 131
+        let val = run_expect(
+            r#"
+            fn test() {
+                let sum = 0;
+                for c in "AB" {
+                    sum = sum + c;
+                }
+                sum
+            }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::UInt(131));
+    }
+
+    #[test]
+    fn test_text_len() {
+        let val = run_expect(
+            r#"
+            fn test() {
+                len("hello")
+            }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::UInt(5));
+    }
+
+    #[test]
+    fn test_bytes_indexing_returns_uint() {
+        // First byte of bytes([0x48, 0x69]) → 0x48 = 72
+        let val = run_expect(
+            r#"
+            fn test() {
+                let b = bytes([0x48, 0x69]);
+                b[0]
+            }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::UInt(0x48));
+    }
+
+    #[test]
+    fn test_bytes_iteration_sum() {
+        // Sum of bytes: bytes([1, 2, 3]) → 1 + 2 + 3 = 6
+        let val = run_expect(
+            r#"
+            fn test() {
+                let sum = 0;
+                for b in bytes([0x01, 0x02, 0x03]) {
+                    sum = sum + b;
+                }
+                sum
+            }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::UInt(6));
+    }
+
+    #[test]
+    fn test_bytes_len() {
+        let val = run_expect(
+            r#"
+            fn test() {
+                len(bytes([0x01, 0x02, 0x03, 0x04]))
+            }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::UInt(4));
+    }
+
+    #[test]
+    fn test_text_unicode_iteration() {
+        // Unicode: "é" is U+00E9 = 233
+        let val = run_expect(
+            r#"
+            fn test() {
+                let s = "é";
+                s[0]
+            }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::UInt(0xE9)); // é = U+00E9
+    }
+
+    // ================================================================
+    // Character literals (sugar for UInt code points)
+    // ================================================================
+
+    #[test]
+    fn test_char_literal_basic() {
+        let val = run_expect("fn test() { 'A' }", "test");
+        assert_eq!(val, Value::UInt(65));
+    }
+
+    #[test]
+    fn test_char_literal_escape() {
+        let val = run_expect("fn test() { '\\n' }", "test");
+        assert_eq!(val, Value::UInt(10));
+    }
+
+    #[test]
+    fn test_char_literal_comparison() {
+        // Compare character from string to char literal
+        let val = run_expect(
+            r#"
+            fn test() {
+                let s = "Hello";
+                s[0] == 'H'
+            }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::Bool(true));
+    }
+
+    #[test]
+    fn test_char_literal_arithmetic() {
+        // 'A' + 1 = 66 = 'B'
+        let val = run_expect("fn test() { 'A' + 1 }", "test");
+        assert_eq!(val, Value::UInt(66));
+    }
+
+    #[test]
+    fn test_char_literal_unicode_escape() {
+        // \u{E9} = é = 233
+        let val = run_expect("fn test() { '\\u{E9}' }", "test");
+        assert_eq!(val, Value::UInt(0xE9));
+    }
+
+    #[test]
+    fn test_char_literal_emoji() {
+        // \u{1F600} = 😀 = 128512 (beyond BMP)
+        let val = run_expect("fn test() { '\\u{1F600}' }", "test");
+        assert_eq!(val, Value::UInt(0x1F600));
+    }
+
+    #[test]
+    fn test_string_unicode_escape() {
+        // \u{...} works in strings too
+        let val = run_expect(
+            r#"
+            fn test() {
+                let s = "\u{48}\u{69}";
+                len(s)
+            }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::UInt(2)); // "Hi" = 2 chars
     }
 }

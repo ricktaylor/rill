@@ -69,7 +69,7 @@ Architecture: Source → Parser (chumsky) → AST → Lower (operators → Intri
       copy that is discarded each iteration. The compiler should emit a warning that
       the mutation has no effect. Requires distinguishing ref-backed loop vars
       (where mutations flow back to the source) from value-backed ones.
-- [ ] Optimizer: dead code elimination pass
+- [x] Optimizer: dead code elimination pass (dce.rs)
 
 ## Code Review Fixes
 
@@ -343,9 +343,10 @@ with just `v3 = Intrinsic(Add, [v1, v2])` — both args provably UInt, no guards
       A Match with one surviving arm becomes a Jump. Also folds non-Bool If
       conditions to Jump(else). Feeds into CFG simplification → DCE.
 
-- [ ] **Dead Code Elimination (DCE)** — remove instructions whose dest VarId is
-      never used. Iterate until stable. Respect purity: keep impure Calls even if
-      result unused. ~50-80 lines.
+- [x] **Dead Code Elimination (DCE)** (`eliminate_dead_code` in dce.rs) — removes
+      instructions whose dest is never used. Iterates until stable (cascading).
+      Respects purity: keeps Calls even if result unused. Runs in Phase 1 fixpoint
+      after copy propagation.
 
 - [x] **Copy Propagation** (`propagate_copies` in copy_prop.rs) — replaces all
       uses of `Copy(dest, src)` dest with src, resolves chains, removes dead Copies.
@@ -392,6 +393,12 @@ with just `v3 = Intrinsic(Add, [v1, v2])` — both args provably UInt, no guards
 
 - [ ] Dead-store warnings for non-ref-backed loop variable mutations
 - [ ] Unused variable warnings (from DCE liveness data)
+- [ ] Suppress spurious E201 warnings for guarded index access in for-loops.
+      The for-loop lowers `arr[i]` guarded by `i < len(arr)`, but the definedness
+      analysis doesn't track that the guard makes the index in-bounds. The loop
+      counter phi shows as MaybeDefined, causing cascading E201 warnings. Fix:
+      teach definedness that `If(Lt(i, Len(arr)), then)` implies `Index(arr, i)`
+      is Defined in the then-branch.
 
 ### P2 — Quality
 
@@ -520,6 +527,7 @@ src/
       definedness.rs  — Definedness analysis
       cast_elision.rs — Identity Cast/Widen → Copy
       copy_prop.rs    — Copy propagation (replace uses, remove dead Copies)
+      dce.rs          — Dead code elimination (remove unused instructions)
       algebra.rs      — Algebraic simplification (identity, annihilation, strength reduction)
 
 docs/

@@ -90,17 +90,17 @@ pub fn const_index(base: &ConstValue, key: &ConstValue) -> Option<ConstValue> {
                 None
             }
         }
-        // Text[UInt] -> single character as Text
+        // Text[UInt] -> Unicode code point as UInt (no Char type)
         (ConstValue::Text(s), ConstValue::UInt(idx)) => s
             .chars()
             .nth(*idx as usize)
-            .map(|c| ConstValue::Text(c.to_string())),
+            .map(|c| ConstValue::UInt(c as u64)),
         // Text[Int] (if non-negative)
         (ConstValue::Text(s), ConstValue::Int(idx)) => {
             if *idx >= 0 {
                 s.chars()
                     .nth(*idx as usize)
-                    .map(|c| ConstValue::Text(c.to_string()))
+                    .map(|c| ConstValue::UInt(c as u64))
             } else {
                 None
             }
@@ -522,15 +522,16 @@ mod tests {
 
     #[test]
     fn test_const_index_text() {
+        // Text indexing returns UInt code points (no Char type)
         let text = ConstValue::Text("hello".to_string());
 
         assert_eq!(
             const_index(&text, &ConstValue::UInt(0)),
-            Some(ConstValue::Text("h".to_string()))
+            Some(ConstValue::UInt('h' as u64))
         );
         assert_eq!(
             const_index(&text, &ConstValue::UInt(4)),
-            Some(ConstValue::Text("o".to_string()))
+            Some(ConstValue::UInt('o' as u64))
         );
         assert_eq!(const_index(&text, &ConstValue::UInt(5)), None); // Out of bounds
     }

@@ -17,6 +17,7 @@ mod cast_elision;
 mod coercion;
 mod const_fold;
 mod copy_prop;
+mod dce;
 mod definedness;
 mod guard_elim;
 mod ref_elision;
@@ -27,6 +28,7 @@ pub use cast_elision::elide_identity_casts;
 pub use coercion::{elide_coercions, insert_coercions};
 pub use const_fold::fold_constants;
 pub use copy_prop::propagate_copies;
+pub use dce::eliminate_dead_code;
 pub use definedness::{Definedness, DefinednessAnalysis, analyze_definedness, check_definedness};
 pub use guard_elim::{eliminate_guards, simplify_cfg};
 pub use ref_elision::elide_refs;
@@ -71,6 +73,7 @@ pub fn optimize_function(
     loop {
         let folded = fold_constants(function, builtins, diagnostics);
         let copies = propagate_copies(function);
+        let dead = eliminate_dead_code(function);
         let refs = elide_refs(function);
         let coerce = elide_coercions(function);
 
@@ -86,7 +89,7 @@ pub fn optimize_function(
         let guards = eliminate_guards(function, &definedness);
         let blocks = simplify_cfg(function);
 
-        if folded + copies + refs + coerce + guards + blocks == 0 {
+        if folded + copies + dead + refs + coerce + guards + blocks == 0 {
             break;
         }
     }
@@ -129,21 +132,20 @@ pub fn optimize_function(
         loop {
             let folded = fold_constants(function, builtins, diagnostics);
             let copies = propagate_copies(function);
+            let dead = eliminate_dead_code(function);
             let refs = elide_refs(function);
             let coerce = elide_coercions(function);
             let definedness = analyze_definedness(function, Some(builtins));
             let guards = eliminate_guards(function, &definedness);
             let blocks = simplify_cfg(function);
-            if folded + copies + refs + coerce + guards + blocks == 0 {
+            if folded + copies + dead + refs + coerce + guards + blocks == 0 {
                 break;
             }
         }
     }
 
     // ── Phase 3: Cleanup ───────────────────────────────────────────────
-
-    // Dead code elimination (TODO)
-    // eliminate_dead_code(function);
+    // DCE runs in both fixpoint loops above. Nothing else needed here.
 }
 
 /// Warn when intrinsic operand types guarantee the result is always undefined.

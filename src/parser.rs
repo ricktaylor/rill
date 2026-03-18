@@ -161,6 +161,26 @@ fn float_literal<'a>() -> BoxedParser<'a, Literal> {
         .boxed()
 }
 
+/// Unicode escape: \u{XXXX} — variable length, 1-6 hex digits, full Unicode range.
+/// Examples: \u{41} = 'A', \u{E9} = 'é', \u{1F600} = '😀'
+fn unicode_escape<'a>() -> BoxedParser<'a, char> {
+    just('u')
+        .ignore_then(
+            text::digits(16)
+                .at_least(1)
+                .at_most(6)
+                .to_slice()
+                .delimited_by(just('{'), just('}'))
+                .try_map(|s: &str, span| {
+                    u32::from_str_radix(s, 16)
+                        .ok()
+                        .and_then(char::from_u32)
+                        .ok_or_else(|| Rich::custom(span, "invalid unicode escape"))
+                }),
+        )
+        .boxed()
+}
+
 fn escape_char<'a>() -> BoxedParser<'a, char> {
     just('\\')
         .ignore_then(choice((
@@ -169,20 +189,34 @@ fn escape_char<'a>() -> BoxedParser<'a, char> {
             just('n').to('\n'),
             just('r').to('\r'),
             just('t').to('\t'),
-            just('u').ignore_then(text::digits(16).exactly(4).to_slice().try_map(
-                |s: &str, span| {
-                    u32::from_str_radix(s, 16)
-                        .ok()
-                        .and_then(char::from_u32)
-                        .ok_or_else(|| Rich::custom(span, "Invalid unicode escape"))
-                },
-            )),
+            unicode_escape(),
         )))
         .boxed()
 }
 
 fn string_char<'a>() -> BoxedParser<'a, char> {
     none_of("\\\"").or(escape_char()).boxed()
+}
+
+/// Character literal: 'A' → UInt(65), '\n' → UInt(10), '\u{E9}' → UInt(233)
+/// Syntactic sugar for UInt code points — no Char type.
+fn char_literal<'a>() -> BoxedParser<'a, Literal> {
+    let char_escape = just('\\')
+        .ignore_then(choice((
+            just('\\').to('\\'),
+            just('\'').to('\''),
+            just('n').to('\n'),
+            just('r').to('\r'),
+            just('t').to('\t'),
+            unicode_escape(),
+        )))
+        .boxed();
+
+    just('\'')
+        .ignore_then(none_of("\\'").or(char_escape))
+        .then_ignore(just('\''))
+        .map(|c| Literal::UInt(c as u64))
+        .boxed()
 }
 
 fn text_literal<'a>() -> BoxedParser<'a, Literal> {
@@ -324,6 +358,7 @@ fn primary_expr<'a>(expr: BoxedParser<'a, Expression>) -> BoxedParser<'a, Expres
         float_literal(),
         int_literal(),
         uint_literal(),
+        char_literal(),
         text_literal(),
     ))
     .padded_by(whitespace())
@@ -1547,6 +1582,37 @@ mod tests {
         assert!(try_parse_expr("\"hello\"").is_ok());
         assert!(try_parse_expr("[1, 2, 3]").is_ok());
         assert!(try_parse_expr("{1: \"a\", 2: \"b\"}").is_ok());
+    }
+
+    #[test]
+    fn test_parse_char_literals() {
+        // Basic char literals → UInt
+        assert!(try_parse_expr("'A'").is_ok());
+        assert!(try_parse_expr("'z'").is_ok());
+        assert!(try_parse_expr("'0'").is_ok());
+
+        // Escape sequences
+        assert!(try_parse_expr("'\\n'").is_ok());
+        assert!(try_parse_expr("'\\t'").is_ok());
+        assert!(try_parse_expr("'\\''").is_ok());
+        assert!(try_parse_expr("'\\\\'").is_ok());
+
+        // Unicode escape
+        assert!(try_parse_expr("'\\u{E9}'").is_ok());
+
+        // Verify it produces UInt
+        let result = try_parse_expr("'A'").unwrap();
+        match result {
+            Expression::Literal(Literal::UInt(n)) => assert_eq!(n, 65),
+            _ => panic!("Expected UInt literal, got {:?}", result),
+        }
+
+        // Verify newline escape
+        let result = try_parse_expr("'\\n'").unwrap();
+        match result {
+            Expression::Literal(Literal::UInt(n)) => assert_eq!(n, 10),
+            _ => panic!("Expected UInt literal"),
+        }
     }
 
     #[test]
