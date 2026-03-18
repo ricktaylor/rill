@@ -33,7 +33,8 @@ impl Program {
     /// ```ignore
     /// let process = program.function("process").expect("function exists");
     /// for input in inputs {
-    ///     let result = process.call(&program, &mut vm, &[input])?;
+    ///     vm.push(input)?;
+    ///     let result = process.call(&mut vm, 1)?;
     /// }
     /// ```
     pub fn function(&self, name: &str) -> Option<FunctionHandle<'_>> {
@@ -48,15 +49,22 @@ impl Program {
 
     /// Call a named function (convenience method — does a name lookup each time).
     ///
+    /// Push arguments onto the VM stack before calling:
+    /// ```ignore
+    /// vm.push(Value::UInt(42))?;
+    /// vm.push(Value::Text("hello".into()))?;
+    /// let result = program.call(&mut vm, "process", 2)?;
+    /// ```
+    ///
     /// For repeated calls to the same function, use [`function()`] to resolve
     /// the name once and then call the returned handle.
     pub fn call(
         &self,
         vm: &mut VM,
         func_name: &str,
-        args: &[Value],
+        argc: usize,
     ) -> Result<Option<Value>, ExecError> {
-        compile::execute(&self.compiled, vm, func_name, args)
+        compile::execute(&self.compiled, vm, func_name, argc)
     }
 }
 
@@ -73,9 +81,13 @@ pub struct FunctionHandle<'a> {
 impl<'a> FunctionHandle<'a> {
     /// Execute this function with the given arguments.
     ///
-    /// No name lookup — the function was resolved when the handle was created.
-    pub fn call(&self, vm: &mut VM, args: &[Value]) -> Result<Option<Value>, ExecError> {
-        compile::execute_by_index(self.program, vm, self.func_idx, args)
+    /// Push arguments onto the VM stack before calling:
+    /// ```ignore
+    /// vm.push(value)?;
+    /// let result = handle.call(&mut vm, 1)?;
+    /// ```
+    pub fn call(&self, vm: &mut VM, argc: usize) -> Result<Option<Value>, ExecError> {
+        compile::execute_by_index(self.program, vm, self.func_idx, argc)
     }
 }
 

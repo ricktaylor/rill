@@ -705,6 +705,51 @@ impl VM {
         Ok(())
     }
 
+    /// Call a function, adopting the top `argc` values on the stack as arguments.
+    ///
+    /// The embedder pushes args before calling this method (Lua-style):
+    /// ```ignore
+    /// vm.push(Value::UInt(42))?;
+    /// vm.push(Value::Text("hello".into()))?;
+    /// vm.call_with_args(frame_size, 2)?;
+    /// // Args are now in slots 1..=2 of the new frame
+    /// ```
+    ///
+    /// Internally, the pushed values are shifted right by one slot to make
+    /// room for the Frame info at slot 0. On `ret()`, the entire frame
+    /// (including adopted args) is cleaned up.
+    pub fn call_with_args(&mut self, frame_size: usize, argc: usize) -> Result<(), ExecError> {
+        if frame_size < 1 + argc {
+            return Err(ExecError::StackOverflow);
+        }
+
+        let args_base = self.stack.len() - argc;
+
+        // Stack overflow check
+        if args_base + frame_size > MAX_STACK_SIZE {
+            return Err(ExecError::StackOverflow);
+        }
+
+        let old_bp = self.bp;
+        self.bp = args_base;
+
+        // Extend to full frame size
+        self.stack.resize(self.bp + frame_size, Slot::Uninit);
+
+        // Shift args right by 1 to make room for Frame slot at bp.
+        // rotate_right(1) on [bp..bp+argc+1] moves args from [bp..bp+argc]
+        // to [bp+1..bp+argc+1] in a single bulk operation (compiles to memmove).
+        self.stack[self.bp..self.bp + argc + 1].rotate_right(1);
+
+        // Slot 0 is frame info (overwrites the Uninit rotated into position)
+        self.stack[self.bp] = Slot::Frame(Box::new(FrameInfo {
+            bp: old_bp,
+            return_slot: None,
+        }));
+
+        Ok(())
+    }
+
     /// Return from function without a value: restore BP, truncate stack
     pub fn ret(&mut self) {
         let saved_bp = match self.stack.get(self.bp) {
@@ -805,6 +850,26 @@ impl VM {
     /// Set value at local offset
     pub fn set_local(&mut self, offset: usize, value: Value) {
         self.set(self.bp + offset, value);
+    }
+
+    // ========================================================================
+    // Builtin argument access (Lua-style stack API)
+    // ========================================================================
+
+    /// Get function argument by 0-based index.
+    ///
+    /// Args occupy slots 1..=N in the current frame (slot 0 is Frame info).
+    /// `arg(0)` returns the first argument, `arg(1)` the second, etc.
+    ///
+    /// ```ignore
+    /// fn my_builtin(vm: &mut VM, argc: usize) -> Result<ExecResult, ExecError> {
+    ///     let x = vm.arg(0).cloned().unwrap_or(Value::UInt(0));
+    ///     let y = vm.arg(1).cloned().unwrap_or(Value::UInt(0));
+    ///     Ok(ExecResult::Return(Some(Value::UInt(x + y))))
+    /// }
+    /// ```
+    pub fn arg(&self, index: usize) -> Option<&Value> {
+        self.local(index + 1) // slot 0 = Frame, slot 1 = arg 0
     }
 
     /// Set a local slot to uninitialized (represents undefined)

@@ -315,8 +315,20 @@ impl ExecResult {
 // Builtin Implementation
 // ============================================================================
 
-/// Function pointer type for builtin implementations
-pub type BuiltinFn = fn(&mut VM, &[Value]) -> Result<ExecResult, ExecError>;
+/// Function pointer type for builtin implementations.
+///
+/// Builtins use a frame-based calling convention (inspired by Lua's C API):
+/// arguments are placed in the current stack frame at slots 1..=N.
+/// The `usize` parameter is the argument count.
+///
+/// Access args via `vm.arg(i)`:
+/// ```ignore
+/// fn my_builtin(vm: &mut VM, argc: usize) -> Result<ExecResult, ExecError> {
+///     let x = vm.arg(0).cloned().unwrap_or(Value::UInt(0));
+///     Ok(ExecResult::Return(Some(x)))
+/// }
+/// ```
+pub type BuiltinFn = fn(&mut VM, usize) -> Result<ExecResult, ExecError>;
 
 /// Builtin implementation variants
 pub enum BuiltinImpl {
@@ -325,7 +337,7 @@ pub enum BuiltinImpl {
 
     /// Boxed closure (for closures capturing state)
     #[allow(clippy::type_complexity)]
-    Closure(Box<dyn Fn(&mut VM, &[Value]) -> Result<ExecResult, ExecError> + Send + Sync>),
+    Closure(Box<dyn Fn(&mut VM, usize) -> Result<ExecResult, ExecError> + Send + Sync>),
 }
 
 impl std::fmt::Debug for BuiltinImpl {
@@ -339,10 +351,10 @@ impl std::fmt::Debug for BuiltinImpl {
 
 impl BuiltinImpl {
     /// Call the builtin implementation
-    pub fn call(&self, vm: &mut VM, args: &[Value]) -> Result<ExecResult, ExecError> {
+    pub fn call(&self, vm: &mut VM, argc: usize) -> Result<ExecResult, ExecError> {
         match self {
-            BuiltinImpl::Native(f) => f(vm, args),
-            BuiltinImpl::Closure(f) => f(vm, args),
+            BuiltinImpl::Native(f) => f(vm, argc),
+            BuiltinImpl::Closure(f) => f(vm, argc),
         }
     }
 }
@@ -386,7 +398,7 @@ impl BuiltinDef {
     /// Default: returns any type, pure but fallible
     pub fn with_closure<F>(name: impl Into<String>, f: F) -> Self
     where
-        F: Fn(&mut VM, &[Value]) -> Result<ExecResult, ExecError> + Send + Sync + 'static,
+        F: Fn(&mut VM, usize) -> Result<ExecResult, ExecError> + Send + Sync + 'static,
     {
         BuiltinDef {
             name: name.into(),
@@ -642,7 +654,7 @@ mod tests {
 
     #[test]
     fn test_builder_pattern() {
-        fn dummy(_vm: &mut VM, _args: &[Value]) -> Result<ExecResult, ExecError> {
+        fn dummy(_vm: &mut VM, _argc: usize) -> Result<ExecResult, ExecError> {
             Ok(ExecResult::Return(None))
         }
 
@@ -662,7 +674,7 @@ mod tests {
 
     #[test]
     fn test_registry() {
-        fn dummy(_vm: &mut VM, _args: &[Value]) -> Result<ExecResult, ExecError> {
+        fn dummy(_vm: &mut VM, _argc: usize) -> Result<ExecResult, ExecError> {
             Ok(ExecResult::Return(None))
         }
 

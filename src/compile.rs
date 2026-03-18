@@ -24,7 +24,7 @@
 //! - Builtins resolved once at compile time (no runtime HashMap lookup)
 //! - VarIds mapped to stack slot offsets at compile time
 //! - Loops use iterative block dispatch (no Rust stack growth)
-//! - User function calls use recursive `execute_function` (bounded by VM stack limit)
+//! - User function calls use recursive inline loops (bounded by VM stack limit)
 //! - Future: tail-call optimization can convert recursive calls to jumps
 
 use crate::builtins::{BuiltinImpl, BuiltinRegistry, ExecResult};
@@ -556,20 +556,33 @@ fn compile_instruction(
 
             // Resolve via link map (all references verified at link time)
             match link_map.get(&func_name).cloned() {
-                Some(CallTarget::Builtin(f)) => Box::new(move |vm: &mut VM, _prog| {
-                    let mut arg_values: Vec<Value> = Vec::with_capacity(arg_slots.len());
-                    for (s, _) in &arg_slots {
-                        if let Some(v) = vm.local(*s).cloned() {
-                            arg_values.push(v);
+                Some(CallTarget::Builtin(f)) => {
+                    let argc = arg_slots.len();
+                    Box::new(move |vm: &mut VM, _prog| {
+                        // Set up frame for builtin (same convention as user functions)
+                        let caller_bp = vm.bp();
+                        let frame_size = 1 + argc; // slot 0 = Frame, slots 1..=N = args
+                        vm.call(frame_size, None)?;
+
+                        // Copy args from caller's slots into builtin's frame
+                        for (i, (s, _by_ref)) in arg_slots.iter().enumerate() {
+                            if let Some(val) = vm.get(caller_bp + s).cloned() {
+                                vm.set_local(i + 1, val);
+                            }
                         }
-                    }
-                    match f(vm, &arg_values)? {
-                        ExecResult::Return(Some(val)) => vm.set_local(d, val),
-                        ExecResult::Return(None) => vm.set_local_uninit(d),
-                        ExecResult::Exit(val) => return Ok(Action::Exit(val)),
-                    }
-                    Ok(Action::Continue)
-                }),
+
+                        // Call builtin — reads args via vm.arg(i)
+                        let result = f(vm, argc);
+                        vm.ret();
+
+                        match result? {
+                            ExecResult::Return(Some(val)) => vm.set_local(d, val),
+                            ExecResult::Return(None) => vm.set_local_uninit(d),
+                            ExecResult::Exit(val) => return Ok(Action::Exit(val)),
+                        }
+                        Ok(Action::Continue)
+                    })
+                }
                 Some(CallTarget::UserFunction(func_idx)) => {
                     Box::new(move |vm: &mut VM, prog: &CompiledProgram| {
                         let func = &prog.functions[func_idx];
@@ -582,9 +595,10 @@ fn compile_instruction(
                         // No intermediate Vec allocation.
                         for (i, (s, _by_ref)) in arg_slots.iter().enumerate() {
                             if i < func.param_count
-                                && let Some(val) = vm.get(caller_bp + s).cloned() {
-                                    vm.set_local(i + 1, val);
-                                }
+                                && let Some(val) = vm.get(caller_bp + s).cloned()
+                            {
+                                vm.set_local(i + 1, val);
+                            }
                         }
 
                         // Execute callee: inline loop (same as execute_function)
@@ -989,34 +1003,56 @@ fn index_value(base: &Value, key: &Value) -> Option<Value> {
 // Execution
 // ============================================================================
 
-/// Execute a named function in a compiled program.
 /// Execute a named function (convenience — does HashMap lookup).
+///
+/// Args should be pushed onto the VM stack before calling:
+/// ```ignore
+/// vm.push(Value::UInt(42))?;
+/// let result = execute(&program, &mut vm, "func", 1)?;
+/// ```
 pub fn execute(
     program: &CompiledProgram,
     vm: &mut VM,
     func_name: &str,
-    args: &[Value],
+    argc: usize,
 ) -> Result<Option<Value>, ExecError> {
-    let func_idx = program
+    let func_idx = *program
         .func_index
         .get(func_name)
         .ok_or(ExecError::StackOverflow)?; // TODO: proper "function not found" error
-    execute_by_index(program, vm, *func_idx, args)
+    execute_by_index(program, vm, func_idx, argc)
 }
 
 /// Execute a function by resolved index (no lookup — hot path).
+///
+/// Args should be pushed onto the VM stack before calling.
 pub fn execute_by_index(
     program: &CompiledProgram,
     vm: &mut VM,
     func_idx: usize,
-    args: &[Value],
+    argc: usize,
 ) -> Result<Option<Value>, ExecError> {
-    let arg_pairs: Vec<(Value, bool)> = args.iter().map(|v| (v.clone(), false)).collect();
+    let func = &program.functions[func_idx];
 
-    match execute_function(program, vm, func_idx, &arg_pairs)? {
-        Action::Return(val) => Ok(val),
-        Action::Exit(_val) => Ok(None), // TODO: propagate exit to driver
-        Action::Continue | Action::NextBlock(_) => unreachable!(),
+    // Adopt pushed args into the call frame (zero allocation)
+    vm.call_with_args(func.frame_size, argc)?;
+
+    // Execute: single flat loop with program counter
+    let mut pc = func.block_starts[func.entry];
+
+    loop {
+        match (func.steps[pc])(vm, program)? {
+            Action::Continue => pc += 1,
+            Action::NextBlock(idx) => pc = func.block_starts[idx],
+            Action::Return(val) => {
+                vm.ret();
+                return Ok(val);
+            }
+            Action::Exit(_val) => {
+                vm.ret();
+                return Ok(None); // TODO: propagate exit to driver
+            }
+        }
     }
 }
 
@@ -2073,52 +2109,6 @@ fn exec_cast(arg_slots: &[usize], vm: &VM) -> Option<Value> {
     }
 }
 
-/// Execute a compiled function by index.
-fn execute_function(
-    program: &CompiledProgram,
-    vm: &mut VM,
-    func_idx: usize,
-    args: &[(Value, bool)],
-) -> Result<Action, ExecError> {
-    let func = &program.functions[func_idx];
-
-    // Set up call frame
-    // return_slot = None for now — caller reads return value from Action
-    vm.call(func.frame_size, None)?;
-
-    // Bind parameters
-    for (i, (val, by_ref)) in args.iter().enumerate() {
-        if i < func.param_count {
-            // Push arg to a temporary location, then bind
-            let param_offset = i + 1; // slot 0 = Frame
-            if *by_ref {
-                // by-ref: for now, just copy (TODO: proper ref binding)
-                vm.set_local(param_offset, val.clone());
-            } else {
-                vm.set_local(param_offset, val.clone());
-            }
-        }
-    }
-
-    // Execute: single flat loop with program counter
-    let mut pc = func.block_starts[func.entry];
-
-    loop {
-        match (func.steps[pc])(vm, program)? {
-            Action::Continue => pc += 1,
-            Action::NextBlock(idx) => pc = func.block_starts[idx],
-            Action::Return(val) => {
-                vm.ret();
-                return Ok(Action::Return(val));
-            }
-            Action::Exit(val) => {
-                vm.ret();
-                return Ok(Action::Exit(val));
-            }
-        }
-    }
-}
-
 // ============================================================================
 // Tests
 // ============================================================================
@@ -2128,8 +2118,8 @@ mod tests {
     use super::*;
     use crate::builtins;
 
-    /// Helper: compile source and execute a named function
-    fn run(source: &str, func_name: &str, args: &[Value]) -> Result<Option<Value>, String> {
+    /// Helper: compile source and execute a named function (no args)
+    fn run(source: &str, func_name: &str) -> Result<Option<Value>, String> {
         let builtins = builtins::standard_builtins();
         let (program, diagnostics) =
             crate::compile(source, &builtins).map_err(|d| format!("compilation failed: {}", d))?;
@@ -2140,13 +2130,13 @@ mod tests {
 
         let mut vm = VM::new();
         program
-            .call(&mut vm, func_name, args)
+            .call(&mut vm, func_name, 0)
             .map_err(|e| format!("exec error: {}", e))
     }
 
     /// Helper: compile and run, expecting a Value back
     fn run_expect(source: &str, func_name: &str) -> Value {
-        run(source, func_name, &[])
+        run(source, func_name)
             .expect("should not error")
             .expect("should return a value")
     }
@@ -2169,7 +2159,7 @@ mod tests {
 
     #[test]
     fn test_return_no_value() {
-        let result = run("fn test() { return; }", "test", &[]).unwrap();
+        let result = run("fn test() { return; }", "test").unwrap();
         assert!(result.is_none());
     }
 
