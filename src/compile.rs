@@ -3230,4 +3230,64 @@ mod tests {
         );
         assert_eq!(val, Value::UInt(0));
     }
+
+    // ================================================================
+    // Dead Match Arm Elimination (end-to-end)
+    // ================================================================
+
+    #[test]
+    fn test_match_dead_arm_eliminated() {
+        // x is UInt(42), so Int arm is dead — only UInt arm executes
+        let val = run_expect(
+            r#"
+            fn test() {
+                let x = 42;
+                match x {
+                    UInt(n) => { n + 1 },
+                    Int(n) => { 999 },
+                    _ => { 0 },
+                }
+            }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::UInt(43));
+    }
+
+    #[test]
+    fn test_match_single_arm_collapse() {
+        // x is UInt, only UInt arm matches — Match collapses to Jump
+        let val = run_expect(
+            r#"
+            fn test() {
+                let x = 10;
+                match x {
+                    UInt(n) => { n * 2 },
+                    _ => { 0 },
+                }
+            }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::UInt(20));
+    }
+
+    #[test]
+    fn test_match_all_arms_dead() {
+        // x is UInt, but only Text/Bool arms — all dead, takes default
+        let val = run_expect(
+            r#"
+            fn test() {
+                let x = 42;
+                match x {
+                    Text(s) => { 1 },
+                    Bool(b) => { 2 },
+                    _ => { 99 },
+                }
+            }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::UInt(99));
+    }
 }
