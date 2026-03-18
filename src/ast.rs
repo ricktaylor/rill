@@ -309,6 +309,14 @@ pub enum Expression {
         end: Box<Expression>,
         inclusive: bool, // true for ..=, false for ..
     },
+
+    // Type cast: value as Type
+    // Infallible numeric reinterpretation or widening
+    // Valid: UInt↔Int (bit reinterpret), UInt/Int→Float (widen)
+    Cast {
+        value: Box<Expression>,
+        target_type: Identifier,
+    },
 }
 
 // Conditions in if expressions (all AND'ed together with &&)

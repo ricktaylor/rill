@@ -12,6 +12,7 @@
 //! 7. Constant Folding (cleanup) - fold constants exposed by earlier passes
 //! 8. Dead Code Elimination - remove unused computations
 
+mod cast_elision;
 mod coercion;
 mod const_fold;
 mod definedness;
@@ -19,6 +20,7 @@ mod guard_elim;
 mod ref_elision;
 mod type_refinement;
 
+pub use cast_elision::elide_identity_casts;
 pub use coercion::{elide_coercions, insert_coercions};
 pub use const_fold::fold_constants;
 pub use definedness::{analyze_definedness, check_definedness};
@@ -95,11 +97,18 @@ pub fn optimize_function(
     // Also replaces provably-incompatible operations with Undefined.
     let coercions = insert_coercions(function, &types);
 
-    // If coercion insertion changed anything, re-run the Phase 1 fixpoint
-    // loop. The expanded IR has:
+    // Identity cast/widen elimination: replaces Cast(v, T) and Widen(v, T)
+    // with Copy when source type already matches target. Catches user-written
+    // redundant casts (e.g. `x as UInt` where x is UInt) and Widens that
+    // became identity after type narrowing.
+    let cast_elisions = elide_identity_casts(function, &types);
+
+    // If coercion insertion or cast elision changed anything, re-run the
+    // Phase 1 fixpoint loop. The expanded IR has:
     //   - Widen(Const(42_u64), 2) → const fold collapses to Const(42_i64)
     //   - Explicit Undefined → definedness sees it, guard elim cleans up
-    if coercions > 0 {
+    //   - Identity casts → Copy → const fold may propagate further
+    if coercions + cast_elisions > 0 {
         loop {
             let folded = fold_constants(function, builtins, diagnostics);
             let refs = elide_refs(function);

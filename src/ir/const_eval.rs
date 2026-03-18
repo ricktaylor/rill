@@ -199,6 +199,28 @@ pub fn eval_intrinsic_const(op: crate::ir::IntrinsicOp, args: &[ConstValue]) -> 
                 _ => None,
             }
         }
+
+        // Cast: infallible numeric reinterpretation / widening
+        IntrinsicOp::Cast => {
+            let value = args.first()?;
+            let target = match args.get(1)? {
+                ConstValue::UInt(t) => *t,
+                _ => return None,
+            };
+            match (value, target) {
+                // Target = UInt (1)
+                (ConstValue::UInt(n), 1) => Some(ConstValue::UInt(*n)),
+                (ConstValue::Int(n), 1) => Some(ConstValue::UInt(*n as u64)), // bit reinterpret
+                // Target = Int (2)
+                (ConstValue::UInt(n), 2) => Some(ConstValue::Int(*n as i64)), // bit reinterpret
+                (ConstValue::Int(n), 2) => Some(ConstValue::Int(*n)),
+                // Target = Float (3)
+                (ConstValue::UInt(n), 3) => Some(ConstValue::Float(*n as f64)),
+                (ConstValue::Int(n), 3) => Some(ConstValue::Float(*n as f64)),
+                (ConstValue::Float(f), 3) => Some(ConstValue::Float(*f)),
+                _ => None,
+            }
+        }
     }
 }
 
@@ -447,6 +469,7 @@ fn const_len(args: &[ConstValue]) -> Option<ConstValue> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::IntrinsicOp;
 
     #[test]
     fn test_literal_to_const() {
@@ -510,6 +533,100 @@ mod tests {
             Some(ConstValue::Text("o".to_string()))
         );
         assert_eq!(const_index(&text, &ConstValue::UInt(5)), None); // Out of bounds
+    }
+
+    #[test]
+    fn test_const_cast_identity() {
+        // Identity casts: same type in, same type out
+        assert_eq!(
+            eval_intrinsic_const(
+                IntrinsicOp::Cast,
+                &[ConstValue::UInt(42), ConstValue::UInt(1)]
+            ),
+            Some(ConstValue::UInt(42))
+        );
+        assert_eq!(
+            eval_intrinsic_const(
+                IntrinsicOp::Cast,
+                &[ConstValue::Int(-5), ConstValue::UInt(2)]
+            ),
+            Some(ConstValue::Int(-5))
+        );
+        assert_eq!(
+            eval_intrinsic_const(
+                IntrinsicOp::Cast,
+                &[ConstValue::Float(3.14), ConstValue::UInt(3)]
+            ),
+            Some(ConstValue::Float(3.14))
+        );
+    }
+
+    #[test]
+    fn test_const_cast_bit_reinterpret() {
+        // Int → UInt: bit reinterpret
+        assert_eq!(
+            eval_intrinsic_const(
+                IntrinsicOp::Cast,
+                &[ConstValue::Int(-1), ConstValue::UInt(1)]
+            ),
+            Some(ConstValue::UInt(u64::MAX))
+        );
+        // UInt → Int: bit reinterpret
+        assert_eq!(
+            eval_intrinsic_const(
+                IntrinsicOp::Cast,
+                &[ConstValue::UInt(u64::MAX), ConstValue::UInt(2)]
+            ),
+            Some(ConstValue::Int(-1))
+        );
+    }
+
+    #[test]
+    fn test_const_cast_widen_to_float() {
+        // UInt → Float
+        assert_eq!(
+            eval_intrinsic_const(
+                IntrinsicOp::Cast,
+                &[ConstValue::UInt(42), ConstValue::UInt(3)]
+            ),
+            Some(ConstValue::Float(42.0))
+        );
+        // Int → Float
+        assert_eq!(
+            eval_intrinsic_const(
+                IntrinsicOp::Cast,
+                &[ConstValue::Int(-10), ConstValue::UInt(3)]
+            ),
+            Some(ConstValue::Float(-10.0))
+        );
+    }
+
+    #[test]
+    fn test_const_cast_invalid_source() {
+        // Bool → UInt: not a valid cast source
+        assert_eq!(
+            eval_intrinsic_const(
+                IntrinsicOp::Cast,
+                &[ConstValue::Bool(true), ConstValue::UInt(1)]
+            ),
+            None
+        );
+        // Text → Int: not a valid cast source
+        assert_eq!(
+            eval_intrinsic_const(
+                IntrinsicOp::Cast,
+                &[ConstValue::Text("42".into()), ConstValue::UInt(2)]
+            ),
+            None
+        );
+        // Float → UInt: not supported (use floor/round/trunc)
+        assert_eq!(
+            eval_intrinsic_const(
+                IntrinsicOp::Cast,
+                &[ConstValue::Float(3.14), ConstValue::UInt(1)]
+            ),
+            None
+        );
     }
 
     #[test]

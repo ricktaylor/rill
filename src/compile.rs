@@ -121,29 +121,6 @@ fn literal_to_value(lit: &Literal, heap: &crate::exec::HeapRef) -> Result<Value,
 }
 
 // ============================================================================
-// Match Pattern Testing
-// ============================================================================
-
-fn test_match_pattern(pattern: &MatchPattern, value: &Value) -> bool {
-    match pattern {
-        MatchPattern::Literal(lit) => match (lit, value) {
-            (Literal::Bool(a), Value::Bool(b)) => a == b,
-            (Literal::UInt(a), Value::UInt(b)) => a == b,
-            (Literal::Int(a), Value::Int(b)) => a == b,
-            (Literal::Float(a), Value::Float(b)) => crate::exec::Float::new(*a)
-                .map(|f| f == *b)
-                .unwrap_or(false),
-            (Literal::Text(a), Value::Text(b)) => a.as_str() == **b,
-            (Literal::Bytes(a), Value::Bytes(b)) => a.as_slice() == **b,
-            _ => false,
-        },
-        MatchPattern::Type(base_type) => value.base_type() == *base_type,
-        MatchPattern::Array(len) => matches!(value, Value::Array(a) if a.len() == *len),
-        MatchPattern::ArrayMin(min) => matches!(value, Value::Array(a) if a.len() >= *min),
-    }
-}
-
-// ============================================================================
 // Compilation: IR → Closures
 // ============================================================================
 
@@ -295,6 +272,24 @@ fn build_ref_map(blocks: &[BasicBlock]) -> HashMap<VarId, RefMeta> {
     map
 }
 
+/// Build a map from VarId → constant UInt value for compile-time resolution
+/// of Cast/Widen target type codes.
+fn build_const_uint_map(blocks: &[BasicBlock]) -> HashMap<VarId, u64> {
+    let mut map = HashMap::new();
+    for block in blocks {
+        for inst in &block.instructions {
+            if let Instruction::Const {
+                dest,
+                value: Literal::UInt(n),
+            } = &inst.node
+            {
+                map.insert(*dest, *n);
+            }
+        }
+    }
+    map
+}
+
 fn compile_function(func: &Function, link_map: &LinkMap) -> Result<CompiledFunction, ExecError> {
     let block_map = build_block_map(&func.blocks);
     let frame_size = 1 + func.locals.len(); // slot 0 = Frame, then locals
@@ -306,6 +301,9 @@ fn compile_function(func: &Function, link_map: &LinkMap) -> Result<CompiledFunct
     // op are provably the same type, the compiler emits a direct closure
     // instead of the 10-way type dispatch.
     let types = crate::ir::opt::analyze_types(func, None);
+
+    // Collect constant UInt values for Cast/Widen target resolution at compile time
+    let const_uint_map = build_const_uint_map(&func.blocks);
 
     // First pass: compile all blocks, collecting phi metadata
     let mut blocks = Vec::new();
@@ -337,7 +335,12 @@ fn compile_function(func: &Function, link_map: &LinkMap) -> Result<CompiledFunct
         }
 
         blocks.push(compile_block(
-            ir_block, &block_map, link_map, &ref_map, &types,
+            ir_block,
+            &block_map,
+            link_map,
+            &ref_map,
+            &types,
+            &const_uint_map,
         )?);
     }
 
@@ -393,6 +396,7 @@ fn compile_block(
     link_map: &LinkMap,
     ref_map: &HashMap<VarId, RefMeta>,
     types: &TypeAnalysis,
+    consts: &HashMap<VarId, u64>,
 ) -> Result<Vec<Step>, ExecError> {
     let mut steps: Vec<Step> = Vec::new();
 
@@ -402,9 +406,9 @@ fn compile_block(
             // copies are inserted into predecessor blocks
             Instruction::Phi { .. } => {}
             inst => {
-                if let Some(step) =
-                    compile_instruction(inst, block_map, link_map, ref_map, types, block.id)?
-                {
+                if let Some(step) = compile_instruction(
+                    inst, block_map, link_map, ref_map, types, block.id, consts,
+                )? {
                     steps.push(step);
                 }
             }
@@ -424,16 +428,63 @@ fn compile_instruction(
     ref_map: &HashMap<VarId, RefMeta>,
     types: &TypeAnalysis,
     block_id: BlockId,
+    consts: &HashMap<VarId, u64>,
 ) -> Result<Option<Step>, ExecError> {
     Ok(Some(match inst {
         Instruction::Const { dest, value } => {
             let d = slot(*dest);
-            let lit = value.clone();
-            Box::new(move |vm: &mut VM, _prog| {
-                let val = literal_to_value(&lit, &vm.heap())?;
-                vm.set_local(d, val);
-                Ok(Action::Continue)
-            })
+            // Pre-compute scalar values at compile time — no runtime match needed.
+            // Only Text/Bytes require runtime heap allocation.
+            match value {
+                Literal::Bool(b) => {
+                    let v = Value::Bool(*b);
+                    Box::new(move |vm: &mut VM, _prog| {
+                        vm.set_local(d, v.clone());
+                        Ok(Action::Continue)
+                    })
+                }
+                Literal::UInt(n) => {
+                    let v = Value::UInt(*n);
+                    Box::new(move |vm: &mut VM, _prog| {
+                        vm.set_local(d, v.clone());
+                        Ok(Action::Continue)
+                    })
+                }
+                Literal::Int(n) => {
+                    let v = Value::Int(*n);
+                    Box::new(move |vm: &mut VM, _prog| {
+                        vm.set_local(d, v.clone());
+                        Ok(Action::Continue)
+                    })
+                }
+                Literal::Float(f) => {
+                    match Float::new(*f) {
+                        Some(float) => {
+                            let v = Value::Float(float);
+                            Box::new(move |vm: &mut VM, _prog| {
+                                vm.set_local(d, v.clone());
+                                Ok(Action::Continue)
+                            })
+                        }
+                        None => {
+                            // NaN → undefined
+                            Box::new(move |vm: &mut VM, _prog| {
+                                vm.set_local_uninit(d);
+                                Ok(Action::Continue)
+                            })
+                        }
+                    }
+                }
+                Literal::Text(_) | Literal::Bytes(_) => {
+                    // Heap types: must allocate at runtime
+                    let lit = value.clone();
+                    Box::new(move |vm: &mut VM, _prog| {
+                        let val = literal_to_value(&lit, &vm.heap())?;
+                        vm.set_local(d, val);
+                        Ok(Action::Continue)
+                    })
+                }
+            }
         }
 
         Instruction::Copy { dest, src } => {
@@ -557,14 +608,20 @@ fn compile_instruction(
                 return Ok(Some(specialized));
             }
 
-            Box::new(move |vm: &mut VM, _prog| {
-                let result = exec_intrinsic(op, &arg_slots, vm)?;
-                match result {
-                    Some(val) => vm.set_local(d, val),
-                    None => vm.set_local_uninit(d),
-                }
-                Ok(Action::Continue)
-            })
+            // Try type-specialized compilation for Cast and Widen.
+            // Target is always a compile-time constant, so these always
+            // succeed — eliminating target slot reads and target dispatch.
+            if let Some(specialized) = try_specialize_cast(
+                op, &arg_slots, d, args, types, block_id, consts,
+            )
+            .or_else(|| try_specialize_widen(op, &arg_slots, d, args, types, block_id, consts))
+            {
+                return Ok(Some(specialized));
+            }
+
+            // Dispatch on op at compile time so each closure goes directly
+            // to its operation's code — no runtime `match op` in exec_intrinsic.
+            compile_intrinsic_dispatch(op, arg_slots, d)
         }
 
         Instruction::MakeRef { dest, base, key } => {
@@ -688,21 +745,8 @@ fn compile_terminator(
             ..
         } => {
             let val_slot = slot(*value);
-            let compiled_arms: Vec<(MatchPattern, usize)> = arms
-                .iter()
-                .map(|(pat, target)| (pat.clone(), block_map[target]))
-                .collect();
             let default_idx = block_map[default];
-            Box::new(move |vm: &mut VM, _prog| {
-                if let Some(val) = vm.local(val_slot) {
-                    for (pattern, target_idx) in &compiled_arms {
-                        if test_match_pattern(pattern, val) {
-                            return Ok(Action::NextBlock(*target_idx));
-                        }
-                    }
-                }
-                Ok(Action::NextBlock(default_idx))
-            })
+            compile_match(val_slot, arms, default_idx, block_map)
         }
 
         Terminator::Guard {
@@ -742,6 +786,152 @@ fn compile_terminator(
 
         Terminator::Unreachable => Box::new(|_vm, _prog| Ok(Action::Return(None))),
     })
+}
+
+// ============================================================================
+// Match Compilation
+// ============================================================================
+
+/// Compile a Match terminator, specializing based on arm count and pattern type.
+///
+/// - Single-arm type match: direct `base_type()` comparison (most common case from if-let)
+/// - Single-arm literal: direct value comparison
+/// - Single-arm array/array-min: direct length check
+/// - Multi-arm: pre-compiled predicate closures (no MatchPattern dispatch at runtime)
+fn compile_match(
+    val_slot: usize,
+    arms: &[(MatchPattern, BlockId)],
+    default_idx: usize,
+    block_map: &HashMap<BlockId, usize>,
+) -> Step {
+    if arms.len() == 1 {
+        // Single-arm fast path — inline the pattern test directly
+        let target_idx = block_map[&arms[0].1];
+        return compile_single_arm_match(val_slot, &arms[0].0, target_idx, default_idx);
+    }
+
+    // Multi-arm: pre-compile each pattern into a predicate closure
+    #[allow(clippy::type_complexity)]
+    let compiled_arms: Vec<(Box<dyn Fn(&Value) -> bool>, usize)> = arms
+        .iter()
+        .map(|(pat, target)| (compile_match_predicate(pat), block_map[target]))
+        .collect();
+
+    Box::new(move |vm: &mut VM, _prog| {
+        if let Some(val) = vm.local(val_slot) {
+            for (predicate, target_idx) in &compiled_arms {
+                if predicate(val) {
+                    return Ok(Action::NextBlock(*target_idx));
+                }
+            }
+        }
+        Ok(Action::NextBlock(default_idx))
+    })
+}
+
+/// Compile a single-arm Match into a direct test — no Vec, no predicate dispatch.
+fn compile_single_arm_match(
+    val_slot: usize,
+    pattern: &MatchPattern,
+    target_idx: usize,
+    default_idx: usize,
+) -> Step {
+    match pattern {
+        MatchPattern::Type(base_type) => {
+            let ty = *base_type;
+            Box::new(move |vm: &mut VM, _prog| {
+                let matched = vm.local(val_slot).is_some_and(|v| v.base_type() == ty);
+                Ok(Action::NextBlock(if matched {
+                    target_idx
+                } else {
+                    default_idx
+                }))
+            })
+        }
+        MatchPattern::Literal(lit) => {
+            let pred = compile_match_predicate(&MatchPattern::Literal(lit.clone()));
+            Box::new(move |vm: &mut VM, _prog| {
+                let matched = vm.local(val_slot).is_some_and(&pred);
+                Ok(Action::NextBlock(if matched {
+                    target_idx
+                } else {
+                    default_idx
+                }))
+            })
+        }
+        MatchPattern::Array(len) => {
+            let expected = *len;
+            Box::new(move |vm: &mut VM, _prog| {
+                let matched = vm
+                    .local(val_slot)
+                    .is_some_and(|v| matches!(v, Value::Array(a) if a.len() == expected));
+                Ok(Action::NextBlock(if matched {
+                    target_idx
+                } else {
+                    default_idx
+                }))
+            })
+        }
+        MatchPattern::ArrayMin(min) => {
+            let expected = *min;
+            Box::new(move |vm: &mut VM, _prog| {
+                let matched = vm
+                    .local(val_slot)
+                    .is_some_and(|v| matches!(v, Value::Array(a) if a.len() >= expected));
+                Ok(Action::NextBlock(if matched {
+                    target_idx
+                } else {
+                    default_idx
+                }))
+            })
+        }
+    }
+}
+
+/// Pre-compile a MatchPattern into a predicate closure for multi-arm dispatch.
+/// The MatchPattern enum is resolved at compile time — the returned closure
+/// does only the value-level test with no pattern variant dispatch.
+fn compile_match_predicate(pattern: &MatchPattern) -> Box<dyn Fn(&Value) -> bool> {
+    match pattern {
+        MatchPattern::Type(base_type) => {
+            let ty = *base_type;
+            Box::new(move |v| v.base_type() == ty)
+        }
+        MatchPattern::Literal(lit) => match lit {
+            Literal::Bool(expected) => {
+                let e = *expected;
+                Box::new(move |v| matches!(v, Value::Bool(b) if *b == e))
+            }
+            Literal::UInt(expected) => {
+                let e = *expected;
+                Box::new(move |v| matches!(v, Value::UInt(n) if *n == e))
+            }
+            Literal::Int(expected) => {
+                let e = *expected;
+                Box::new(move |v| matches!(v, Value::Int(n) if *n == e))
+            }
+            Literal::Float(expected) => {
+                let e = *expected;
+                Box::new(move |v| matches!(v, Value::Float(f) if f.get() == e))
+            }
+            Literal::Text(expected) => {
+                let e = expected.clone();
+                Box::new(move |v| matches!(v, Value::Text(s) if **s == *e))
+            }
+            Literal::Bytes(expected) => {
+                let e = expected.clone();
+                Box::new(move |v| matches!(v, Value::Bytes(b) if **b == *e))
+            }
+        },
+        MatchPattern::Array(len) => {
+            let expected = *len;
+            Box::new(move |v| matches!(v, Value::Array(a) if a.len() == expected))
+        }
+        MatchPattern::ArrayMin(min) => {
+            let expected = *min;
+            Box::new(move |v| matches!(v, Value::Array(a) if a.len() >= expected))
+        }
+    }
 }
 
 // ============================================================================
@@ -810,7 +1000,7 @@ pub fn execute_by_index(
 ///
 /// Consults TypeAnalysis: if both operands are provably a single numeric type
 /// and they match, emits a direct closure that skips the 10-way runtime
-/// type dispatch. Returns `None` to fall back to the generic `exec_intrinsic`.
+/// type dispatch. Returns `None` to fall back to `compile_intrinsic_dispatch`.
 fn try_specialize_binary(
     op: IntrinsicOp,
     arg_slots: &[usize],
@@ -858,6 +1048,269 @@ fn try_specialize_binary(
     } else {
         None
     }
+}
+
+/// Try to emit a type-specialized closure for a Cast intrinsic.
+///
+/// Consults TypeAnalysis for the source type and the const map for the target
+/// type code. Three levels of specialization:
+///
+/// 1. Source type + target both known → fully specialized (identity copy or
+///    single direct conversion, zero dispatch at runtime)
+/// 2. Target known, source unknown → target-specialized closure that only
+///    dispatches on source value type (eliminates target slot read + target match)
+/// 3. Neither known → falls through to `compile_intrinsic_dispatch`
+fn try_specialize_cast(
+    op: IntrinsicOp,
+    arg_slots: &[usize],
+    dest_slot: usize,
+    args: &[VarId],
+    types: &TypeAnalysis,
+    block_id: BlockId,
+    consts: &HashMap<VarId, u64>,
+) -> Option<Step> {
+    if op != IntrinsicOp::Cast || args.len() != 2 {
+        return None;
+    }
+
+    let target = *consts.get(&args[1])?;
+    let src = arg_slots[0];
+    let d = dest_slot;
+
+    // Check if source type is known
+    let src_code = types
+        .get_at_exit(block_id, args[0])
+        .filter(|t| t.is_single())
+        .and_then(|t| {
+            if t.contains(BaseType::UInt) {
+                Some(1u64)
+            } else if t.contains(BaseType::Int) {
+                Some(2u64)
+            } else if t.contains(BaseType::Float) {
+                Some(3u64)
+            } else {
+                None
+            }
+        });
+
+    if let Some(src_code) = src_code {
+        // === Level 1: both source type and target known ===
+
+        // Identity cast → slot copy
+        if src_code == target {
+            return Some(Box::new(move |vm: &mut VM, _| {
+                match vm.local(src) {
+                    Some(v) => vm.set_local(d, v.clone()),
+                    None => vm.set_local_uninit(d),
+                }
+                Ok(Action::Continue)
+            }));
+        }
+
+        // Fully specialized conversion — no dispatch at runtime
+        return match (src_code, target) {
+            (1, 2) => Some(Box::new(move |vm: &mut VM, _| {
+                let n = expect_uint(vm, src);
+                vm.set_local(d, Value::Int(n as i64));
+                Ok(Action::Continue)
+            })),
+            (1, 3) => Some(Box::new(move |vm: &mut VM, _| {
+                let n = expect_uint(vm, src);
+                match Float::new(n as f64) {
+                    Some(f) => vm.set_local(d, Value::Float(f)),
+                    None => vm.set_local_uninit(d),
+                }
+                Ok(Action::Continue)
+            })),
+            (2, 1) => Some(Box::new(move |vm: &mut VM, _| {
+                let n = expect_int(vm, src);
+                vm.set_local(d, Value::UInt(n as u64));
+                Ok(Action::Continue)
+            })),
+            (2, 3) => Some(Box::new(move |vm: &mut VM, _| {
+                let n = expect_int(vm, src);
+                match Float::new(n as f64) {
+                    Some(f) => vm.set_local(d, Value::Float(f)),
+                    None => vm.set_local_uninit(d),
+                }
+                Ok(Action::Continue)
+            })),
+            (3, _) => Some(Box::new(move |vm: &mut VM, _| {
+                vm.set_local_uninit(d);
+                Ok(Action::Continue)
+            })),
+            _ => None,
+        };
+    }
+
+    // === Level 2: target known, source type unknown ===
+    // Emit a target-specific closure — eliminates target slot read and
+    // target match; only source value dispatch remains.
+    Some(match target {
+        1 => Box::new(move |vm: &mut VM, _| {
+            let result = match vm.local(src) {
+                Some(Value::UInt(n)) => Some(Value::UInt(*n)),
+                Some(Value::Int(n)) => Some(Value::UInt(*n as u64)),
+                _ => None,
+            };
+            match result {
+                Some(v) => vm.set_local(d, v),
+                None => vm.set_local_uninit(d),
+            }
+            Ok(Action::Continue)
+        }),
+        2 => Box::new(move |vm: &mut VM, _| {
+            let result = match vm.local(src) {
+                Some(Value::UInt(n)) => Some(Value::Int(*n as i64)),
+                Some(Value::Int(n)) => Some(Value::Int(*n)),
+                _ => None,
+            };
+            match result {
+                Some(v) => vm.set_local(d, v),
+                None => vm.set_local_uninit(d),
+            }
+            Ok(Action::Continue)
+        }),
+        3 => Box::new(move |vm: &mut VM, _| {
+            let result = match vm.local(src) {
+                Some(Value::UInt(n)) => Float::new(*n as f64).map(Value::Float),
+                Some(Value::Int(n)) => Float::new(*n as f64).map(Value::Float),
+                Some(Value::Float(f)) => Some(Value::Float(*f)),
+                _ => None,
+            };
+            match result {
+                Some(v) => vm.set_local(d, v),
+                None => vm.set_local_uninit(d),
+            }
+            Ok(Action::Continue)
+        }),
+        _ => return None,
+    })
+}
+
+/// Try to emit a target-specialized closure for a Widen intrinsic.
+///
+/// Same approach as `try_specialize_cast`: the target type code is always a
+/// compile-time constant. Unlike Cast, Widen is overflow-checked (UInt→Int
+/// fails if value > i64::MAX).
+fn try_specialize_widen(
+    op: IntrinsicOp,
+    arg_slots: &[usize],
+    dest_slot: usize,
+    args: &[VarId],
+    types: &TypeAnalysis,
+    block_id: BlockId,
+    consts: &HashMap<VarId, u64>,
+) -> Option<Step> {
+    if op != IntrinsicOp::Widen || args.len() != 2 {
+        return None;
+    }
+
+    let target = *consts.get(&args[1])?;
+    let src = arg_slots[0];
+    let d = dest_slot;
+
+    // Check if source type is known
+    let src_code = types
+        .get_at_exit(block_id, args[0])
+        .filter(|t| t.is_single())
+        .and_then(|t| {
+            if t.contains(BaseType::UInt) {
+                Some(1u64)
+            } else if t.contains(BaseType::Int) {
+                Some(2u64)
+            } else if t.contains(BaseType::Float) {
+                Some(3u64)
+            } else {
+                None
+            }
+        });
+
+    if let Some(src_code) = src_code {
+        // === Fully specialized: source type + target both known ===
+
+        // Identity widen → slot copy
+        if src_code == target {
+            return Some(Box::new(move |vm: &mut VM, _| {
+                match vm.local(src) {
+                    Some(v) => vm.set_local(d, v.clone()),
+                    None => vm.set_local_uninit(d),
+                }
+                Ok(Action::Continue)
+            }));
+        }
+
+        return match (src_code, target) {
+            // UInt → Int: overflow-checked
+            (1, 2) => Some(Box::new(move |vm: &mut VM, _| {
+                let n = expect_uint(vm, src);
+                if n > i64::MAX as u64 {
+                    vm.set_local_uninit(d);
+                } else {
+                    vm.set_local(d, Value::Int(n as i64));
+                }
+                Ok(Action::Continue)
+            })),
+            // UInt → Float
+            (1, 3) => Some(Box::new(move |vm: &mut VM, _| {
+                let n = expect_uint(vm, src);
+                match Float::new(n as f64) {
+                    Some(f) => vm.set_local(d, Value::Float(f)),
+                    None => vm.set_local_uninit(d),
+                }
+                Ok(Action::Continue)
+            })),
+            // Int → Float
+            (2, 3) => Some(Box::new(move |vm: &mut VM, _| {
+                let n = expect_int(vm, src);
+                match Float::new(n as f64) {
+                    Some(f) => vm.set_local(d, Value::Float(f)),
+                    None => vm.set_local_uninit(d),
+                }
+                Ok(Action::Continue)
+            })),
+            _ => Some(Box::new(move |vm: &mut VM, _| {
+                vm.set_local_uninit(d);
+                Ok(Action::Continue)
+            })),
+        };
+    }
+
+    // === Target known, source unknown ===
+    Some(match target {
+        2 => Box::new(move |vm: &mut VM, _| {
+            let result = match vm.local(src) {
+                Some(Value::UInt(n)) => {
+                    if *n > i64::MAX as u64 {
+                        None
+                    } else {
+                        Some(Value::Int(*n as i64))
+                    }
+                }
+                Some(Value::Int(n)) => Some(Value::Int(*n)),
+                _ => None,
+            };
+            match result {
+                Some(v) => vm.set_local(d, v),
+                None => vm.set_local_uninit(d),
+            }
+            Ok(Action::Continue)
+        }),
+        3 => Box::new(move |vm: &mut VM, _| {
+            let result = match vm.local(src) {
+                Some(Value::UInt(n)) => Float::new(*n as f64).map(Value::Float),
+                Some(Value::Int(n)) => Float::new(*n as f64).map(Value::Float),
+                Some(Value::Float(f)) => Some(Value::Float(*f)),
+                _ => None,
+            };
+            match result {
+                Some(v) => vm.set_local(d, v),
+                None => vm.set_local_uninit(d),
+            }
+            Ok(Action::Continue)
+        }),
+        _ => return None,
+    })
 }
 
 // Type-extraction helpers for specialized closures.
@@ -1057,442 +1510,539 @@ fn specialize_float(op: IntrinsicOp, a: usize, b: usize, d: usize) -> Step {
     }
 }
 
-/// Execute an intrinsic operation at runtime.
-///
-/// Returns `Some(value)` on success, `None` for undefined (type mismatch,
-/// overflow, out-of-bounds, etc.)
-fn exec_intrinsic(
-    op: IntrinsicOp,
-    arg_slots: &[usize],
-    vm: &mut VM,
-) -> Result<Option<Value>, ExecError> {
+/// Compile-time dispatch: match on the IntrinsicOp and return a closure
+/// specific to that operation. Eliminates the runtime `match op` that
+/// `exec_intrinsic` would perform on every execution.
+fn compile_intrinsic_dispatch(op: IntrinsicOp, arg_slots: Vec<usize>, d: usize) -> Step {
+    // Helper: wrap exec body in the standard result-to-slot pattern
+    macro_rules! emit {
+        ($body:expr) => {
+            Box::new(move |vm: &mut VM, _prog| {
+                let result: Option<Value> = $body(vm);
+                match result {
+                    Some(val) => vm.set_local(d, val),
+                    None => vm.set_local_uninit(d),
+                }
+                Ok(Action::Continue)
+            })
+        };
+    }
+    // Helper for operations that need ExecError propagation
+    macro_rules! emit_try {
+        ($body:expr) => {
+            Box::new(move |vm: &mut VM, _prog| {
+                let result: Result<Option<Value>, ExecError> = $body(vm);
+                match result? {
+                    Some(val) => vm.set_local(d, val),
+                    None => vm.set_local_uninit(d),
+                }
+                Ok(Action::Continue)
+            })
+        };
+    }
+
     match op {
-        // -- Arithmetic --
-        IntrinsicOp::Add => {
-            let (a, b) = get_two(arg_slots, vm);
-            Ok(match (a, b) {
-                (Some(Value::UInt(a)), Some(Value::UInt(b))) => a.checked_add(*b).map(Value::UInt),
-                (Some(Value::Int(a)), Some(Value::Int(b))) => a.checked_add(*b).map(Value::Int),
-                (Some(Value::Float(a)), Some(Value::Float(b))) => {
-                    Float::new(a.get() + b.get()).map(Value::Float)
-                }
-                (Some(Value::UInt(a)), Some(Value::Int(b))) => i64::try_from(*a)
-                    .ok()
-                    .and_then(|a| a.checked_add(*b))
-                    .map(Value::Int),
-                (Some(Value::Int(a)), Some(Value::UInt(b))) => i64::try_from(*b)
-                    .ok()
-                    .and_then(|b| a.checked_add(b))
-                    .map(Value::Int),
-                (Some(Value::UInt(a)), Some(Value::Float(b))) => {
-                    Float::new(*a as f64 + b.get()).map(Value::Float)
-                }
-                (Some(Value::Float(a)), Some(Value::UInt(b))) => {
-                    Float::new(a.get() + *b as f64).map(Value::Float)
-                }
-                (Some(Value::Int(a)), Some(Value::Float(b))) => {
-                    Float::new(*a as f64 + b.get()).map(Value::Float)
-                }
-                (Some(Value::Float(a)), Some(Value::Int(b))) => {
-                    Float::new(a.get() + *b as f64).map(Value::Float)
-                }
-                _ => None,
-            })
-        }
-        IntrinsicOp::Sub => {
-            let (a, b) = get_two(arg_slots, vm);
-            Ok(match (a, b) {
-                (Some(Value::UInt(a)), Some(Value::UInt(b))) => a.checked_sub(*b).map(Value::UInt),
-                (Some(Value::Int(a)), Some(Value::Int(b))) => a.checked_sub(*b).map(Value::Int),
-                (Some(Value::Float(a)), Some(Value::Float(b))) => {
-                    Float::new(a.get() - b.get()).map(Value::Float)
-                }
-                (Some(Value::UInt(a)), Some(Value::Int(b))) => i64::try_from(*a)
-                    .ok()
-                    .and_then(|a| a.checked_sub(*b))
-                    .map(Value::Int),
-                (Some(Value::Int(a)), Some(Value::UInt(b))) => i64::try_from(*b)
-                    .ok()
-                    .and_then(|b| a.checked_sub(b))
-                    .map(Value::Int),
-                (Some(Value::UInt(a)), Some(Value::Float(b))) => {
-                    Float::new(*a as f64 - b.get()).map(Value::Float)
-                }
-                (Some(Value::Float(a)), Some(Value::UInt(b))) => {
-                    Float::new(a.get() - *b as f64).map(Value::Float)
-                }
-                (Some(Value::Int(a)), Some(Value::Float(b))) => {
-                    Float::new(*a as f64 - b.get()).map(Value::Float)
-                }
-                (Some(Value::Float(a)), Some(Value::Int(b))) => {
-                    Float::new(a.get() - *b as f64).map(Value::Float)
-                }
-                _ => None,
-            })
-        }
-        IntrinsicOp::Mul => {
-            let (a, b) = get_two(arg_slots, vm);
-            Ok(match (a, b) {
-                (Some(Value::UInt(a)), Some(Value::UInt(b))) => a.checked_mul(*b).map(Value::UInt),
-                (Some(Value::Int(a)), Some(Value::Int(b))) => a.checked_mul(*b).map(Value::Int),
-                (Some(Value::Float(a)), Some(Value::Float(b))) => {
-                    Float::new(a.get() * b.get()).map(Value::Float)
-                }
-                (Some(Value::UInt(a)), Some(Value::Int(b))) => i64::try_from(*a)
-                    .ok()
-                    .and_then(|a| a.checked_mul(*b))
-                    .map(Value::Int),
-                (Some(Value::Int(a)), Some(Value::UInt(b))) => i64::try_from(*b)
-                    .ok()
-                    .and_then(|b| a.checked_mul(b))
-                    .map(Value::Int),
-                (Some(Value::UInt(a)), Some(Value::Float(b))) => {
-                    Float::new(*a as f64 * b.get()).map(Value::Float)
-                }
-                (Some(Value::Float(a)), Some(Value::UInt(b))) => {
-                    Float::new(a.get() * *b as f64).map(Value::Float)
-                }
-                (Some(Value::Int(a)), Some(Value::Float(b))) => {
-                    Float::new(*a as f64 * b.get()).map(Value::Float)
-                }
-                (Some(Value::Float(a)), Some(Value::Int(b))) => {
-                    Float::new(a.get() * *b as f64).map(Value::Float)
-                }
-                _ => None,
-            })
-        }
-        IntrinsicOp::Div => {
-            let (a, b) = get_two(arg_slots, vm);
-            Ok(match (a, b) {
-                (Some(Value::UInt(a)), Some(Value::UInt(b))) => a.checked_div(*b).map(Value::UInt),
-                (Some(Value::Int(a)), Some(Value::Int(b))) => a.checked_div(*b).map(Value::Int),
-                (Some(Value::Float(a)), Some(Value::Float(b))) => {
-                    Float::new(a.get() / b.get()).map(Value::Float)
-                }
-                (Some(Value::UInt(a)), Some(Value::Int(b))) => i64::try_from(*a)
-                    .ok()
-                    .and_then(|a| a.checked_div(*b))
-                    .map(Value::Int),
-                (Some(Value::Int(a)), Some(Value::UInt(b))) => i64::try_from(*b)
-                    .ok()
-                    .and_then(|b| a.checked_div(b))
-                    .map(Value::Int),
-                (Some(Value::UInt(a)), Some(Value::Float(b))) => {
-                    Float::new(*a as f64 / b.get()).map(Value::Float)
-                }
-                (Some(Value::Float(a)), Some(Value::UInt(b))) => {
-                    Float::new(a.get() / *b as f64).map(Value::Float)
-                }
-                (Some(Value::Int(a)), Some(Value::Float(b))) => {
-                    Float::new(*a as f64 / b.get()).map(Value::Float)
-                }
-                (Some(Value::Float(a)), Some(Value::Int(b))) => {
-                    Float::new(a.get() / *b as f64).map(Value::Float)
-                }
-                _ => None,
-            })
-        }
-        IntrinsicOp::Mod => {
-            let (a, b) = get_two(arg_slots, vm);
-            Ok(match (a, b) {
-                (Some(Value::UInt(a)), Some(Value::UInt(b))) => a.checked_rem(*b).map(Value::UInt),
-                (Some(Value::Int(a)), Some(Value::Int(b))) => a.checked_rem(*b).map(Value::Int),
-                (Some(Value::Float(a)), Some(Value::Float(b))) => {
-                    Float::new(a.get() % b.get()).map(Value::Float)
-                }
-                (Some(Value::UInt(a)), Some(Value::Int(b))) => i64::try_from(*a)
-                    .ok()
-                    .and_then(|a| a.checked_rem(*b))
-                    .map(Value::Int),
-                (Some(Value::Int(a)), Some(Value::UInt(b))) => i64::try_from(*b)
-                    .ok()
-                    .and_then(|b| a.checked_rem(b))
-                    .map(Value::Int),
-                _ => None,
-            })
-        }
-        IntrinsicOp::Neg => {
+        IntrinsicOp::Add => emit!(|vm: &mut VM| {
+            let (a, b) = (vm.local(arg_slots[0]), vm.local(arg_slots[1]));
+            exec_add(a, b)
+        }),
+        IntrinsicOp::Sub => emit!(|vm: &mut VM| {
+            let (a, b) = (vm.local(arg_slots[0]), vm.local(arg_slots[1]));
+            exec_sub(a, b)
+        }),
+        IntrinsicOp::Mul => emit!(|vm: &mut VM| {
+            let (a, b) = (vm.local(arg_slots[0]), vm.local(arg_slots[1]));
+            exec_mul(a, b)
+        }),
+        IntrinsicOp::Div => emit!(|vm: &mut VM| {
+            let (a, b) = (vm.local(arg_slots[0]), vm.local(arg_slots[1]));
+            exec_div(a, b)
+        }),
+        IntrinsicOp::Mod => emit!(|vm: &mut VM| {
+            let (a, b) = (vm.local(arg_slots[0]), vm.local(arg_slots[1]));
+            exec_mod(a, b)
+        }),
+        IntrinsicOp::Neg => emit!(|vm: &mut VM| {
             let a = vm.local(arg_slots[0]);
-            Ok(match a {
-                Some(Value::Int(a)) => a.checked_neg().map(Value::Int),
-                Some(Value::Float(a)) => Float::new(-a.get()).map(Value::Float),
-                Some(Value::UInt(a)) => i64::try_from(*a)
-                    .ok()
-                    .and_then(|v| v.checked_neg())
-                    .map(Value::Int),
-                _ => None,
-            })
-        }
-
-        // -- Comparison --
-        IntrinsicOp::Eq => {
-            let (a, b) = get_two(arg_slots, vm);
-            Ok(match (a, b) {
-                (Some(a), Some(b)) => Some(Value::Bool(a == b)),
-                _ => None,
-            })
-        }
-        IntrinsicOp::Lt => {
-            let (a, b) = get_two(arg_slots, vm);
-            Ok(match (a, b) {
-                (Some(Value::UInt(a)), Some(Value::UInt(b))) => Some(Value::Bool(a < b)),
-                (Some(Value::Int(a)), Some(Value::Int(b))) => Some(Value::Bool(a < b)),
-                (Some(Value::Float(a)), Some(Value::Float(b))) => {
-                    Some(Value::Bool(a.get() < b.get()))
-                }
-                (Some(Value::UInt(a)), Some(Value::Int(b))) => {
-                    Some(Value::Bool((*a as i128) < (*b as i128)))
-                }
-                (Some(Value::Int(a)), Some(Value::UInt(b))) => {
-                    Some(Value::Bool((*a as i128) < (*b as i128)))
-                }
-                (Some(Value::UInt(a)), Some(Value::Float(b))) => {
-                    Some(Value::Bool((*a as f64) < b.get()))
-                }
-                (Some(Value::Float(a)), Some(Value::UInt(b))) => {
-                    Some(Value::Bool(a.get() < (*b as f64)))
-                }
-                (Some(Value::Int(a)), Some(Value::Float(b))) => {
-                    Some(Value::Bool((*a as f64) < b.get()))
-                }
-                (Some(Value::Float(a)), Some(Value::Int(b))) => {
-                    Some(Value::Bool(a.get() < (*b as f64)))
-                }
-                _ => None,
-            })
-        }
-
-        // -- Logical --
-        IntrinsicOp::Not => {
+            exec_neg(a)
+        }),
+        IntrinsicOp::Eq => emit!(|vm: &mut VM| {
+            let (a, b) = (vm.local(arg_slots[0]), vm.local(arg_slots[1]));
+            exec_eq(a, b)
+        }),
+        IntrinsicOp::Lt => emit!(|vm: &mut VM| {
+            let (a, b) = (vm.local(arg_slots[0]), vm.local(arg_slots[1]));
+            exec_lt(a, b)
+        }),
+        IntrinsicOp::Not => emit!(|vm: &mut VM| {
             let a = vm.local(arg_slots[0]);
-            Ok(match a {
-                Some(Value::Bool(b)) => Some(Value::Bool(!b)),
-                _ => None,
-            })
-        }
-
-        // -- Bitwise --
-        IntrinsicOp::BitAnd => {
-            let (a, b) = get_two(arg_slots, vm);
-            Ok(match (a, b) {
-                (Some(Value::UInt(a)), Some(Value::UInt(b))) => Some(Value::UInt(a & b)),
-                _ => None,
-            })
-        }
-        IntrinsicOp::BitOr => {
-            let (a, b) = get_two(arg_slots, vm);
-            Ok(match (a, b) {
-                (Some(Value::UInt(a)), Some(Value::UInt(b))) => Some(Value::UInt(a | b)),
-                _ => None,
-            })
-        }
-        IntrinsicOp::BitXor => {
-            let (a, b) = get_two(arg_slots, vm);
-            Ok(match (a, b) {
-                (Some(Value::UInt(a)), Some(Value::UInt(b))) => Some(Value::UInt(a ^ b)),
-                _ => None,
-            })
-        }
-        IntrinsicOp::BitNot => {
+            exec_not(a)
+        }),
+        IntrinsicOp::BitAnd => emit!(|vm: &mut VM| {
+            let (a, b) = (vm.local(arg_slots[0]), vm.local(arg_slots[1]));
+            exec_bitand(a, b)
+        }),
+        IntrinsicOp::BitOr => emit!(|vm: &mut VM| {
+            let (a, b) = (vm.local(arg_slots[0]), vm.local(arg_slots[1]));
+            exec_bitor(a, b)
+        }),
+        IntrinsicOp::BitXor => emit!(|vm: &mut VM| {
+            let (a, b) = (vm.local(arg_slots[0]), vm.local(arg_slots[1]));
+            exec_bitxor(a, b)
+        }),
+        IntrinsicOp::BitNot => emit!(|vm: &mut VM| {
             let a = vm.local(arg_slots[0]);
-            Ok(match a {
-                Some(Value::UInt(a)) => Some(Value::UInt(!a)),
-                _ => None,
-            })
-        }
-        IntrinsicOp::Shl => {
-            let (a, b) = get_two(arg_slots, vm);
-            Ok(match (a, b) {
-                (Some(Value::UInt(a)), Some(Value::UInt(b))) => {
-                    Some(Value::UInt(a.wrapping_shl(*b as u32)))
-                }
-                _ => None,
-            })
-        }
-        IntrinsicOp::Shr => {
-            let (a, b) = get_two(arg_slots, vm);
-            Ok(match (a, b) {
-                (Some(Value::UInt(a)), Some(Value::UInt(b))) => {
-                    Some(Value::UInt(a.wrapping_shr(*b as u32)))
-                }
-                _ => None,
-            })
-        }
-        IntrinsicOp::BitTest => {
-            let (x, b) = get_two(arg_slots, vm);
-            Ok(match (x, b) {
-                (Some(Value::UInt(x)), Some(Value::UInt(b))) => {
-                    if *b >= 64 {
-                        None
-                    } else {
-                        Some(Value::Bool((x >> b) & 1 == 1))
-                    }
-                }
-                _ => None,
-            })
-        }
-        IntrinsicOp::BitSet => {
-            let (x, b) = get_two(arg_slots, vm);
-            let v = vm.local(arg_slots[2]);
-            Ok(match (x, b, v) {
-                (Some(Value::UInt(x)), Some(Value::UInt(b)), Some(Value::Bool(v))) => {
-                    if *b >= 64 {
-                        None
-                    } else if *v {
-                        Some(Value::UInt(x | (1 << b)))
-                    } else {
-                        Some(Value::UInt(x & !(1 << b)))
-                    }
-                }
-                _ => None,
-            })
-        }
-
-        // -- Collection --
-        IntrinsicOp::Len => {
+            exec_bitnot(a)
+        }),
+        IntrinsicOp::Shl => emit!(|vm: &mut VM| {
+            let (a, b) = (vm.local(arg_slots[0]), vm.local(arg_slots[1]));
+            exec_shl(a, b)
+        }),
+        IntrinsicOp::Shr => emit!(|vm: &mut VM| {
+            let (a, b) = (vm.local(arg_slots[0]), vm.local(arg_slots[1]));
+            exec_shr(a, b)
+        }),
+        IntrinsicOp::BitTest => emit!(|vm: &mut VM| {
+            let (x, b) = (vm.local(arg_slots[0]), vm.local(arg_slots[1]));
+            exec_bittest(x, b)
+        }),
+        IntrinsicOp::BitSet => emit!(|vm: &mut VM| {
+            let (x, b, v) = (
+                vm.local(arg_slots[0]),
+                vm.local(arg_slots[1]),
+                vm.local(arg_slots[2]),
+            );
+            exec_bitset(x, b, v)
+        }),
+        IntrinsicOp::Len => emit!(|vm: &mut VM| {
             let a = vm.local(arg_slots[0]);
-            Ok(match a {
-                Some(Value::Text(s)) => Some(Value::UInt(s.chars().count() as u64)),
-                Some(Value::Bytes(b)) => Some(Value::UInt(b.len() as u64)),
-                Some(Value::Array(arr)) => Some(Value::UInt(arr.len() as u64)),
-                Some(Value::Map(map)) => Some(Value::UInt(map.len() as u64)),
-                Some(Value::Sequence(seq)) => seq.remaining().map(|n| Value::UInt(n as u64)),
-                _ => None,
-            })
-        }
-        IntrinsicOp::MakeArray => {
-            let elems: Vec<Value> = arg_slots
-                .iter()
-                .filter_map(|s| vm.local(*s).cloned())
-                .collect();
-            let arr = HeapVal::new(elems, vm.heap())?;
-            Ok(Some(Value::Array(arr)))
-        }
-        IntrinsicOp::MakeMap => {
-            if !arg_slots.len().is_multiple_of(2) {
-                return Ok(None);
+            exec_len(a)
+        }),
+        IntrinsicOp::MakeArray => emit_try!(|vm: &mut VM| { exec_make_array(&arg_slots, vm) }),
+        IntrinsicOp::MakeMap => emit_try!(|vm: &mut VM| { exec_make_map(&arg_slots, vm) }),
+        IntrinsicOp::MakeSeq => emit!(|vm: &mut VM| { exec_make_seq(&arg_slots, vm) }),
+        IntrinsicOp::ArraySeq => emit!(|vm: &mut VM| { exec_array_seq(&arg_slots, vm) }),
+        IntrinsicOp::SeqNext => Box::new(move |vm: &mut VM, _prog| {
+            match vm.seq_next(vm.bp() + arg_slots[0])? {
+                Some(val) => vm.set_local(d, val),
+                None => vm.set_local_uninit(d),
             }
-            let map: IndexMap<Value, Value> = arg_slots
-                .chunks(2)
-                .filter_map(|pair| {
-                    let k = vm.local(pair[0]).cloned()?;
-                    let v = vm.local(pair[1]).cloned()?;
-                    Some((k, v))
-                })
-                .collect();
-            let heap_map = HeapVal::new(map, vm.heap())?;
-            Ok(Some(Value::Map(heap_map)))
-        }
-
-        // -- Sequence --
-        IntrinsicOp::MakeSeq => {
-            // MakeSeq(start, end, inclusive) → Sequence(Range)
-            let inclusive = match vm.local(arg_slots[2]) {
-                Some(Value::Bool(b)) => *b,
-                _ => false,
-            };
-            let seq = match (vm.local(arg_slots[0]), vm.local(arg_slots[1])) {
-                (Some(Value::UInt(start)), Some(Value::UInt(end))) => Some(SeqState::RangeUInt {
-                    current: *start,
-                    end: *end,
-                    inclusive,
-                }),
-                (Some(Value::Int(start)), Some(Value::Int(end))) => Some(SeqState::RangeInt {
-                    current: *start,
-                    end: *end,
-                    inclusive,
-                }),
-                // Mixed: promote UInt to Int
-                (Some(Value::UInt(start)), Some(Value::Int(end))) => Some(SeqState::RangeInt {
-                    current: *start as i64,
-                    end: *end,
-                    inclusive,
-                }),
-                (Some(Value::Int(start)), Some(Value::UInt(end))) => Some(SeqState::RangeInt {
-                    current: *start,
-                    end: *end as i64,
-                    inclusive,
-                }),
-                _ => None,
-            };
-            match seq {
-                Some(state) => {
-                    let hv = HeapVal::new(state, vm.heap())?;
-                    Ok(Some(Value::Sequence(hv)))
-                }
-                None => Ok(None),
+            Ok(Action::Continue)
+        }),
+        IntrinsicOp::Collect => Box::new(move |vm: &mut VM, _prog| {
+            match vm.seq_collect(vm.bp() + arg_slots[0])? {
+                Some(val) => vm.set_local(d, val),
+                None => vm.set_local_uninit(d),
             }
-        }
-        IntrinsicOp::ArraySeq => {
-            // ArraySeq(array, start, end, mutable) → Sequence(ArraySlice)
-            let start = match vm.local(arg_slots[1]) {
-                Some(Value::UInt(n)) => *n as usize,
-                _ => return Ok(None),
-            };
-            let end = match vm.local(arg_slots[2]) {
-                Some(Value::UInt(n)) => *n as usize,
-                _ => return Ok(None),
-            };
-            let mutable = match vm.local(arg_slots[3]) {
-                Some(Value::Bool(b)) => *b,
-                _ => false,
-            };
-            match vm.local(arg_slots[0]) {
-                Some(Value::Array(arr)) => {
-                    let state = SeqState::ArraySlice {
-                        source: arr.clone(),
-                        start,
-                        end,
-                        mutable,
-                    };
-                    let hv = HeapVal::new(state, vm.heap())?;
-                    Ok(Some(Value::Sequence(hv)))
-                }
-                _ => Ok(None),
-            }
-        }
-        IntrinsicOp::SeqNext => {
-            // SeqNext(seq) → next element or None (undefined)
-            // Mutates the sequence in-place (advances position).
-            // Uses VM::seq_next to handle borrow splitting (heap vs stack).
-            vm.seq_next(vm.bp() + arg_slots[0])
-        }
-        IntrinsicOp::Collect => {
-            // Collect(seq) → Array: drain all remaining elements from the sequence.
-            vm.seq_collect(vm.bp() + arg_slots[0])
-        }
-
-        // -- Coercion --
-        IntrinsicOp::Widen => {
-            let target = match vm.local(arg_slots[1]) {
-                Some(Value::UInt(t)) => *t,
-                _ => return Ok(None),
-            };
-            let value = vm.local(arg_slots[0]);
-            Ok(match (value, target) {
-                // Target = Int (BaseType discriminant 2)
-                (Some(Value::UInt(n)), 2) => {
-                    let n = *n;
-                    if n > i64::MAX as u64 {
-                        None // overflow
-                    } else {
-                        Some(Value::Int(n as i64))
-                    }
-                }
-                (Some(Value::Int(n)), 2) => Some(Value::Int(*n)),
-                // Target = Float (BaseType discriminant 3)
-                (Some(Value::UInt(n)), 3) => Float::new(*n as f64).map(Value::Float),
-                (Some(Value::Int(n)), 3) => Float::new(*n as f64).map(Value::Float),
-                (Some(Value::Float(f)), 3) => Some(Value::Float(*f)),
-                _ => None,
-            })
-        }
+            Ok(Action::Continue)
+        }),
+        IntrinsicOp::Widen => emit!(|vm: &mut VM| { exec_widen(&arg_slots, vm) }),
+        IntrinsicOp::Cast => emit!(|vm: &mut VM| { exec_cast(&arg_slots, vm) }),
     }
 }
 
-/// Helper: get two values from slots
-fn get_two<'a>(slots: &[usize], vm: &'a VM) -> (Option<&'a Value>, Option<&'a Value>) {
-    (vm.local(slots[0]), vm.local(slots[1]))
+// ========================================================================
+// Per-operation functions for compile-time dispatch
+// Each takes value references directly (no slot lookup, no op dispatch).
+// ========================================================================
+
+fn exec_add(a: Option<&Value>, b: Option<&Value>) -> Option<Value> {
+    match (a, b) {
+        (Some(Value::UInt(a)), Some(Value::UInt(b))) => a.checked_add(*b).map(Value::UInt),
+        (Some(Value::Int(a)), Some(Value::Int(b))) => a.checked_add(*b).map(Value::Int),
+        (Some(Value::Float(a)), Some(Value::Float(b))) => {
+            Float::new(a.get() + b.get()).map(Value::Float)
+        }
+        (Some(Value::UInt(a)), Some(Value::Int(b))) => i64::try_from(*a)
+            .ok()
+            .and_then(|a| a.checked_add(*b))
+            .map(Value::Int),
+        (Some(Value::Int(a)), Some(Value::UInt(b))) => i64::try_from(*b)
+            .ok()
+            .and_then(|b| a.checked_add(b))
+            .map(Value::Int),
+        (Some(Value::UInt(a)), Some(Value::Float(b))) => {
+            Float::new(*a as f64 + b.get()).map(Value::Float)
+        }
+        (Some(Value::Float(a)), Some(Value::UInt(b))) => {
+            Float::new(a.get() + *b as f64).map(Value::Float)
+        }
+        (Some(Value::Int(a)), Some(Value::Float(b))) => {
+            Float::new(*a as f64 + b.get()).map(Value::Float)
+        }
+        (Some(Value::Float(a)), Some(Value::Int(b))) => {
+            Float::new(a.get() + *b as f64).map(Value::Float)
+        }
+        _ => None,
+    }
+}
+
+fn exec_sub(a: Option<&Value>, b: Option<&Value>) -> Option<Value> {
+    match (a, b) {
+        (Some(Value::UInt(a)), Some(Value::UInt(b))) => a.checked_sub(*b).map(Value::UInt),
+        (Some(Value::Int(a)), Some(Value::Int(b))) => a.checked_sub(*b).map(Value::Int),
+        (Some(Value::Float(a)), Some(Value::Float(b))) => {
+            Float::new(a.get() - b.get()).map(Value::Float)
+        }
+        (Some(Value::UInt(a)), Some(Value::Int(b))) => i64::try_from(*a)
+            .ok()
+            .and_then(|a| a.checked_sub(*b))
+            .map(Value::Int),
+        (Some(Value::Int(a)), Some(Value::UInt(b))) => i64::try_from(*b)
+            .ok()
+            .and_then(|b| a.checked_sub(b))
+            .map(Value::Int),
+        (Some(Value::UInt(a)), Some(Value::Float(b))) => {
+            Float::new(*a as f64 - b.get()).map(Value::Float)
+        }
+        (Some(Value::Float(a)), Some(Value::UInt(b))) => {
+            Float::new(a.get() - *b as f64).map(Value::Float)
+        }
+        (Some(Value::Int(a)), Some(Value::Float(b))) => {
+            Float::new(*a as f64 - b.get()).map(Value::Float)
+        }
+        (Some(Value::Float(a)), Some(Value::Int(b))) => {
+            Float::new(a.get() - *b as f64).map(Value::Float)
+        }
+        _ => None,
+    }
+}
+
+fn exec_mul(a: Option<&Value>, b: Option<&Value>) -> Option<Value> {
+    match (a, b) {
+        (Some(Value::UInt(a)), Some(Value::UInt(b))) => a.checked_mul(*b).map(Value::UInt),
+        (Some(Value::Int(a)), Some(Value::Int(b))) => a.checked_mul(*b).map(Value::Int),
+        (Some(Value::Float(a)), Some(Value::Float(b))) => {
+            Float::new(a.get() * b.get()).map(Value::Float)
+        }
+        (Some(Value::UInt(a)), Some(Value::Int(b))) => i64::try_from(*a)
+            .ok()
+            .and_then(|a| a.checked_mul(*b))
+            .map(Value::Int),
+        (Some(Value::Int(a)), Some(Value::UInt(b))) => i64::try_from(*b)
+            .ok()
+            .and_then(|b| a.checked_mul(b))
+            .map(Value::Int),
+        (Some(Value::UInt(a)), Some(Value::Float(b))) => {
+            Float::new(*a as f64 * b.get()).map(Value::Float)
+        }
+        (Some(Value::Float(a)), Some(Value::UInt(b))) => {
+            Float::new(a.get() * *b as f64).map(Value::Float)
+        }
+        (Some(Value::Int(a)), Some(Value::Float(b))) => {
+            Float::new(*a as f64 * b.get()).map(Value::Float)
+        }
+        (Some(Value::Float(a)), Some(Value::Int(b))) => {
+            Float::new(a.get() * *b as f64).map(Value::Float)
+        }
+        _ => None,
+    }
+}
+
+fn exec_div(a: Option<&Value>, b: Option<&Value>) -> Option<Value> {
+    match (a, b) {
+        (Some(Value::UInt(a)), Some(Value::UInt(b))) => a.checked_div(*b).map(Value::UInt),
+        (Some(Value::Int(a)), Some(Value::Int(b))) => a.checked_div(*b).map(Value::Int),
+        (Some(Value::Float(a)), Some(Value::Float(b))) => {
+            Float::new(a.get() / b.get()).map(Value::Float)
+        }
+        (Some(Value::UInt(a)), Some(Value::Int(b))) => i64::try_from(*a)
+            .ok()
+            .and_then(|a| a.checked_div(*b))
+            .map(Value::Int),
+        (Some(Value::Int(a)), Some(Value::UInt(b))) => i64::try_from(*b)
+            .ok()
+            .and_then(|b| a.checked_div(b))
+            .map(Value::Int),
+        (Some(Value::UInt(a)), Some(Value::Float(b))) => {
+            Float::new(*a as f64 / b.get()).map(Value::Float)
+        }
+        (Some(Value::Float(a)), Some(Value::UInt(b))) => {
+            Float::new(a.get() / *b as f64).map(Value::Float)
+        }
+        (Some(Value::Int(a)), Some(Value::Float(b))) => {
+            Float::new(*a as f64 / b.get()).map(Value::Float)
+        }
+        (Some(Value::Float(a)), Some(Value::Int(b))) => {
+            Float::new(a.get() / *b as f64).map(Value::Float)
+        }
+        _ => None,
+    }
+}
+
+fn exec_mod(a: Option<&Value>, b: Option<&Value>) -> Option<Value> {
+    match (a, b) {
+        (Some(Value::UInt(a)), Some(Value::UInt(b))) => a.checked_rem(*b).map(Value::UInt),
+        (Some(Value::Int(a)), Some(Value::Int(b))) => a.checked_rem(*b).map(Value::Int),
+        (Some(Value::Float(a)), Some(Value::Float(b))) => {
+            Float::new(a.get() % b.get()).map(Value::Float)
+        }
+        (Some(Value::UInt(a)), Some(Value::Int(b))) => i64::try_from(*a)
+            .ok()
+            .and_then(|a| a.checked_rem(*b))
+            .map(Value::Int),
+        (Some(Value::Int(a)), Some(Value::UInt(b))) => i64::try_from(*b)
+            .ok()
+            .and_then(|b| a.checked_rem(b))
+            .map(Value::Int),
+        _ => None,
+    }
+}
+
+fn exec_neg(a: Option<&Value>) -> Option<Value> {
+    match a {
+        Some(Value::Int(a)) => a.checked_neg().map(Value::Int),
+        Some(Value::Float(a)) => Float::new(-a.get()).map(Value::Float),
+        Some(Value::UInt(a)) => i64::try_from(*a)
+            .ok()
+            .and_then(|v| v.checked_neg())
+            .map(Value::Int),
+        _ => None,
+    }
+}
+
+fn exec_eq(a: Option<&Value>, b: Option<&Value>) -> Option<Value> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(Value::Bool(a == b)),
+        _ => None,
+    }
+}
+
+fn exec_lt(a: Option<&Value>, b: Option<&Value>) -> Option<Value> {
+    match (a, b) {
+        (Some(Value::UInt(a)), Some(Value::UInt(b))) => Some(Value::Bool(a < b)),
+        (Some(Value::Int(a)), Some(Value::Int(b))) => Some(Value::Bool(a < b)),
+        (Some(Value::Float(a)), Some(Value::Float(b))) => Some(Value::Bool(a.get() < b.get())),
+        (Some(Value::UInt(a)), Some(Value::Int(b))) => {
+            Some(Value::Bool((*a as i128) < (*b as i128)))
+        }
+        (Some(Value::Int(a)), Some(Value::UInt(b))) => {
+            Some(Value::Bool((*a as i128) < (*b as i128)))
+        }
+        (Some(Value::UInt(a)), Some(Value::Float(b))) => Some(Value::Bool((*a as f64) < b.get())),
+        (Some(Value::Float(a)), Some(Value::UInt(b))) => Some(Value::Bool(a.get() < (*b as f64))),
+        (Some(Value::Int(a)), Some(Value::Float(b))) => Some(Value::Bool((*a as f64) < b.get())),
+        (Some(Value::Float(a)), Some(Value::Int(b))) => Some(Value::Bool(a.get() < (*b as f64))),
+        _ => None,
+    }
+}
+
+fn exec_not(a: Option<&Value>) -> Option<Value> {
+    match a {
+        Some(Value::Bool(b)) => Some(Value::Bool(!b)),
+        _ => None,
+    }
+}
+
+fn exec_bitand(a: Option<&Value>, b: Option<&Value>) -> Option<Value> {
+    match (a, b) {
+        (Some(Value::UInt(a)), Some(Value::UInt(b))) => Some(Value::UInt(a & b)),
+        _ => None,
+    }
+}
+
+fn exec_bitor(a: Option<&Value>, b: Option<&Value>) -> Option<Value> {
+    match (a, b) {
+        (Some(Value::UInt(a)), Some(Value::UInt(b))) => Some(Value::UInt(a | b)),
+        _ => None,
+    }
+}
+
+fn exec_bitxor(a: Option<&Value>, b: Option<&Value>) -> Option<Value> {
+    match (a, b) {
+        (Some(Value::UInt(a)), Some(Value::UInt(b))) => Some(Value::UInt(a ^ b)),
+        _ => None,
+    }
+}
+
+fn exec_bitnot(a: Option<&Value>) -> Option<Value> {
+    match a {
+        Some(Value::UInt(a)) => Some(Value::UInt(!a)),
+        _ => None,
+    }
+}
+
+fn exec_shl(a: Option<&Value>, b: Option<&Value>) -> Option<Value> {
+    match (a, b) {
+        (Some(Value::UInt(a)), Some(Value::UInt(b))) => {
+            Some(Value::UInt(a.wrapping_shl(*b as u32)))
+        }
+        _ => None,
+    }
+}
+
+fn exec_shr(a: Option<&Value>, b: Option<&Value>) -> Option<Value> {
+    match (a, b) {
+        (Some(Value::UInt(a)), Some(Value::UInt(b))) => {
+            Some(Value::UInt(a.wrapping_shr(*b as u32)))
+        }
+        _ => None,
+    }
+}
+
+fn exec_bittest(x: Option<&Value>, b: Option<&Value>) -> Option<Value> {
+    match (x, b) {
+        (Some(Value::UInt(x)), Some(Value::UInt(b))) => {
+            if *b >= 64 {
+                None
+            } else {
+                Some(Value::Bool((x >> b) & 1 == 1))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn exec_bitset(x: Option<&Value>, b: Option<&Value>, v: Option<&Value>) -> Option<Value> {
+    match (x, b, v) {
+        (Some(Value::UInt(x)), Some(Value::UInt(b)), Some(Value::Bool(v))) => {
+            if *b >= 64 {
+                None
+            } else if *v {
+                Some(Value::UInt(x | (1 << b)))
+            } else {
+                Some(Value::UInt(x & !(1 << b)))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn exec_len(a: Option<&Value>) -> Option<Value> {
+    match a {
+        Some(Value::Text(s)) => Some(Value::UInt(s.chars().count() as u64)),
+        Some(Value::Bytes(b)) => Some(Value::UInt(b.len() as u64)),
+        Some(Value::Array(arr)) => Some(Value::UInt(arr.len() as u64)),
+        Some(Value::Map(map)) => Some(Value::UInt(map.len() as u64)),
+        Some(Value::Sequence(seq)) => seq.remaining().map(|n| Value::UInt(n as u64)),
+        _ => None,
+    }
+}
+
+fn exec_make_array(arg_slots: &[usize], vm: &mut VM) -> Result<Option<Value>, ExecError> {
+    let elems: Vec<Value> = arg_slots
+        .iter()
+        .filter_map(|s| vm.local(*s).cloned())
+        .collect();
+    let arr = HeapVal::new(elems, vm.heap())?;
+    Ok(Some(Value::Array(arr)))
+}
+
+fn exec_make_map(arg_slots: &[usize], vm: &mut VM) -> Result<Option<Value>, ExecError> {
+    if !arg_slots.len().is_multiple_of(2) {
+        return Ok(None);
+    }
+    let map: IndexMap<Value, Value> = arg_slots
+        .chunks(2)
+        .filter_map(|pair| {
+            let k = vm.local(pair[0]).cloned()?;
+            let v = vm.local(pair[1]).cloned()?;
+            Some((k, v))
+        })
+        .collect();
+    let heap_map = HeapVal::new(map, vm.heap())?;
+    Ok(Some(Value::Map(heap_map)))
+}
+
+fn exec_make_seq(arg_slots: &[usize], vm: &mut VM) -> Option<Value> {
+    let inclusive = match vm.local(arg_slots[2]) {
+        Some(Value::Bool(b)) => *b,
+        _ => false,
+    };
+    let seq = match (vm.local(arg_slots[0]), vm.local(arg_slots[1])) {
+        (Some(Value::UInt(start)), Some(Value::UInt(end))) => Some(SeqState::RangeUInt {
+            current: *start,
+            end: *end,
+            inclusive,
+        }),
+        (Some(Value::Int(start)), Some(Value::Int(end))) => Some(SeqState::RangeInt {
+            current: *start,
+            end: *end,
+            inclusive,
+        }),
+        (Some(Value::UInt(start)), Some(Value::Int(end))) => Some(SeqState::RangeInt {
+            current: *start as i64,
+            end: *end,
+            inclusive,
+        }),
+        (Some(Value::Int(start)), Some(Value::UInt(end))) => Some(SeqState::RangeInt {
+            current: *start,
+            end: *end as i64,
+            inclusive,
+        }),
+        _ => None,
+    };
+    // HeapVal::new can fail, but for sequences this is infallible in practice.
+    // Use try_into pattern to avoid changing the return type.
+    seq.and_then(|state| HeapVal::new(state, vm.heap()).ok().map(Value::Sequence))
+}
+
+fn exec_array_seq(arg_slots: &[usize], vm: &mut VM) -> Option<Value> {
+    let start = match vm.local(arg_slots[1]) {
+        Some(Value::UInt(n)) => *n as usize,
+        _ => return None,
+    };
+    let end = match vm.local(arg_slots[2]) {
+        Some(Value::UInt(n)) => *n as usize,
+        _ => return None,
+    };
+    let mutable = match vm.local(arg_slots[3]) {
+        Some(Value::Bool(b)) => *b,
+        _ => false,
+    };
+    match vm.local(arg_slots[0]) {
+        Some(Value::Array(arr)) => {
+            let state = SeqState::ArraySlice {
+                source: arr.clone(),
+                start,
+                end,
+                mutable,
+            };
+            HeapVal::new(state, vm.heap()).ok().map(Value::Sequence)
+        }
+        _ => None,
+    }
+}
+
+fn exec_widen(arg_slots: &[usize], vm: &VM) -> Option<Value> {
+    let target = match vm.local(arg_slots[1]) {
+        Some(Value::UInt(t)) => *t,
+        _ => return None,
+    };
+    let value = vm.local(arg_slots[0]);
+    match (value, target) {
+        (Some(Value::UInt(n)), 2) => {
+            let n = *n;
+            if n > i64::MAX as u64 {
+                None
+            } else {
+                Some(Value::Int(n as i64))
+            }
+        }
+        (Some(Value::Int(n)), 2) => Some(Value::Int(*n)),
+        (Some(Value::UInt(n)), 3) => Float::new(*n as f64).map(Value::Float),
+        (Some(Value::Int(n)), 3) => Float::new(*n as f64).map(Value::Float),
+        (Some(Value::Float(f)), 3) => Some(Value::Float(*f)),
+        _ => None,
+    }
+}
+
+fn exec_cast(arg_slots: &[usize], vm: &VM) -> Option<Value> {
+    let target = match vm.local(arg_slots[1]) {
+        Some(Value::UInt(t)) => *t,
+        _ => return None,
+    };
+    let value = vm.local(arg_slots[0]);
+    match (value, target) {
+        (Some(Value::UInt(n)), 1) => Some(Value::UInt(*n)),
+        (Some(Value::Int(n)), 1) => Some(Value::UInt(*n as u64)),
+        (Some(Value::UInt(n)), 2) => Some(Value::Int(*n as i64)),
+        (Some(Value::Int(n)), 2) => Some(Value::Int(*n)),
+        (Some(Value::UInt(n)), 3) => Float::new(*n as f64).map(Value::Float),
+        (Some(Value::Int(n)), 3) => Float::new(*n as f64).map(Value::Float),
+        (Some(Value::Float(f)), 3) => Some(Value::Float(*f)),
+        _ => None,
+    }
 }
 
 /// Execute a compiled function by index.
@@ -2370,6 +2920,102 @@ mod tests {
             "test",
         );
         assert_eq!(val, Value::UInt(6));
+    }
+
+    // ================================================================
+    // Type cast (as) tests
+    // ================================================================
+
+    #[test]
+    fn test_cast_uint_to_int() {
+        let val = run_expect("fn test() { 42 as Int }", "test");
+        assert_eq!(val, Value::Int(42));
+    }
+
+    #[test]
+    fn test_cast_int_to_uint_reinterpret() {
+        // -1 as UInt should give u64::MAX (bit reinterpret)
+        let val = run_expect("fn test() { -1 as UInt }", "test");
+        assert_eq!(val, Value::UInt(u64::MAX));
+    }
+
+    #[test]
+    fn test_cast_uint_to_int_reinterpret() {
+        // Large UInt wraps to negative Int
+        let val = run_expect(
+            r#"
+            fn test() {
+                let x = 18446744073709551615 as Int;
+                x
+            }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::Int(-1));
+    }
+
+    #[test]
+    fn test_cast_to_float() {
+        let val = run_expect("fn test() { 42 as Float }", "test");
+        assert_eq!(val, Value::Float(crate::exec::Float::new(42.0).unwrap()));
+    }
+
+    #[test]
+    fn test_cast_int_to_float() {
+        let val = run_expect("fn test() { -10 as Float }", "test");
+        assert_eq!(val, Value::Float(crate::exec::Float::new(-10.0).unwrap()));
+    }
+
+    #[test]
+    fn test_cast_identity() {
+        // Same-type cast is identity
+        let val = run_expect("fn test() { 42 as UInt }", "test");
+        assert_eq!(val, Value::UInt(42));
+    }
+
+    #[test]
+    fn test_cast_in_arithmetic() {
+        // Cast then add
+        let val = run_expect(
+            r#"
+            fn test() {
+                let x = 10 as Float;
+                let y = 3 as Float;
+                x + y
+            }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::Float(crate::exec::Float::new(13.0).unwrap()));
+    }
+
+    #[test]
+    fn test_cast_chained() {
+        // UInt → Int → UInt roundtrip
+        let val = run_expect("fn test() { 42 as Int as UInt }", "test");
+        assert_eq!(val, Value::UInt(42));
+    }
+
+    #[test]
+    fn test_cast_precedence() {
+        // x + y as Float should parse as x + (y as Float)
+        // 10 + 5 as Float = 10 + 5.0
+        // With implicit coercion, 10 (UInt) + 5.0 (Float) → 15.0
+        let val = run_expect("fn test() { 10 + 5 as Float }", "test");
+        assert_eq!(val, Value::Float(crate::exec::Float::new(15.0).unwrap()));
+    }
+
+    #[test]
+    fn test_cast_const_fold() {
+        // Constant cast should be folded at compile time
+        let val = run_expect(
+            r#"
+            const X = -1 as UInt;
+            fn test() { X }
+            "#,
+            "test",
+        );
+        assert_eq!(val, Value::UInt(u64::MAX));
     }
 
     #[test]

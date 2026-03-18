@@ -85,6 +85,17 @@ pub enum IntrinsicOp {
     /// eliminate widening operations. Currently implicit inside each
     /// arithmetic op's type dispatch.
     Widen,
+
+    /// Infallible numeric cast (`value as Type`).
+    ///
+    /// `Cast(value, target)` where target is a UInt constant encoding a BaseType:
+    /// - `1` (UInt) — Int→UInt bit reinterpret, UInt identity
+    /// - `2` (Int) — UInt→Int bit reinterpret, Int identity
+    /// - `3` (Float) — UInt→Float or Int→Float widen, Float identity
+    ///
+    /// Unlike Widen (which is compiler-inserted and overflow-checked), Cast is
+    /// user-requested and always succeeds for valid numeric pairs.
+    Cast,
 }
 
 impl IntrinsicOp {
@@ -114,6 +125,8 @@ impl IntrinsicOp {
             Self::Collect => false, // always succeeds (empty seq → empty array)
             // Coercion: UInt→Int can overflow (u64::MAX > i64::MAX)
             Self::Widen => true,
+            // Cast: infallible for valid numeric pairs
+            Self::Cast => false,
         }
     }
 
@@ -162,6 +175,10 @@ impl IntrinsicOp {
                 0 => TypeSet::numeric(), // value to widen
                 _ => TypeSet::uint(),    // target type code
             },
+            Self::Cast => match index {
+                0 => TypeSet::numeric(), // value to cast
+                _ => TypeSet::uint(),    // target type code
+            },
         }
     }
 
@@ -186,6 +203,7 @@ impl IntrinsicOp {
             Self::SeqNext => TypeSet::all(), // element could be any type
             Self::Collect => TypeSet::single(BaseType::Array),
             Self::Widen => TypeSet::numeric(), // result is Int or Float
+            Self::Cast => TypeSet::numeric(),  // result is UInt, Int, or Float
         }
     }
 

@@ -129,7 +129,42 @@ impl<'a> Lowerer<'a> {
             ast::Expression::Assignment { target, op, value } => {
                 self.lower_assignment(target, op, value)
             }
+
+            ast::Expression::Cast { value, target_type } => self.lower_cast(value, target_type),
         }
+    }
+
+    /// Lower a type cast expression (`value as Type`)
+    fn lower_cast(&mut self, value: &ast::Expression, target_type: &ast::Identifier) -> VarId {
+        let val = self.lower_expression(value);
+
+        // Validate target is a castable numeric type
+        let target_code = match target_type.as_ref() {
+            "UInt" => 1u64,  // BaseType::UInt discriminant
+            "Int" => 2u64,   // BaseType::Int discriminant
+            "Float" => 3u64, // BaseType::Float discriminant
+            other => {
+                self.diagnostics.error(
+                    diagnostics::DiagnosticCode::E300_TypeMismatch,
+                    self.current_span,
+                    format!(
+                        "cannot cast to '{}' (valid cast targets: UInt, Int, Float)",
+                        other
+                    ),
+                );
+                // Return undefined — error already emitted
+                let dest = self.new_temp(TypeSet::empty());
+                self.emit(Instruction::Undefined { dest });
+                return dest;
+            }
+        };
+
+        let target = self.new_temp(TypeSet::single(types::BaseType::UInt));
+        self.emit(Instruction::Const {
+            dest: target,
+            value: Literal::UInt(target_code),
+        });
+        self.emit_binary_intrinsic(IntrinsicOp::Cast, val, target)
     }
 
     /// Lower a literal value

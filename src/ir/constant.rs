@@ -93,6 +93,26 @@ impl<'a> Lowerer<'a> {
                 self.const_index_expr(&obj, &key)
             }
 
+            ast::Expression::Cast { value, target_type } => {
+                let val = self.const_eval_expr(value)?;
+                let target = match target_type.as_ref() {
+                    "UInt" => 1u64,
+                    "Int" => 2u64,
+                    "Float" => 3u64,
+                    other => {
+                        return Err(format!(
+                            "cannot cast to '{}' (valid cast targets: UInt, Int, Float)",
+                            other
+                        ));
+                    }
+                };
+                const_eval::eval_intrinsic_const(
+                    crate::ir::IntrinsicOp::Cast,
+                    &[val, ConstValue::UInt(target)],
+                )
+                .ok_or_else(|| "cast failed: incompatible source type".to_string())
+            }
+
             // Control flow and assignment are not allowed in const expressions
             ast::Expression::Block { .. }
             | ast::Expression::If { .. }

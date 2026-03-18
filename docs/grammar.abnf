@@ -103,9 +103,10 @@ expression = match-expr
 ; 9. << >>
 ; 10. + -
 ; 11. * / %
-; 12. Unary: ! - ~
-; 13. @ (bit test)
-; 14. Postfix: . [] ()
+; 12. as (type cast)
+; 13. Unary: ! - ~
+; 14. @ (bit test)
+; 15. Postfix: . [] ()
 
 ; Assignment expression: returns the assigned value (or undefined if lvalue invalid)
 ; Right-associative: a = b = c parses as a = (b = c)
@@ -137,7 +138,15 @@ shift-expr = additive-expr *(("<<" / ">>") additive-expr)
 
 additive-expr = multiplicative-expr *(("+"/"-") multiplicative-expr)
 
-multiplicative-expr = unary-expr *(("*" / "/" / "%") unary-expr)
+multiplicative-expr = cast-expr *(("*" / "/" / "%") cast-expr)
+
+; Type cast: infallible numeric reinterpretation or widening
+; Valid targets: UInt, Int, Float
+; UInt <-> Int is bit reinterpretation, UInt/Int -> Float is widening
+; Examples: x as UInt, -1 as UInt, counter as Float
+cast-expr = unary-expr *("as" cast-type)
+
+cast-type = "UInt" / "Int" / "Float"
 
 unary-expr = [("!" / "-" / "~")] bittest-expr
 
@@ -430,19 +439,21 @@ CR = %x0D                  ; Carriage return
 ;    - No explicit import needed
 ;    - See stdlib_prelude.txt for complete documentation
 ;
-; 15. Type intrinsics (is_, to_) and type patterns:
-;    - is_X(v): returns Bool - COMPILER SUGAR for pattern matching
-;      Lowered to: if let Type(_) = v { true } else { false }
-;      Kept for convenience; internally everything is pattern matching
-;    - to_X(v): returns Value or Missing - type conversion (creates new value)
-;    Examples:
-;    - is_uint(val) - sugar for: if let UInt(_) = val { true } else { false }
-;    - to_uint(val) - returns converted uint value, or missing if can't convert
-;    Type patterns (replace old as_X functions):
-;    - `with UInt(n) = val` - reference binding if val is UInt
-;    - `let UInt(n) = val` - value binding if val is UInt
-;    - `if let UInt(n) = val { }` - conditional value binding
-;    - `if with UInt(n) = val { }` - conditional reference binding
+; 15. Type checking, casting, and type patterns:
+;    - Type TEST (pattern): is this value already a UInt?
+;      UInt(n) in patterns — branches on type, no conversion
+;      if let UInt(n) = val { }  — conditional type test
+;    - Type CAST (as): reinterpret/widen numeric types (infallible)
+;      val as UInt  — bit reinterpret Int→UInt or identity
+;      val as Float — widen UInt/Int→Float or identity
+;      See note 28 for full details
+;    - Type CHECK (is_X): convenience functions, not intrinsics
+;      is_uint(v) — user-defined: match v { UInt(_) => true, _ => false }
+;    - Type patterns:
+;      `with UInt(n) = val` - reference binding if val is UInt
+;      `let UInt(n) = val` - value binding if val is UInt
+;      `if let UInt(n) = val { }` - conditional value binding
+;      `if with UInt(n) = val { }` - conditional reference binding
 ;
 ; 16. Value binding vs Reference binding:
 ;    - `if let x = to_uint(val) { }` - VALUE binding (x is a copy)
@@ -594,7 +605,31 @@ CR = %x0D                  ; Carriage return
 ;      }
 ;    - Type names: UInt, Int, Float, Bool, Text, Bytes, Array, Map
 ;
-; 28. Bit test/set operator (@):
+; 28. Type cast operator (as):
+;    - Syntax: expr as Type
+;    - Infallible numeric reinterpretation or widening
+;    - Valid target types: UInt, Int, Float
+;    - Valid conversions:
+;      UInt as Int   → bit reinterpret (u64::MAX → -1)
+;      Int as UInt   → bit reinterpret (-1 → u64::MAX)
+;      UInt as Float → widen (lossless for small values)
+;      Int as Float  → widen (lossless for small values)
+;      Float as Float, UInt as UInt, Int as Int → identity (no-op)
+;    - Invalid conversions (compile error on target, undefined on source):
+;      x as Bool     → compile error (not a valid cast target)
+;      x as Text     → compile error (use format functions)
+;      "hello" as Int → undefined at runtime (Text is not a numeric source)
+;      true as UInt  → undefined at runtime (Bool is not a numeric source)
+;      Float as Int  → undefined (use floor/round/trunc functions)
+;    - Precedence: between unary and multiplicative
+;      -x as UInt   → (-x) as UInt  (unary binds tighter)
+;      x + y as Float → x + (y as Float)  (cast binds tighter than +)
+;      x as Int as UInt → (x as Int) as UInt  (left-associative)
+;    - Distinct from type patterns:
+;      UInt(x) in patterns → type TEST (is it already a UInt?)
+;      x as UInt → type CAST (reinterpret/widen to UInt)
+;
+; 29. Bit test/set operator (@):
 ;    - Syntax: X @ B where X is a UInt and B is a UInt bit position
 ;    - As rvalue: returns true if bit B is set in X, false if clear
 ;    - As lvalue: sets bit B if assigned true, clears if assigned false

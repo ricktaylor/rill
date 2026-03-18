@@ -274,8 +274,11 @@ fn expression<'a>() -> BoxedParser<'a, Expression> {
         // Unary prefix operators
         let unary = unary_expr(bittest);
 
+        // Type cast: expr as Type (between unary and binary)
+        let cast = cast_expr(unary);
+
         // Binary operators with precedence
-        let binary = binary_expr(unary);
+        let binary = binary_expr(cast);
 
         // Assignment expression (lowest precedence, right-associative)
         assign_expr(binary, expr_boxed)
@@ -478,7 +481,25 @@ fn unary_expr<'a>(bittest: BoxedParser<'a, Expression>) -> BoxedParser<'a, Expre
         .boxed()
 }
 
-fn binary_expr<'a>(unary: BoxedParser<'a, Expression>) -> BoxedParser<'a, Expression> {
+fn cast_expr<'a>(unary: BoxedParser<'a, Expression>) -> BoxedParser<'a, Expression> {
+    // Type cast: expr as Type
+    // Uses text::keyword to match "as" followed by a word boundary,
+    // then parses a type name identifier.
+    let cast_target = text::keyword("as")
+        .padded_by(whitespace())
+        .ignore_then(ident());
+
+    unary
+        .foldl(cast_target.repeated(), |lhs, target_type| {
+            Expression::Cast {
+                value: Box::new(lhs),
+                target_type,
+            }
+        })
+        .boxed()
+}
+
+fn binary_expr<'a>(atom: BoxedParser<'a, Expression>) -> BoxedParser<'a, Expression> {
     // Multiplicative
     let mult_op = choice((
         just('*').to(BinaryOperator::Multiply),
@@ -488,9 +509,9 @@ fn binary_expr<'a>(unary: BoxedParser<'a, Expression>) -> BoxedParser<'a, Expres
     .padded_by(whitespace())
     .boxed();
 
-    let multiplicative = unary
+    let multiplicative = atom
         .clone()
-        .foldl(mult_op.then(unary).repeated(), |l, (op, r)| {
+        .foldl(mult_op.then(atom).repeated(), |l, (op, r)| {
             Expression::BinaryOp {
                 left: Box::new(l),
                 op,
@@ -1537,6 +1558,60 @@ mod tests {
         assert!(try_parse_expr("a == b").is_ok());
         assert!(try_parse_expr("!x").is_ok());
         assert!(try_parse_expr("-x").is_ok());
+    }
+
+    #[test]
+    fn test_parse_cast() {
+        // Basic cast expressions
+        assert!(try_parse_expr("x as UInt").is_ok());
+        assert!(try_parse_expr("x as Int").is_ok());
+        assert!(try_parse_expr("x as Float").is_ok());
+
+        // Cast with sub-expressions
+        assert!(try_parse_expr("-1 as UInt").is_ok());
+        assert!(try_parse_expr("(a + b) as Float").is_ok());
+        assert!(try_parse_expr("arr[0] as Int").is_ok());
+
+        // Chained casts
+        assert!(try_parse_expr("x as Int as UInt").is_ok());
+
+        // Cast in larger expressions
+        assert!(try_parse_expr("x as Float + 1.0").is_ok());
+        assert!(try_parse_expr("x + y as Float").is_ok());
+    }
+
+    #[test]
+    fn test_parse_cast_ast_structure() {
+        // Verify AST node is correct
+        let result = try_parse_expr("x as Int").unwrap();
+        match result {
+            Expression::Cast { value, target_type } => {
+                assert!(matches!(*value, Expression::Variable(_)));
+                assert_eq!(target_type, Identifier("Int".to_string()));
+            }
+            _ => panic!("Expected Cast expression"),
+        }
+
+        // Verify precedence: x + y as Float → x + (y as Float)
+        let result = try_parse_expr("x + y as Float").unwrap();
+        match result {
+            Expression::BinaryOp { left, op, right } => {
+                assert!(matches!(*left, Expression::Variable(_)));
+                assert!(matches!(op, BinaryOperator::Add));
+                assert!(matches!(*right, Expression::Cast { .. }));
+            }
+            _ => panic!("Expected BinaryOp with Cast on right"),
+        }
+
+        // Verify precedence: -x as UInt → (-x) as UInt
+        let result = try_parse_expr("-x as UInt").unwrap();
+        match result {
+            Expression::Cast { value, target_type } => {
+                assert!(matches!(*value, Expression::UnaryOp { .. }));
+                assert_eq!(target_type, Identifier("UInt".to_string()));
+            }
+            _ => panic!("Expected Cast wrapping UnaryOp"),
+        }
     }
 
     #[test]

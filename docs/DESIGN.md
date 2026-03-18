@@ -649,6 +649,8 @@ without registry lookup. Each intrinsic carries metadata methods:
 | Bit access | `@` | `BitTest` (read), `BitSet` (write) | Yes (OOB) |
 | Collection | `len(x)` `[a,b]` `{k:v}` | `Len`, `MakeArray`, `MakeMap` | Yes / No / Yes |
 | Sequence | `start..end` `..rest` | `MakeSeq`, `ArraySeq` | No |
+| Coercion | (implicit) | `Widen` | Yes (overflow) |
+| Cast | `x as UInt` | `Cast` | No |
 
 Short-circuit operators (`&&`, `||`) lower to control flow (If + Phi), not a
 single `Instruction::Intrinsic`. All other operators lower to
@@ -669,6 +671,26 @@ lattice: `UInt + UInt → UInt`, `UInt + Int → Int`, `anything + Float → Flo
 whether any intrinsic's operand types have zero intersection with the required
 types. If so, the result is guaranteed undefined — almost certainly a bug.
 Example: `"hello" + 5` warns because `Add` requires numeric but got Text.
+
+**Type cast operator (`as`):** Explicit infallible numeric cast. Distinct from
+both type patterns (which test types) and the compiler-inserted `Widen` (which
+is overflow-checked). `Cast` is user-requested and always succeeds for valid
+numeric pairs:
+
+| Source | `as UInt` | `as Int` | `as Float` |
+|--------|-----------|----------|------------|
+| UInt | identity | bit reinterpret | widen |
+| Int | bit reinterpret | identity | widen |
+| Float | — | — | identity |
+
+- `as Bool`, `as Text`, etc. are **compile-time errors** (E300)
+- Float → Int/UInt is not supported — use `floor()`, `round()`, `trunc()`
+- Bool/Text/Bytes/Array/Map sources produce undefined at runtime
+- Precedence: between unary and multiplicative — `-x as UInt` is `(-x) as UInt`
+
+Lowering: `x as UInt` → `Intrinsic(Cast, [x, Const(1)])` where the target is
+encoded as a UInt constant matching the `BaseType` discriminant (1=UInt, 2=Int,
+3=Float). Follows the same encoding convention as `Widen`.
 
 ### Control Flow Primitives
 
@@ -931,6 +953,27 @@ x @ 128 = compute();     // compute() NOT called if bit 128 is invalid
 This is consistent with `&&` and `||` short-circuit behavior and avoids wasted
 computation when assigning to invalid locations. The generated IR uses Guard
 terminators to check lvalue validity before evaluating the rhs.
+
+### Type Cast (`as`)
+
+The `as` operator performs infallible numeric reinterpretation or widening:
+
+```rill
+let unsigned = -1 as UInt;       // bit reinterpret: 2^64-1
+let signed = max_uint as Int;    // bit reinterpret: -1
+let precise = counter as Float;  // widen to float
+```
+
+Key properties:
+- **Infallible** for valid numeric pairs — always produces a value
+- **No implicit truncation** — Float→Int requires explicit `floor()`/`round()`/`trunc()`
+- **Compile-time validated** — invalid targets like `as Bool` or `as Text` are E300 errors
+- **Distinct from type patterns** — `UInt(x)` tests if a value *is* UInt; `x as UInt` *makes* it UInt
+
+Precedence is between unary operators and multiplicative, so:
+- `-x as UInt` parses as `(-x) as UInt`
+- `x + y as Float` parses as `x + (y as Float)`
+- `x as Int as UInt` chains left-to-right: `(x as Int) as UInt`
 
 ### Semicolons and Blocks
 
@@ -1909,6 +1952,7 @@ to `Instruction::Intrinsic { op: IntrinsicOp, args }`. Some expand to control fl
 | `with x = arr[i]` | `MakeRef(arr, Some(i))` | Reference binding |
 | `with x = y` | `MakeRef(y, None)` | Reference binding |
 | `x = v` (ref-backed) | `WriteRef(ref_var, v)` + Copy + rebind | Write-back through reference |
+| `x as UInt` | `Intrinsic(Cast, [x, Const(1)])` | Single instruction |
 
 ### Reflexive Comparison Operators
 
