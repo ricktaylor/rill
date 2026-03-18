@@ -15,7 +15,7 @@ Architecture: Source → Parser (chumsky) → AST → Lower (operators → Intri
 - Heap tracking system (CoW HeapVal, capacity-based, limit-checked)
 - Builtin registry for host-provided extern functions — `src/builtins.rs`
 - IntrinsicOp: all operators, len, collection construction are intrinsics (not builtins)
-  Runtime in `compile.rs::exec_intrinsic`, const-eval in `ir/const_eval.rs::eval_intrinsic_const`
+  Runtime in `compile/exec.rs`, const-eval in `ir/const_eval.rs::eval_intrinsic_const`
 - Diagnostics system with source spans — `src/diagnostics.rs`
 - IR lowering (AST → SSA IR) with loop-carried phis — `src/ir/`
 - Optimizer passes — const fold, definedness, guard elim, CFG simplify, type refinement
@@ -25,7 +25,7 @@ Architecture: Source → Parser (chumsky) → AST → Lower (operators → Intri
   that will always produce undefined (e.g. `"hello" + 5`, `!42`, `len(true)`)
 - Definedness diagnostics (E200/E201): warns on use of undefined/maybe-undefined values
   with provenance tracking (traces back to originating call/index operation)
-- Closure-threaded compiler with link phase — `src/compile.rs`
+- Closure-threaded compiler with link phase — `src/compile/`
 - Flat pc-based executor — 123 end-to-end tests passing
 - Sequence type (lazy ranges, zero-copy array slices with mutable flag)
 - For-loop pair binding: `for k, v in map`
@@ -521,7 +521,12 @@ with just `v3 = Intrinsic(Add, [v1, v2])` — both args provably UInt, no guards
 ```
 src/
   lib.rs              — Public API: compile(), Program::call(), re-exports
-  compile.rs          — Link phase, closure compilation, type/definedness-specialized dispatch, phi elimination, flat pc executor
+  compile/
+    mod.rs            — Types, public API (compile_program, execute), link phase, compile_function/block/instruction
+    terminator.rs     — compile_terminator, compile_match, match predicate compilation
+    specialize.rs     — try_specialize_binary/cast/widen, compile_intrinsic_dispatch, type-specialized closures
+    exec.rs           — Per-op functions (exec_add etc.), index_value
+    tests.rs          — Unit + end-to-end tests
   ast.rs              — AST node types, Span, Spanned
   types.rs            — BaseType, TypeSet
   parser.rs           — Chumsky-based parser -> AST
