@@ -557,10 +557,12 @@ fn compile_instruction(
             // Resolve via link map (all references verified at link time)
             match link_map.get(&func_name).cloned() {
                 Some(CallTarget::Builtin(f)) => Box::new(move |vm: &mut VM, _prog| {
-                    let arg_values: Vec<Value> = arg_slots
-                        .iter()
-                        .filter_map(|(s, _)| vm.local(*s).cloned())
-                        .collect();
+                    let mut arg_values: Vec<Value> = Vec::with_capacity(arg_slots.len());
+                    for (s, _) in &arg_slots {
+                        if let Some(v) = vm.local(*s).cloned() {
+                            arg_values.push(v);
+                        }
+                    }
                     match f(vm, &arg_values)? {
                         ExecResult::Return(Some(val)) => vm.set_local(d, val),
                         ExecResult::Return(None) => vm.set_local_uninit(d),
@@ -570,15 +572,41 @@ fn compile_instruction(
                 }),
                 Some(CallTarget::UserFunction(func_idx)) => {
                     Box::new(move |vm: &mut VM, prog: &CompiledProgram| {
-                        let arg_values: Vec<(Value, bool)> = arg_slots
-                            .iter()
-                            .filter_map(|(s, by_ref)| vm.local(*s).cloned().map(|v| (v, *by_ref)))
-                            .collect();
-                        match execute_function(prog, vm, func_idx, &arg_values)? {
-                            Action::Return(Some(val)) => vm.set_local(d, val),
-                            Action::Return(None) => vm.set_local_uninit(d),
-                            Action::Exit(val) => return Ok(Action::Exit(val)),
-                            Action::Continue | Action::NextBlock(_) => unreachable!(),
+                        let func = &prog.functions[func_idx];
+
+                        // Save caller's bp, then set up callee frame
+                        let caller_bp = vm.bp();
+                        vm.call(func.frame_size, None)?;
+
+                        // Copy args directly from caller's slots into callee's param slots.
+                        // No intermediate Vec allocation.
+                        for (i, (s, _by_ref)) in arg_slots.iter().enumerate() {
+                            if i < func.param_count
+                                && let Some(val) = vm.get(caller_bp + s).cloned() {
+                                    vm.set_local(i + 1, val);
+                                }
+                        }
+
+                        // Execute callee: inline loop (same as execute_function)
+                        let mut pc = func.block_starts[func.entry];
+                        let result = loop {
+                            match (func.steps[pc])(vm, prog)? {
+                                Action::Continue => pc += 1,
+                                Action::NextBlock(idx) => pc = func.block_starts[idx],
+                                Action::Return(val) => {
+                                    vm.ret();
+                                    break val;
+                                }
+                                Action::Exit(val) => {
+                                    vm.ret();
+                                    return Ok(Action::Exit(val));
+                                }
+                            }
+                        };
+
+                        match result {
+                            Some(val) => vm.set_local(d, val),
+                            None => vm.set_local_uninit(d),
                         }
                         Ok(Action::Continue)
                     })
