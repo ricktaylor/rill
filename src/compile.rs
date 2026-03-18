@@ -35,7 +35,7 @@ use crate::ir::{
     BasicBlock, BlockId, Function, Instruction, IntrinsicOp, IrProgram, Literal, MatchPattern,
     Terminator, VarId,
 };
-use crate::types::BaseType;
+use crate::types::{BaseType, TypeSet};
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 
@@ -169,8 +169,13 @@ pub fn compile_program(
 /// Resolution of a function call — determined at link time.
 #[derive(Clone)]
 enum CallTarget {
-    /// Native builtin — function pointer resolved at compile time
-    Builtin(crate::builtins::BuiltinFn),
+    /// Native builtin — function pointer resolved at compile time.
+    /// Includes optional type-specialized variants for monomorphic dispatch.
+    Builtin {
+        generic: crate::builtins::BuiltinFn,
+        /// Variants: (param TypeSets, return TypeSet, specialized fn pointer)
+        variants: Vec<(Vec<TypeSet>, TypeSet, crate::builtins::BuiltinFn)>,
+    },
     /// User-defined function — index into CompiledProgram.functions
     UserFunction(usize),
 }
@@ -191,7 +196,24 @@ fn link_functions(
     // Pre-populate with all builtins
     for (name, def) in builtins.iter() {
         if let BuiltinImpl::Native(f) = &def.implementation {
-            link_map.insert(name.clone(), CallTarget::Builtin(*f));
+            let variants: Vec<(Vec<TypeSet>, TypeSet, crate::builtins::BuiltinFn)> = def
+                .variants
+                .iter()
+                .filter_map(|v| {
+                    if let BuiltinImpl::Native(vf) = &v.implementation {
+                        Some((v.param_types.clone(), v.returns, *vf))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            link_map.insert(
+                name.clone(),
+                CallTarget::Builtin {
+                    generic: *f,
+                    variants,
+                },
+            );
         }
     }
 
@@ -672,7 +694,32 @@ fn compile_instruction(
 
             // Resolve via link map (all references verified at link time)
             match link_map.get(&func_name).cloned() {
-                Some(CallTarget::Builtin(f)) => {
+                Some(CallTarget::Builtin { generic, variants }) => {
+                    // Try to select a type-specialized variant at compile time
+                    let f = if !variants.is_empty() {
+                        let arg_types: Vec<TypeSet> = args
+                            .iter()
+                            .map(|a| {
+                                types
+                                    .get_at_exit(block_id, a.value)
+                                    .copied()
+                                    .unwrap_or(TypeSet::all())
+                            })
+                            .collect();
+                        variants
+                            .iter()
+                            .find(|(param_types, _, _)| {
+                                param_types.len() == arg_types.len()
+                                    && param_types.iter().zip(&arg_types).all(|(spec, actual)| {
+                                        !actual.is_empty() && actual.difference(spec).is_empty()
+                                    })
+                            })
+                            .map(|(_, _, vf)| *vf)
+                            .unwrap_or(generic)
+                    } else {
+                        generic
+                    };
+
                     let argc = arg_slots.len();
                     Box::new(move |vm: &mut VM, _prog| {
                         // Set up frame for builtin (same convention as user functions)
@@ -3666,5 +3713,55 @@ mod tests {
             "test",
         );
         assert_eq!(val, Value::UInt(15));
+    }
+
+    // ================================================================
+    // Builtin monomorphism (variant selection)
+    // ================================================================
+
+    #[test]
+    fn test_builtin_variant_selection() {
+        // Register a builtin with type-specific variants.
+        // The generic returns 0, uint variant returns 1, int variant returns 2.
+        fn generic(_vm: &mut VM, _argc: usize) -> Result<ExecResult, ExecError> {
+            Ok(ExecResult::Return(Some(Value::UInt(0))))
+        }
+        fn uint_variant(_vm: &mut VM, _argc: usize) -> Result<ExecResult, ExecError> {
+            Ok(ExecResult::Return(Some(Value::UInt(1))))
+        }
+        fn int_variant(_vm: &mut VM, _argc: usize) -> Result<ExecResult, ExecError> {
+            Ok(ExecResult::Return(Some(Value::UInt(2))))
+        }
+
+        use crate::builtins::{BuiltinDef, BuiltinRegistry};
+        use crate::types::TypeSet;
+
+        let mut builtins = BuiltinRegistry::new();
+        builtins.register(
+            BuiltinDef::new("classify", generic)
+                .param("x", TypeSet::numeric())
+                .returns(TypeSet::uint())
+                .pure_infallible()
+                .variant(&[TypeSet::uint()], TypeSet::uint(), uint_variant)
+                .variant(&[TypeSet::int()], TypeSet::uint(), int_variant),
+        );
+
+        // Compile with the custom registry
+        let source = r#"
+            fn test() {
+                let a = classify(42);
+                a
+            }
+        "#;
+        let (program, _diagnostics) = crate::compile(source, &builtins).expect("should compile");
+
+        let mut vm = VM::new();
+        let result = program
+            .call(&mut vm, "test", 0)
+            .expect("should not error")
+            .expect("should return a value");
+
+        // 42 is UInt → uint_variant selected → returns 1
+        assert_eq!(result, Value::UInt(1));
     }
 }

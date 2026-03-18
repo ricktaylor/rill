@@ -363,14 +363,39 @@ impl BuiltinImpl {
 // Builtin Definition
 // ============================================================================
 
+/// A type-specialized variant of a builtin function.
+///
+/// When the compiler proves all arguments match the variant's param types
+/// at compile time, it selects this variant instead of the generic implementation.
+/// The variant's param guards are tighter, so the optimizer eliminates them.
+pub struct BuiltinVariant {
+    /// Required param types for this variant (positional, must match exactly)
+    pub param_types: Vec<TypeSet>,
+    /// Return type for this variant (may be tighter than the generic)
+    pub returns: TypeSet,
+    /// Type-specialized implementation
+    pub implementation: BuiltinImpl,
+}
+
+impl std::fmt::Debug for BuiltinVariant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BuiltinVariant")
+            .field("param_types", &self.param_types)
+            .field("returns", &self.returns)
+            .finish()
+    }
+}
+
 /// Complete definition of a builtin function
 pub struct BuiltinDef {
     /// Function name
     pub name: String,
     /// Compiler metadata
     pub meta: BuiltinMeta,
-    /// Runtime implementation
+    /// Runtime implementation (generic fallback)
     pub implementation: BuiltinImpl,
+    /// Type-specialized variants (selected when arg types are statically known)
+    pub variants: Vec<BuiltinVariant>,
 }
 
 impl std::fmt::Debug for BuiltinDef {
@@ -379,6 +404,7 @@ impl std::fmt::Debug for BuiltinDef {
             .field("name", &self.name)
             .field("meta", &self.meta)
             .field("implementation", &self.implementation)
+            .field("variants", &self.variants)
             .finish()
     }
 }
@@ -391,6 +417,7 @@ impl BuiltinDef {
             name: name.into(),
             meta: BuiltinMeta::returning(TypeSet::all()),
             implementation: BuiltinImpl::Native(f),
+            variants: Vec::new(),
         }
     }
 
@@ -404,6 +431,7 @@ impl BuiltinDef {
             name: name.into(),
             meta: BuiltinMeta::returning(TypeSet::all()),
             implementation: BuiltinImpl::Closure(Box::new(f)),
+            variants: Vec::new(),
         }
     }
 
@@ -485,6 +513,55 @@ impl BuiltinDef {
     pub fn purity(mut self, purity: Purity) -> Self {
         self.meta.purity = purity;
         self
+    }
+
+    /// Add a type-specialized variant with a native function.
+    ///
+    /// When the compiler proves all arguments match `param_types` at compile
+    /// time, this variant is selected instead of the generic implementation.
+    ///
+    /// ```ignore
+    /// BuiltinDef::new("sqrt", sqrt_generic)
+    ///     .param("x", TypeSet::numeric())
+    ///     .returns(TypeSet::numeric())
+    ///     .variant(&[TypeSet::uint()], TypeSet::uint(), sqrt_uint)
+    ///     .variant(&[TypeSet::single(Float)], TypeSet::single(Float), sqrt_float)
+    /// ```
+    pub fn variant(mut self, param_types: &[TypeSet], returns: TypeSet, f: BuiltinFn) -> Self {
+        self.variants.push(BuiltinVariant {
+            param_types: param_types.to_vec(),
+            returns,
+            implementation: BuiltinImpl::Native(f),
+        });
+        self
+    }
+
+    /// Add a type-specialized variant with a closure.
+    pub fn variant_closure<F>(mut self, param_types: &[TypeSet], returns: TypeSet, f: F) -> Self
+    where
+        F: Fn(&mut VM, usize) -> Result<ExecResult, ExecError> + Send + Sync + 'static,
+    {
+        self.variants.push(BuiltinVariant {
+            param_types: param_types.to_vec(),
+            returns,
+            implementation: BuiltinImpl::Closure(Box::new(f)),
+        });
+        self
+    }
+
+    /// Find the best matching variant for the given argument types.
+    ///
+    /// Returns the variant whose param_types all match (each arg TypeSet is a
+    /// subset of or equal to the variant's param TypeSet). Returns None if no
+    /// variant matches or arg types are too broad.
+    pub fn select_variant(&self, arg_types: &[TypeSet]) -> Option<&BuiltinVariant> {
+        self.variants.iter().find(|v| {
+            v.param_types.len() == arg_types.len()
+                && v.param_types
+                    .iter()
+                    .zip(arg_types)
+                    .all(|(spec, actual)| !actual.is_empty() && actual.difference(spec).is_empty())
+        })
     }
 }
 
@@ -688,5 +765,52 @@ mod tests {
 
         let def = registry.get("foo").unwrap();
         assert_eq!(def.name, "foo");
+    }
+
+    #[test]
+    fn test_variant_selection() {
+        fn generic(_vm: &mut VM, _argc: usize) -> Result<ExecResult, ExecError> {
+            Ok(ExecResult::Return(Some(Value::UInt(0))))
+        }
+        fn uint_variant(_vm: &mut VM, _argc: usize) -> Result<ExecResult, ExecError> {
+            Ok(ExecResult::Return(Some(Value::UInt(1))))
+        }
+        fn float_variant(_vm: &mut VM, _argc: usize) -> Result<ExecResult, ExecError> {
+            Ok(ExecResult::Return(Some(Value::UInt(2))))
+        }
+
+        let def = BuiltinDef::new("sqrt", generic)
+            .param("x", TypeSet::numeric())
+            .returns(TypeSet::numeric())
+            .variant(&[TypeSet::uint()], TypeSet::uint(), uint_variant)
+            .variant(
+                &[TypeSet::single(crate::types::BaseType::Float)],
+                TypeSet::single(crate::types::BaseType::Float),
+                float_variant,
+            );
+
+        assert_eq!(def.variants.len(), 2);
+
+        // UInt arg → selects uint_variant
+        let v = def.select_variant(&[TypeSet::uint()]);
+        assert!(v.is_some());
+        assert!(v.unwrap().returns.contains(crate::types::BaseType::UInt));
+
+        // Float arg → selects float_variant
+        let v = def.select_variant(&[TypeSet::single(crate::types::BaseType::Float)]);
+        assert!(v.is_some());
+        assert!(v.unwrap().returns.contains(crate::types::BaseType::Float));
+
+        // Numeric (union) → no variant matches (too broad)
+        let v = def.select_variant(&[TypeSet::numeric()]);
+        assert!(v.is_none());
+
+        // All types → no variant matches
+        let v = def.select_variant(&[TypeSet::all()]);
+        assert!(v.is_none());
+
+        // Wrong arity → no match
+        let v = def.select_variant(&[TypeSet::uint(), TypeSet::uint()]);
+        assert!(v.is_none());
     }
 }

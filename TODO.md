@@ -360,6 +360,12 @@ with just `v3 = Intrinsic(Add, [v1, v2])` — both args provably UInt, no guards
       eliminates guards when types are statically known (dead arm elimination).
       Builtins can trust their inputs — no internal type checking needed.
 
+- [x] **Builtin monomorphism** (`BuiltinVariant` in builtins.rs) — builtins can
+      register type-specialized variants via `.variant(param_types, returns, fn)`.
+      At compile time, if type analysis proves arg types match a variant, the
+      compiler selects the specialized fn pointer directly. Generic fallback used
+      when types are unknown. Zero runtime type dispatch for specialized calls.
+
 - [ ] **Common Subexpression Elimination (CSE)** — reuse results of identical pure
       operations. Purity checking via `IntrinsicOp::is_fallible()` and
       `BuiltinMeta.purity`.

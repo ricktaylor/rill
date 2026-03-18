@@ -2126,6 +2126,58 @@ enum Purity {
 The optimizer uses `purity.may_return_undefined()` for definedness analysis.
 Intrinsics use `IntrinsicOp::is_fallible()` directly instead.
 
+### Param Type Guards
+
+When a builtin declares `ParamSpec.type_sig` constraints, the compiler inserts
+Match guards before the call during lowering:
+
+```
+// fn encode(data: Bytes) → result
+// Lowered with guard:
+Match(data_arg, [(Type(Bytes), call_bb)], default: skip_bb)
+
+call_bb:
+  result = Call("encode", [data_arg])   // data_arg proven Bytes
+  Jump(join)
+
+skip_bb:
+  result = Undefined                     // type mismatch → skip call
+  Jump(join)
+
+join:
+  Phi(result)
+```
+
+This means builtins can trust their inputs — no internal type checking needed.
+The guards integrate with the existing optimizer:
+
+- **Type refinement**: narrows arg type in the call block (existing Match refinement)
+- **Definedness**: arg is Defined in call block (existing Match scrutinee refinement)
+- **Dead arm elimination**: collapses guard to Jump when type is statically known
+- **Interprocedural analysis**: sees narrowed types at call sites automatically
+
+### Type-Specialized Variants (Builtin Monomorphism)
+
+Builtins can register type-specialized implementations that the compiler
+selects at compile time based on argument types:
+
+```rust
+BuiltinDef::new("sqrt", sqrt_generic)
+    .param("x", TypeSet::numeric())
+    .returns(TypeSet::numeric())
+    .variant(&[TypeSet::uint()], TypeSet::uint(), sqrt_uint)
+    .variant(&[TypeSet::single(Float)], TypeSet::single(Float), sqrt_float)
+```
+
+When type analysis proves the argument is `{UInt}`, the compiler emits
+`Call(sqrt_uint)` — the generic implementation and its internal type dispatch
+are bypassed entirely. When types are unknown, the generic implementation
+is used as a fallback.
+
+Variant selection uses subset matching: `actual ⊆ spec` for each parameter.
+The compiler resolves this at compile time in `compile_instruction` — zero
+runtime overhead for the variant selection itself.
+
 ### Example Registration
 
 ```rust
