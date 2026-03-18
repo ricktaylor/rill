@@ -15,6 +15,7 @@
 mod cast_elision;
 mod coercion;
 mod const_fold;
+mod copy_prop;
 mod definedness;
 mod guard_elim;
 mod ref_elision;
@@ -23,6 +24,7 @@ mod type_refinement;
 pub use cast_elision::elide_identity_casts;
 pub use coercion::{elide_coercions, insert_coercions};
 pub use const_fold::fold_constants;
+pub use copy_prop::propagate_copies;
 pub use definedness::{Definedness, DefinednessAnalysis, analyze_definedness, check_definedness};
 pub use guard_elim::{eliminate_guards, simplify_cfg};
 pub use ref_elision::elide_refs;
@@ -30,7 +32,8 @@ pub use type_refinement::{TypeAnalysis, analyze_types};
 
 // Import IR types from parent module
 use super::{
-    BlockId, CallArg, Function, FunctionRef, Instruction, IntrinsicOp, IrProgram, Terminator, VarId,
+    BlockId, CallArg, Function, FunctionRef, Instruction, IntrinsicOp, IrProgram, Literal,
+    MatchPattern, Terminator, VarId,
 };
 
 // Import builtins for metadata lookup
@@ -65,6 +68,7 @@ pub fn optimize_function(
     let mut first_iteration = true;
     loop {
         let folded = fold_constants(function, builtins, diagnostics);
+        let copies = propagate_copies(function);
         let refs = elide_refs(function);
         let coerce = elide_coercions(function);
 
@@ -80,7 +84,7 @@ pub fn optimize_function(
         let guards = eliminate_guards(function, &definedness);
         let blocks = simplify_cfg(function);
 
-        if folded + refs + coerce + guards + blocks == 0 {
+        if folded + copies + refs + coerce + guards + blocks == 0 {
             break;
         }
     }
@@ -109,16 +113,22 @@ pub fn optimize_function(
     // in the fixpoint re-run below.
     let condition_folds = fold_non_bool_conditions(function, &types);
 
+    // Prune Match arms where the scrutinee's type can never match the pattern.
+    // A Match with zero surviving arms → Jump(default).
+    // A Match with one surviving arm whose type covers the scrutinee → Jump(arm).
+    let dead_arms = eliminate_dead_match_arms(function, &types);
+
     // If any Phase 2 pass changed the IR, re-run Phase 1 fixpoint.
-    if coercions + cast_elisions + condition_folds > 0 {
+    if coercions + cast_elisions + condition_folds + dead_arms > 0 {
         loop {
             let folded = fold_constants(function, builtins, diagnostics);
+            let copies = propagate_copies(function);
             let refs = elide_refs(function);
             let coerce = elide_coercions(function);
             let definedness = analyze_definedness(function, Some(builtins));
             let guards = eliminate_guards(function, &definedness);
             let blocks = simplify_cfg(function);
-            if folded + refs + coerce + guards + blocks == 0 {
+            if folded + copies + refs + coerce + guards + blocks == 0 {
                 break;
             }
         }
@@ -219,6 +229,108 @@ fn fold_non_bool_conditions(
     changes
 }
 
+/// Eliminate Match arms that can never match based on type analysis.
+///
+/// For each arm, check if the scrutinee's TypeSet intersects the arm's pattern type.
+/// Dead arms are removed. If no arms survive, the Match becomes Jump(default).
+/// If one arm survives and the scrutinee's type is fully covered by that arm,
+/// the Match becomes Jump(arm_target).
+fn eliminate_dead_match_arms(
+    function: &mut Function,
+    types: &type_refinement::TypeAnalysis,
+) -> usize {
+    let mut changes = 0;
+
+    for block in &mut function.blocks {
+        let (value, arms, default, span) = match &block.terminator {
+            Terminator::Match {
+                value,
+                arms,
+                default,
+                span,
+            } => (*value, arms.clone(), *default, *span),
+            _ => continue,
+        };
+
+        let scrutinee_type = match types.get_at_exit(block.id, value) {
+            Some(ts) if !ts.is_empty() => *ts,
+            _ => continue, // unknown type — can't prune
+        };
+
+        let original_count = arms.len();
+
+        // Filter to surviving arms
+        let surviving: Vec<(MatchPattern, BlockId)> = arms
+            .into_iter()
+            .filter(|(pattern, _)| pattern_can_match(&scrutinee_type, pattern))
+            .collect();
+
+        if surviving.len() == original_count {
+            continue; // nothing pruned
+        }
+
+        if surviving.is_empty() {
+            // No arms can match → Jump to default
+            block.terminator = Terminator::Jump { target: default };
+            changes += 1;
+        } else if surviving.len() == 1 && pattern_covers_type(&scrutinee_type, &surviving[0].0) {
+            // One arm fully covers the scrutinee type → Jump to that arm
+            block.terminator = Terminator::Jump {
+                target: surviving[0].1,
+            };
+            changes += 1;
+        } else {
+            // Reduced arms — rebuild the Match
+            block.terminator = Terminator::Match {
+                value,
+                arms: surviving,
+                default,
+                span,
+            };
+            changes += 1;
+        }
+    }
+
+    changes
+}
+
+/// Can this pattern ever match a value from the given TypeSet?
+fn pattern_can_match(type_set: &crate::types::TypeSet, pattern: &MatchPattern) -> bool {
+    match pattern {
+        MatchPattern::Type(ty) => type_set.contains(*ty),
+        MatchPattern::Literal(lit) => {
+            let lit_type = match lit {
+                Literal::Bool(_) => crate::types::BaseType::Bool,
+                Literal::UInt(_) => crate::types::BaseType::UInt,
+                Literal::Int(_) => crate::types::BaseType::Int,
+                Literal::Float(_) => crate::types::BaseType::Float,
+                Literal::Text(_) => crate::types::BaseType::Text,
+                Literal::Bytes(_) => crate::types::BaseType::Bytes,
+            };
+            type_set.contains(lit_type)
+        }
+        MatchPattern::Array(_) | MatchPattern::ArrayMin(_) => {
+            type_set.contains(crate::types::BaseType::Array)
+        }
+    }
+}
+
+/// Does this pattern fully cover the scrutinee's TypeSet?
+/// True when the scrutinee is a single type and the pattern matches that type.
+fn pattern_covers_type(type_set: &crate::types::TypeSet, pattern: &MatchPattern) -> bool {
+    if !type_set.is_single() {
+        return false;
+    }
+    match pattern {
+        MatchPattern::Type(ty) => type_set.contains(*ty),
+        MatchPattern::Array(_) | MatchPattern::ArrayMin(_) => {
+            type_set.contains(crate::types::BaseType::Array)
+        }
+        // Literal match doesn't cover the full type (other values possible)
+        MatchPattern::Literal(_) => false,
+    }
+}
+
 /// Warn when an If/While condition is provably not Bool.
 ///
 /// Rill has strict boolean typing — no truthiness. A non-Bool condition
@@ -256,5 +368,237 @@ fn check_condition_types(
 
 #[cfg(test)]
 mod tests {
-    // Integration tests for the full pipeline will go here
+    use super::*;
+    use crate::ast;
+    use crate::ir::{BasicBlock, Literal, Var};
+    use crate::types::TypeSet;
+
+    fn var(id: u32) -> VarId {
+        VarId(id)
+    }
+    fn block(id: u32) -> BlockId {
+        BlockId(id)
+    }
+    fn si(inst: Instruction) -> ast::Spanned<Instruction> {
+        ast::Spanned::new(inst, ast::Span::default())
+    }
+    fn make_function(blocks: Vec<BasicBlock>, locals: Vec<Var>) -> Function {
+        Function {
+            name: ast::Identifier("test".into()),
+            params: vec![],
+            rest_param: None,
+            blocks,
+            locals,
+            entry_block: BlockId(0),
+        }
+    }
+
+    // ================================================================
+    // Dead Match Arm Elimination
+    // ================================================================
+
+    #[test]
+    fn test_dead_arm_all_pruned() {
+        // Match on a UInt with only an Int arm → Jump(default)
+        let locals = vec![Var::new(
+            var(0),
+            ast::Identifier("x".into()),
+            TypeSet::uint(),
+        )];
+        let blocks = vec![
+            BasicBlock {
+                id: block(0),
+                instructions: vec![si(Instruction::Const {
+                    dest: var(0),
+                    value: Literal::UInt(42),
+                })],
+                terminator: Terminator::Match {
+                    value: var(0),
+                    arms: vec![(MatchPattern::Type(crate::types::BaseType::Int), block(1))],
+                    default: block(2),
+                    span: ast::Span::default(),
+                },
+            },
+            BasicBlock {
+                id: block(1),
+                instructions: vec![],
+                terminator: Terminator::Return { value: None },
+            },
+            BasicBlock {
+                id: block(2),
+                instructions: vec![],
+                terminator: Terminator::Return { value: None },
+            },
+        ];
+
+        let mut func = make_function(blocks, locals);
+        let types = type_refinement::analyze_types(&func, None);
+        let changes = eliminate_dead_match_arms(&mut func, &types);
+
+        assert_eq!(changes, 1);
+        assert!(matches!(
+            func.blocks[0].terminator,
+            Terminator::Jump { target } if target == block(2)
+        ));
+    }
+
+    #[test]
+    fn test_dead_arm_one_survives_covers() {
+        // Match on a UInt with UInt arm + Int arm → Jump(uint_arm)
+        let locals = vec![Var::new(
+            var(0),
+            ast::Identifier("x".into()),
+            TypeSet::uint(),
+        )];
+        let blocks = vec![
+            BasicBlock {
+                id: block(0),
+                instructions: vec![si(Instruction::Const {
+                    dest: var(0),
+                    value: Literal::UInt(42),
+                })],
+                terminator: Terminator::Match {
+                    value: var(0),
+                    arms: vec![
+                        (MatchPattern::Type(crate::types::BaseType::UInt), block(1)),
+                        (MatchPattern::Type(crate::types::BaseType::Int), block(2)),
+                    ],
+                    default: block(3),
+                    span: ast::Span::default(),
+                },
+            },
+            BasicBlock {
+                id: block(1),
+                instructions: vec![],
+                terminator: Terminator::Return { value: None },
+            },
+            BasicBlock {
+                id: block(2),
+                instructions: vec![],
+                terminator: Terminator::Return { value: None },
+            },
+            BasicBlock {
+                id: block(3),
+                instructions: vec![],
+                terminator: Terminator::Return { value: None },
+            },
+        ];
+
+        let mut func = make_function(blocks, locals);
+        let types = type_refinement::analyze_types(&func, None);
+        let changes = eliminate_dead_match_arms(&mut func, &types);
+
+        assert_eq!(changes, 1);
+        // UInt arm covers the scrutinee fully → Jump
+        assert!(matches!(
+            func.blocks[0].terminator,
+            Terminator::Jump { target } if target == block(1)
+        ));
+    }
+
+    #[test]
+    fn test_dead_arm_no_change_when_types_unknown() {
+        // Match on a parameter with unknown type → no pruning
+        let locals = vec![Var::new(
+            var(0),
+            ast::Identifier("x".into()),
+            TypeSet::all(),
+        )];
+        let blocks = vec![BasicBlock {
+            id: block(0),
+            instructions: vec![],
+            terminator: Terminator::Match {
+                value: var(0),
+                arms: vec![
+                    (MatchPattern::Type(crate::types::BaseType::UInt), block(1)),
+                    (MatchPattern::Type(crate::types::BaseType::Int), block(2)),
+                ],
+                default: block(3),
+                span: ast::Span::default(),
+            },
+        }];
+
+        let mut func = make_function(blocks, locals);
+        let types = type_refinement::analyze_types(&func, None);
+        let changes = eliminate_dead_match_arms(&mut func, &types);
+
+        assert_eq!(changes, 0);
+    }
+
+    // ================================================================
+    // Non-Bool Condition Folding
+    // ================================================================
+
+    #[test]
+    fn test_non_bool_condition_folded() {
+        // if uint_value { } → Jump(else)
+        let locals = vec![Var::new(
+            var(0),
+            ast::Identifier("x".into()),
+            TypeSet::uint(),
+        )];
+        let blocks = vec![
+            BasicBlock {
+                id: block(0),
+                instructions: vec![si(Instruction::Const {
+                    dest: var(0),
+                    value: Literal::UInt(42),
+                })],
+                terminator: Terminator::If {
+                    condition: var(0),
+                    then_target: block(1),
+                    else_target: block(2),
+                    span: ast::Span::default(),
+                },
+            },
+            BasicBlock {
+                id: block(1),
+                instructions: vec![],
+                terminator: Terminator::Return { value: None },
+            },
+            BasicBlock {
+                id: block(2),
+                instructions: vec![],
+                terminator: Terminator::Return { value: None },
+            },
+        ];
+
+        let mut func = make_function(blocks, locals);
+        let types = type_refinement::analyze_types(&func, None);
+        let changes = fold_non_bool_conditions(&mut func, &types);
+
+        assert_eq!(changes, 1);
+        assert!(matches!(
+            func.blocks[0].terminator,
+            Terminator::Jump { target } if target == block(2)
+        ));
+    }
+
+    #[test]
+    fn test_bool_condition_not_folded() {
+        let locals = vec![Var::new(
+            var(0),
+            ast::Identifier("x".into()),
+            TypeSet::bool(),
+        )];
+        let blocks = vec![BasicBlock {
+            id: block(0),
+            instructions: vec![si(Instruction::Const {
+                dest: var(0),
+                value: Literal::Bool(true),
+            })],
+            terminator: Terminator::If {
+                condition: var(0),
+                then_target: block(1),
+                else_target: block(2),
+                span: ast::Span::default(),
+            },
+        }];
+
+        let mut func = make_function(blocks, locals);
+        let types = type_refinement::analyze_types(&func, None);
+        let changes = fold_non_bool_conditions(&mut func, &types);
+
+        assert_eq!(changes, 0);
+    }
 }
