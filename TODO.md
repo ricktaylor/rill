@@ -366,9 +366,12 @@ with just `v3 = Intrinsic(Add, [v1, v2])` — both args provably UInt, no guards
       compiler selects the specialized fn pointer directly. Generic fallback used
       when types are unknown. Zero runtime type dispatch for specialized calls.
 
-- [ ] **Common Subexpression Elimination (CSE)** — reuse results of identical pure
-      operations. Purity checking via `IntrinsicOp::is_fallible()` and
-      `BuiltinMeta.purity`.
+- [x] **Common Subexpression Elimination (CSE)** (`eliminate_common_subexpressions`
+      in cse.rs) — within each basic block, replaces duplicate computations with
+      Copy of the first result. Handles all intrinsics (pure, even fallible —
+      same inputs → same result/undefined), constants, Index, and pure function
+      calls (builtins with `is_pure()` + user functions from `collect_pure_functions`).
+      Runs in Phase 1 fixpoint after const fold, before copy prop + DCE.
 
 - [x] **Algebraic Simplification** (`simplify_algebra` in algebra.rs) — identity
       rewrites: `x+0→x`, `x*1→x`, `x*0→0`, `x-x→0`, `x==x→true`, `x/1→x`.

@@ -17,6 +17,7 @@ mod cast_elision;
 mod coercion;
 mod const_fold;
 mod copy_prop;
+mod cse;
 mod dce;
 mod definedness;
 mod guard_elim;
@@ -28,6 +29,7 @@ pub use cast_elision::elide_identity_casts;
 pub use coercion::{elide_coercions, insert_coercions};
 pub use const_fold::fold_constants;
 pub use copy_prop::propagate_copies;
+pub use cse::eliminate_common_subexpressions;
 pub use dce::eliminate_dead_code;
 pub use definedness::{
     Definedness, DefinednessAnalysis, analyze_definedness, analyze_definedness_full,
@@ -133,6 +135,11 @@ pub fn optimize(
                     let pd = param_defs.get(name.as_str()).map(|v| v.as_slice());
                     loop {
                         let folded = fold_constants(function, builtins, diagnostics);
+                        let cse = cse::eliminate_common_subexpressions_with_purity(
+                            function,
+                            Some(builtins),
+                            &pure_functions,
+                        );
                         let copies = propagate_copies(function);
                         let dead = dce::eliminate_dead_code_with_purity(
                             function,
@@ -144,7 +151,7 @@ pub fn optimize(
                         let definedness = analyze_definedness_full(function, Some(builtins), pd);
                         let guards = eliminate_guards(function, &definedness);
                         let blocks = simplify_cfg(function);
-                        if folded + copies + dead + refs + coerce + guards + blocks == 0 {
+                        if folded + cse + copies + dead + refs + coerce + guards + blocks == 0 {
                             break;
                         }
                     }
@@ -299,6 +306,7 @@ pub fn optimize_function(
     let mut first_iteration = true;
     loop {
         let folded = fold_constants(function, builtins, diagnostics);
+        let cse = eliminate_common_subexpressions(function);
         let copies = propagate_copies(function);
         let dead = eliminate_dead_code(function);
         let refs = elide_refs(function);
@@ -316,7 +324,7 @@ pub fn optimize_function(
         let guards = eliminate_guards(function, &definedness);
         let blocks = simplify_cfg(function);
 
-        if folded + copies + dead + refs + coerce + guards + blocks == 0 {
+        if folded + cse + copies + dead + refs + coerce + guards + blocks == 0 {
             break;
         }
     }
@@ -358,6 +366,7 @@ pub fn optimize_function(
     if coercions + cast_elisions + algebra + condition_folds + dead_arms > 0 {
         loop {
             let folded = fold_constants(function, builtins, diagnostics);
+            let cse = eliminate_common_subexpressions(function);
             let copies = propagate_copies(function);
             let dead = eliminate_dead_code(function);
             let refs = elide_refs(function);
@@ -365,7 +374,7 @@ pub fn optimize_function(
             let definedness = analyze_definedness(function, Some(builtins));
             let guards = eliminate_guards(function, &definedness);
             let blocks = simplify_cfg(function);
-            if folded + copies + dead + refs + coerce + guards + blocks == 0 {
+            if folded + cse + copies + dead + refs + coerce + guards + blocks == 0 {
                 break;
             }
         }
