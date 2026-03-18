@@ -474,16 +474,99 @@ impl<'a> Lowerer<'a> {
             })
             .collect();
 
-        let dest = self.new_temp(TypeSet::all());
-        self.emit(Instruction::Call {
-            dest,
-            function: FunctionRef {
-                namespace: namespace.cloned(),
-                name: name.clone(),
-            },
-            args,
+        // Insert type guards for builtin params with type constraints.
+        // Each constrained param gets a Match that checks the arg's type
+        // against the declared type_sig. On mismatch, the call is skipped
+        // and the result is undefined. The optimizer eliminates guards when
+        // types are statically known.
+        let has_type_guards = param_specs.is_some_and(|specs| {
+            specs
+                .iter()
+                .any(|s| !s.type_sig.is_empty() && s.type_sig != TypeSet::all())
         });
-        dest
+
+        if has_type_guards {
+            let skip_bb = self.fresh_block();
+            let call_bb = self.fresh_block();
+            let join_bb = self.fresh_block();
+
+            // Emit a Match guard for each constrained param
+            for (i, arg) in args.iter().enumerate() {
+                let type_sig = param_specs
+                    .and_then(|specs| specs.get(i))
+                    .map(|s| s.type_sig)
+                    .unwrap_or(TypeSet::all());
+
+                if type_sig.is_empty() || type_sig == TypeSet::all() {
+                    continue; // no constraint
+                }
+
+                // Build Match arms: one per type in the sig, all going to next check
+                let next_bb = self.fresh_block();
+                let match_arms: Vec<(MatchPattern, BlockId)> = type_sig
+                    .iter()
+                    .map(|ty| (MatchPattern::Type(ty), next_bb))
+                    .collect();
+
+                self.finish_block(Terminator::Match {
+                    value: arg.value,
+                    arms: match_arms,
+                    default: skip_bb,
+                    span: self.current_span,
+                });
+
+                self.current_block = next_bb;
+                self.current_instructions = Vec::new();
+            }
+
+            // All guards passed — jump to call block
+            self.finish_block(Terminator::Jump { target: call_bb });
+
+            // Call block
+            self.current_block = call_bb;
+            self.current_instructions = Vec::new();
+            let call_dest = self.new_temp(TypeSet::all());
+            self.emit(Instruction::Call {
+                dest: call_dest,
+                function: FunctionRef {
+                    namespace: namespace.cloned(),
+                    name: name.clone(),
+                },
+                args,
+            });
+            let call_exit = self.current_block;
+            self.finish_block(Terminator::Jump { target: join_bb });
+
+            // Skip block — type mismatch, result is undefined
+            self.current_block = skip_bb;
+            self.current_instructions = Vec::new();
+            let undef_dest = self.new_temp(TypeSet::empty());
+            self.emit(Instruction::Undefined { dest: undef_dest });
+            let skip_exit = self.current_block;
+            self.finish_block(Terminator::Jump { target: join_bb });
+
+            // Join with phi
+            self.current_block = join_bb;
+            self.current_instructions = Vec::new();
+            let result = self.new_temp(TypeSet::all());
+            self.emit(Instruction::Phi {
+                dest: result,
+                sources: vec![(call_exit, call_dest), (skip_exit, undef_dest)],
+            });
+            result
+        } else {
+            // No type constraints — emit call directly
+            let dest = self.new_temp(TypeSet::all());
+            self.emit(Instruction::Call {
+                dest,
+                function: FunctionRef {
+                    namespace: namespace.cloned(),
+                    name: name.clone(),
+                },
+                args,
+            });
+            dest
+        }
     }
 
     /// Try to lower a call as a compiler intrinsic.

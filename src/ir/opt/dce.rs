@@ -159,9 +159,10 @@ fn is_removable(
         Instruction::Call { function, .. } => {
             // Check builtins for purity metadata
             if let Some(registry) = builtins
-                && let Some(def) = registry.get(&function.qualified_name()) {
-                    return def.meta.purity.is_pure();
-                }
+                && let Some(def) = registry.get(&function.qualified_name())
+            {
+                return def.meta.purity.is_pure();
+            }
             // Check user functions proven pure by interprocedural analysis
             pure_functions.contains(&function.qualified_name())
         }

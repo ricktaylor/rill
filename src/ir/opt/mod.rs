@@ -189,9 +189,10 @@ fn collect_pure_functions(
                     } => {
                         let callee = func_ref.qualified_name();
                         if let Some(registry) = builtins
-                            && let Some(def) = registry.get(&callee) {
-                                return def.meta.purity.is_pure();
-                            }
+                            && let Some(def) = registry.get(&callee)
+                        {
+                            return def.meta.purity.is_pure();
+                        }
                         // User function: pure only if callee is in our pure set
                         pure.contains(&callee)
                     }
@@ -604,7 +605,7 @@ fn check_condition_types(
 mod tests {
     use super::*;
     use crate::ast;
-    use crate::ir::{BasicBlock, Import, Literal, Var};
+    use crate::ir::{BasicBlock, Literal, Var};
     use crate::types::TypeSet;
 
     fn var(id: u32) -> VarId {

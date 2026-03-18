@@ -354,10 +354,11 @@ with just `v3 = Intrinsic(Add, [v1, v2])` — both args provably UInt, no guards
       uses of `Copy(dest, src)` dest with src, resolves chains, removes dead Copies.
       Runs in Phase 1 fixpoint loop after const fold.
 
-- [ ] **Builtin param type validation** — `check_intrinsic_types` validates intrinsic
-      arg types (W009) but doesn't check builtin Call args against `ParamSpec.type_sig`.
-      Thread `BuiltinRegistry` into the check and validate that actual arg types
-      intersect with declared param types. Emit W009 for mismatches.
+- [x] **Builtin param type guards** — during lowering, builtin calls with
+      `ParamSpec.type_sig` constraints get Match guards inserted before the call.
+      On type mismatch, the call is skipped and result is undefined. The optimizer
+      eliminates guards when types are statically known (dead arm elimination).
+      Builtins can trust their inputs — no internal type checking needed.
 
 - [ ] **Common Subexpression Elimination (CSE)** — reuse results of identical pure
       operations. Purity checking via `IntrinsicOp::is_fallible()` and
