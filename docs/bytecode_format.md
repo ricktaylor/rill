@@ -147,7 +147,7 @@ integers with no wrapper:
 
 ### BaseType
 
-Encoded as a CBOR unsigned integer using fixed discriminants:
+Encoded as a CBOR unsigned integer via `From<BaseType> for u64`:
 
 | Variant    | Value |
 |------------|-------|
@@ -160,8 +160,6 @@ Encoded as a CBOR unsigned integer using fixed discriminants:
 | `Array`    | 6     |
 | `Map`      | 7     |
 | `Sequence` | 8     |
-
-These values are part of the bytecode ABI and must not change.
 
 ### Identifier
 
@@ -218,8 +216,8 @@ Encoded as a CBOR unsigned integer:
 | `BitXor`   | 11    | | `Collect` | 24   |
 | `Widen`    | 12    | | `Cast`    | 25   |
 
-These values are part of the bytecode ABI. New intrinsics are appended at
-the end; existing values never change.
+These values are defined in the `From<IntrinsicOp> for u64` impl. New
+intrinsics are appended at the end; existing values never change.
 
 ## Instruction Encoding
 
@@ -501,7 +499,7 @@ functions, not core intrinsics or prelude functions.
 | `type_refinement` | Optional | `extern.meta.returns.type_sig()` for return type narrowing; `extern.meta.diverges()` for empty TypeSet | YES — falls back to `TypeSet::all()` for unknown calls |
 | `dce` | Optional | `extern.meta.purity.is_pure()` to determine if Call is removable | YES — conservatively keeps all extern calls |
 | `cse` | Optional | `extern.meta.purity.is_pure()` to determine if Call is CSE-able | YES — conservatively skips extern calls |
-| `definedness` | Optional | Signature accepts `Option<&ExternRegistry>` but doesn't use it | YES |
+| `definedness` | Optional | `extern.meta.diverges()`, `extern.meta.purity.may_return_undefined()` for call result definedness | YES — conservatively returns `MaybeDefined` for all extern calls |
 | `guard_elim` | None | Uses `DefinednessAnalysis` output only | YES |
 | `copy_prop` | None | Pure structural rewrite | YES |
 | `algebra` | None | Uses `TypeAnalysis` only | YES |
@@ -671,10 +669,9 @@ lookup already returns `Option`.
 ### New files
 
 - `src/bytecode.rs` — public API: `save(IrProgram, Option<DebugInfo>) -> Vec<u8>` and `load(&[u8]) -> Result<(IrProgram, Option<DebugInfo>), BytecodeError>`
-- `src/bytecode/encode.rs` — `ToCbor` impls for IR types
-- `src/bytecode/decode.rs` — `FromCbor` impls for IR types
+- `src/bytecode/encode.rs` — `ToCbor` impls and `From<Enum> for u64` mappings
+- `src/bytecode/decode.rs` — `FromCbor` impls and `TryFrom<u64> for Enum` mappings
 - `src/bytecode/debug_info.rs` — `DebugInfo` type plus encode/decode
-- `src/bytecode/opcodes.rs` — opcode and discriminant constants
 
 ### Dependencies
 
@@ -704,41 +701,68 @@ hardy-cbor = { path = "../hardy/cbor", optional = true }
 | Debug info | 1 | ~80 |
 | **Total** | **~19** | **~820** |
 
-### Opcode constants module
+### Discriminant mapping
 
-All integer discriminants are defined as named constants in a single file,
-forming the bytecode ABI:
+Bytecode discriminants are mapped directly in `From`/`TryFrom` impls on
+the existing enums — no companion types, no `#[repr(u8)]`, no constants
+file. This follows the pattern used throughout the hardy codebase (e.g.,
+`bpv7::status_report::ReasonCode`).
+
+For each enum that needs a CBOR integer encoding:
+
+1. `impl From<Enum> for u64` — match arms mapping variants to integers
+2. `impl TryFrom<u64> for Enum` — reverse mapping, returns error for unknown values
+3. `ToCbor` — one-liner: `encoder.emit(&u64::from(*self))`
+4. `FromCbor` — one-liner: decode `u64`, call `try_into()`
+
+Example for `BaseType`:
 
 ```rust
-// bytecode/opcodes.rs
+impl From<BaseType> for u64 {
+    fn from(value: BaseType) -> Self {
+        match value {
+            BaseType::Bool     => 0,
+            BaseType::UInt     => 1,
+            BaseType::Int      => 2,
+            BaseType::Float    => 3,
+            BaseType::Text     => 4,
+            BaseType::Bytes    => 5,
+            BaseType::Array    => 6,
+            BaseType::Map      => 7,
+            BaseType::Sequence => 8,
+        }
+    }
+}
 
-// Instruction opcodes
-pub const INST_PHI: u64 = 0;
-pub const INST_COPY: u64 = 1;
-pub const INST_UNDEFINED: u64 = 2;
-pub const INST_CONST: u64 = 3;
-pub const INST_INDEX: u64 = 4;
-pub const INST_SET_INDEX: u64 = 5;
-pub const INST_INTRINSIC: u64 = 6;
-pub const INST_CALL: u64 = 7;
-pub const INST_MAKE_REF: u64 = 8;
-pub const INST_WRITE_REF: u64 = 9;
-pub const INST_DROP: u64 = 10;
+impl TryFrom<u64> for BaseType {
+    type Error = BytecodeError;
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(BaseType::Bool),
+            1 => Ok(BaseType::UInt),
+            // ...
+            v => Err(BytecodeError::UnknownDiscriminant("BaseType", v)),
+        }
+    }
+}
 
-// Terminator opcodes
-pub const TERM_JUMP: u64 = 0;
-pub const TERM_IF: u64 = 1;
-pub const TERM_MATCH: u64 = 2;
-pub const TERM_GUARD: u64 = 3;
-pub const TERM_RETURN: u64 = 4;
-pub const TERM_EXIT: u64 = 5;
-pub const TERM_UNREACHABLE: u64 = 6;
-
-// IntrinsicOp discriminants
-pub const OP_ADD: u64 = 0;
-pub const OP_SUB: u64 = 1;
-// ... etc
+impl ToCbor for BaseType {
+    type Result = ();
+    fn to_cbor(&self, encoder: &mut Encoder) {
+        encoder.emit(&u64::from(*self));
+    }
+}
 ```
+
+`IntrinsicOp`, `Instruction`, `Terminator`, `Literal`, `MatchPattern`,
+and `ConstValue` all follow the same pattern. For data-carrying enums,
+the `ToCbor` match emits the discriminant then the variant's fields;
+`FromCbor` reads the discriminant, matches, then reads the fields.
+
+The discriminant values in the `From` impl ARE the bytecode ABI. New
+variants are appended at the end; existing values never change.
+Exhaustive matching in `From` ensures the compiler catches any new
+variant added without a discriminant assignment.
 
 ### DebugInfo extraction
 
@@ -792,7 +816,29 @@ pub fn extract_debug_info(
     source_file: Option<&str>,
     source_text: Option<&str>,
 ) -> DebugInfo;
+
+/// Strip debug info from bytecode, returning smaller bytecode.
+///
+/// Operates directly on the CBOR wire format — parses the top-level map,
+/// drops key 4 (debug info), re-emits. Does not deserialize any IR types,
+/// so this works without understanding the IR schema and will remain
+/// compatible across bytecode versions.
+///
+/// Returns the input unchanged if debug info is already absent.
+pub fn strip(data: &[u8]) -> Result<Vec<u8>, BytecodeError>;
 ```
+
+The `strip` function is intentionally CBOR-level, not IR-level. It
+re-emits the top-level map with key `4` omitted, copying all other keys
+as raw CBOR bytes (using hardy-cbor's `Raw` wrapper). This means:
+
+- **No IR dependency.** The strip tool doesn't need to understand
+  `IrProgram`, `Instruction`, or any IR types. It works on any valid
+  Rill bytecode regardless of version.
+- **Fast.** No deserialization/reserialization of the program — just a
+  single pass copying raw bytes with one key filtered out.
+- **Standalone tool.** Can be shipped as a tiny binary that depends only
+  on hardy-cbor, not on the rill crate.
 
 ## Size Estimates
 
