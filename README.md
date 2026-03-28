@@ -14,24 +14,24 @@ Unable to find a scripting language that felt truly "at home" in a high-reliabil
 
 ## Why "Rill"?
 
-A *rill* is a small stream—a modest channel through which water flows. In lunar geology, *rilles* are the sinuous channels carved across the Moon's surface, remnants of ancient lava flows. Like these channels, Rill is designed to be a conduit: small, efficient pathways for data to flow through your systems. A fitting name for a language born in deep space communications.
+A *rill* is a small stream — a modest channel through which water flows. In lunar geology, *rilles* are the sinuous channels carved across the Moon's surface, remnants of ancient lava flows. Like these channels, Rill is designed to be a conduit: small, efficient pathways for data to flow through your systems. A fitting name for a language born in deep space communications.
 
 ## Key Features
 
 - **Memory Safe**: Guaranteed resource limits (stack, heap) with no undefined behavior
 - **Rust-like Syntax**: Familiar to Rust developers, but duck-typed and without fighting the borrow checker
-- **CBOR-Native**: First-class support for CBOR data types and manipulation
-- **Embeddable**: Lua-style builtin registration system for seamless host integration
+- **Duck-Typed Values**: Practical scalar and collection types (Bool, UInt, Int, Float, Text, Bytes, Array, Map) — the common denominator of JSON, CBOR, MessagePack, and similar data interchange formats
+- **Embeddable**: Builtin registration system for seamless host integration
+- **Optimizing Compiler**: SSA IR with type inference, specialization, and 11 optimization passes — compiles to closure-threaded code, not a bytecode interpreter
 - **Pattern Matching**: Rich destructuring with type narrowing and rest patterns
 - **Reference Semantics**: Explicit `with` bindings for in-place mutation vs `let` for value copies
-- **Lightweight**: Interpreted language optimized for resource-constrained environments
+- **No Exceptions**: No error types, no panics, no stack unwinding — failed operations produce `undefined` values that propagate silently until handled. Scripts never crash; the host always gets a clean result.
+- **Lightweight**: Minimal dependencies, designed for resource-constrained environments
 
 ## Quick Example
 
 ```rust
-// DTN bundle filtering example
-import std.status_report.codes as codes;
-
+// Data validation and transformation
 fn check_lifetime(bundle) {
     if bundle.age > MAX_TTL {
         exit(codes::LifetimeExpired);
@@ -47,7 +47,7 @@ fn validate_payload(bundle) {
     }
 }
 
-// Pattern matching with type narrowing
+// Pattern matching with type narrowing and in-place mutation
 fn process_priority(bundle) {
     if with UInt(priority) = bundle.priority {
         priority += 1;  // Mutates bundle.priority in place
@@ -71,20 +71,34 @@ Source Code
 └────┬────┘
      │
      ▼
-┌─────────┐
-│   VM    │  Stack-based with heap tracking
-└─────────┘
+┌──────────────┐
+│  Optimizer   │  11 passes: const fold, type refinement, coercion,
+│              │  guard elim, definedness, copy prop, DCE, CSE,
+│              │  algebra, cast elision, ref elision
+└──────┬───────┘
+       │
+       ▼
+┌──────────────┐
+│   Compiler   │  Closure-threaded with type specialization
+└──────┬───────┘
+       │
+       ▼
+┌──────────────┐
+│   Executor   │  Flat PC-based loop, stack + heap tracking
+└──────────────┘
 ```
 
 - **Parser**: Built with [chumsky](https://github.com/zesterer/chumsky) combinator library
-- **IR**: Single Static Assignment intermediate representation for optimization
-- **VM**: Stack-based execution with accurate heap tracking and resource limits
+- **IR**: Single Static Assignment with loop-carried phis, `with` reference tracking
+- **Optimizer**: Two-phase pipeline — coarse (pre-type-info) and type-informed (post-refinement), with interprocedural analysis and function monomorphization
+- **Compiler**: Type-specialized closures — emits direct `u64::checked_add` instead of runtime type dispatch when types are provably known
+- **Executor**: Stack-based with accurate capacity-based heap tracking and configurable resource limits
 
 ## Language Highlights
 
-### CBOR-First Design
+### Duck-Typed Values
 
-Rill has native support for the CBOR data model:
+Rill's type system covers the common ground across structured data formats — the same types you'd find in JSON, CBOR, or MessagePack:
 
 ```rust
 let data = {
@@ -96,6 +110,8 @@ let data = {
     }
 };
 ```
+
+No type annotations needed — the optimizer infers types and specializes arithmetic at compile time.
 
 ### Reference vs Value Semantics
 
@@ -129,19 +145,22 @@ match bundle.payload {
 }
 ```
 
-### Undefined Propagation
+### No Exceptions — Just Undefined
 
-No need for `?` operators—undefined values propagate naturally:
+Rill has no error type, no exceptions, and no stack unwinding. Operations that can't produce a meaningful result — a missing map key, division by zero, type mismatches — simply return `undefined`. Undefined propagates through subsequent operations without interrupting the script:
 
 ```rust
-let x = undefined_value.field.nested;  // → undefined
-let y = x + 10;  // → undefined
+let x = data.missing_field.nested;  // → undefined (no KeyError)
+let y = x + 10;                     // → undefined (not a runtime error)
+let z = 1 / 0;                      // → undefined (not a panic)
 
-// Use if let when you need to handle presence explicitly
+// Use if let to branch on presence
 if let value = potentially_undefined {
     // value is guaranteed to be defined here
 }
 ```
+
+This means scripts never crash mid-execution. The host always gets a clean result — either a defined value or `undefined` — making Rill predictable in environments where partial failures must not bring down the system.
 
 ## Embedding Rill
 
@@ -151,47 +170,61 @@ use rill::{VM, BuiltinRegistry, Value};
 // Register custom builtins
 let mut registry = BuiltinRegistry::new();
 registry.register(
-    BuiltinDef::new("my_function", my_builtin_impl)
-        .param("input", TypeSig::text())
-        .returns(TypeSig::uint())
-        .purity(Purity::Pure)
+    BuiltinDef::new("send_report", my_send_impl)
+        .param("data", TypeSet::bytes())
+        .returns(TypeSet::bool())
+        .impure()
 );
 
 // Compile and execute
-let program = rill::parse(source)?;
-let compiled = rill::compile(program, &registry)?;
-let mut vm = VM::new(compiled);
+let (program, warnings) = rill::compile(source, &registry)?;
+let mut vm = VM::new();
 
-match vm.call_function("main", &[]) {
-    Ok(result) => println!("Result: {:?}", result),
-    Err(e) => eprintln!("Script error: {}", e),
+// Push arguments and call
+vm.push(Value::UInt(42))?;
+let result = program.call(&mut vm, "process", 1)?;
+
+// For hot-path execution, resolve the function once
+let process = program.function("process").expect("function exists");
+for input in inputs {
+    vm.push(input)?;
+    let result = process.call(&mut vm, 1)?;
 }
 ```
 
 ## Current Status
 
-⚠️ **Early Development** - Rill is functional but not yet production-ready.
-
 **Complete:**
 
-- ✅ Grammar specification (ABNF)
-- ✅ Full parser with comprehensive tests
-- ✅ AST and type definitions
-- ✅ Virtual machine core
-- ✅ Heap tracking system
-- ✅ Builtin registry
+- Full parser with implicit return support
+- SSA intermediate representation with loop-carried phis
+- `with` reference bindings with write-back (MakeRef/WriteRef)
+- Pattern matching: type narrowing, destructuring, rest patterns, guards
+- Sequence type with lazy ranges and zero-copy array slices
+- 11 optimizer passes: constant folding, type refinement, coercion insertion, guard elimination, definedness analysis, copy propagation, dead code elimination, common subexpression elimination, algebraic simplification, cast elision, ref elision
+- Interprocedural return type inference and argument type propagation
+- Function monomorphization (up to 4 type-specialized variants)
+- Closure-threaded compiler with type-specialized arithmetic
+- Flat PC-based executor with stack/heap tracking
+- Builtin registry with monomorphic variants and purity tracking
+- Diagnostics with source spans, line:column formatting, and error codes
+- Public API: `compile()`, `Program::call()`, `FunctionHandle` for hot-path execution
+- 139+ end-to-end tests passing
+- Grammar specification (ABNF) and design documentation
 
 **In Progress:**
 
-- 🚧 IR lowering (AST → IR)
-- 🚧 Standard library modules
+- Module/import resolution system
+- Standard library (`std.time`, `std.cbor`, `std.encoding`, `std.parsing`)
+- Prelude (utility functions: `is_some`, `is_uint`, `default`, etc.)
 
 **Planned:**
 
-- ⏳ Optimizer passes
-- ⏳ CBOR encode/decode integration
-- ⏳ Compiled bytecode format
-- ⏳ Comprehensive standard library
+- CLI tool (`rill run`, `rill check`, `rill dump`)
+- Tail-call optimization, function inlining, loop-invariant code motion
+- Bytecode serialization format
+- LSP support
+- StepKind peephole optimization layer
 
 ## Documentation
 
@@ -204,10 +237,10 @@ match vm.call_function("main", &[]) {
 
 While born in the Deep Space Network, Rill is a general-purpose language suitable for:
 
-- **CBOR document validation and transformation**: Native CBOR support for policy enforcement
 - **Embedded scripting**: Safe sandboxing for untrusted scripts in Rust applications
+- **Data validation and transformation**: Rich pattern matching for structured data
 - **Configuration processing**: Complex rule evaluation without compromising host safety
-- **Data transformation pipelines**: Rich pattern matching for structured data manipulation
+- **Policy engines**: Filter, route, and prioritize based on runtime data
 - **Domain-specific applications**: DTN bundle filtering, IoT device policies, network packet inspection
 
 ## Building
@@ -235,12 +268,12 @@ Scripts cannot:
 
 ## Contributing
 
-Rill is in early development and feedback is greatly appreciated! Areas of particular interest:
+Feedback is greatly appreciated! Areas of particular interest:
 
-- **IR lowering completion**: Help finish the AST → IR transformation
-- **Standard library**: Implementing core modules (time, encoding, parsing)
-- **Optimizer**: Constant folding, dead code elimination, type narrowing
-- **Documentation**: Examples, tutorials, API documentation
+- **Module system**: Import resolution and multi-file programs
+- **Standard library**: Core modules (time, encoding, data format codecs)
+- **Advanced optimizations**: TCO, inlining, LICM
+- **Documentation**: Embedding guide, tutorials, API documentation
 - **Testing**: Edge cases, fuzzing, integration tests
 
 Please open issues for bugs, feature requests, or design discussions.
@@ -256,10 +289,10 @@ at your option.
 
 ## Acknowledgments
 
-- Inspired by the needs of [Hardy](https://github.com/YOUR_USERNAME/hardy) and the Deep Space Network
+- Inspired by the needs of [Hardy](https://github.com/ricktaylor/hardy) and the Deep Space Network
 - Built with [chumsky](https://github.com/zesterer/chumsky) parser combinators
 - Designed for environments where reliability isn't optional
 
 ---
 
-*"Small streams carve deep channels—in rock, in regolith, in code."*
+*"Small streams carve deep channels — in rock, in regolith, in code."*
