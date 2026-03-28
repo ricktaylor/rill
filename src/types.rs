@@ -100,7 +100,7 @@ impl BaseType {
 /// A set of possible types for a value, stored as a compact bitfield.
 ///
 /// Used throughout the compiler for:
-/// - Builtin parameter and return type signatures
+/// - Extern parameter and return type signatures
 /// - IR type analysis and refinement
 /// - Type checking and inference
 ///

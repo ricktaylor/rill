@@ -4,8 +4,8 @@
 //! - `const` declarations
 //! - Compile-time evaluation of pure expressions with literal arguments
 //!
-//! Const evaluation delegates to builtin const evaluators registered in
-//! the BuiltinRegistry. Shared const evaluation utilities are in the
+//! Const evaluation delegates to extern const evaluators registered in
+//! the ExternRegistry. Shared const evaluation utilities are in the
 //! `const_eval` module.
 
 use super::*;
@@ -243,13 +243,13 @@ impl<'a> Lowerer<'a> {
             return self.eval_intrinsic(op, &args);
         }
 
-        // Fall through to registry lookup for host-provided builtins
+        // Fall through to registry lookup for host-provided externs
         let lookup_name = match namespace {
             Some(ns) => format!("{}::{}", ns, name),
             None => name.to_string(),
         };
 
-        self.call_const_builtin(&lookup_name, &args)
+        self.call_const_extern(&lookup_name, &args)
     }
 
     /// Evaluate an intrinsic at compile time
@@ -258,17 +258,17 @@ impl<'a> Lowerer<'a> {
             .ok_or_else(|| format!("constant evaluation of {:?} failed", op))
     }
 
-    /// Call a builtin's const evaluator
-    fn call_const_builtin(&self, name: &str, args: &[ConstValue]) -> ConstResult<ConstValue> {
-        // Look up the builtin
-        let builtin = self
-            .builtins
+    /// Call an extern's const evaluator
+    fn call_const_extern(&self, name: &str, args: &[ConstValue]) -> ConstResult<ConstValue> {
+        // Look up the extern
+        let def = self
+            .externs
             .get(name)
             .ok_or_else(|| format!("unknown function '{}' in constant expression", name))?;
 
         // Check if it's a const function
         let const_eval =
-            builtin.meta.purity.const_eval().ok_or_else(|| {
+            def.meta.purity.const_eval().ok_or_else(|| {
                 format!("function '{}' cannot be used in constant expression", name)
             })?;
 

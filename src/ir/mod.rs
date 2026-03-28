@@ -74,8 +74,8 @@ pub struct RefOrigin {
 
 /// Main lowering context
 pub struct Lowerer<'a> {
-    /// Registry of builtin functions (for const evaluation)
-    pub builtins: &'a builtins::BuiltinRegistry,
+    /// Registry of extern functions (for const evaluation)
+    pub externs: &'a externs::ExternRegistry,
 
     /// Diagnostics accumulator for errors and warnings
     pub diagnostics: &'a mut Diagnostics,
@@ -121,10 +121,10 @@ pub struct LoopContext {
 }
 
 impl<'a> Lowerer<'a> {
-    /// Create a new lowerer with the given builtin registry and diagnostics
-    pub fn new(builtins: &'a builtins::BuiltinRegistry, diagnostics: &'a mut Diagnostics) -> Self {
+    /// Create a new lowerer with the given extern registry and diagnostics
+    pub fn new(externs: &'a externs::ExternRegistry, diagnostics: &'a mut Diagnostics) -> Self {
         Lowerer {
-            builtins,
+            externs,
             diagnostics,
             const_bindings: HashMap::new(),
             next_var_id: 0,
@@ -324,16 +324,16 @@ pub fn all_types() -> impl Iterator<Item = types::BaseType> {
 // Public API
 // ============================================================================
 
-/// Lower an AST program to IR with the given builtin registry
+/// Lower an AST program to IR with the given extern registry
 ///
 /// Errors are emitted to the diagnostics accumulator. Returns `Some(IrProgram)` if
 /// lowering succeeded (possibly with warnings), `None` if there were errors.
 pub fn lower(
     program: &ast::AstProgram,
-    builtins: &builtins::BuiltinRegistry,
+    externs: &externs::ExternRegistry,
     diagnostics: &mut Diagnostics,
 ) -> Option<IrProgram> {
-    let mut lowerer = Lowerer::new(builtins, diagnostics);
+    let mut lowerer = Lowerer::new(externs, diagnostics);
     lowerer.lower_program(program)
 }
 
@@ -342,8 +342,8 @@ mod tests {
     use super::*;
     use crate::diagnostics::Diagnostics;
 
-    fn test_registry() -> builtins::BuiltinRegistry {
-        builtins::standard_builtins()
+    fn test_registry() -> externs::ExternRegistry {
+        externs::standard_externs()
     }
 
     fn try_parse(source: &str) -> ast::AstProgram {
@@ -351,7 +351,7 @@ mod tests {
         parser::parse(source, &mut diags).expect("parse failed")
     }
 
-    fn try_lower(ast: &ast::AstProgram, registry: &builtins::BuiltinRegistry) -> IrProgram {
+    fn try_lower(ast: &ast::AstProgram, registry: &externs::ExternRegistry) -> IrProgram {
         let mut diags = Diagnostics::new();
         lower(ast, registry, &mut diags).expect("lower failed")
     }

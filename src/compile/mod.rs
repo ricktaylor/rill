@@ -2,7 +2,7 @@
 //!
 //! Compiles the SSA-form IR into closure-threaded code for execution.
 //! Each IR instruction becomes a Rust closure that captures its operands
-//! (slot offsets, resolved builtin function pointers, constant values).
+//! (slot offsets, resolved extern function pointers, constant values).
 //!
 //! # Architecture
 //!
@@ -21,7 +21,7 @@
 //! # Design Notes
 //!
 //! - No per-instruction dispatch switch — closures ARE the instructions
-//! - Builtins resolved once at compile time (no runtime HashMap lookup)
+//! - Externs resolved once at compile time (no runtime HashMap lookup)
 //! - VarIds mapped to stack slot offsets at compile time
 //! - Loops use iterative block dispatch (no Rust stack growth)
 //! - User function calls use recursive inline loops (bounded by VM stack limit)
@@ -34,9 +34,9 @@ mod terminator;
 #[cfg(test)]
 mod tests;
 
-use crate::builtins::{BuiltinImpl, BuiltinRegistry, ExecResult};
 use crate::diagnostics::Diagnostics;
 use crate::exec::{ExecError, Float, HeapVal, SeqState, VM, Value};
+use crate::externs::{ExecResult, ExternImpl, ExternRegistry};
 use crate::ir::opt::TypeAnalysis;
 use crate::ir::{
     BasicBlock, BlockId, Function, Instruction, IntrinsicOp, IrProgram, Literal, MatchPattern,
@@ -89,7 +89,7 @@ pub(crate) enum Action {
     NextBlock(usize),
     /// Return from function
     Return(Option<Value>),
-    /// Hard exit to driver (diverging builtin)
+    /// Hard exit to driver (diverging extern)
     Exit(Value),
 }
 
@@ -122,7 +122,7 @@ fn build_block_map(blocks: &[BasicBlock]) -> HashMap<BlockId, usize> {
 /// and emits diagnostics for undefined or unused functions.
 pub fn compile_program(
     ir: &IrProgram,
-    builtins: &BuiltinRegistry,
+    externs: &ExternRegistry,
 ) -> Result<CompiledProgram, Diagnostics> {
     let mut diagnostics = Diagnostics::new();
 
@@ -136,7 +136,7 @@ pub fn compile_program(
     let mut used_functions: HashSet<usize> = HashSet::new();
     let link_map = link_functions(
         ir,
-        builtins,
+        externs,
         &func_index,
         &mut used_functions,
         &mut diagnostics,
@@ -181,12 +181,12 @@ pub fn compile_program(
 /// Resolution of a function call — determined at link time.
 #[derive(Clone)]
 pub(crate) enum CallTarget {
-    /// Native builtin — function pointer resolved at compile time.
+    /// Native extern — function pointer resolved at compile time.
     /// Includes optional type-specialized variants for monomorphic dispatch.
-    Builtin {
-        generic: crate::builtins::BuiltinFn,
+    Extern {
+        generic: crate::externs::ExternFn,
         /// Variants: (param TypeSets, return TypeSet, specialized fn pointer)
-        variants: Vec<(Vec<TypeSet>, TypeSet, crate::builtins::BuiltinFn)>,
+        variants: Vec<(Vec<TypeSet>, TypeSet, crate::externs::ExternFn)>,
     },
     /// User-defined function — index into CompiledProgram.functions
     UserFunction(usize),
@@ -198,21 +198,21 @@ pub(crate) type LinkMap = HashMap<String, CallTarget>;
 /// Link phase: resolve all function references and track usage.
 fn link_functions(
     ir: &IrProgram,
-    builtins: &BuiltinRegistry,
+    externs: &ExternRegistry,
     func_index: &HashMap<String, usize>,
     used_functions: &mut HashSet<usize>,
     diagnostics: &mut Diagnostics,
 ) -> LinkMap {
     let mut link_map = LinkMap::new();
 
-    // Pre-populate with all builtins
-    for (name, def) in builtins.iter() {
-        if let BuiltinImpl::Native(f) = &def.implementation {
-            let variants: Vec<(Vec<TypeSet>, TypeSet, crate::builtins::BuiltinFn)> = def
+    // Pre-populate with all externs
+    for (name, def) in externs.iter() {
+        if let ExternImpl::Native(f) = &def.implementation {
+            let variants: Vec<(Vec<TypeSet>, TypeSet, crate::externs::ExternFn)> = def
                 .variants
                 .iter()
                 .filter_map(|v| {
-                    if let BuiltinImpl::Native(vf) = &v.implementation {
+                    if let ExternImpl::Native(vf) = &v.implementation {
                         Some((v.param_types.clone(), v.returns, *vf))
                     } else {
                         None
@@ -221,7 +221,7 @@ fn link_functions(
                 .collect();
             link_map.insert(
                 name.clone(),
-                CallTarget::Builtin {
+                CallTarget::Extern {
                     generic: *f,
                     variants,
                 },
@@ -706,7 +706,7 @@ fn compile_instruction(
 
             // Resolve via link map (all references verified at link time)
             match link_map.get(&func_name).cloned() {
-                Some(CallTarget::Builtin { generic, variants }) => {
+                Some(CallTarget::Extern { generic, variants }) => {
                     // Try to select a type-specialized variant at compile time
                     let f = if !variants.is_empty() {
                         let arg_types: Vec<TypeSet> = args
@@ -734,19 +734,19 @@ fn compile_instruction(
 
                     let argc = arg_slots.len();
                     Box::new(move |vm: &mut VM, _prog| {
-                        // Set up frame for builtin (same convention as user functions)
+                        // Set up frame for extern (same convention as user functions)
                         let caller_bp = vm.bp();
                         let frame_size = 1 + argc; // slot 0 = Frame, slots 1..=N = args
                         vm.call(frame_size, None)?;
 
-                        // Copy args from caller's slots into builtin's frame
+                        // Copy args from caller's slots into extern's frame
                         for (i, (s, _by_ref)) in arg_slots.iter().enumerate() {
                             if let Some(val) = vm.get(caller_bp + s).cloned() {
                                 vm.set_local(i + 1, val);
                             }
                         }
 
-                        // Call builtin — reads args via vm.arg(i)
+                        // Call extern — reads args via vm.arg(i)
                         let result = f(vm, argc);
                         vm.ret();
 

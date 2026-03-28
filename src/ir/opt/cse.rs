@@ -12,7 +12,7 @@
 //! the resulting Copy + dead original instruction.
 
 use super::{Function, Instruction, IntrinsicOp, VarId};
-use crate::builtins::BuiltinRegistry;
+use crate::externs::ExternRegistry;
 use std::collections::{HashMap, HashSet};
 
 /// A hashable key representing a computation.
@@ -37,10 +37,10 @@ pub fn eliminate_common_subexpressions(function: &mut Function) -> usize {
 
 /// CSE with interprocedural purity information.
 ///
-/// Pure builtin and user function calls with the same args are also CSE'd.
+/// Pure extern and user function calls with the same args are also CSE'd.
 pub fn eliminate_common_subexpressions_with_purity(
     function: &mut Function,
-    builtins: Option<&BuiltinRegistry>,
+    externs: Option<&ExternRegistry>,
     pure_functions: &HashSet<String>,
 ) -> usize {
     let mut changes = 0;
@@ -71,7 +71,7 @@ pub fn eliminate_common_subexpressions_with_purity(
                     args,
                 } => {
                     let name = func_ref.qualified_name();
-                    let is_pure = if let Some(registry) = builtins {
+                    let is_pure = if let Some(registry) = externs {
                         registry
                             .get(&name)
                             .is_some_and(|def| def.meta.purity.is_pure())

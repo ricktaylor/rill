@@ -1,16 +1,16 @@
 mod ast;
-pub mod builtins;
 mod compile;
 pub mod diagnostics;
 pub mod exec;
+pub mod externs;
 mod ir;
 mod parser;
 pub mod types;
 
 // Re-export key types for convenient access
-pub use builtins::BuiltinRegistry;
 pub use diagnostics::{Diagnostics, LineCol, offset_to_line_col, span_to_line_col};
 pub use exec::{ExecError, VM, Value};
+pub use externs::ExternRegistry;
 pub use types::{BaseType, TypeSet};
 
 /// Compiled Rill program, ready for execution.
@@ -99,7 +99,7 @@ impl<'a> FunctionHandle<'a> {
 /// warnings), or `Err(diagnostics)` if there were compilation errors.
 pub fn compile(
     source: &str,
-    builtins: &BuiltinRegistry,
+    externs: &ExternRegistry,
 ) -> Result<(Program, Diagnostics), Diagnostics> {
     let mut diagnostics = Diagnostics::new();
 
@@ -108,15 +108,15 @@ pub fn compile(
         None => return Err(diagnostics),
     };
 
-    let mut ir_program = match ir::lower(&ast, builtins, &mut diagnostics) {
+    let mut ir_program = match ir::lower(&ast, externs, &mut diagnostics) {
         Some(ir) => ir,
         None => return Err(diagnostics),
     };
 
-    ir::opt::optimize(&mut ir_program, builtins, &mut diagnostics);
+    ir::opt::optimize(&mut ir_program, externs, &mut diagnostics);
 
     // Compile IR to closure-threaded code (includes link phase)
-    let mut compiled = match compile::compile_program(&ir_program, builtins) {
+    let mut compiled = match compile::compile_program(&ir_program, externs) {
         Ok(compiled) => compiled,
         Err(link_errors) => {
             diagnostics.merge(link_errors);
@@ -130,7 +130,7 @@ pub fn compile(
     Ok((Program { compiled }, diagnostics))
 }
 
-/// Create a builtin registry with all standard builtins registered.
-pub fn standard_builtins() -> BuiltinRegistry {
-    builtins::standard_builtins()
+/// Create an extern registry with standard externs registered.
+pub fn standard_externs() -> ExternRegistry {
+    externs::standard_externs()
 }

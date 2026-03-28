@@ -21,7 +21,7 @@ A *rill* is a small stream — a modest channel through which water flows. In lu
 - **Memory Safe**: Guaranteed resource limits (stack, heap) with no undefined behavior
 - **Rust-like Syntax**: Familiar to Rust developers, but duck-typed and without fighting the borrow checker
 - **Duck-Typed Values**: Practical scalar and collection types (Bool, UInt, Int, Float, Text, Bytes, Array, Map) — the common denominator of JSON, CBOR, MessagePack, and similar data interchange formats
-- **Embeddable**: Builtin registration system for seamless host integration
+- **Embeddable**: Extern registration system for seamless host integration
 - **Optimizing Compiler**: SSA IR with type inference, specialization, and 11 optimization passes — compiles to closure-threaded code, not a bytecode interpreter
 - **Pattern Matching**: Rich destructuring with type narrowing and rest patterns
 - **Reference Semantics**: Explicit `with` bindings for in-place mutation vs `let` for value copies
@@ -165,12 +165,12 @@ This means scripts never crash mid-execution. The host always gets a clean resul
 ## Embedding Rill
 
 ```rust
-use rill::{VM, BuiltinRegistry, Value};
+use rill::{VM, ExternRegistry, Value};
 
-// Register custom builtins
-let mut registry = BuiltinRegistry::new();
+// Register custom externs
+let mut registry = ExternRegistry::new();
 registry.register(
-    BuiltinDef::new("send_report", my_send_impl)
+    ExternDef::new("send_report", my_send_impl)
         .param("data", TypeSet::bytes())
         .returns(TypeSet::bool())
         .impure()
@@ -206,7 +206,7 @@ for input in inputs {
 - Function monomorphization (up to 4 type-specialized variants)
 - Closure-threaded compiler with type-specialized arithmetic
 - Flat PC-based executor with stack/heap tracking
-- Builtin registry with monomorphic variants and purity tracking
+- Extern registry with monomorphic variants and purity tracking
 - Diagnostics with source spans, line:column formatting, and error codes
 - Public API: `compile()`, `Program::call()`, `FunctionHandle` for hot-path execution
 - 139+ end-to-end tests passing
@@ -264,7 +264,7 @@ Scripts cannot:
 - Escape the sandbox
 - Crash the host process
 - Leak memory beyond the heap limit
-- Access host resources except through registered builtins
+- Access host resources except through registered externs
 
 ## Contributing
 

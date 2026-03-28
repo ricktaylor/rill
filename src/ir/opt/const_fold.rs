@@ -3,7 +3,7 @@
 //! Evaluates expressions at compile time when all operands are known constants.
 //! This pass:
 //! - Tracks which variables hold constant values
-//! - Replaces builtin calls with `Purity::Const` with their evaluated result
+//! - Replaces extern calls with `Purity::Const` with their evaluated result
 //! - Folds intrinsic operations (And, Or) on constant operands
 //! - Propagates constants through Copy instructions
 //! - Simplifies control flow when conditions are constant
@@ -14,10 +14,10 @@
 //! - After inlining (arguments become constants in inlined code)
 
 use super::{BlockId, Function, FunctionRef, Instruction, Terminator, VarId};
-use crate::builtins::BuiltinRegistry;
 use crate::diagnostics::{DiagnosticCode, Diagnostics};
+use crate::externs::ExternRegistry;
 use crate::ir::const_eval::{
-    const_index, const_to_literal, eval_builtin_const, eval_intrinsic_const, literal_to_const,
+    const_index, const_to_literal, eval_extern_const, eval_intrinsic_const, literal_to_const,
 };
 use crate::ir::{ConstValue, IntrinsicOp};
 use std::collections::HashMap;
@@ -33,7 +33,7 @@ pub type ConstantMap = HashMap<VarId, ConstValue>;
 /// Returns the number of instructions/terminators folded.
 pub fn fold_constants(
     function: &mut Function,
-    builtins: &BuiltinRegistry,
+    externs: &ExternRegistry,
     diagnostics: &mut Diagnostics,
 ) -> usize {
     let mut constants: ConstantMap = HashMap::new();
@@ -44,7 +44,7 @@ pub fn fold_constants(
     // converges in 1-2 iterations.
     loop {
         let prev_count = constants.len();
-        collect_constants(function, &mut constants, builtins);
+        collect_constants(function, &mut constants, externs);
         if constants.len() == prev_count {
             break;
         }
@@ -53,8 +53,7 @@ pub fn fold_constants(
     // Second pass: replace instructions that produce constants
     for block in &mut function.blocks {
         for spanned_inst in &mut block.instructions {
-            if let Some(replacement) =
-                try_fold_instruction(&spanned_inst.node, &constants, builtins)
+            if let Some(replacement) = try_fold_instruction(&spanned_inst.node, &constants, externs)
             {
                 spanned_inst.node = replacement;
                 folded += 1;
@@ -74,7 +73,7 @@ pub fn fold_constants(
 }
 
 /// Collect constant values from instructions (SSA: each VarId assigned once)
-fn collect_constants(function: &Function, constants: &mut ConstantMap, builtins: &BuiltinRegistry) {
+fn collect_constants(function: &Function, constants: &mut ConstantMap, externs: &ExternRegistry) {
     for block in &function.blocks {
         for spanned_inst in &block.instructions {
             match &spanned_inst.node {
@@ -99,7 +98,7 @@ fn collect_constants(function: &Function, constants: &mut ConstantMap, builtins:
                     function: func_ref,
                     args,
                 } => {
-                    if let Some(cv) = try_fold_call(func_ref, args, constants, builtins) {
+                    if let Some(cv) = try_fold_call(func_ref, args, constants, externs) {
                         constants.insert(*dest, cv);
                     }
                 }
@@ -126,7 +125,7 @@ fn collect_constants(function: &Function, constants: &mut ConstantMap, builtins:
 fn try_fold_instruction(
     instruction: &Instruction,
     constants: &ConstantMap,
-    builtins: &BuiltinRegistry,
+    externs: &ExternRegistry,
 ) -> Option<Instruction> {
     match instruction {
         // Already a Const - nothing to fold
@@ -148,7 +147,7 @@ fn try_fold_instruction(
             function: func_ref,
             args,
         } => {
-            let cv = try_fold_call(func_ref, args, constants, builtins)?;
+            let cv = try_fold_call(func_ref, args, constants, externs)?;
             let lit = const_to_literal(&cv)?;
             Some(Instruction::Const {
                 dest: *dest,
@@ -315,12 +314,12 @@ fn pattern_matches(pattern: &crate::ir::MatchPattern, value: &ConstValue) -> boo
     }
 }
 
-/// Try to fold a builtin call with constant arguments
+/// Try to fold an extern call with constant arguments
 fn try_fold_call(
     func_ref: &FunctionRef,
     args: &[crate::ir::CallArg],
     constants: &ConstantMap,
-    builtins: &BuiltinRegistry,
+    externs: &ExternRegistry,
 ) -> Option<ConstValue> {
     // Collect constant arguments
     let const_args: Option<Vec<ConstValue>> = args
@@ -331,7 +330,7 @@ fn try_fold_call(
     let const_args = const_args?;
 
     // Use shared helper
-    eval_builtin_const(func_ref, &const_args, builtins)
+    eval_extern_const(func_ref, &const_args, externs)
 }
 
 /// Try to fold an intrinsic operation with constant arguments
@@ -381,8 +380,8 @@ fn try_fold_index(base: VarId, key: VarId, constants: &ConstantMap) -> Option<Co
 mod tests {
     use super::*;
     use crate::ast;
-    use crate::builtins::standard_builtins;
     use crate::diagnostics::Diagnostics;
+    use crate::externs::standard_externs;
     use crate::ir::{BasicBlock, Literal, SpannedInst};
 
     fn var(id: u32) -> VarId {
@@ -407,7 +406,7 @@ mod tests {
 
     #[test]
     fn test_fold_copy_of_constant() {
-        let builtins = standard_builtins();
+        let externs = standard_externs();
         let blocks = vec![BasicBlock {
             id: block(0),
             instructions: vec![
@@ -427,7 +426,7 @@ mod tests {
 
         let mut func = make_function(blocks);
         let mut diags = Diagnostics::new();
-        fold_constants(&mut func, &builtins, &mut diags);
+        fold_constants(&mut func, &externs, &mut diags);
 
         // var(1) should now be a Const instruction
         assert!(matches!(
@@ -438,7 +437,7 @@ mod tests {
 
     #[test]
     fn test_fold_if_constant_true() {
-        let builtins = standard_builtins();
+        let externs = standard_externs();
         let blocks = vec![
             BasicBlock {
                 id: block(0),
@@ -467,7 +466,7 @@ mod tests {
 
         let mut func = make_function(blocks);
         let mut diags = Diagnostics::new();
-        fold_constants(&mut func, &builtins, &mut diags);
+        fold_constants(&mut func, &externs, &mut diags);
 
         // Block 0's terminator should be a jump to block 1
         assert!(matches!(
@@ -478,7 +477,7 @@ mod tests {
 
     #[test]
     fn test_fold_if_constant_false() {
-        let builtins = standard_builtins();
+        let externs = standard_externs();
         let blocks = vec![
             BasicBlock {
                 id: block(0),
@@ -507,7 +506,7 @@ mod tests {
 
         let mut func = make_function(blocks);
         let mut diags = Diagnostics::new();
-        fold_constants(&mut func, &builtins, &mut diags);
+        fold_constants(&mut func, &externs, &mut diags);
 
         // Block 0's terminator should be a jump to block 2
         assert!(matches!(
@@ -518,7 +517,7 @@ mod tests {
 
     #[test]
     fn test_fold_guard_on_constant() {
-        let builtins = standard_builtins();
+        let externs = standard_externs();
         let blocks = vec![
             BasicBlock {
                 id: block(0),
@@ -547,7 +546,7 @@ mod tests {
 
         let mut func = make_function(blocks);
         let mut diags = Diagnostics::new();
-        fold_constants(&mut func, &builtins, &mut diags);
+        fold_constants(&mut func, &externs, &mut diags);
 
         // Constants are always defined, so jump to defined branch
         assert!(matches!(
@@ -558,7 +557,7 @@ mod tests {
 
     #[test]
     fn test_fold_phi_same_constants() {
-        let builtins = standard_builtins();
+        let externs = standard_externs();
         // Simulate: if cond { 42 } else { 42 } -> always 42
         let blocks = vec![
             BasicBlock {
@@ -601,7 +600,7 @@ mod tests {
 
         let mut func = make_function(blocks);
         let mut diags = Diagnostics::new();
-        fold_constants(&mut func, &builtins, &mut diags);
+        fold_constants(&mut func, &externs, &mut diags);
 
         // var(3) should now be a Const 42
         assert!(matches!(

@@ -47,20 +47,16 @@ use super::{
     MatchPattern, Terminator, VarId,
 };
 
-// Import builtins for metadata lookup
-use crate::builtins::BuiltinRegistry;
+// Import externs for metadata lookup
 use crate::diagnostics::Diagnostics;
+use crate::externs::ExternRegistry;
 use std::collections::HashMap;
 
 /// Run all optimization passes on a program
-pub fn optimize(
-    program: &mut IrProgram,
-    builtins: &BuiltinRegistry,
-    diagnostics: &mut Diagnostics,
-) {
+pub fn optimize(program: &mut IrProgram, externs: &ExternRegistry, diagnostics: &mut Diagnostics) {
     // Phase A: per-function optimization (intraprocedural)
     for function in &mut program.functions {
-        optimize_function(function, builtins, diagnostics);
+        optimize_function(function, externs, diagnostics);
     }
 
     // Phase M: Function monomorphization
@@ -68,7 +64,7 @@ pub fn optimize(
     // When a function is called with different type signatures at different
     // sites, clone it per signature. Each clone gets fully narrowed params
     // in Phase B. Skip recursive functions and limit clones to avoid explosion.
-    monomorphize(program, builtins);
+    monomorphize(program, externs);
 
     // Phase B: interprocedural analysis
     //
@@ -79,15 +75,15 @@ pub fn optimize(
     // B1 and B2 iterate until stable (handles forward refs, recursion, mutual recursion).
 
     // B1: Collect argument types, definedness, and purity from call sites
-    let (param_types, param_defs) = collect_param_info(program, Some(builtins));
-    let pure_functions = collect_pure_functions(program, Some(builtins));
+    let (param_types, param_defs) = collect_param_info(program, Some(externs));
+    let pure_functions = collect_pure_functions(program, Some(externs));
 
     // B2: Return type inference (uses narrowed param types)
     let mut return_types = ReturnTypes::new();
     loop {
         let mut changed = false;
         for function in &program.functions {
-            let rt = infer_return_type(function, Some(builtins), &return_types, &param_types);
+            let rt = infer_return_type(function, Some(externs), &return_types, &param_types);
             let name = function.name.to_string();
             let old = return_types
                 .get(&name)
@@ -128,7 +124,7 @@ pub fn optimize(
                 // Re-run Phase 2 with full interprocedural type info
                 let types = type_refinement::analyze_types_full(
                     function,
-                    Some(builtins),
+                    Some(externs),
                     &return_types,
                     &param_types,
                 );
@@ -142,21 +138,21 @@ pub fn optimize(
                     // Use interprocedural param definedness + purity in the fixpoint loop
                     let pd = param_defs.get(name.as_str()).map(|v| v.as_slice());
                     loop {
-                        let folded = fold_constants(function, builtins, diagnostics);
+                        let folded = fold_constants(function, externs, diagnostics);
                         let cse = cse::eliminate_common_subexpressions_with_purity(
                             function,
-                            Some(builtins),
+                            Some(externs),
                             &pure_functions,
                         );
                         let copies = propagate_copies(function);
                         let dead = dce::eliminate_dead_code_with_purity(
                             function,
-                            Some(builtins),
+                            Some(externs),
                             &pure_functions,
                         );
                         let refs = elide_refs(function);
                         let coerce = elide_coercions(function);
-                        let definedness = analyze_definedness_full(function, Some(builtins), pd);
+                        let definedness = analyze_definedness_full(function, Some(externs), pd);
                         let guards = eliminate_guards(function, &definedness);
                         let blocks = simplify_cfg(function);
                         if folded + cse + copies + dead + refs + coerce + guards + blocks == 0 {
@@ -175,7 +171,7 @@ pub fn optimize(
 /// impure functions. Iterates until stable for mutual recursion.
 fn collect_pure_functions(
     program: &IrProgram,
-    builtins: Option<&BuiltinRegistry>,
+    externs: Option<&ExternRegistry>,
 ) -> std::collections::HashSet<String> {
     let all_names: std::collections::HashSet<String> = program
         .functions
@@ -203,7 +199,7 @@ fn collect_pure_functions(
                         function: func_ref, ..
                     } => {
                         let callee = func_ref.qualified_name();
-                        if let Some(registry) = builtins
+                        if let Some(registry) = externs
                             && let Some(def) = registry.get(&callee)
                         {
                             return def.meta.purity.is_pure();
@@ -235,7 +231,7 @@ fn collect_pure_functions(
 /// Phase B then narrows each clone's params to its specific signature.
 ///
 /// Limits: max 4 variants per function, skip recursive functions.
-fn monomorphize(program: &mut IrProgram, builtins: &BuiltinRegistry) {
+fn monomorphize(program: &mut IrProgram, externs: &ExternRegistry) {
     const MAX_VARIANTS: usize = 4;
 
     // Collect type signatures at each call site: (caller_func_idx, block_idx, inst_idx) → arg types
@@ -254,7 +250,7 @@ fn monomorphize(program: &mut IrProgram, builtins: &BuiltinRegistry) {
 
     // Collect call-site signatures using type analysis
     for (func_idx, function) in program.functions.iter().enumerate() {
-        let types = analyze_types(function, Some(builtins));
+        let types = analyze_types(function, Some(externs));
 
         for block in &function.blocks {
             for (inst_idx, inst) in block.instructions.iter().enumerate() {
@@ -266,7 +262,7 @@ fn monomorphize(program: &mut IrProgram, builtins: &BuiltinRegistry) {
                 {
                     let callee_name = func_ref.qualified_name();
                     if !user_functions.contains(&callee_name) {
-                        continue; // skip builtins
+                        continue; // skip externs
                     }
 
                     let arg_types: Vec<crate::types::TypeSet> = args
@@ -393,7 +389,7 @@ fn monomorphize(program: &mut IrProgram, builtins: &BuiltinRegistry) {
     let clone_start = program.functions.len() - clone_map.len();
     for function in &mut program.functions[clone_start..] {
         let mut diags = Diagnostics::new();
-        optimize_function(function, builtins, &mut diags);
+        optimize_function(function, externs, &mut diags);
     }
 }
 
@@ -404,7 +400,7 @@ fn monomorphize(program: &mut IrProgram, builtins: &BuiltinRegistry) {
 /// then param 0 narrows to `{UInt}` + `Defined`.
 fn collect_param_info(
     program: &IrProgram,
-    builtins: Option<&BuiltinRegistry>,
+    externs: Option<&ExternRegistry>,
 ) -> (ParamTypes, ParamDefinedness) {
     // Build function name → param count map
     let func_param_counts: HashMap<String, usize> = program
@@ -418,8 +414,8 @@ fn collect_param_info(
 
     for function in &program.functions {
         // Run type + definedness analysis on this function
-        let types = analyze_types(function, builtins);
-        let defs = analyze_definedness(function, builtins);
+        let types = analyze_types(function, externs);
+        let defs = analyze_definedness(function, externs);
 
         for block in &function.blocks {
             for inst in &block.instructions {
@@ -469,7 +465,7 @@ fn collect_param_info(
 /// Run all optimization passes on a single function
 pub fn optimize_function(
     function: &mut Function,
-    builtins: &BuiltinRegistry,
+    externs: &ExternRegistry,
     diagnostics: &mut Diagnostics,
 ) {
     // ── Phase 1: Optimize to fixpoint ────────────────────────────────────
@@ -482,19 +478,19 @@ pub fn optimize_function(
 
     let mut first_iteration = true;
     loop {
-        let folded = fold_constants(function, builtins, diagnostics);
+        let folded = fold_constants(function, externs, diagnostics);
         let cse = eliminate_common_subexpressions(function);
         let copies = propagate_copies(function);
         let dead = eliminate_dead_code(function);
         let refs = elide_refs(function);
         let coerce = elide_coercions(function);
 
-        let definedness = analyze_definedness(function, Some(builtins));
+        let definedness = analyze_definedness(function, Some(externs));
 
         // Emit definedness diagnostics only on the first iteration,
         // before guard elimination reshapes the control flow.
         if first_iteration {
-            check_definedness(function, &definedness, Some(builtins), diagnostics);
+            check_definedness(function, &definedness, Some(externs), diagnostics);
             first_iteration = false;
         }
 
@@ -509,7 +505,7 @@ pub fn optimize_function(
     // ── Phase 2: Type-informed analysis (on simplified CFG) ────────────
 
     // Type refinement — intrinsic-aware: Add(UInt, UInt) → {UInt}.
-    let types = analyze_types(function, Some(builtins));
+    let types = analyze_types(function, Some(externs));
 
     // Type mismatch diagnostics (W009)
     check_intrinsic_types(function, &types, diagnostics);
@@ -542,13 +538,13 @@ pub fn optimize_function(
     // If any Phase 2 pass changed the IR, re-run Phase 1 fixpoint.
     if coercions + cast_elisions + algebra + condition_folds + dead_arms > 0 {
         loop {
-            let folded = fold_constants(function, builtins, diagnostics);
+            let folded = fold_constants(function, externs, diagnostics);
             let cse = eliminate_common_subexpressions(function);
             let copies = propagate_copies(function);
             let dead = eliminate_dead_code(function);
             let refs = elide_refs(function);
             let coerce = elide_coercions(function);
-            let definedness = analyze_definedness(function, Some(builtins));
+            let definedness = analyze_definedness(function, Some(externs));
             let guards = eliminate_guards(function, &definedness);
             let blocks = simplify_cfg(function);
             if folded + cse + copies + dead + refs + coerce + guards + blocks == 0 {

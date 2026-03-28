@@ -18,8 +18,8 @@
 //! site - passing undefined to a function that ignores the argument is harmless.
 
 use super::{BlockId, CallArg, Function, FunctionRef, Instruction, IntrinsicOp, Terminator, VarId};
-use crate::builtins::BuiltinRegistry;
 use crate::diagnostics::{DiagnosticCode, Diagnostics};
+use crate::externs::ExternRegistry;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 // ============================================================================
@@ -179,7 +179,7 @@ fn transfer_instruction(
     instruction: &Instruction,
     state: &mut HashMap<VarId, Definedness>,
     provenance: &mut ProvenanceMap,
-    builtins: Option<&BuiltinRegistry>,
+    externs: Option<&ExternRegistry>,
     guarded: Option<&Vec<IndexGuard>>,
     const_uints: &HashMap<VarId, u64>,
 ) {
@@ -268,13 +268,13 @@ fn transfer_instruction(
             }
         }
 
-        // Function calls: use builtin metadata if available
+        // Function calls: use extern metadata if available
         Instruction::Call {
             dest,
             function,
             args,
         } => {
-            let definedness = compute_call_definedness(function, args, state, builtins);
+            let definedness = compute_call_definedness(function, args, state, externs);
             state.insert(*dest, definedness);
             // Track call provenance if result may be undefined
             if definedness != Definedness::Defined {
@@ -319,27 +319,27 @@ fn transfer_instruction(
     }
 }
 
-/// Compute the definedness of a function call result using builtin metadata
+/// Compute the definedness of a function call result using extern metadata
 fn compute_call_definedness(
     function: &FunctionRef,
     args: &[CallArg],
     state: &HashMap<VarId, Definedness>,
-    builtins: Option<&BuiltinRegistry>,
+    externs: Option<&ExternRegistry>,
 ) -> Definedness {
-    let Some(builtin) = builtins.and_then(|r| r.lookup(function)) else {
+    let Some(def) = externs.and_then(|r| r.lookup(function)) else {
         // Unknown function or no registry - conservatively assume MaybeDefined
         return Definedness::MaybeDefined;
     };
 
     // Check if function diverges (never returns)
-    if builtin.meta.diverges() {
+    if def.meta.diverges() {
         // Diverging function - doesn't matter what we return here
         // since control never reaches the destination
         return Definedness::Undefined;
     }
 
     // Check if function may return undefined (fallible)
-    if builtin.meta.purity.may_return_undefined() {
+    if def.meta.purity.may_return_undefined() {
         // Function may return undefined due to:
         // - Domain errors (overflow, div-by-zero, OOB)
         // - External factors (Impure functions)
@@ -599,21 +599,21 @@ fn collect_guarded_indices(function: &Function) -> (GuardedIndices, HashMap<VarI
 /// Returns a DefinednessAnalysis containing the state at each block's entry
 /// and exit points.
 ///
-/// If `builtins` is provided, function call results will use the metadata
-/// from the builtin registry to determine definedness more precisely.
+/// If `externs` is provided, function call results will use the metadata
+/// from the extern registry to determine definedness more precisely.
 /// If `param_defs` is provided, parameter definedness is seeded from
 /// interprocedural analysis instead of defaulting to MaybeDefined.
 pub fn analyze_definedness(
     function: &Function,
-    builtins: Option<&BuiltinRegistry>,
+    externs: Option<&ExternRegistry>,
 ) -> DefinednessAnalysis {
-    analyze_definedness_full(function, builtins, None)
+    analyze_definedness_full(function, externs, None)
 }
 
 /// Analyze definedness with interprocedural parameter definedness.
 pub fn analyze_definedness_full(
     function: &Function,
-    builtins: Option<&BuiltinRegistry>,
+    externs: Option<&ExternRegistry>,
     param_defs: Option<&[Definedness]>,
 ) -> DefinednessAnalysis {
     let block_index = build_block_index_map(function);
@@ -673,7 +673,7 @@ pub fn analyze_definedness_full(
                 &spanned_inst.node,
                 &mut state,
                 &mut provenance,
-                builtins,
+                externs,
                 guarded,
                 &const_uints,
             );
@@ -761,11 +761,11 @@ pub fn analyze_definedness_full(
 /// - E201: Use of maybe-undefined value without guard (warning)
 ///
 /// The function takes the pre-computed analysis results to avoid re-analyzing.
-/// If `builtins` is provided, builtin metadata is used for more precise transfer functions.
+/// If `externs` is provided, extern metadata is used for more precise transfer functions.
 pub fn check_definedness(
     function: &Function,
     analysis: &DefinednessAnalysis,
-    builtins: Option<&BuiltinRegistry>,
+    externs: Option<&ExternRegistry>,
     diagnostics: &mut Diagnostics,
 ) {
     let block_index = build_block_index_map(function);
@@ -804,7 +804,7 @@ pub fn check_definedness(
                 &spanned_inst.node,
                 &mut state,
                 &mut dummy_provenance,
-                builtins,
+                externs,
                 None, // no guard info needed for diagnostics pass
                 &HashMap::new(),
             );
@@ -1705,7 +1705,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Builtin Registry Tests
+    // Extern Registry Tests
     // ========================================================================
 
     #[test]
@@ -1775,9 +1775,9 @@ mod tests {
 
     #[test]
     fn test_call_unknown_function() {
-        use crate::builtins::standard_builtins;
+        use crate::externs::standard_externs;
 
-        let registry = standard_builtins();
+        let registry = standard_externs();
 
         let blocks = vec![BasicBlock {
             id: block(0),

@@ -9,10 +9,10 @@
 //! - Match terminators: each arm knows the matched type
 //! - Guard terminators: defined branch knows value is not undefined
 //! - Const instructions: produce known single types
-//! - Call instructions: use builtin metadata for return types
+//! - Call instructions: use extern metadata for return types
 
 use super::{BlockId, CallArg, Function, FunctionRef, Instruction, Terminator, VarId};
-use crate::builtins::BuiltinRegistry;
+use crate::externs::ExternRegistry;
 use crate::ir::types::{BaseType, TypeSet};
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -69,7 +69,7 @@ fn build_block_index_map(function: &Function) -> HashMap<BlockId, usize> {
 fn transfer_instruction(
     instruction: &Instruction,
     state: &mut HashMap<VarId, TypeSet>,
-    builtins: Option<&BuiltinRegistry>,
+    externs: Option<&ExternRegistry>,
     return_types: &ReturnTypes,
 ) {
     match instruction {
@@ -140,13 +140,13 @@ fn transfer_instruction(
             state.insert(*dest, op.result_type_refined(&arg_types));
         }
 
-        // Call: use builtin metadata if available
+        // Call: use extern metadata if available
         Instruction::Call {
             dest,
             function,
             args,
         } => {
-            let type_set = compute_call_type(function, args, state, builtins, return_types);
+            let type_set = compute_call_type(function, args, state, externs, return_types);
             state.insert(*dest, type_set);
         }
 
@@ -182,23 +182,23 @@ fn transfer_instruction(
     }
 }
 
-/// Compute the return type of a function call using builtin metadata
+/// Compute the return type of a function call using extern metadata
 fn compute_call_type(
     function: &FunctionRef,
     _args: &[CallArg],
     _state: &HashMap<VarId, TypeSet>,
-    builtins: Option<&BuiltinRegistry>,
+    externs: Option<&ExternRegistry>,
     return_types: &ReturnTypes,
 ) -> TypeSet {
-    let Some(builtin) = builtins.and_then(|r| r.lookup(function)) else {
-        // Not a builtin — check inferred return types for user functions
+    let Some(def) = externs.and_then(|r| r.lookup(function)) else {
+        // Not an extern — check inferred return types for user functions
         let name = function.qualified_name();
         if let Some(rt) = return_types.get(&name)
             && !rt.is_empty()
         {
             return *rt;
         }
-        // Not a builtin and no inferred return type yet.
+        // Not an extern and no inferred return type yet.
         // During Phase A (per-function): return types haven't been collected.
         // During Phase B (interprocedural): recursive calls or functions
         // analyzed later in the iteration — conservatively return all types.
@@ -207,16 +207,16 @@ fn compute_call_type(
     };
 
     // If the function diverges, it never returns (empty type set)
-    if builtin.meta.diverges() {
+    if def.meta.diverges() {
         return TypeSet::empty();
     }
 
     // Get the return type signature and convert to TypeSet
     // Note: fallibility (may_return_undefined) is tracked by Definedness analysis
-    type_sig_to_type_set(builtin.meta.returns.type_sig())
+    type_sig_to_type_set(def.meta.returns.type_sig())
 }
 
-/// Convert a builtin's TypeSet to analysis TypeSet
+/// Convert an extern's TypeSet to analysis TypeSet
 /// (Now they're the same type, so just clone)
 fn type_sig_to_type_set(sig: &TypeSet) -> TypeSet {
     if sig.is_empty() {
@@ -348,11 +348,11 @@ pub type ParamDefinedness = std::collections::HashMap<String, Vec<crate::ir::opt
 /// Functions with no return value (all returns are `None`) produce `TypeSet::empty()`.
 pub fn infer_return_type(
     function: &Function,
-    builtins: Option<&BuiltinRegistry>,
+    externs: Option<&ExternRegistry>,
     return_types: &ReturnTypes,
     param_types: &ParamTypes,
 ) -> TypeSet {
-    let types = analyze_types_full(function, builtins, return_types, param_types);
+    let types = analyze_types_full(function, externs, return_types, param_types);
 
     let mut result = TypeSet::empty();
     for block in &function.blocks {
@@ -369,14 +369,14 @@ pub fn infer_return_type(
 ///
 /// Returns a TypeAnalysis containing the TypeSet at each block's entry
 /// and exit points.
-pub fn analyze_types(function: &Function, builtins: Option<&BuiltinRegistry>) -> TypeAnalysis {
-    analyze_types_full(function, builtins, &ReturnTypes::new(), &ParamTypes::new())
+pub fn analyze_types(function: &Function, externs: Option<&ExternRegistry>) -> TypeAnalysis {
+    analyze_types_full(function, externs, &ReturnTypes::new(), &ParamTypes::new())
 }
 
 /// Analyze types with full interprocedural information.
 pub fn analyze_types_full(
     function: &Function,
-    builtins: Option<&BuiltinRegistry>,
+    externs: Option<&ExternRegistry>,
     return_types: &ReturnTypes,
     param_types: &ParamTypes,
 ) -> TypeAnalysis {
@@ -424,7 +424,7 @@ pub fn analyze_types_full(
 
         // Apply transfer function for each instruction
         for spanned_inst in &block.instructions {
-            transfer_instruction(&spanned_inst.node, &mut state, builtins, return_types);
+            transfer_instruction(&spanned_inst.node, &mut state, externs, return_types);
         }
 
         // Check if exit state changed

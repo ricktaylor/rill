@@ -16,7 +16,7 @@ The full compilation and execution pipeline is working end-to-end with 139+ test
   - `with` reference bindings (MakeRef/WriteRef), ref origin tracking
   - Constant expression lowering and compile-time evaluation
   - IntrinsicOp for all operators, `len`, collection construction
-  - Builtin param type guards (Match guards inserted before constrained calls)
+  - Extern param type guards (Match guards inserted before constrained calls)
 - **Optimizer** — 11 passes in two-phase pipeline (`src/ir/opt/`)
   - Phase 1 (fixpoint): const fold → CSE → copy prop → definedness → guard elim → CFG simplify → coercion elision → DCE
   - Phase 2 (type-informed): type refinement → coercion insertion (Widen/Undefined) → algebraic simplification → cast elision → ref elision → dead arm elimination → re-run Phase 1
@@ -26,7 +26,7 @@ The full compilation and execution pipeline is working end-to-end with 139+ test
   - Guarded index suppression (loop guards, length checks, match scrutinees)
 - **Compiler** — closure-threaded with type specialization (`src/compile/`)
   - Type-specialized closures (direct `u64::checked_add` etc. when types provably known)
-  - Builtin monomorphism (variant selection at compile time)
+  - Extern monomorphism (variant selection at compile time)
   - Link phase, phi elimination, flat PC executor
 - **Runtime** — stack-based VM with heap tracking (`src/exec.rs`)
   - CoW HeapVal, capacity-based heap accounting, configurable limits
@@ -34,7 +34,7 @@ The full compilation and execution pipeline is working end-to-end with 139+ test
   - For-loop type dispatch (Sequence → SeqNext path, default → index path)
   - For-loop pair binding (`for k, v in map`)
 - **Public API** — `compile()`, `Program::call()`, `FunctionHandle` for hot-path (`src/lib.rs`)
-- **Builtins** — registry with purity tracking, monomorphic variants (`src/builtins.rs`)
+- **Externs** — registry with purity tracking, monomorphic variants (`src/externs.rs`)
 - **Diagnostics** — source spans, line:column formatting, error codes (`src/diagnostics.rs`)
 - **Docs** — ABNF grammar, design document, stdlib spec, examples
 
@@ -195,7 +195,7 @@ src/
   ast.rs              — AST node types, Span, Spanned
   types.rs            — BaseType, TypeSet
   parser.rs           — Chumsky-based parser -> AST
-  builtins.rs         — BuiltinRegistry, Lua-style builtin API: fn(&mut VM, usize)
+  externs.rs         — ExternRegistry, Lua-style extern API: fn(&mut VM, usize)
   diagnostics.rs      — Error/warning accumulator with codes
   exec.rs             — VM, Heap, HeapVal, Value, Slot, Float
   ir/
@@ -207,7 +207,7 @@ src/
     control.rs        — Control flow lowering (if, match, loops)
     pattern.rs        — Pattern destructuring lowering
     constant.rs       — Constant expression lowering
-    const_eval.rs     — Compile-time constant evaluation (intrinsic + builtin)
+    const_eval.rs     — Compile-time constant evaluation (intrinsic + extern)
     opt/
       mod.rs          — Optimizer pass runner
       const_fold.rs   — Constant folding pass

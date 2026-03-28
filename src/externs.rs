@@ -1,16 +1,16 @@
-//! Builtin Function System
+//! Extern Function System
 //!
 //! Provides a registry for host-provided extern functions that Rill scripts
 //! can call by name. This is the embedding API — how the host application
-//! extends the language with custom capabilities.
+//! (and optional stdlib crate) extends the language with custom capabilities.
 //!
 //! Language-defined operators (arithmetic, comparison, bitwise, etc.) and
 //! compiler-internal synthetics (array/map construction, etc.) are handled
-//! as `IntrinsicOp` and do not appear in this registry.
+//! as `IntrinsicOp` (core intrinsics) and do not appear in this registry.
 //!
 //! # Purity and Fallibility
 //!
-//! Each builtin has a purity level that determines optimization potential
+//! Each extern has a purity level that determines optimization potential
 //! and whether it may return undefined:
 //!
 //! - `Impure`: Has side effects, always fallible (may return undefined)
@@ -20,17 +20,17 @@
 //! # Example
 //!
 //! ```ignore
-//! let mut registry = BuiltinRegistry::new();
+//! let mut registry = ExternRegistry::new();
 //!
 //! registry.register(
-//!     BuiltinDef::new("send_report", my_send_impl)
+//!     ExternDef::new("send_report", my_send_impl)
 //!         .param("data", TypeSet::bytes())
 //!         .returns(TypeSet::bool())
 //!         .impure()
 //! );
 //!
 //! registry.register(
-//!     BuiltinDef::new("exit", my_exit_impl)
+//!     ExternDef::new("exit", my_exit_impl)
 //!         .param_optional("code", TypeSet::uint())
 //!         .exits(TypeSet::uint())  // Diverges, implicitly Impure
 //! );
@@ -47,7 +47,7 @@ use types::TypeSet;
 // Return Behavior
 // ============================================================================
 
-/// Describes how a builtin returns control
+/// Describes how an extern returns control
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReturnBehavior {
     /// Returns a value of this type to the caller
@@ -83,7 +83,7 @@ impl ReturnBehavior {
 /// Takes const arguments and returns a const result (or None if evaluation fails)
 pub type ConstEvalFn = fn(&[ConstValue]) -> Option<ConstValue>;
 
-/// Purity level of a builtin function
+/// Purity level of an extern function
 ///
 /// Forms a hierarchy: Const ⊂ Pure ⊂ Impure
 #[derive(Clone, Copy)]
@@ -196,7 +196,7 @@ impl Hash for Purity {
 // Parameter Specification
 // ============================================================================
 
-/// Specification for a builtin parameter
+/// Specification for an extern parameter
 #[derive(Debug, Clone)]
 pub struct ParamSpec {
     /// Parameter name (for documentation and error messages)
@@ -238,12 +238,12 @@ impl ParamSpec {
 }
 
 // ============================================================================
-// Builtin Metadata
+// Extern Metadata
 // ============================================================================
 
-/// Metadata for a builtin function, used by the compiler for lowering decisions
+/// Metadata for an extern function, used by the compiler for lowering decisions
 #[derive(Debug, Clone)]
-pub struct BuiltinMeta {
+pub struct ExternMeta {
     /// Parameter specifications
     pub params: Vec<ParamSpec>,
     /// Return behavior (returns or exits)
@@ -252,11 +252,11 @@ pub struct BuiltinMeta {
     pub purity: Purity,
 }
 
-impl BuiltinMeta {
+impl ExternMeta {
     /// Create metadata for a function that returns a value
     /// Default purity is Pure { fallible: true } (conservative)
     pub fn returning(type_sig: TypeSet) -> Self {
-        BuiltinMeta {
+        ExternMeta {
             params: Vec::new(),
             returns: ReturnBehavior::Returns(type_sig),
             purity: Purity::Pure { fallible: true },
@@ -265,24 +265,24 @@ impl BuiltinMeta {
 
     /// Create metadata for a function that exits to driver
     pub fn exiting(type_sig: TypeSet) -> Self {
-        BuiltinMeta {
+        ExternMeta {
             params: Vec::new(),
             returns: ReturnBehavior::Exits(type_sig),
             purity: Purity::Impure,
         }
     }
 
-    /// Check if this builtin diverges (never returns to caller)
+    /// Check if this extern diverges (never returns to caller)
     pub fn diverges(&self) -> bool {
         self.returns.diverges()
     }
 
-    /// Check if this builtin can be used in const expressions
+    /// Check if this extern can be used in const expressions
     pub fn is_const(&self) -> bool {
         self.purity.is_const()
     }
 
-    /// Check if this builtin is pure (can be optimized)
+    /// Check if this extern is pure (can be optimized)
     pub fn is_pure(&self) -> bool {
         self.purity.is_pure()
     }
@@ -292,7 +292,7 @@ impl BuiltinMeta {
 // Execution Result
 // ============================================================================
 
-/// Result of executing code (builtins, functions, or entire programs)
+/// Result of executing code (externs, functions, or entire programs)
 #[derive(Debug)]
 pub enum ExecResult {
     /// Normal return - value goes to caller
@@ -300,107 +300,107 @@ pub enum ExecResult {
     Return(Option<Value>),
 
     /// Hard exit - value goes to driver, never returns to caller
-    /// Used by diverging builtins like exit()
+    /// Used by diverging externs like exit()
     Exit(Value),
 }
 
 impl ExecResult {
-    /// Create an exit result (for diverging builtins like exit())
+    /// Create an exit result (for diverging externs like exit())
     pub fn exit(value: Value) -> Self {
         ExecResult::Exit(value)
     }
 }
 
 // ============================================================================
-// Builtin Implementation
+// Extern Implementation
 // ============================================================================
 
-/// Function pointer type for builtin implementations.
+/// Function pointer type for extern implementations.
 ///
-/// Builtins use a frame-based calling convention (inspired by Lua's C API):
+/// Externs use a frame-based calling convention (inspired by Lua's C API):
 /// arguments are placed in the current stack frame at slots 1..=N.
 /// The `usize` parameter is the argument count.
 ///
 /// Access args via `vm.arg(i)`:
 /// ```ignore
-/// fn my_builtin(vm: &mut VM, argc: usize) -> Result<ExecResult, ExecError> {
+/// fn my_extern(vm: &mut VM, argc: usize) -> Result<ExecResult, ExecError> {
 ///     let x = vm.arg(0).cloned().unwrap_or(Value::UInt(0));
 ///     Ok(ExecResult::Return(Some(x)))
 /// }
 /// ```
-pub type BuiltinFn = fn(&mut VM, usize) -> Result<ExecResult, ExecError>;
+pub type ExternFn = fn(&mut VM, usize) -> Result<ExecResult, ExecError>;
 
-/// Builtin implementation variants
-pub enum BuiltinImpl {
+/// Extern implementation variants
+pub enum ExternImpl {
     /// Static function pointer
-    Native(BuiltinFn),
+    Native(ExternFn),
 
     /// Boxed closure (for closures capturing state)
     #[allow(clippy::type_complexity)]
     Closure(Box<dyn Fn(&mut VM, usize) -> Result<ExecResult, ExecError> + Send + Sync>),
 }
 
-impl std::fmt::Debug for BuiltinImpl {
+impl std::fmt::Debug for ExternImpl {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            BuiltinImpl::Native(_) => write!(f, "Native(fn)"),
-            BuiltinImpl::Closure(_) => write!(f, "Closure(dyn Fn)"),
+            ExternImpl::Native(_) => write!(f, "Native(fn)"),
+            ExternImpl::Closure(_) => write!(f, "Closure(dyn Fn)"),
         }
     }
 }
 
-impl BuiltinImpl {
-    /// Call the builtin implementation
+impl ExternImpl {
+    /// Call the extern implementation
     pub fn call(&self, vm: &mut VM, argc: usize) -> Result<ExecResult, ExecError> {
         match self {
-            BuiltinImpl::Native(f) => f(vm, argc),
-            BuiltinImpl::Closure(f) => f(vm, argc),
+            ExternImpl::Native(f) => f(vm, argc),
+            ExternImpl::Closure(f) => f(vm, argc),
         }
     }
 }
 
 // ============================================================================
-// Builtin Definition
+// Extern Definition
 // ============================================================================
 
-/// A type-specialized variant of a builtin function.
+/// A type-specialized variant of an extern function.
 ///
 /// When the compiler proves all arguments match the variant's param types
 /// at compile time, it selects this variant instead of the generic implementation.
 /// The variant's param guards are tighter, so the optimizer eliminates them.
-pub struct BuiltinVariant {
+pub struct ExternVariant {
     /// Required param types for this variant (positional, must match exactly)
     pub param_types: Vec<TypeSet>,
     /// Return type for this variant (may be tighter than the generic)
     pub returns: TypeSet,
     /// Type-specialized implementation
-    pub implementation: BuiltinImpl,
+    pub implementation: ExternImpl,
 }
 
-impl std::fmt::Debug for BuiltinVariant {
+impl std::fmt::Debug for ExternVariant {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BuiltinVariant")
+        f.debug_struct("ExternVariant")
             .field("param_types", &self.param_types)
             .field("returns", &self.returns)
             .finish()
     }
 }
 
-/// Complete definition of a builtin function
-pub struct BuiltinDef {
+/// Complete definition of an extern function
+pub struct ExternDef {
     /// Function name
     pub name: String,
     /// Compiler metadata
-    pub meta: BuiltinMeta,
+    pub meta: ExternMeta,
     /// Runtime implementation (generic fallback)
-    pub implementation: BuiltinImpl,
+    pub implementation: ExternImpl,
     /// Type-specialized variants (selected when arg types are statically known)
-    pub variants: Vec<BuiltinVariant>,
+    pub variants: Vec<ExternVariant>,
 }
 
-impl std::fmt::Debug for BuiltinDef {
+impl std::fmt::Debug for ExternDef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BuiltinDef")
+        f.debug_struct("ExternDef")
             .field("name", &self.name)
             .field("meta", &self.meta)
             .field("implementation", &self.implementation)
@@ -409,28 +409,28 @@ impl std::fmt::Debug for BuiltinDef {
     }
 }
 
-impl BuiltinDef {
-    /// Create a new builtin definition with a native function
+impl ExternDef {
+    /// Create a new extern definition with a native function
     /// Default: returns any type, pure but fallible
-    pub fn new(name: impl Into<String>, f: BuiltinFn) -> Self {
-        BuiltinDef {
+    pub fn new(name: impl Into<String>, f: ExternFn) -> Self {
+        ExternDef {
             name: name.into(),
-            meta: BuiltinMeta::returning(TypeSet::all()),
-            implementation: BuiltinImpl::Native(f),
+            meta: ExternMeta::returning(TypeSet::all()),
+            implementation: ExternImpl::Native(f),
             variants: Vec::new(),
         }
     }
 
-    /// Create a new builtin definition with a closure
+    /// Create a new extern definition with a closure
     /// Default: returns any type, pure but fallible
     pub fn with_closure<F>(name: impl Into<String>, f: F) -> Self
     where
         F: Fn(&mut VM, usize) -> Result<ExecResult, ExecError> + Send + Sync + 'static,
     {
-        BuiltinDef {
+        ExternDef {
             name: name.into(),
-            meta: BuiltinMeta::returning(TypeSet::all()),
-            implementation: BuiltinImpl::Closure(Box::new(f)),
+            meta: ExternMeta::returning(TypeSet::all()),
+            implementation: ExternImpl::Closure(Box::new(f)),
             variants: Vec::new(),
         }
     }
@@ -521,17 +521,17 @@ impl BuiltinDef {
     /// time, this variant is selected instead of the generic implementation.
     ///
     /// ```ignore
-    /// BuiltinDef::new("sqrt", sqrt_generic)
+    /// ExternDef::new("sqrt", sqrt_generic)
     ///     .param("x", TypeSet::numeric())
     ///     .returns(TypeSet::numeric())
     ///     .variant(&[TypeSet::uint()], TypeSet::uint(), sqrt_uint)
     ///     .variant(&[TypeSet::single(Float)], TypeSet::single(Float), sqrt_float)
     /// ```
-    pub fn variant(mut self, param_types: &[TypeSet], returns: TypeSet, f: BuiltinFn) -> Self {
-        self.variants.push(BuiltinVariant {
+    pub fn variant(mut self, param_types: &[TypeSet], returns: TypeSet, f: ExternFn) -> Self {
+        self.variants.push(ExternVariant {
             param_types: param_types.to_vec(),
             returns,
-            implementation: BuiltinImpl::Native(f),
+            implementation: ExternImpl::Native(f),
         });
         self
     }
@@ -541,10 +541,10 @@ impl BuiltinDef {
     where
         F: Fn(&mut VM, usize) -> Result<ExecResult, ExecError> + Send + Sync + 'static,
     {
-        self.variants.push(BuiltinVariant {
+        self.variants.push(ExternVariant {
             param_types: param_types.to_vec(),
             returns,
-            implementation: BuiltinImpl::Closure(Box::new(f)),
+            implementation: ExternImpl::Closure(Box::new(f)),
         });
         self
     }
@@ -554,7 +554,7 @@ impl BuiltinDef {
     /// Returns the variant whose param_types all match (each arg TypeSet is a
     /// subset of or equal to the variant's param TypeSet). Returns None if no
     /// variant matches or arg types are too broad.
-    pub fn select_variant(&self, arg_types: &[TypeSet]) -> Option<&BuiltinVariant> {
+    pub fn select_variant(&self, arg_types: &[TypeSet]) -> Option<&ExternVariant> {
         self.variants.iter().find(|v| {
             v.param_types.len() == arg_types.len()
                 && v.param_types
@@ -566,78 +566,76 @@ impl BuiltinDef {
 }
 
 // ============================================================================
-// Builtin Registry
+// Extern Registry
 // ============================================================================
 
-/// Registry of builtin functions
+/// Registry of extern functions
 ///
-/// Contains only user-callable extern functions — functions that a Rill
+/// Contains extern functions (stdlib and embedder-provided) that a Rill
 /// script can invoke by name. Language-defined operators are handled as
-/// `IntrinsicOp` and do not appear here.
+/// `IntrinsicOp` (core intrinsics) and do not appear here.
 ///
 /// Used by the compiler for lowering decisions and by the VM for execution.
 #[derive(Debug, Default)]
-pub struct BuiltinRegistry {
-    builtins: HashMap<String, BuiltinDef>,
+pub struct ExternRegistry {
+    externs: HashMap<String, ExternDef>,
 }
 
-impl BuiltinRegistry {
+impl ExternRegistry {
     /// Create an empty registry
     pub fn new() -> Self {
-        BuiltinRegistry {
-            builtins: HashMap::new(),
+        ExternRegistry {
+            externs: HashMap::new(),
         }
     }
 
-    /// Register a builtin function
-    pub fn register(&mut self, def: BuiltinDef) {
-        self.builtins.insert(def.name.clone(), def);
+    /// Register an extern function
+    pub fn register(&mut self, def: ExternDef) {
+        self.externs.insert(def.name.clone(), def);
     }
 
-    /// Look up a builtin by name
-    pub fn get(&self, name: &str) -> Option<&BuiltinDef> {
-        self.builtins.get(name)
+    /// Look up an extern by name
+    pub fn get(&self, name: &str) -> Option<&ExternDef> {
+        self.externs.get(name)
     }
 
-    /// Look up a builtin by function reference
+    /// Look up an extern by function reference
     ///
     /// Uses the qualified name (e.g., "str::len") for lookup.
-    pub fn lookup(&self, func: &FunctionRef) -> Option<&BuiltinDef> {
-        self.builtins.get(&func.qualified_name())
+    pub fn lookup(&self, func: &FunctionRef) -> Option<&ExternDef> {
+        self.externs.get(&func.qualified_name())
     }
 
-    /// Check if a name is a registered builtin
+    /// Check if a name is a registered extern
     pub fn contains(&self, name: &str) -> bool {
-        self.builtins.contains_key(name)
+        self.externs.contains_key(name)
     }
 
-    /// Iterate over all registered builtins
-    pub fn iter(&self) -> impl Iterator<Item = (&String, &BuiltinDef)> {
-        self.builtins.iter()
+    /// Iterate over all registered externs
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &ExternDef)> {
+        self.externs.iter()
     }
 
-    /// Get the number of registered builtins
+    /// Get the number of registered externs
     pub fn len(&self) -> usize {
-        self.builtins.len()
+        self.externs.len()
     }
 
     /// Check if the registry is empty
     pub fn is_empty(&self) -> bool {
-        self.builtins.is_empty()
+        self.externs.is_empty()
     }
 }
 
 // ============================================================================
-// Standard Builtins
+// Standard Externs
 // ============================================================================
 
-/// Create a registry with standard builtins.
+/// Create a registry with standard externs.
 ///
-/// This contains only user-callable extern functions — functions that a Rill
-/// script can invoke by name. Language-defined operators (arithmetic,
-/// comparison, bitwise, etc.) and compiler-internal synthetics (MakeArray,
-/// MakeMap, etc.) are handled as `IntrinsicOp` and never appear here.
-pub fn standard_builtins() -> BuiltinRegistry {
+/// Currently empty — all language-defined operations are core intrinsics.
+/// The stdlib crate (when implemented) will register its functions here.
+pub fn standard_externs() -> ExternRegistry {
     // Only `len` is a compiler intrinsic (via try_lower_intrinsic).
     // Type-checking (is_uint, etc.) and presence-checking (is_some)
     // are user-definable — will move to a prelude in the future.
@@ -645,7 +643,7 @@ pub fn standard_builtins() -> BuiltinRegistry {
     //
     // Future: exit, encode, decode, print, etc.
 
-    BuiltinRegistry::new()
+    ExternRegistry::new()
 }
 
 // ============================================================================
@@ -735,7 +733,7 @@ mod tests {
             Ok(ExecResult::Return(None))
         }
 
-        let def = BuiltinDef::new("test", dummy)
+        let def = ExternDef::new("test", dummy)
             .param("x", TypeSet::uint())
             .param_optional("y", TypeSet::int())
             .returns(TypeSet::bool())
@@ -755,10 +753,10 @@ mod tests {
             Ok(ExecResult::Return(None))
         }
 
-        let mut registry = BuiltinRegistry::new();
+        let mut registry = ExternRegistry::new();
         assert!(registry.is_empty());
 
-        registry.register(BuiltinDef::new("foo", dummy));
+        registry.register(ExternDef::new("foo", dummy));
         assert_eq!(registry.len(), 1);
         assert!(registry.contains("foo"));
         assert!(!registry.contains("bar"));
@@ -779,7 +777,7 @@ mod tests {
             Ok(ExecResult::Return(Some(Value::UInt(2))))
         }
 
-        let def = BuiltinDef::new("sqrt", generic)
+        let def = ExternDef::new("sqrt", generic)
             .param("x", TypeSet::numeric())
             .returns(TypeSet::numeric())
             .variant(&[TypeSet::uint()], TypeSet::uint(), uint_variant)

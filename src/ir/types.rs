@@ -26,11 +26,11 @@ pub use crate::types::{BaseType, TypeSet};
 /// semantics, arity, types, and const-eval behavior. They are never
 /// user-callable by name; they exist only as lowering targets for syntax.
 ///
-/// Separating intrinsics from the `BuiltinRegistry` enables:
+/// Separating intrinsics from the `ExternRegistry` enables:
 /// - Type-specialized code generation (e.g., `Add` on two `UInt` values
 ///   compiles to a single `u64::checked_add`, not a 10-way type dispatch)
 /// - Peephole optimization via a `StepKind` intermediate
-/// - A clean `BuiltinRegistry` containing only host-provided extern functions
+/// - A clean `ExternRegistry` containing only host-provided extern functions
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IntrinsicOp {
     // -- Arithmetic --
@@ -433,7 +433,7 @@ pub struct FunctionRef {
 }
 
 impl FunctionRef {
-    /// Create a FunctionRef for a core builtin (e.g., "add" -> core::add)
+    /// Create a FunctionRef for an extern (e.g., "math::sqrt")
     pub fn core(name: &str) -> Self {
         FunctionRef {
             namespace: Some(ast::Identifier("core".to_string())),
@@ -443,7 +443,7 @@ impl FunctionRef {
 
     /// Get the fully qualified name using `::` as separator
     ///
-    /// This matches the naming convention used by the builtin registry.
+    /// This matches the naming convention used by the extern registry.
     /// Examples: "core::add", "str::len", "my_function"
     pub fn qualified_name(&self) -> String {
         match &self.namespace {
@@ -526,7 +526,7 @@ pub enum Terminator {
     /// Return from function
     Return { value: Option<VarId> },
 
-    /// Hard exit to driver (from diverging builtins like drop())
+    /// Hard exit to driver (from diverging externs like drop())
     #[allow(dead_code)]
     Exit { value: VarId },
 

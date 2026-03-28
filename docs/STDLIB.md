@@ -1,48 +1,51 @@
-# Standard Library Organization
+# Rill Function Library
 
-## Prelude (Auto-imported)
+See the **Terminology** section in `DESIGN.md` for definitions of core,
+prelude, stdlib, and externs.
 
-These functions are available in every script without explicit import.
+## Prelude (Injected Source)
 
-### Type Intrinsics
-
-| Function | Returns | Purpose |
-|----------|---------|---------|
-| `is_X()` | `Bool` | Type check (sugar for pattern match) |
-| `to_X()` | `X` or `missing` | Type conversion (creates new value) |
-
-Note: Type patterns (`UInt(x)`, `Text(s)`, etc.) replace the old `as_X()` functions.
-Use `with Type(x) = value` for type-narrowing reference bindings.
-
-### Size/Length
-- `len(x)` - Returns length of Array, Map, Text, or Bytes
+Prelude functions are Rill source text injected at the start of every
+program. They are regular user-defined functions — not core intrinsics,
+not externs. In bytecode, they appear in the function list alongside user
+code.
 
 ### Existence Checking
-- `is_some(x)` - Returns `Bool` (true if present, false if missing)
+- `is_defined(x)` - Returns `Bool` (true if present, false if undefined)
 
-### Type Checking (is_) - Compiler Sugar
+### Type Checking (is_)
 - `is_uint(x)`, `is_int(x)`, `is_float(x)`, `is_bool(x)`
 - `is_text(x)`, `is_bytes(x)`, `is_array(x)`, `is_map(x)`
-- All return `Bool`, never `missing`
-- **These are pure syntactic sugar** - compiler lowers to pattern matching:
-  - `is_uint(x)` → `if let UInt(_) = x { true } else { false }`
-- Kept for convenience; internally everything is pattern matching
-
-### Type Patterns (replaces as_X)
-- Use type patterns for type-narrowing bindings:
-  - `with UInt(n) = value;` - n is reference if value is UInt, else missing
-  - `if with UInt(n) = value { n += 1; }` - conditional reference binding
-  - `let UInt(n) = value;` - n is copy if value is UInt, else missing
+- All return `Bool`, never undefined
+- These compile to `Match` + Phi — identical to hand-written pattern matching
 
 ### Type Conversion (to_)
 - `to_uint(x)`, `to_int(x)`, `to_float(x)`, `to_text(x)`
-- Return a **new value** (converted), or `missing` on failure
+- Return a **new value** (converted), or undefined on failure
 - Use with `if let`: `if let n = to_uint(val) { use(n); }`
-- No `?` needed: the implicit presence check IS the point of if let
 
-See `stdlib_prelude.txt` for detailed documentation.
+### Utilities
+- `default(value, fallback)` — returns value if defined, else fallback
 
-## Core Modules (Explicit Import)
+### Core Intrinsics (Not Prelude)
+
+These are hard-coded in the compiler, not prelude source:
+
+- `len(x)` — Collection/sequence length (core intrinsic, callable by name)
+- `collect(seq)` — Materialize sequence to array (core intrinsic, callable by name)
+
+### Type Patterns
+
+Type patterns are syntax, not functions:
+- `with UInt(n) = value;` - n is reference if value is UInt, else undefined
+- `if with UInt(n) = value { n += 1; }` - conditional reference binding
+- `let UInt(n) = value;` - n is copy if value is UInt, else undefined
+
+## Stdlib Modules (Registered by Embedder)
+
+Stdlib modules are Rust crates providing utility functions via
+`ExternRegistry`. The embedder opts in by registering them. In bytecode,
+they appear as symbolic `FunctionRef` names resolved at load time.
 
 ### Domain-Specific Modules (DTN/Bundle Protocol)
 
@@ -83,7 +86,7 @@ if admin::is_admin_record(bundle) {
 }
 ```
 
-### General-Purpose Modules
+### General-Purpose Stdlib Modules
 
 #### `std.cbor`
 CBOR encoding/decoding utilities
@@ -130,38 +133,48 @@ let b64 = encoding::base64_encode(bytes);
 
 ## Module System
 
-### Importing
-```rust
-// Standard library (unquoted dotted paths)
+See `DESIGN.md` Module System section for full details.
+
+### Importing (Source Modules)
+```rill
+// Dotted paths (resolve to Rill source modules)
 import std.bpsec;
 import std.status_report.codes as codes;
 
 // Local files (quoted strings)
-import "../common/validation.flt";
-import "./helpers.flt" as helpers;
+import "../common/validation.rill";
+import "./helpers.rill" as helpers;
+```
+
+### Stdlib/Extern Access (No Import Needed)
+```rill
+// Stdlib and embedder-provided functions are accessed via namespace
+// qualification — registered by the embedder, not imported
+math::sqrt(x)
+console::log("hello")
 ```
 
 ### Namespacing
-```rust
-// Call imported functions with namespace::function
+```rill
+// Source module functions use namespace from import
 codes::LifetimeExpired
-bpsec::validate_signature(block, bundle)
 validation::check_structure(bundle)
 
-// Prelude functions don't need namespace
+// Prelude and core intrinsics need no namespace
 len(array)
 is_uint(value)
+is_defined(value)
 ```
 
 ### Default Aliases
-- Standard library: last component (`std.bpsec` → `bpsec`)
-- Files: filename without extension (`"helpers.flt"` → `helpers`)
+- Dotted paths: last component (`std.bpsec` → `bpsec`)
+- Files: filename without extension (`"helpers.rill"` → `helpers`)
 - Override with `as name`
 
 ## Design Principles
 
-1. **Auto-import essentials** - Core operations always available
-2. **Explicit opt-in** - Specialized functionality requires import
-3. **Consistent semantics** - All coercion returns `missing` on failure
-4. **No magic** - Clear distinction between prelude and imports
-5. **Duck typing** - Type checking is runtime, not compile-time
+1. **Prelude for essentials** — common functions always available, as Rill source
+2. **Explicit opt-in** — stdlib and domain modules require embedder registration
+3. **Consistent semantics** — failed operations return undefined, not exceptions
+4. **No magic** — prelude is just source code; core intrinsics are minimal
+5. **Duck typing** — type checking is runtime, not compile-time

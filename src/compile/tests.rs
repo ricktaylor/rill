@@ -1,11 +1,11 @@
 use super::*;
-use crate::builtins;
+use crate::externs;
 
 /// Helper: compile source and execute a named function (no args)
 fn run(source: &str, func_name: &str) -> Result<Option<Value>, String> {
-    let builtins = builtins::standard_builtins();
+    let externs = externs::standard_externs();
     let (program, diagnostics) =
-        crate::compile(source, &builtins).map_err(|d| format!("compilation failed: {}", d))?;
+        crate::compile(source, &externs).map_err(|d| format!("compilation failed: {}", d))?;
 
     if diagnostics.has_warnings() {
         eprintln!("warnings: {}", diagnostics);
@@ -54,7 +54,7 @@ fn test_implicit_return() {
 }
 
 // ========================================================================
-// Arithmetic (binary builtins)
+// Arithmetic (binary externs)
 // ========================================================================
 
 #[test]
@@ -249,7 +249,7 @@ fn test_short_circuit_or() {
 }
 
 // ========================================================================
-// Builtins
+// Externs
 // ========================================================================
 
 #[test]
@@ -1374,12 +1374,12 @@ fn test_forward_reference_return_type() {
 }
 
 // ================================================================
-// Builtin monomorphism (variant selection)
+// Extern monomorphism (variant selection)
 // ================================================================
 
 #[test]
-fn test_builtin_variant_selection() {
-    // Register a builtin with type-specific variants.
+fn test_extern_variant_selection() {
+    // Register an extern with type-specific variants.
     // The generic returns 0, uint variant returns 1, int variant returns 2.
     fn generic(_vm: &mut VM, _argc: usize) -> Result<ExecResult, ExecError> {
         Ok(ExecResult::Return(Some(Value::UInt(0))))
@@ -1391,12 +1391,12 @@ fn test_builtin_variant_selection() {
         Ok(ExecResult::Return(Some(Value::UInt(2))))
     }
 
-    use crate::builtins::{BuiltinDef, BuiltinRegistry};
+    use crate::externs::{ExternDef, ExternRegistry};
     use crate::types::TypeSet;
 
-    let mut builtins = BuiltinRegistry::new();
-    builtins.register(
-        BuiltinDef::new("classify", generic)
+    let mut externs = ExternRegistry::new();
+    externs.register(
+        ExternDef::new("classify", generic)
             .param("x", TypeSet::numeric())
             .returns(TypeSet::uint())
             .pure_infallible()
@@ -1411,7 +1411,7 @@ fn test_builtin_variant_selection() {
                 a
             }
         "#;
-    let (program, _diagnostics) = crate::compile(source, &builtins).expect("should compile");
+    let (program, _diagnostics) = crate::compile(source, &externs).expect("should compile");
 
     let mut vm = VM::new();
     let result = program

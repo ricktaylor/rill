@@ -853,7 +853,7 @@ impl VM {
     }
 
     // ========================================================================
-    // Builtin argument access (Lua-style stack API)
+    // Extern argument access (Lua-style stack API)
     // ========================================================================
 
     /// Get function argument by 0-based index.
@@ -862,7 +862,7 @@ impl VM {
     /// `arg(0)` returns the first argument, `arg(1)` the second, etc.
     ///
     /// ```ignore
-    /// fn my_builtin(vm: &mut VM, argc: usize) -> Result<ExecResult, ExecError> {
+    /// fn my_extern(vm: &mut VM, argc: usize) -> Result<ExecResult, ExecError> {
     ///     let x = vm.arg(0).cloned().unwrap_or(Value::UInt(0));
     ///     let y = vm.arg(1).cloned().unwrap_or(Value::UInt(0));
     ///     Ok(ExecResult::Return(Some(Value::UInt(x + y))))

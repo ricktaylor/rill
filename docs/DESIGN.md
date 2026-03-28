@@ -20,7 +20,7 @@ processing structured data without schema declarations.
   strings (Text, Bytes), and collections (Array, Map, Sequence). No type annotations
   in source code — types are inferred by the optimizer.
 - **Pattern matching**: Rich destructuring with type narrowing and reference binding.
-- **Safe embedding**: Resource limits (stack, heap), no undefined behavior, host-provided builtins.
+- **Safe embedding**: Resource limits (stack, heap), no undefined behavior, host-provided externs.
 - **Undefined propagation**: Failed operations produce undefined values that propagate silently —
   no exceptions, no panics. Scripts can probe data structures without defensive checks.
 
@@ -43,7 +43,7 @@ Source Code
      │
      ▼
 ┌─────────┐
-│   IR    │  SSA form, type sets, builtins
+│   IR    │  SSA form, type sets, externs
 └────┬────┘
      │
      ▼
@@ -51,6 +51,84 @@ Source Code
 │   VM    │  Stack-based execution with heap tracking
 └─────────┘
 ```
+
+## Terminology: Core, Stdlib, Prelude, Externs
+
+Rill has four distinct categories of functionality. These terms are used
+consistently throughout the codebase and documentation.
+
+### Core (Intrinsics)
+
+Operations required by the language runtime to function. These are the
+`IntrinsicOp` variants — `Add`, `Eq`, `MakeArray`, `MakeMap`, `Len`,
+`SeqNext`, etc. The compiler knows their exact semantics, arity, types,
+and const-eval behavior.
+
+Core operations are **not user-callable by name** (with the exception of
+`len()` and `collect()` which have syntactic shortcuts). They exist only
+as lowering targets for syntax. `x + y` lowers to `Intrinsic(Add, [x, y])`.
+They are encoded as `IntrinsicOp` discriminants in bytecode and are always
+available — no registry, no linking, no import.
+
+### Stdlib
+
+Utility functions written in Rust, provided as a separate crate (e.g.,
+`rill-std`) that embedders can optionally link in. Examples: `math::sqrt`,
+`str::upper`, `str::split`, `encoding::base64_encode`.
+
+Stdlib functions are registered via the `ExternRegistry` by the embedder.
+They are **optional** — an embedder links only what they need. In bytecode,
+they appear as symbolic `FunctionRef` names (e.g., `["math", "sqrt"]`)
+that are resolved at load time against the host's registry.
+
+Stdlib functions are indistinguishable from any other extern at the IR
+level. The distinction is organizational: stdlib is the "batteries
+included" set that Rill provides as a crate, while other externs are
+application-specific.
+
+### Prelude
+
+Convenience functions injected at the start of every program as source
+text. These are **regular Rill functions** — they compile to the same IR
+as hand-written code. Examples: `is_defined(x)`, `is_uint(x)`,
+`default(value, fallback)`.
+
+```rill
+// Prelude (injected before user source):
+fn is_defined(x) { if let _ = x { true } else { false } }
+fn is_uint(x) { match x { UInt(_) => true, _ => false } }
+fn default(value, fallback) { if let v = value { v } else { fallback } }
+```
+
+Prelude functions become ordinary user-defined functions in the IR. In
+bytecode, they are present in the function list alongside the user's own
+functions — no special treatment. There is no performance difference
+between a prelude function and the same function written by the user.
+
+### Externs (ExternRegistry)
+
+Host-provided Rust functions registered by the embedder. This is the
+embedding API. Examples: `exit()`, `console::log()`, `send_report()`,
+domain-specific operations.
+
+Externs are registered via the `ExternRegistry` with metadata (parameter
+types, return type, purity). In bytecode, they appear as symbolic
+`FunctionRef` names resolved at load time. The standard registry is empty —
+all language-defined operations are core intrinsics.
+
+### Summary
+
+| Category | Implementation | Callable by name? | In bytecode as | Available without registry? |
+|----------|---------------|-------------------|----------------|---------------------------|
+| **Core** | `IntrinsicOp` (Rust enum) | No (lowering targets) | Integer opcode | Yes — always |
+| **Prelude** | Rill source (injected) | Yes | Internal function | Yes — in function list |
+| **Stdlib** | Rust crate (`rill-std`) | Yes (qualified) | Symbolic `FunctionRef` | No — needs `ExternRegistry` |
+| **Externs** | Rust (embedder-provided) | Yes (qualified) | Symbolic `FunctionRef` | No — needs `ExternRegistry` |
+
+The key architectural boundary is between **resolved** (core + prelude —
+always available, no external dependencies) and **late-bound** (stdlib +
+externs — resolved against `ExternRegistry` at load time). Bytecode
+contains everything resolved; only late-bound symbols require the host.
 
 ## Files
 
@@ -62,9 +140,7 @@ Source Code
 | `parser.rs` | Chumsky-based parser → AST |
 | `ir.rs` | Intermediate representation (SSA) |
 | `exec.rs` | Virtual machine and runtime values |
-| `builtins.rs` | Builtin function registry and metadata |
-| `stdlib_prelude.txt` | Auto-imported standard functions |
-| `STDLIB.md` | Standard library documentation |
+| `externs.rs` | Extern function registry and metadata |
 
 ---
 
@@ -383,7 +459,7 @@ separate terminator type. The last step of each block returns `NextBlock`,
 IR blocks (SSA with phis)
     │
     ├─ 1. Compile each IR instruction to a Step closure
-    │     (VarIds → slot offsets, builtins → fn pointers)
+    │     (VarIds → slot offsets, externs → fn pointers)
     │
     ├─ 2. Compile each terminator to a Step closure
     │     (If/Match/Guard → NextBlock closures)
@@ -419,7 +495,7 @@ Identity phis (all sources are the same slot as dest) are dropped entirely.
 | IR concept | Compile-time resolution |
 |------------|------------------------|
 | `VarId(n)` | Stack slot offset `n + 1` |
-| `FunctionRef("core::add")` | Native function pointer (Copy) |
+| `FunctionRef("math::sqrt")` | Native function pointer (via ExternRegistry) |
 | `Literal::UInt(42)` | Pre-computed `Value` captured directly |
 | `Literal::Text("key")` | Interned on first execution (Rc clone after) |
 | `BlockId` | Index into `block_starts` |
@@ -450,13 +526,13 @@ closures, eliminating runtime dispatches when static information is sufficient:
 
 ### Calling Convention
 
-All function calls (user and builtin) use frame-based argument passing — no
+All function calls (user and extern) use frame-based argument passing — no
 intermediate `Vec` allocation:
 
 - **User calls**: caller copies args slot-to-slot into callee's frame, executes
   callee body inline (same loop, no `execute_function` indirection)
-- **Builtin calls**: frame set up with `call_with_args` (Lua-style: pre-pushed
-  args adopted into frame via `rotate_right`). Builtins read args via `vm.arg(i)`
+- **Extern calls**: frame set up with `call_with_args` (Lua-style: pre-pushed
+  args adopted into frame via `rotate_right`). Externs read args via `vm.arg(i)`
 - **Entry point**: embedder pushes args with `vm.push()`, calls with `argc`
 
 ### Execution Loop
@@ -487,7 +563,7 @@ loop {
 - **No Rust stack growth for loops**: Back-edges set `pc` to an earlier offset.
 - **User function calls inline**: Caller sets up frame and runs callee loop
   directly, bounded by VM's `MAX_STACK_SIZE` (65K slots, ~3000-6000 levels).
-- **Zero allocation per call**: Args copied slot-to-slot, no Vec. Builtins
+- **Zero allocation per call**: Args copied slot-to-slot, no Vec. Externs
   use frame-based `vm.arg(i)` access.
 - **Linear blocks are merged**: CFG simplification (runs twice in optimizer)
   concatenates chains of single-predecessor/single-successor blocks. The
@@ -502,7 +578,7 @@ can be inspected and optimized. This requires a tagged intermediate form:
 enum StepKind {
     Copy { dest: usize, src: usize },
     Const { dest: usize, value: Value },
-    Call { dest: usize, func: BuiltinFn, args: Vec<usize> },
+    Call { dest: usize, func: ExternFn, args: Vec<usize> },
     // ...
 }
 // Optimize StepKind sequences, then convert to closures
@@ -552,10 +628,10 @@ params and sets `pc` to the entry offset instead of recursing through
 
 | Category | Description | Examples |
 |----------|-------------|----------|
-| **Intrinsic** | Language-defined operations with fixed semantics | `Add`, `Eq`, `Len`, `MakeArray` |
-| **Extern Call** | Host-provided functions registered by embedder | `exit()`, `decode()`, `validate()` |
+| **Core intrinsic** | Language-defined operations with fixed semantics | `Add`, `Eq`, `Len`, `MakeArray` |
+| **Extern call** | Stdlib or embedder-provided functions (via `ExternRegistry`) | `math::sqrt()`, `exit()`, `console::log()` |
 
-**Intrinsics** (`IntrinsicOp` enum) cover all language-defined operations:
+**Core intrinsics** (`IntrinsicOp` enum) cover all language-defined operations:
 
 - Arithmetic: `Add`, `Sub`, `Mul`, `Div`, `Mod`, `Neg`
 - Comparison: `Eq`, `Lt`
@@ -577,9 +653,11 @@ folds to `3` using the inline const evaluator.
 - `x && y` → `If(x, evaluate_y, false)` + Phi (short-circuit)
 - `x || y` → `If(x, true, evaluate_y)` + Phi (short-circuit)
 
-**Extern calls** (`Instruction::Call`) are reserved for host-provided functions
-registered via the `BuiltinRegistry`. The standard registry is empty — all
-language-defined functions are intrinsics.
+**Extern calls** (`Instruction::Call`) are for stdlib and embedder-provided
+functions registered via the `ExternRegistry`. The standard registry is
+empty — all language-defined operations are core intrinsics. `Call` is also
+used for user-defined functions (including prelude functions), which resolve
+internally within the program rather than against the registry.
 
 ### Pattern Lowering Example
 
@@ -739,7 +817,7 @@ Plus terminators that exit the function:
 | Terminator | Purpose |
 |------------|---------|
 | `Return` | Return value to caller |
-| `Exit` | Hard exit to driver (from diverging builtins) |
+| `Exit` | Hard exit to driver (from diverging externs) |
 
 ```rust
 pub enum Terminator {
@@ -1348,7 +1426,7 @@ without knowing its concrete type, and vice versa. Definedness flows from source
 | `WriteRef { .. }` | no dest (side effect only) |
 | `Intrinsic { op, .. }` infallible, all args Defined | `Defined` |
 | `Intrinsic { op, .. }` fallible or args MaybeDefined | `MaybeDefined` |
-| `Call { dest, function, .. }` | depends on `BuiltinMeta.purity` |
+| `Call { dest, function, .. }` | depends on `ExternMeta.purity` |
 | `Phi { dest, sources }` | meet of all sources |
 
 **Control flow refinement:**
@@ -1515,7 +1593,7 @@ may emerge. This pass runs the same constant folding logic as Pass 1 to clean up
 **Transformations:**
 
 - Fold `Intrinsic` ops with const args: `Intrinsic(Add, [1, 2])` → `Const(3)`
-- Fold `Call` to const builtins with const args
+- Fold `Call` to const externs with const args
 - Simplify `If` terminators: `If { condition: Const(true), .. }` → `Jump { target: then }`
 - Replace variable references with `Const` instructions when value is known
 
@@ -1564,9 +1642,9 @@ Some passes may enable further optimizations by others. The pipeline can iterate
 
 ```rust
 loop {
-    let folded = fold_constants(&mut func, builtins, diagnostics);
+    let folded = fold_constants(&mut func, externs, diagnostics);
     let refs = elide_refs(&mut func);
-    let analysis = analyze_definedness(&func, Some(builtins));
+    let analysis = analyze_definedness(&func, Some(externs));
     let guards = eliminate_guards(&mut func, &analysis);
     let blocks = simplify_cfg(&mut func);
     if folded + refs + guards + blocks == 0 { break; }
@@ -1776,33 +1854,33 @@ if with UInt(n) = record.priority {
 
 ### Prelude Functions
 
-Auto-imported functions available without qualification.
+Functions injected as Rill source at the start of every program. Available
+without qualification or import.
 
-**Always inlined** (expansion simpler than a call):
+**Type checking** (regular Rill code, inlined by the optimizer):
 
-| Function | Returns | Inlines To |
-|----------|---------|------------|
+| Function | Returns | Compiles To |
+|----------|---------|-------------|
+| `is_defined(v)` | `Bool` | `Guard` + Phi |
 | `is_uint(v)`, `is_int(v)`, ... | `Bool` | `Match` + Phi |
-| `is_some(v)` | `Bool` | `Guard` + Phi |
+| `to_uint(v)`, `to_int(v)`, ... | Value or Undefined | Type conversion |
+| `default(v, fallback)` | Value | `Guard` + Phi |
 
-**Regular functions** (Const purity, may be inlined):
+**Core intrinsics** callable by name (not prelude — hard-coded in compiler):
 
 | Function | Returns | Purpose |
 |----------|---------|---------|
-| `to_uint(v)`, `to_int(v)`, ... | Value or Undefined | Type conversion |
 | `len(v)` | `UInt` or Undefined | Collection/sequence length |
-| `concat(a, b)` | Collection or Undefined | Concatenate arrays, text, bytes |
 | `collect(seq)` | Array | Materialize a sequence into an Array |
-| `sub_slice(coll, start, end)` | Collection | Extract sub-collection [start, end) |
 
-**Internal functions** (compiler-generated for lowering literals):
+**Core intrinsics** not callable by name (lowering targets for syntax):
 
-| Function | Returns | Used For |
-|----------|---------|----------|
-| `make_array()` | Array | `[a, b, c]` literals |
-| `make_map()` | Map | `{k: v}` literals |
-| `push(coll, elem)` | Collection | Building collection literals |
-| `insert(map, k, v)` | Map | Building map literals |
+| IntrinsicOp | Used For |
+|-------------|----------|
+| `MakeArray` | `[a, b, c]` literals |
+| `MakeMap` | `{k: v}` literals |
+| `MakeSeq` | `start..end` ranges |
+| `ArraySeq` | `..rest` patterns |
 
 ### Rest Patterns
 
@@ -1841,7 +1919,7 @@ Sequences are an internal type — not user-visible for pattern matching. Users
 never write "Sequence" in their code. They write `0..10`, use `for` loops,
 and call `collect()`.
 
-Host builtins can return sequences for lazy data streams (e.g., iterating over
+Host externs can return sequences for lazy data streams (e.g., iterating over
 records in a database cursor or pages in a document without materializing
 them all into an Array).
 
@@ -1860,7 +1938,7 @@ them all into an Array).
 
 Everything else returns Undefined:
 
-- Type mismatch in builtin
+- Type mismatch in extern
 - Division by zero
 - Arithmetic overflow/underflow
 - Out of bounds index
@@ -1881,10 +1959,10 @@ let y = x;                   // Undefined propagates through operations
 
 ### Import Syntax
 
-Imports introduce namespaces using dotted paths (stdlib) or string paths (files):
+Imports introduce namespaces using dotted paths or string paths (files):
 
 ```rill
-// Standard library - dotted path, last segment becomes namespace
+// Dotted path - resolves to a Rill source module, last segment becomes namespace
 import std.cbor;                     // → namespace `cbor`
 import std.encoding.base64;          // → namespace `base64`
 import std.time as t;                // → namespace `t` (explicit alias)
@@ -1893,6 +1971,11 @@ import std.time as t;                // → namespace `t` (explicit alias)
 import "../common/validation.rill";  // → namespace `validation`
 import "./helpers.rill" as h;        // → namespace `h` (explicit alias)
 ```
+
+Note: dotted-path imports resolve to Rill source modules, not to the stdlib
+crate. Stdlib functions (e.g., `math::sqrt`) are registered by the embedder
+via `ExternRegistry` and accessed via namespace qualification — no import
+statement needed.
 
 ### Namespace Qualification
 
@@ -1963,7 +2046,7 @@ recognized by the compiler during lowering, not namespace-qualified functions.
 When resolving an unqualified function call, the lowerer searches in order:
 
 1. **Intrinsics** — `len()`, `is_some()`, `is_uint()`, etc. (checked first via `try_lower_intrinsic`)
-2. **Registry** — host-provided extern functions (via `BuiltinRegistry`)
+2. **Registry** — host-provided extern functions (via `ExternRegistry`)
 3. **User functions** — defined in current module or imported
 
 For const declarations, `intrinsic_by_name()` maps function names to `IntrinsicOp`
@@ -1988,43 +2071,50 @@ console::log("Hello, world!")
 
 ### Prelude (Planned)
 
-A future prelude will provide standard utility functions that are automatically
-available without imports. These are regular user-defined functions, not intrinsics:
+The prelude is Rill source text injected at the start of every program. It
+provides convenience functions as regular user-defined code — not intrinsics,
+not externs. Prelude functions compile to identical IR to hand-written equivalents:
 
 ```rill
-// Planned prelude functions (user-definable, identical IR to hand-written):
-fn is_some(x) { if let _ = x { true } else { false } }
+// Prelude source (injected before user code):
+fn is_defined(x) { if let _ = x { true } else { false } }
 fn is_uint(x) { match x { UInt(_) => true, _ => false } }
 fn is_int(x) { match x { Int(_) => true, _ => false } }
 // ... etc for all types
 fn default(value, fallback) { if let v = value { v } else { fallback } }
 ```
 
-The only compiler intrinsic that is user-callable by name is `len()`, which the
-compiler recognizes in `try_lower_intrinsic` and emits as `Intrinsic(Len, [x])`.
-This is necessary because `len()` is used internally by for-loop lowering and
-pattern matching.
+In bytecode, prelude functions appear in the function list alongside user
+functions — they are resolved internally, not late-bound against the registry.
+
+The only core intrinsics that are user-callable by name are `len()` and
+`collect()`, which the compiler recognizes in `try_lower_intrinsic` and emits
+as `Intrinsic(Len/Collect, [x])`. This is necessary because `len()` is used
+internally by for-loop lowering and pattern matching.
 
 ---
 
-## Builtins and Intrinsics
+## Core Intrinsics and Externs
 
-Rill distinguishes between two types of "built-in" functionality:
+See the **Terminology** section above for definitions of core, stdlib,
+prelude, and externs.
 
 | Concept | Definition | When Evaluated | Registered? |
 |---------|------------|----------------|-------------|
-| **Intrinsic** | Language-defined operation with fixed semantics | Compile time + Runtime | No — hard-coded in `IntrinsicOp` enum |
-| **Extern** | Host-provided Rust function | Runtime (VM execution) | Yes — via `BuiltinRegistry` |
+| **Core intrinsic** | Language-required operation with fixed semantics | Compile time + Runtime | No — hard-coded in `IntrinsicOp` enum |
+| **Extern** | Stdlib or embedder-provided Rust function | Runtime (VM execution) | Yes — via `ExternRegistry` |
 
 ### Design Philosophy
 
-**Intrinsics are minimal.** Only operations that require compiler knowledge are
-intrinsics: operators (need type dispatch), `len()` (used in for-loop lowering),
-and literal constructors. Functions like `is_some()` and `is_uint()` are
-user-definable — they compile to identical IR via normal `match`/`if let` syntax.
+**Core intrinsics are minimal.** Only operations that require compiler
+knowledge are intrinsics: operators (need type dispatch), `len()` (used in
+for-loop lowering), and literal constructors. Functions like `is_some()` and
+`is_uint()` are prelude functions — regular Rill code that compiles to
+identical IR via normal `match`/`if let` syntax.
 
-**Externs are the embedding API.** Host applications register functions that scripts
-can call by name. The standard registry is empty.
+**Externs are the embedding API.** Host applications (and the optional stdlib
+crate) register functions via `ExternRegistry`. The standard registry is
+empty.
 
 ---
 
@@ -2072,37 +2162,40 @@ sufficient because Rill uses `undefined` instead of IEEE-754 NaN. Without NaN's
 special comparison semantics (where `NaN != NaN` is true), mathematical reflexivity
 holds and these expansions are equivalent to dedicated operators.
 
-### User-Definable Utility Functions
+### Prelude Functions (Not Intrinsics)
 
-Functions like `is_some()`, `is_uint()`, `default()`, etc. are **not intrinsics**.
-Users define them as regular functions — they compile to identical IR:
+Functions like `is_defined()`, `is_uint()`, `default()`, etc. are **not core
+intrinsics** — they are prelude functions, written in Rill source and injected
+at the start of every program. They compile to identical IR as hand-written code:
 
 ```rill
-fn is_some(x) { if let _ = x { true } else { false } }
+fn is_defined(x) { if let _ = x { true } else { false } }
 fn is_uint(x) { match x { UInt(_) => true, _ => false } }
 fn default(value, fallback) { if let v = value { v } else { fallback } }
 ```
 
-These produce the same Guard/Match + Phi control flow that a compiler intrinsic
-would. There is no performance penalty — the IR is identical.
-
-A future prelude will provide standard definitions of common utility functions.
+These produce the same Guard/Match + Phi control flow that a core intrinsic
+would. There is no performance penalty — the IR is identical. In bytecode,
+they appear as internal functions in the function list.
 
 ---
 
-## Extern Function System (BuiltinRegistry)
+## Extern Function System (ExternRegistry)
 
-The `BuiltinRegistry` is the embedding API — how host applications register
-functions that Rill scripts can call by name. It follows Lua embedding patterns.
+The `ExternRegistry` is the embedding API — how host applications and the
+optional stdlib crate register functions that Rill scripts can call by name.
+It follows Lua embedding patterns.
 
-The standard registry is **empty**. All language-defined operations (`+`, `len()`,
-`is_uint()`, etc.) are intrinsics. The registry exists purely for host-provided
-functionality like `exit()`, `encode()`, or domain-specific operations.
+The standard registry is **empty**. All language-defined operations (`+`,
+`len()`, etc.) are core intrinsics. Convenience functions (`is_uint()`,
+`is_some()`, etc.) are prelude functions. The registry exists for
+stdlib utility functions (`math::sqrt`, `str::upper`) and embedder-provided
+functionality (`exit()`, `console::log()`, domain-specific operations).
 
-### Builtin Metadata
+### Extern Metadata
 
 ```rust
-struct BuiltinMeta {
+struct ExternMeta {
     params: Vec<ParamSpec>,      // Parameter types and optionality
     returns: ReturnBehavior,     // Returns or Exits
     purity: Purity,              // Optimization potential + fallibility
@@ -2133,7 +2226,7 @@ Intrinsics use `IntrinsicOp::is_fallible()` directly instead.
 
 ### Param Type Guards
 
-When a builtin declares `ParamSpec.type_sig` constraints, the compiler inserts
+When an extern declares `ParamSpec.type_sig` constraints, the compiler inserts
 Match guards before the call during lowering:
 
 ```
@@ -2153,7 +2246,7 @@ join:
   Phi(result)
 ```
 
-This means builtins can trust their inputs — no internal type checking needed.
+This means externs can trust their inputs — no internal type checking needed.
 The guards integrate with the existing optimizer:
 
 - **Type refinement**: narrows arg type in the call block (existing Match refinement)
@@ -2161,13 +2254,13 @@ The guards integrate with the existing optimizer:
 - **Dead arm elimination**: collapses guard to Jump when type is statically known
 - **Interprocedural analysis**: sees narrowed types at call sites automatically
 
-### Type-Specialized Variants (Builtin Monomorphism)
+### Type-Specialized Variants (Extern Monomorphism)
 
-Builtins can register type-specialized implementations that the compiler
+Externs can register type-specialized implementations that the compiler
 selects at compile time based on argument types:
 
 ```rust
-BuiltinDef::new("sqrt", sqrt_generic)
+ExternDef::new("sqrt", sqrt_generic)
     .param("x", TypeSet::numeric())
     .returns(TypeSet::numeric())
     .variant(&[TypeSet::uint()], TypeSet::uint(), sqrt_uint)
@@ -2186,18 +2279,18 @@ runtime overhead for the variant selection itself.
 ### Example Registration
 
 ```rust
-let mut registry = BuiltinRegistry::new();
+let mut registry = ExternRegistry::new();
 
 // Exit — diverges, implicitly impure
 registry.register(
-    BuiltinDef::new("exit", exit_impl)
+    ExternDef::new("exit", exit_impl)
         .param_optional("code", TypeSet::uint())
         .exits(TypeSet::uint())
 );
 
 // Host-provided encoding
 registry.register(
-    BuiltinDef::new("encode", cbor_encode_impl)
+    ExternDef::new("encode", cbor_encode_impl)
         .param("value", TypeSet::all())
         .returns(TypeSet::bytes())
         .pure()
@@ -2206,13 +2299,13 @@ registry.register(
 
 ### Intrinsic vs Extern: Compilation
 
-| Aspect | Intrinsic (`IntrinsicOp`) | Extern (`BuiltinRegistry`) |
+| Aspect | Intrinsic (`IntrinsicOp`) | Extern (`ExternRegistry`) |
 |--------|--------------------------|---------------------------|
-| **Registration** | Hard-coded in `IntrinsicOp` enum | `registry.register(BuiltinDef)` |
+| **Registration** | Hard-coded in `IntrinsicOp` enum | `registry.register(ExternDef)` |
 | **IR instruction** | `Instruction::Intrinsic { op, args }` | `Instruction::Call { function, args }` |
 | **Const eval** | `eval_intrinsic_const()` in `const_eval.rs` | `Purity::Const { eval }` function pointer |
 | **Runtime** | `exec_intrinsic()` in `compile.rs` | Function pointer via `LinkMap` |
-| **Type info** | `param_type()`, `result_type_refined()` | `BuiltinMeta.params`, `BuiltinMeta.returns` |
+| **Type info** | `param_type()`, `result_type_refined()` | `ExternMeta.params`, `ExternMeta.returns` |
 | **Link phase** | Not needed — compiled directly | Resolved via `LinkMap` at link time |
 
 ---
@@ -2282,7 +2375,7 @@ struct ParamMeta {
 The host driver compiles scripts and resolves function handles by name:
 
 ```rust
-let (program, _) = compile(source, &builtins).unwrap();
+let (program, _) = compile(source, &externs).unwrap();
 
 // Resolve once, call many times
 let process = program.function("process").unwrap();
@@ -2332,7 +2425,7 @@ Tag(0xF1700) Module {
 ## Example: Embedding Rill
 
 Rill is designed to be embedded in a host application. The host compiles
-scripts, registers domain-specific builtins, and calls script functions
+scripts, registers domain-specific externs, and calls script functions
 with application data.
 
 ### Validation Pipeline
@@ -2368,14 +2461,14 @@ fn transform(with record) {
 ### Host Driver (Rust)
 
 ```rust
-use rill::{compile, standard_builtins, VM, Value};
+use rill::{compile, standard_externs, VM, Value};
 
-// Register domain builtins
-let mut builtins = standard_builtins();
-builtins.register(/* time::now, logging, etc. */);
+// Register domain externs
+let mut externs = standard_externs();
+externs.register(/* time::now, logging, etc. */);
 
 // Compile once, execute many times
-let (program, _warnings) = compile(source, &builtins).unwrap();
+let (program, _warnings) = compile(source, &externs).unwrap();
 
 // Resolve function handles for hot-path execution
 let check_age = program.function("check_age").unwrap();
@@ -2402,21 +2495,21 @@ for record in incoming_records {
 }
 ```
 
-### The `exit()` Builtin
+### The `exit()` Extern
 
-The `exit(code)` builtin is a diverging function — it exits the script
+The `exit(code)` extern is a diverging function — it exits the script
 immediately and returns a disposition code to the host. This enables
 filter/validation patterns without exceptions or error types.
 
 ```rust
 registry.register(
-    BuiltinDef::new("exit", builtin_exit)
+    ExternDef::new("exit", extern_exit)
         .param("code", TypeSet::uint())
         .exits()
         .purity(Purity::Impure)
 );
 
-fn builtin_exit(_vm: &mut VM, args: &[Value]) -> Result<ExecResult, ExecError> {
+fn extern_exit(_vm: &mut VM, args: &[Value]) -> Result<ExecResult, ExecError> {
     let code = args.first().cloned().unwrap_or(Value::UInt(0));
     Ok(ExecResult::Exit(code))
 }
@@ -2439,7 +2532,7 @@ fn builtin_exit(_vm: &mut VM, args: &[Value]) -> Result<ExecResult, ExecError> {
 - [x] Sequence type (SeqState: RangeUInt, RangeInt, ArraySlice with mutable flag)
 - [x] Call convention with return slots
 - [x] Reference binding via Slot::Ref (VM) + MakeRef/WriteRef (IR)
-- [x] Builtin registry and metadata system
+- [x] Extern registry and metadata system
 - [x] Optimization passes:
   - [x] Constant folding (early + cleanup)
   - [x] Definedness analysis
@@ -2447,7 +2540,7 @@ fn builtin_exit(_vm: &mut VM, args: &[Value]) -> Result<ExecResult, ExecError> {
   - [x] Guard elimination
   - [x] CFG simplification
   - [x] Type refinement
-- [x] Public API: opaque `Program`, `compile()`, `standard_builtins()`
+- [x] Public API: opaque `Program`, `compile()`, `standard_externs()`
 - [x] Source location utilities: `span_to_line_col()`, `LineCol`
 - [x] For-loop pair binding: `for k, v in map { }`
 - [x] Pattern lowering: Type, Map, ArrayRest with after patterns
@@ -2456,7 +2549,7 @@ fn builtin_exit(_vm: &mut VM, args: &[Value]) -> Result<ExecResult, ExecError> {
 ### Pending
 
 - [ ] Instruction execution (IR interpreter or VM codegen)
-- [ ] Builtin implementations: `core::make_seq`, `core::seq_next`,
+- [ ] Extern implementations: `core::make_seq`, `core::seq_next`,
       `core::array_seq`, `core::collect`
 - [ ] For-loop type dispatch (Match on iterable type for unknown types)
 - [ ] For-loop sequence path (seq_next-based loop for Sequence type)
@@ -2539,7 +2632,7 @@ All functions use the same `fn` syntax. The host driver selects entry points
 by name or convention, not by keyword. This keeps the language simple and
 enables multiple use cases (validation, transforms, queries) without
 domain-specific syntax.
-- `exit()` as a builtin rather than special syntax
+- `exit()` as an extern rather than special syntax
 
 ### Why CBOR for compiled binary format?
 

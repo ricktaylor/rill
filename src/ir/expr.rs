@@ -445,7 +445,7 @@ impl<'a> Lowerer<'a> {
             return result;
         }
 
-        // Build the lookup name for the builtin registry.
+        // Build the lookup name for the extern registry.
         // The registry now contains only user-callable extern functions
         // (no core:: prefix needed).
         let lookup_name = if let Some(ns) = namespace {
@@ -455,9 +455,9 @@ impl<'a> Lowerer<'a> {
         };
 
         // Check if the function exists in the registry
-        let builtin_def = self.builtins.get(&lookup_name);
+        let extern_def = self.externs.get(&lookup_name);
 
-        let param_specs = builtin_def.map(|b| &b.meta.params);
+        let param_specs = extern_def.map(|b| &b.meta.params);
 
         let args: Vec<CallArg> = arguments
             .iter()
@@ -474,7 +474,7 @@ impl<'a> Lowerer<'a> {
             })
             .collect();
 
-        // Insert type guards for builtin params with type constraints.
+        // Insert type guards for extern params with type constraints.
         // Each constrained param gets a Match that checks the arg's type
         // against the declared type_sig. On mismatch, the call is skipped
         // and the result is undefined. The optimizer eliminates guards when

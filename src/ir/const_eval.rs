@@ -6,13 +6,13 @@
 //!
 //! # Future: Const User Functions
 //!
-//! Currently only builtin functions with `Purity::Const` can be evaluated at
+//! Currently only extern functions with `Purity::Const` can be evaluated at
 //! compile time. In the future, we could support const user functions by:
 //! 1. Inferring or annotating pure functions
 //! 2. Interpreting the IR with constant inputs
 //! 3. Detecting and preventing side effects
 
-use crate::builtins::BuiltinRegistry;
+use crate::externs::ExternRegistry;
 use crate::ir::{ConstValue, FunctionRef, Literal};
 
 // ============================================================================
@@ -49,22 +49,22 @@ pub fn const_to_literal(cv: &ConstValue) -> Option<Literal> {
 }
 
 // ============================================================================
-// Builtin Const Evaluation
+// Extern Const Evaluation
 // ============================================================================
 
-/// Evaluate a builtin function call with constant arguments
+/// Evaluate an extern function call with constant arguments
 ///
 /// Returns `None` if:
 /// - The function is not found in the registry
 /// - The function doesn't have a const evaluator
 /// - The const evaluation fails (e.g., domain error)
-pub fn eval_builtin_const(
+pub fn eval_extern_const(
     func: &FunctionRef,
     args: &[ConstValue],
-    registry: &BuiltinRegistry,
+    registry: &ExternRegistry,
 ) -> Option<ConstValue> {
-    let builtin = registry.lookup(func)?;
-    let eval_fn = builtin.meta.purity.const_eval()?;
+    let def = registry.lookup(func)?;
+    let eval_fn = def.meta.purity.const_eval()?;
     eval_fn(args)
 }
 
@@ -124,7 +124,7 @@ pub fn const_index(base: &ConstValue, key: &ConstValue) -> Option<ConstValue> {
 /// Evaluate an intrinsic operation at compile time with constant arguments.
 ///
 /// This replaces the old approach of looking up const-eval functions from the
-/// BuiltinRegistry. All operator semantics are defined here, in one place.
+/// ExternRegistry. All operator semantics are defined here, in one place.
 pub fn eval_intrinsic_const(op: crate::ir::IntrinsicOp, args: &[ConstValue]) -> Option<ConstValue> {
     use crate::ir::IntrinsicOp;
     match op {

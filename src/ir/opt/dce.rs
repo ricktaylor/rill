@@ -6,14 +6,14 @@
 //!
 //! Respects side effects:
 //! - Impure `Call` is always kept (side effects)
-//! - Pure `Call` (builtin with `is_pure()`, or user function proven pure)
+//! - Pure `Call` (extern with `is_pure()`, or user function proven pure)
 //!   can be removed if result is unused
 //! - `SetIndex`, `WriteRef`, `Drop` have no dest — always kept
 //! - Everything else (Const, Copy, Undefined, Index, Intrinsic, Phi, MakeRef)
 //!   is removed if its dest is unused
 
 use super::{Function, Instruction, Terminator, VarId};
-use crate::builtins::BuiltinRegistry;
+use crate::externs::ExternRegistry;
 use std::collections::HashSet;
 
 /// Eliminate dead instructions. Returns the number removed.
@@ -27,7 +27,7 @@ pub fn eliminate_dead_code(function: &mut Function) -> usize {
 /// Eliminate dead code with purity information for interprocedural DCE.
 pub fn eliminate_dead_code_with_purity(
     function: &mut Function,
-    builtins: Option<&BuiltinRegistry>,
+    externs: Option<&ExternRegistry>,
     pure_functions: &HashSet<String>,
 ) -> usize {
     let mut total = 0;
@@ -35,7 +35,7 @@ pub fn eliminate_dead_code_with_purity(
     // Iterate until stable — removing dead instructions may expose more
     loop {
         let used = collect_used_vars(function);
-        let removed = remove_dead(function, &used, builtins, pure_functions);
+        let removed = remove_dead(function, &used, externs, pure_functions);
         if removed == 0 {
             break;
         }
@@ -142,7 +142,7 @@ fn collect_terminator_reads(term: &Terminator, used: &mut HashSet<VarId>) {
 /// Is this instruction safe to remove when its dest is unused?
 fn is_removable(
     inst: &Instruction,
-    builtins: Option<&BuiltinRegistry>,
+    externs: Option<&ExternRegistry>,
     pure_functions: &HashSet<String>,
 ) -> bool {
     match inst {
@@ -157,8 +157,8 @@ fn is_removable(
 
         // Call: removable only if the callee is proven pure
         Instruction::Call { function, .. } => {
-            // Check builtins for purity metadata
-            if let Some(registry) = builtins
+            // Check extern registry for purity metadata
+            if let Some(registry) = externs
                 && let Some(def) = registry.get(&function.qualified_name())
             {
                 return def.meta.purity.is_pure();
@@ -196,7 +196,7 @@ fn get_dest(inst: &Instruction) -> Option<VarId> {
 fn remove_dead(
     function: &mut Function,
     used: &HashSet<VarId>,
-    builtins: Option<&BuiltinRegistry>,
+    externs: Option<&ExternRegistry>,
     pure_functions: &HashSet<String>,
 ) -> usize {
     let mut removed = 0;
@@ -204,7 +204,7 @@ fn remove_dead(
     for block in &mut function.blocks {
         let before = block.instructions.len();
         block.instructions.retain(|inst| {
-            if !is_removable(&inst.node, builtins, pure_functions) {
+            if !is_removable(&inst.node, externs, pure_functions) {
                 return true; // side-effectful — keep
             }
             match get_dest(&inst.node) {
