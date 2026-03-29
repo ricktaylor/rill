@@ -904,6 +904,24 @@ impl VM {
         }
     }
 
+    /// Append a value to an array (CoW: clones if shared, checks heap limit).
+    ///
+    /// Returns `Ok(true)` if the append succeeded, `Ok(false)` if the slot
+    /// is not an array.
+    pub fn array_append(&mut self, arr_idx: usize, value: Value) -> Result<bool, ExecError> {
+        let resolved = self.resolve(arr_idx);
+        let heap = &*self.heap;
+        match self.stack.get_mut(resolved).and_then(|s| s.as_value_mut()) {
+            Some(Value::Array(arr)) => {
+                let old_size = arr.size();
+                arr.make_mut(heap)?.push(value);
+                arr.update_heap_size(old_size, heap)?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     // ========================================================================
     // Value construction (pushes to stack, returns index)
     // ========================================================================

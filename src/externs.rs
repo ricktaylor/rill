@@ -614,7 +614,7 @@ impl ExternRegistry {
     }
 
     /// Names reserved by the compiler — cannot be used for global externs.
-    const RESERVED_NAMES: &[&str] = &["len", "collect"];
+    const RESERVED_NAMES: &[&str] = &["len", "collect", "append"];
 
     /// Register a global extern function (available without `require`).
     ///

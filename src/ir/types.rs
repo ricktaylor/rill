@@ -166,7 +166,10 @@ impl IntrinsicOp {
             Self::MakeArray | Self::MakeMap => TypeSet::all(),
 
             // Sequence
-            Self::MakeSeq => TypeSet::numeric(), // start/end are numeric
+            Self::MakeSeq => match index {
+                0 | 1 => TypeSet::numeric(), // start, end
+                _ => TypeSet::bool(),        // inclusive flag
+            },
             Self::ArraySeq => TypeSet::all(),
             Self::SeqNext => TypeSet::single(BaseType::Sequence), // arg must be Sequence
             Self::Collect => TypeSet::single(BaseType::Sequence),
@@ -323,6 +326,12 @@ pub fn intrinsic_by_name(name: &str) -> Option<IntrinsicOp> {
     }
 }
 
+/// Names reserved by the compiler — intrinsics and special instructions.
+/// Used for name clash detection during lowering.
+pub fn is_reserved_name(name: &str) -> bool {
+    matches!(name, "len" | "collect" | "append")
+}
+
 // ============================================================================
 // SSA Variables
 // ============================================================================
@@ -419,6 +428,18 @@ pub enum Instruction {
     /// or variable through a reference). The optimizer can see these explicitly
     /// and reason about dead write-backs, forwarding, etc.
     WriteRef { ref_var: VarId, value: VarId },
+
+    /// Append a value to an array in place: `append(arr, val)`.
+    ///
+    /// Mutates `arr` via CoW. Like `SetIndex`, this is a side-effecting
+    /// instruction — not a pure intrinsic. `dest` receives the array
+    /// after mutation (for result capture), or undefined if `arr` is not
+    /// an Array.
+    Append {
+        dest: VarId,
+        arr: VarId,
+        value: VarId,
+    },
 
     /// Mark end of variable scope - slots can be reclaimed (planned)
     #[allow(dead_code)]

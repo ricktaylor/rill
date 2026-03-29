@@ -109,6 +109,11 @@ fn collect_reads(inst: &Instruction, used: &mut HashSet<VarId>) {
             used.insert(*value);
         }
 
+        Instruction::Append { arr, value, .. } => {
+            used.insert(*arr);
+            used.insert(*value);
+        }
+
         Instruction::Drop { vars } => {
             for v in vars {
                 used.insert(*v);
@@ -167,10 +172,11 @@ fn is_removable(
             pure_functions.contains(&function.qualified_name())
         }
 
-        // No dest — always keep (side effects)
-        Instruction::SetIndex { .. } | Instruction::WriteRef { .. } | Instruction::Drop { .. } => {
-            false
-        }
+        // No dest or side effects — always keep
+        Instruction::SetIndex { .. }
+        | Instruction::WriteRef { .. }
+        | Instruction::Append { .. }
+        | Instruction::Drop { .. } => false,
     }
 }
 
@@ -184,6 +190,7 @@ fn get_dest(inst: &Instruction) -> Option<VarId> {
         | Instruction::Intrinsic { dest, .. }
         | Instruction::Phi { dest, .. }
         | Instruction::MakeRef { dest, .. }
+        | Instruction::Append { dest, .. }
         | Instruction::Call { dest, .. } => Some(*dest),
 
         Instruction::SetIndex { .. } | Instruction::WriteRef { .. } | Instruction::Drop { .. } => {

@@ -115,6 +115,16 @@ fn collect_constants(function: &Function, constants: &mut ConstantMap, externs: 
                     }
                 }
 
+                // Mutating instructions invalidate the target's constant value.
+                // After `append(arr, val)` or `arr[i] = val`, arr is no longer
+                // the original constant — its contents have changed.
+                Instruction::Append { arr, .. } => {
+                    constants.remove(arr);
+                }
+                Instruction::SetIndex { base, .. } => {
+                    constants.remove(base);
+                }
+
                 _ => {}
             }
         }

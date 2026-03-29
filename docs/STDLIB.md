@@ -36,6 +36,7 @@ These are hard-coded in the compiler, not prelude functions:
 
 - `len(x)` — Collection/sequence length (core intrinsic, callable by name)
 - `collect(seq)` — Materialize sequence to array (core intrinsic, callable by name)
+- `append(arr, val)` — Append value to array in place (core intrinsic, callable by name)
 
 ### Type Patterns
 

@@ -601,6 +601,17 @@ impl<'a> Lowerer<'a> {
                 let arg = self.lower_expression(&arguments[0]);
                 Some(self.emit_unary_intrinsic(IntrinsicOp::Collect, arg))
             }
+            "append" if arguments.len() == 2 => {
+                let arr = self.lower_expression(&arguments[0]);
+                let val = self.lower_expression(&arguments[1]);
+                let dest = self.new_temp(TypeSet::single(types::BaseType::Array));
+                self.emit(Instruction::Append {
+                    dest,
+                    arr,
+                    value: val,
+                });
+                Some(dest)
+            }
             _ => None,
         }
     }

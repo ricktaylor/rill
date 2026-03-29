@@ -314,6 +314,11 @@ fn transfer_instruction(
         // WriteRef writes through a reference — side effect only, no dest
         Instruction::WriteRef { .. } => {}
 
+        // Append: dest is Defined if arr is an Array (optimistically Defined)
+        Instruction::Append { dest, .. } => {
+            state.insert(*dest, Definedness::MaybeDefined);
+        }
+
         // Drop doesn't produce a value
         Instruction::Drop { .. } => {}
     }
@@ -958,6 +963,10 @@ fn check_instruction_uses(
                 span,
                 diagnostics,
             );
+        }
+
+        Instruction::Append { .. } => {
+            // Append to undefined array produces undefined — no diagnostic needed
         }
 
         Instruction::Drop { vars } => {

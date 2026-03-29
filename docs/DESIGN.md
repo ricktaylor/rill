@@ -65,7 +65,7 @@ Operations required by the language runtime to function. These are the
 and const-eval behavior.
 
 Core operations are **not user-callable by name** (with the exception of
-`len()` and `collect()` which have syntactic shortcuts). They exist only
+`len()`, `collect()`, and `append()` which have syntactic shortcuts). They exist only
 as lowering targets for syntax. `x + y` lowers to `Intrinsic(Add, [x, y])`.
 They are encoded as `IntrinsicOp` discriminants in bytecode and are always
 available — no registry, no linking, no import.
@@ -2096,7 +2096,7 @@ with another `import`), the compiler emits an error.
 
 **Unqualified calls** (`func()`):
 
-1. Intrinsics — `len()`, `collect()` (compiler built-in, cannot be shadowed)
+1. Intrinsics — `len()`, `collect()`, `append()` (compiler built-in, cannot be shadowed)
 2. Global externs — registered without namespace, error if ambiguous
 3. Functions in the root scope — from the current file, `as _` imports/requires,
    and standard prelude (if provided)
@@ -2263,6 +2263,7 @@ to `Instruction::Intrinsic { op: IntrinsicOp, args }`. Some expand to control fl
 | `x == y` | `Intrinsic(Eq, [x, y])` | Single instruction |
 | `-x` | `Intrinsic(Neg, [x])` | Single instruction |
 | `len(x)` | `Intrinsic(Len, [x])` | Single instruction |
+| `append(arr, v)` | `Intrinsic(Append, [arr, v])` | Single instruction (mutating) |
 | `[a, b, c]` | `Intrinsic(MakeArray, [a, b, c])` | Single instruction |
 | `{k: v, ...}` | `Intrinsic(MakeMap, [k, v, ...])` | Single instruction |
 | `start..end` | `Intrinsic(MakeSeq, [start, end, inclusive])` | Single instruction |

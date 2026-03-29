@@ -990,6 +990,28 @@ fn compile_instruction(
             }
         }
 
+        Instruction::Append { dest, arr, value } => {
+            let d = slot(*dest);
+            let a = slot(*arr);
+            let v = slot(*value);
+            Box::new(move |vm: &mut VM, _prog| {
+                if let Some(val) = vm.local(v).cloned() {
+                    if vm.array_append(vm.bp() + a, val)? {
+                        if let Some(arr_val) = vm.local(a).cloned() {
+                            vm.set_local(d, arr_val);
+                        } else {
+                            vm.set_local_uninit(d);
+                        }
+                    } else {
+                        vm.set_local_uninit(d);
+                    }
+                } else {
+                    vm.set_local_uninit(d);
+                }
+                Ok(Action::Continue)
+            })
+        }
+
         Instruction::Drop { .. } => {
             // No-op for now — slots are reclaimed when frame is popped
             return Ok(None);

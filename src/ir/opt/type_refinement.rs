@@ -177,6 +177,11 @@ fn transfer_instruction(
         // WriteRef: side effect only (writes through a reference), no dest
         Instruction::WriteRef { .. } => {}
 
+        // Append: mutates array, result is Array type
+        Instruction::Append { dest, .. } => {
+            state.insert(*dest, TypeSet::single(BaseType::Array));
+        }
+
         // Drop doesn't produce a value
         Instruction::Drop { .. } => {}
     }

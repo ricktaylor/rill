@@ -172,6 +172,17 @@ fn replace_vars_in_instruction(inst: &mut Instruction, map: &HashMap<VarId, VarI
             }
         }
 
+        Instruction::Append { arr, value, .. } => {
+            if let Some(&new) = map.get(arr) {
+                *arr = new;
+                count += 1;
+            }
+            if let Some(&new) = map.get(value) {
+                *value = new;
+                count += 1;
+            }
+        }
+
         Instruction::Drop { vars } => {
             for v in vars.iter_mut() {
                 if let Some(&new) = map.get(v) {

@@ -171,7 +171,7 @@ impl<'a> Lowerer<'a> {
     ///
     /// Returns `Some(message)` if there's a clash, `None` if clean.
     fn check_name_clash(&self, name: &ast::Identifier, kind: &str) -> Option<String> {
-        if intrinsic_by_name(name).is_some() {
+        if is_reserved_name(name) {
             return Some(format!(
                 "{} `{}` clashes with built-in intrinsic",
                 kind, name
