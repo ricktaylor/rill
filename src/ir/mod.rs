@@ -300,27 +300,6 @@ impl<'a> Lowerer<'a> {
 }
 
 // ============================================================================
-// Helper Functions
-// ============================================================================
-
-/// All base types (for unknown/any type)
-pub fn all_types() -> impl Iterator<Item = types::BaseType> {
-    use types::BaseType;
-    [
-        BaseType::Bool,
-        BaseType::UInt,
-        BaseType::Int,
-        BaseType::Float,
-        BaseType::Text,
-        BaseType::Bytes,
-        BaseType::Array,
-        BaseType::Map,
-        BaseType::Sequence,
-    ]
-    .into_iter()
-}
-
-// ============================================================================
 // Public API
 // ============================================================================
 

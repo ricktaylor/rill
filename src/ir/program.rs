@@ -102,7 +102,7 @@ impl<'a> Lowerer<'a> {
         // Lower parameters
         let mut params = Vec::new();
         for param in &func.params {
-            let var = self.new_var(param.name.clone(), TypeSet::from_types(all_types()));
+            let var = self.new_var(param.name.clone(), TypeSet::all());
             self.bind(&param.name, var);
             params.push(Param {
                 var,

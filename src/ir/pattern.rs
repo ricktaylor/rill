@@ -41,7 +41,7 @@ impl<'a> Lowerer<'a> {
 
             ast::Pattern::Variable(name) => match mode {
                 BindingMode::Value => {
-                    let dest = self.new_var(name.clone(), TypeSet::from_types(all_types()));
+                    let dest = self.new_var(name.clone(), TypeSet::all());
                     self.emit(Instruction::Copy { dest, src: value });
                     self.bind(name, dest);
                 }
