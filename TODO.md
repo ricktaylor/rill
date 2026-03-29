@@ -128,24 +128,39 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
     - [ ] Forward compatibility: unknown top-level keys skipped gracefully
     - [ ] Debug info: present and absent cases
 
-### P1 — Known Bugs
+### P1 — SSA Construction (fixes all known phi bugs)
 
-- [ ] **Multi-variable reassignment in for-loops** — when two or more variables
-      are reassigned inside a for-loop body (e.g., `a = b; b = next;` in iterative
-      fibonacci), the loop-carried phis may not propagate correctly across the
-      for-loop's seq/idx dispatch paths. Single-variable mutation (`x += 1`) works.
-      Affects: `fib_iter`, any swap/rotate pattern in for-loops.
-      Tests: `bench_for_fib_no_if`, `bench_fib_iter_inline`, `bench_fib_iterative`,
-      `bench_fib_iterative_50`, `bench_if_then_for` (all `#[ignore]`).
-- [ ] **In-place mutation not visible after for-loop dispatch** — when a collection
-      is mutated via SetIndex inside a for-loop body (`m[i] = v`), the mutation
-      may not be visible after the loop due to the seq/idx dispatch phi merging.
-      Affects: `build_map` pattern (loop inserting into a map).
-      Tests: `bench_map_operations` (`#[ignore]`).
-- [ ] **merge_branch_bindings may break if/else expression results** — the new
-      phi creation for modified variables in if/else branches may interfere with
-      nested if/else expressions used as function return values (e.g., ackermann).
-      Tests: `bench_ackermann` (`#[ignore]`).
+- [ ] **LLVM-style lowering + mem2reg split** — separate the lowerer from SSA
+      construction. Currently the lowerer does both AST→IR translation AND
+      manual phi insertion (snapshot_scope, merge_branch_bindings,
+      create_loop_phis, patch_loop_phis). This ad-hoc approach breaks for
+      multi-variable reassignment in for-loops, in-place mutation across
+      dispatch boundaries, and nested if/else expression results.
+  - Phase 1: Pre-SSA IR
+    - [ ] Add `Instruction::Assign { name, value }` and `Instruction::Read { name, dest }`
+    - [ ] Lowerer emits Assign/Read instead of managing VarIds and scopes
+    - [ ] Remove snapshot_scope, merge_branch_bindings, create_loop_phis,
+          patch_loop_phis, and all manual phi insertion from the lowerer
+  - Phase 2: mem2reg pass (Braun et al. 2013)
+    - [ ] Implement `readVariable(name, block)` — recursive predecessor lookup
+    - [ ] Implement `writeVariable(name, block, value)` — record definitions
+    - [ ] Sealed blocks: mark block as sealed when all predecessors known
+    - [ ] Phi insertion at control flow merge points (automatic)
+    - [ ] Trivial phi elimination (all operands same → use value directly)
+    - [ ] Convert Assign/Read to SSA VarIds with Phi nodes
+    - [ ] Reference: "Simple and Efficient Construction of Static Single
+          Assignment Form" (Braun, Buchwald, Hack, Leißa, Mallon, Zwinkau
+          — CC 2013)
+  - Phase 3: Validate
+    - [ ] Un-ignore all 7 benchmark tests (fib_iter, map_operations, ackermann, etc.)
+    - [ ] Add multi-variable loop reassignment tests
+    - [ ] Add nested if/else expression result tests
+
+  Known bugs fixed by this change:
+  - Multi-variable reassignment in for-loops (fib_iter doubling bug)
+  - In-place mutation not visible after for-loop dispatch (build_map bug)
+  - merge_branch_bindings breaking nested if/else results (ackermann bug)
+  - Tests: 7 `#[ignore]` benchmarks
 
 ### P2 — Optimization
 
