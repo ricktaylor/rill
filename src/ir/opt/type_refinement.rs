@@ -332,15 +332,15 @@ pub(super) fn all_types() -> TypeSet {
 // ============================================================================
 
 /// Inferred return types for user-defined functions.
-pub type ReturnTypes = std::collections::HashMap<String, TypeSet>;
+pub type ReturnTypes = HashMap<String, TypeSet>;
 
 /// Inferred parameter types for user-defined functions.
 /// Maps function name → Vec of TypeSets (one per parameter, positional).
-pub type ParamTypes = std::collections::HashMap<String, Vec<TypeSet>>;
+pub type ParamTypes = HashMap<String, Vec<TypeSet>>;
 
 /// Inferred parameter definedness for user-defined functions.
 /// Maps function name → Vec of Definedness (one per parameter, positional).
-pub type ParamDefinedness = std::collections::HashMap<String, Vec<crate::ir::opt::Definedness>>;
+pub type ParamDefinedness = HashMap<String, Vec<crate::ir::opt::Definedness>>;
 
 /// Infer the return type of a function from its Return terminators.
 ///

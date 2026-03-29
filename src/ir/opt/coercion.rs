@@ -24,6 +24,7 @@ use crate::ast;
 use crate::ir::opt::type_refinement::TypeAnalysis;
 use crate::ir::{Literal, SpannedInst, Var};
 use crate::types::{BaseType, TypeSet};
+use std::collections::HashMap;
 
 /// Insert explicit Widen instructions for mixed-type arithmetic.
 ///
@@ -244,10 +245,9 @@ struct WidenInfo {
 /// on instruction structure. Returns the number of instructions rewritten.
 pub fn elide_coercions(function: &mut Function) -> usize {
     // Phase 1: Collect Widen metadata
-    let mut widen_info: std::collections::HashMap<VarId, WidenInfo> =
-        std::collections::HashMap::new();
+    let mut widen_info: HashMap<VarId, WidenInfo> = HashMap::new();
     // Also collect constant values for target resolution
-    let mut const_values: std::collections::HashMap<VarId, u64> = std::collections::HashMap::new();
+    let mut const_values: HashMap<VarId, u64> = HashMap::new();
 
     for block in &function.blocks {
         for inst in &block.instructions {

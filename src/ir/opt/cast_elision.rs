@@ -9,6 +9,7 @@
 use super::{Function, Instruction, IntrinsicOp, VarId};
 use crate::ir::Literal;
 use crate::types::BaseType;
+use std::collections::HashMap;
 
 /// Eliminate identity Cast and Widen instructions.
 ///
@@ -20,7 +21,7 @@ pub fn elide_identity_casts(
     types: &super::type_refinement::TypeAnalysis,
 ) -> usize {
     // Collect constant UInt values for target resolution
-    let mut const_values: std::collections::HashMap<VarId, u64> = std::collections::HashMap::new();
+    let mut const_values: HashMap<VarId, u64> = HashMap::new();
     for block in &function.blocks {
         for inst in &block.instructions {
             if let Instruction::Const {

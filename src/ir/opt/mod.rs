@@ -50,7 +50,7 @@ use super::{
 // Import externs for metadata lookup
 use crate::diagnostics::Diagnostics;
 use crate::externs::ExternRegistry;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Run all optimization passes on a program
 pub fn optimize(program: &mut IrProgram, externs: &ExternRegistry, diagnostics: &mut Diagnostics) {
@@ -172,15 +172,15 @@ pub fn optimize(program: &mut IrProgram, externs: &ExternRegistry, diagnostics: 
 fn collect_pure_functions(
     program: &IrProgram,
     externs: Option<&ExternRegistry>,
-) -> std::collections::HashSet<String> {
-    let all_names: std::collections::HashSet<String> = program
+) -> HashSet<String> {
+    let all_names: HashSet<String> = program
         .functions
         .iter()
         .map(|f| f.name.to_string())
         .collect();
 
     // Start optimistic: assume all user functions are pure
-    let mut pure: std::collections::HashSet<String> = all_names.clone();
+    let mut pure: HashSet<String> = all_names.clone();
 
     loop {
         let mut changed = false;
@@ -242,7 +242,7 @@ fn monomorphize(program: &mut IrProgram, externs: &ExternRegistry) {
     > = HashMap::new();
 
     // Build function name set for detecting user functions
-    let user_functions: std::collections::HashSet<String> = program
+    let user_functions: HashSet<String> = program
         .functions
         .iter()
         .map(|f| f.name.to_string())
@@ -285,7 +285,7 @@ fn monomorphize(program: &mut IrProgram, externs: &ExternRegistry) {
     }
 
     // Detect recursive functions (call themselves — skip monomorphization)
-    let recursive: std::collections::HashSet<String> = program
+    let recursive: HashSet<String> = program
         .functions
         .iter()
         .filter(|f| {
