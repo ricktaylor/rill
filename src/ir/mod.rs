@@ -237,6 +237,12 @@ impl<'a> Lowerer<'a> {
     }
 
     pub fn bind(&mut self, name: &ast::Identifier, var: VarId) {
+        // `_` is a discard binding — never enters scope, each use is
+        // a unique VarId that can't be referenced. The optimizer will
+        // DCE it if the assigned value has no side effects.
+        if name.0 == "_" {
+            return;
+        }
         if let Some(scope) = self.scopes.last_mut() {
             scope.insert(name.clone(), var);
         }

@@ -60,17 +60,12 @@ fn kw<'a>(keyword: &'static str) -> BoxedParser<'a, ()> {
         .boxed()
 }
 
-/// Parse an identifier
+/// Parse an identifier (including `_` as a discard/throwaway name)
 fn ident<'a>() -> BoxedParser<'a, Identifier> {
     text::ident()
         .try_map(|s: &str, span| {
             if KEYWORDS.contains(&s) {
                 Err(Rich::custom(span, format!("'{}' is a reserved keyword", s)))
-            } else if s == "_" {
-                Err(Rich::custom(
-                    span,
-                    "'_' is not a valid identifier (use in patterns only)",
-                ))
             } else {
                 Ok(Identifier(s.to_string()))
             }
@@ -941,7 +936,7 @@ fn for_expr<'a>(expr: BoxedParser<'a, Expression>) -> BoxedParser<'a, Expression
         .map(|(first, second)| ForBinding::Pair(first, second))
         .boxed();
 
-    // Single variable binding: for x in arr { }
+    // Single variable binding: for x in arr { } or for _ in range { }
     let single_var = ident().map(ForBinding::Single).boxed();
 
     let binding = choice((pair_binding, single_var)).boxed();
@@ -1278,14 +1273,7 @@ fn statement_inner<'a>(expr: BoxedParser<'a, Expression>) -> BoxedParser<'a, Sta
 
 /// Parse an alias: `as identifier` or `as _`
 fn alias<'a>() -> BoxedParser<'a, Identifier> {
-    kw("as")
-        .ignore_then(
-            just('_')
-                .padded_by(whitespace())
-                .to(Identifier("_".to_string()))
-                .or(ident()),
-        )
-        .boxed()
+    kw("as").ignore_then(ident()).boxed()
 }
 
 /// Parse: `import "path/to/file.rill" [as alias | as _] ;`
