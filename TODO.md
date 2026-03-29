@@ -44,19 +44,85 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
 
 ### P1 — Core Functionality
 
-- [ ] **Module/import resolution system** — no multi-file support yet
-- [ ] **Standard library**
-  - [ ] `std.cbor` (encode/decode)
-  - [ ] `std.time` (now, format)
-  - [ ] `std.encoding` (hex, base64)
-  - [ ] `std.parsing` (parse_int, etc.)
-- [ ] **Prelude** — standard utility functions (is_some, is_uint, is_int, ..., default, etc.)
-      User-definable functions loaded automatically — not intrinsics.
-- [ ] **Public/private function visibility** — structural, not declarative:
-      root file functions/constants = public (embedder entry points),
-      imported file functions/constants = private (DCE can eliminate unused).
-      No `pub` keyword needed. Enables unused-import elimination.
+- [ ] **Module system** — `import` for source files, `require` for extern namespaces
+  - Phase 1: ExternRegistry namespaces + `require`
+    - [ ] `ExternRegistry::register_in(namespace, def)` — namespaced extern registration
+    - [ ] `ExternRegistry::namespaces()` — list registered namespace names (for validation)
+    - [ ] Update parser: add `require` keyword, parse `require ident [as (ident / "_")] ;`
+    - [ ] Update parser: `import` takes only quoted string path (remove `ImportPath::Stdlib`)
+    - [ ] Update parser: `import` supports `as _` (merge into root scope)
+    - [ ] Update AST: replace `Import`/`ImportPath` with separate `Import` (file) and `Require` (extern) types
+    - [ ] Update `AstProgram` to include `requires: Vec<Spanned<Require>>`
+    - [ ] Update lowerer: validate `require` namespaces against ExternRegistry
+    - [ ] Update lowerer: resolve `ns::func()` calls against required extern namespaces
+    - [ ] Update lowerer: resolve `ns::CONST` against required extern namespaces
+    - [ ] Update lowerer: `as _` requires merge extern functions into root scope
+    - [ ] Diagnostic: "extern namespace `X` not provided by embedder"
+    - [ ] Diagnostic: duplicate namespace alias error
+    - [ ] Diagnostic: namespace alias clashes with global extern error
+  - Phase 2: Source file imports
+    - [ ] `SourceLoader` trait — `load()` for imports, `preamble()` for standard prelude
+    - [ ] `compile()` signature: add `Option<&dyn SourceLoader>` parameter
+    - [ ] Import resolution: derive namespace from filename stem
+    - [ ] Import resolution: `as name` explicit alias, `as _` merge into root scope
+    - [ ] Parse imported source files (recursive — imported files can import)
+    - [ ] Cycle detection: error on circular imports
+    - [ ] Lower imported functions/constants into namespaced scope
+    - [ ] Private imports: each file's imports are invisible to its importers
+    - [ ] Diagnostic: "source file not found" (via SourceLoader::load error)
+    - [ ] Diagnostic: duplicate namespace alias (import vs import, import vs require)
+  - Phase 3: Name clash enforcement
+    - [ ] Duplicate function/constant name in root scope → error (any origin)
+    - [ ] Function/constant name vs intrinsic (`len`, `collect`) → error
+    - [ ] Function/constant name vs global extern → error
+    - [ ] `as _` import/require name vs local name → error
+    - [ ] Global extern name vs intrinsic → error at registration
+  - Phase 4: Visibility and DCE
+    - [ ] Track function origin: root file (public) vs imported file (private)
+    - [ ] DCE: imported functions not referenced from root → eliminate
+    - [ ] Root file functions always kept (potential embedder entry points)
+    - [ ] Unused import warning
+- [ ] **Standard prelude** — `STANDARD_PRELUDE` const string of Rill source
+      containing is_defined, is_uint, is_int, ..., default, etc.
+      Embedder includes via `SourceLoader::preamble()`.
+      Not a language feature — an embedder API convenience.
 - [ ] **Host sequence support** (`SeqState::Host` variant, defer trait design to embedder API)
+- [ ] **Bytecode format** — CBOR serialization of optimized IR (see `docs/bytecode_format.md`)
+  - Phase 1: Encoding infrastructure
+    - [ ] Add `hardy-cbor` dependency (optional, behind `bytecode` feature flag)
+    - [ ] `From<Enum> for u64` / `TryFrom<u64> for Enum` for all discriminated types:
+          `BaseType`, `IntrinsicOp`, `Literal`, `ConstValue`, `Instruction`,
+          `Terminator`, `MatchPattern`
+    - [ ] `ToCbor` / `FromCbor` impls for primitive wrappers: `VarId`, `BlockId`, `TypeSet`
+    - [ ] `ToCbor` / `FromCbor` for `Literal`, `ConstValue` (tagged `[type, value]` pairs)
+    - [ ] `ToCbor` / `FromCbor` for `Instruction` (opcode + operands array)
+    - [ ] `ToCbor` / `FromCbor` for `FunctionRef`, `CallArg` (variable-length arrays)
+    - [ ] `ToCbor` / `FromCbor` for `Terminator` (opcode + operands)
+    - [ ] `ToCbor` / `FromCbor` for `MatchPattern`
+    - [ ] `ToCbor` / `FromCbor` for containers: `Var`, `Param`, `BasicBlock`
+    - [ ] `ToCbor` / `FromCbor` for top-level: `Function`, `ConstBinding`, `IrProgram`
+    - [ ] `BytecodeError` type for decode errors
+  - Phase 2: Top-level API
+    - [ ] `bytecode::save(program, debug_info) -> Vec<u8>`
+    - [ ] `bytecode::load(bytes) -> Result<(IrProgram, Option<DebugInfo>), BytecodeError>`
+    - [ ] Top-level CBOR map: magic, version, functions, constants, debug info
+    - [ ] Version validation on load
+  - Phase 3: Debug info
+    - [ ] `DebugInfo` / `FunctionDebug` types
+    - [ ] `extract_debug_info(ir) -> DebugInfo` — capture spans before encoding
+    - [ ] `reattach_spans(ir, debug_info)` — restore spans after decoding
+    - [ ] `ToCbor` / `FromCbor` for debug info structures
+    - [ ] Optional source text inclusion
+  - Phase 4: Two-phase optimization
+    - [ ] `optimize_pre_link(program, diagnostics)` — optimize without externs
+    - [ ] Update `fold_constants` to accept `Option<&ExternRegistry>`
+    - [ ] Bytecode emission pipeline: parse → lower → optimize_pre_link → save
+    - [ ] Bytecode loading pipeline: load → reattach_spans → optimize → compile
+  - Phase 5: Testing
+    - [ ] Round-trip tests: IR → save → load → IR (structural equality)
+    - [ ] End-to-end: source → bytecode → load → execute (same results as source)
+    - [ ] Forward compatibility: unknown top-level keys skipped gracefully
+    - [ ] Debug info: present and absent cases
 
 ### P2 — Optimization
 
@@ -90,7 +156,6 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
       update, compare+branch, index+guard, seq advance+guard). Only fuse when
       type-specialized variants exist. See design notes below.
 - [ ] **CLI tool** (`rill run script.rl func`, `rill check`, `rill dump --function f`)
-- [ ] Compiled bytecode serialization format
 - [ ] LSP support
 - [ ] Performance benchmarks against Lua, Python (fibonacci, n-body, binary trees, etc.)
 - [ ] Domain-specific embedding examples
@@ -226,6 +291,4 @@ docs/
   STDLIB.md           — Standard library documentation
   grammar.abnf        — Formal ABNF grammar
   example.txt         — Syntax examples
-  stdlib_prelude.txt  — Prelude function docs
-  stdlib_example.txt  — Stdlib usage examples
 ```

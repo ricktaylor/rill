@@ -5,22 +5,22 @@
 ; Program Structure
 ; ============================================================================
 
-; Imports, constants, and functions can appear in any order
+; Imports, requires, constants, and functions can appear in any order
 ; The compiler will collect and organize them during AST construction
-program = *(import / constant / function)
+program = *(import / require / constant / function)
 
-import = "import" import-path ["as" identifier] ";"
+; Source file import — loads a .rill file, creates a namespace from filename stem
+; `as identifier` overrides the namespace; `as _` merges into root scope (no namespace)
+import = "import" string-literal ["as" (identifier / "_")] ";"
+
+; Extern dependency — declares that the script needs an embedder-provided namespace
+; `as identifier` aliases the namespace; `as _` merges into root scope (no namespace)
+require = "require" identifier ["as" (identifier / "_")] ";"
 
 ; Constants: any expression that can be evaluated at compile-time
 ; Compiler verifies the expression is const-evaluable and has a single type
 ; Pattern match failure is a compile-time error (unlike let/with which produce missing)
 constant = "const" pattern "=" expression ";"
-
-import-path = stdlib-path / file-path
-
-stdlib-path = identifier *("." identifier)  ; std.cbor, std.encoding.base64
-
-file-path = string-literal  ; "../common/validation.rill"
 
 ; ============================================================================
 ; Functions
@@ -329,7 +329,7 @@ identifier = (ALPHA / "_") *(ALPHA / DIGIT / "_")
            ; but not a keyword or "_" by itself
 
 ; Keywords (reserved words, cannot be used as identifiers):
-; fn, import, as, const, let, with, if, else, match, while
+; fn, import, require, as, const, let, with, if, else, match, while
 ; loop, for, in, return, break, continue, true, false, bytes
 
 ; Note: Type names for patterns (UInt, Int, Float, Bool, Text, Bytes, Array, Map)
@@ -418,15 +418,27 @@ CR = %x0D                  ; Carriage return
 ;           result                                // return value (last item)
 ;       }
 ;
-; 11. Import paths:
-;    - Unquoted dotted paths (std.cbor) → standard library modules
-;    - Quoted strings ("../path/file.flt") → file system paths
-;    - Default alias: last component for stdlib (cbor), filename for files
+; 11. Source file imports and extern dependencies:
+;    - `import "path/to/file.rill";` loads a source file
+;      Default namespace: filename stem (e.g., "helpers.rill" → helpers)
+;      Explicit alias: `import "./file.rill" as f;`
+;      Unqualified: `import "./utils.rill" as _;` — merges into root scope
+;      Collision (two files with same stem): compiler error, must alias one
+;    - `require namespace;` declares an extern dependency
+;      The embedder must have registered functions in this namespace
+;      Explicit alias: `require cbor as c;`
+;      Unqualified: `require encoding as _;` — merges into root scope
+;    - `as _` makes functions available without namespace prefix
+;      Name clashes with local functions or other `as _` imports → error
+;    - Imports are private: if A imports B, and B imports C, A cannot see C
+;    - No re-exports, no chained namespaces
+;    - Call sites use single-segment qualification: namespace::function()
+;      (or just function() for `as _` and global externs)
 ;
 ; 12. Declaration ordering:
-;    - Imports, constants, and functions can appear in any order
+;    - Imports, requires, constants, and functions can appear in any order
 ;    - Multi-pass compilation resolves all references regardless of order
-;    - Convention: imports at top for readability, but not required
+;    - Convention: requires and imports at top for readability, but not required
 ;
 ; 13. Constants:
 ;    - Top-level only (const MaxAge = 86400;)
@@ -435,7 +447,7 @@ CR = %x0D                  ; Carriage return
 ;    - Can use any expression; compiler verifies const-evaluability
 ;    - Const-evaluable: literals, other constants, pure operations, const fn calls
 ;    - Must resolve to a single type (no union types)
-;    - Automatically exported from modules
+;    - Constants are visible to importers (part of the module's public surface)
 ;    - Examples:
 ;      const MaxAge = 86400;
 ;      const Double = MaxAge * 2;
@@ -443,11 +455,14 @@ CR = %x0D                  ; Carriage return
 ;      const [A, B, C] = [1, 2, 3];           // destructuring
 ;      const {x: X, y: Y} = {x: 10, y: 20};   // map destructuring
 ;
-; 14. Standard Library Prelude:
-;    - Core functions automatically imported (len, is_*, to_*)
-;    - Type patterns replace old as_X functions
-;    - No explicit import needed
-;    - See stdlib_prelude.txt for complete documentation
+; 14. Standard Prelude:
+;    - Rill source provided by the rill crate as STANDARD_PRELUDE
+;    - Embedder passes to compile() as optional additional source
+;    - Provides is_defined, is_uint, is_int, ..., default, etc.
+;    - These are regular user-defined functions, not intrinsics or externs
+;    - No import or require needed — compiled into the root scope
+;    - Embedder can skip, customize, or extend
+;    - Duplicate names between prelude and user code are a compile error
 ;
 ; 15. Type checking, casting, and type patterns:
 ;    - Type TEST (pattern): is this value already a UInt?

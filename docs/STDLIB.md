@@ -1,14 +1,17 @@
 # Rill Function Library
 
 See the **Terminology** section in `DESIGN.md` for definitions of core,
-prelude, stdlib, and externs.
+standard prelude, and externs.
 
-## Prelude (Injected Source)
+## Standard Prelude
 
-Prelude functions are Rill source text injected at the start of every
-program. They are regular user-defined functions — not core intrinsics,
-not externs. In bytecode, they appear in the function list alongside user
-code.
+The rill crate provides `STANDARD_PRELUDE` — Rill source code containing
+common utility functions. The embedder includes it via the `SourceLoader`
+trait's `preamble()` method — see `DESIGN.md` for the full API. These are
+regular Rill functions compiled alongside user code — not intrinsics, not
+externs. The embedder can skip, customize, or extend the preamble.
+Duplicate names between preamble and user code are a compile error — the
+embedder must customise the preamble to resolve conflicts.
 
 ### Existence Checking
 - `is_defined(x)` - Returns `Bool` (true if present, false if undefined)
@@ -29,7 +32,7 @@ code.
 
 ### Core Intrinsics (Not Prelude)
 
-These are hard-coded in the compiler, not prelude source:
+These are hard-coded in the compiler, not prelude functions:
 
 - `len(x)` — Collection/sequence length (core intrinsic, callable by name)
 - `collect(seq)` — Materialize sequence to array (core intrinsic, callable by name)
@@ -41,79 +44,80 @@ Type patterns are syntax, not functions:
 - `if with UInt(n) = value { n += 1; }` - conditional reference binding
 - `let UInt(n) = value;` - n is copy if value is UInt, else undefined
 
-## Stdlib Modules (Registered by Embedder)
+## Extern Namespaces (Registered by Embedder)
 
-Stdlib modules are Rust crates providing utility functions via
-`ExternRegistry`. The embedder opts in by registering them. In bytecode,
-they appear as symbolic `FunctionRef` names resolved at load time.
+Extern namespaces are groups of Rust functions registered by the embedder
+via `ExternRegistry::register_in()`. Scripts declare their dependency on
+an extern namespace with `require`. In bytecode, they appear as symbolic
+`FunctionRef` names resolved at load time.
 
-### Domain-Specific Modules (DTN/Bundle Protocol)
+### Domain-Specific Namespaces (DTN/Bundle Protocol)
 
-The following modules are domain-specific examples for DTN bundle processing applications.
-Host applications can provide their own domain-specific modules using the same patterns.
+The following are domain-specific examples for DTN bundle processing
+applications. Host applications provide their own namespaces using the
+same `register_in()` API.
 
-#### `std.status_report.codes`
+#### `codes`
 Bundle Protocol and BPSec status report reason codes (RFC 9171, RFC 9172)
 
-```rust
-import std.status_report.codes as codes;
+```rill
+require codes;
 
 exit codes::LifetimeExpired;
 exit codes::FailedSecurityOperation;
 ```
 
-See `stdlib_example.txt` for all constants.
 
-#### `std.bpsec`
+#### `bpsec`
 BPSec signature and encryption validation
 
-```rust
-import std.bpsec;
+```rill
+require bpsec;
 
 if !bpsec::validate_signature(block, bundle) {
     exit codes::FailedSecurityOperation;
 }
 ```
 
-#### `std.admin`
+#### `admin`
 Administrative bundle handling
 
-```rust
-import std.admin;
+```rill
+require admin;
 
 if admin::is_admin_record(bundle) {
     process_admin(bundle);
 }
 ```
 
-### General-Purpose Stdlib Modules
+### General-Purpose Extern Namespaces
 
-#### `std.cbor`
+#### `cbor`
 CBOR encoding/decoding utilities
 
-```rust
-import std.cbor;
+```rill
+require cbor;
 
 if !cbor::is_well_formed(data) {
     exit codes::BlockUnintelligible;
 }
 ```
 
-#### `std.time`
+#### `time`
 Time and timestamp functions
 
-```rust
-import std.time;
+```rill
+require time;
 
 let now = time::now();
 let formatted = time::format_rfc3339(timestamp);
 ```
 
-#### `std.parsing`
+#### `parsing`
 String parsing functions (beyond prelude)
 
-```rust
-import std.parsing;
+```rill
+require parsing;
 
 // parse_int returns a value, use if let (no ? needed)
 if let value = parsing::parse_int(text) {
@@ -121,11 +125,11 @@ if let value = parsing::parse_int(text) {
 }
 ```
 
-#### `std.encoding`
+#### `encoding`
 Encoding/decoding utilities
 
-```rust
-import std.encoding;
+```rill
+require encoding;
 
 let hex = encoding::hex_encode(bytes);
 let b64 = encoding::base64_encode(bytes);
@@ -135,46 +139,44 @@ let b64 = encoding::base64_encode(bytes);
 
 See `DESIGN.md` Module System section for full details.
 
-### Importing (Source Modules)
+### Source File Imports
 ```rill
-// Dotted paths (resolve to Rill source modules)
-import std.bpsec;
-import std.status_report.codes as codes;
-
-// Local files (quoted strings)
-import "../common/validation.rill";
-import "./helpers.rill" as helpers;
+import "../common/validation.rill";     // Namespace: validation
+import "./helpers.rill" as h;           // Namespace: h (explicit alias)
+import "./utils.rill" as _;            // No namespace — functions available unqualified
 ```
 
-### Stdlib/Extern Access (No Import Needed)
+### Extern Dependencies
 ```rill
-// Stdlib and embedder-provided functions are accessed via namespace
-// qualification — registered by the embedder, not imported
-math::sqrt(x)
-console::log("hello")
+require cbor;                           // Embedder must provide "cbor" namespace
+require cbor as c;                      // Alias to "c"
+require encoding as _;                  // No namespace — functions available unqualified
 ```
 
 ### Namespacing
 ```rill
-// Source module functions use namespace from import
-codes::LifetimeExpired
+// Qualified: extern and imported functions use namespace prefix
+cbor::decode(bytes)
 validation::check_structure(bundle)
 
-// Prelude and core intrinsics need no namespace
-len(array)
-is_uint(value)
-is_defined(value)
+// Unqualified: `as _` imports, global externs, intrinsics, standard prelude
+hex_encode(data)                        // from `require encoding as _`
+my_util(x)                             // from `import "utils.rill" as _`
+len(array)                             // core intrinsic
+is_uint(value)                         // standard prelude (if included)
+exit(0)                                // global extern
 ```
 
-### Default Aliases
-- Dotted paths: last component (`std.bpsec` → `bpsec`)
-- Files: filename without extension (`"helpers.rill"` → `helpers`)
-- Override with `as name`
+### Aliases
+- Source file imports: default is filename stem (`"helpers.rill"` → `helpers`)
+- Extern requires: default is the namespace name (`require cbor` → `cbor`)
+- `as name` overrides the namespace alias
+- `as _` discards the namespace — functions merge into root scope
 
 ## Design Principles
 
-1. **Prelude for essentials** — common functions always available, as Rill source
-2. **Explicit opt-in** — stdlib and domain modules require embedder registration
+1. **Standard prelude for essentials** — common functions as Rill source, embedder opt-in
+2. **Explicit dependencies** — extern namespaces require `require` declarations
 3. **Consistent semantics** — failed operations return undefined, not exceptions
-4. **No magic** — prelude is just source code; core intrinsics are minimal
+4. **No magic** — prelude is embedder-provided source; core intrinsics are minimal
 5. **Duck typing** — type checking is runtime, not compile-time

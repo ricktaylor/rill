@@ -23,8 +23,8 @@ For rapid loading, we need a bytecode format that:
 2. **Is fully linked** — all source-level imports resolved; functions and
    constants from every source file merged into one compilation unit
 3. **Supports late binding** — the only unresolved symbols are extern
-   functions (stdlib and embedder-provided), referenced by name and resolved
-   against the host's `ExternRegistry` at load time
+   functions (embedder-provided), referenced by name and resolved against
+   the host's `ExternRegistry` at load time
 4. **Allows re-optimization** — the optimizer can run again after loading,
    since the host's externs may differ from the original compilation context
 5. **Carries optional debug info** — source spans for optimizer warnings,
@@ -106,13 +106,13 @@ into one of three categories:
 Core intrinsics never appear as `Call` instructions — they are lowered to
 `Instruction::Intrinsic` during compilation and encoded as integer opcodes.
 
-Internal functions include both user-defined code and prelude functions.
-They are present in the bytecode's function list and resolve without any
-external registry.
+Internal functions include user-defined code and any standard prelude
+functions included by the embedder at compilation time. They are present
+in the bytecode's function list and resolve without any external registry.
 
-Externs (stdlib and embedder-provided functions) are the only truly
-late-bound symbols. They appear as symbolic `FunctionRef` names and are
-resolved against the host's `ExternRegistry` at load time.
+Externs (embedder-provided functions, both global and namespaced) are the
+only truly late-bound symbols. They appear as symbolic `FunctionRef` names
+and are resolved against the host's `ExternRegistry` at load time.
 
 ### Top-level structure
 
@@ -467,9 +467,9 @@ A major version bump (e.g., v1 -> v2) is required for:
 Extern calls are encoded as symbolic `FunctionRef` names (e.g.,
 `["math", "sqrt"]`). At load time, `compile_program` resolves each
 `FunctionRef` — first against the bytecode's own function list (internal
-functions including prelude), then against the host's `ExternRegistry`
-(stdlib and embedder-provided externs). If a reference doesn't resolve
-in either:
+functions including any standard prelude), then against the host's `ExternRegistry`
+(embedder-provided externs, both global and namespaced). If a reference
+doesn't resolve:
 
 - The linker emits an `E500_UndefinedExternal` diagnostic
 - No silent breakage — missing functions are caught at load time, not at
@@ -489,9 +489,9 @@ into different embeddings with different extern registries.
 ### Extern Dependencies by Pass
 
 The optimizer refers to externs via the `ExternRegistry` type (the Rust
-API for registering stdlib and embedder-provided functions). In the
-analysis below, "externs" refers to this registry — i.e., extern
-functions, not core intrinsics or prelude functions.
+API for registering embedder-provided functions). In the analysis below,
+"externs" refers to this registry — i.e., extern functions, not core
+intrinsics or standard prelude functions.
 
 | Pass | Externs? | What it uses | Works without? |
 |------|-----------|--------------|----------------|
