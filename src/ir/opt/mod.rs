@@ -230,9 +230,13 @@ fn collect_pure_functions(
 /// the function per signature and rewrite callers to target their matching clone.
 /// Phase B then narrows each clone's params to its specific signature.
 ///
-/// Limits: max 4 variants per function, skip recursive functions.
+/// Limits: max 9 variants per function, skip recursive functions.
+///
+/// 9 covers the 3×3 case for binary functions called with all numeric
+/// type combinations (UInt, Int, Float). Higher arity functions rarely
+/// exercise every combination in practice.
 fn monomorphize(program: &mut IrProgram, externs: &ExternRegistry) {
-    const MAX_VARIANTS: usize = 4;
+    const MAX_VARIANTS: usize = 9;
 
     // Collect type signatures at each call site: (caller_func_idx, block_idx, inst_idx) → arg types
     #[allow(clippy::type_complexity)]
