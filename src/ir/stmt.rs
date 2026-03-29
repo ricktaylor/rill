@@ -226,8 +226,11 @@ impl<'a> Lowerer<'a> {
 
     /// Lower assignment to an indexed location (arr[i] or obj.field).
     ///
-    /// Guards on the slot existing, evaluates rhs only if defined,
-    /// performs SetIndex, and joins with a phi.
+    /// For plain `=`: emits SetIndex directly (maps insert new keys,
+    /// arrays update in-bounds only).
+    ///
+    /// For compound assignment (`+=`, `-=`, etc.): guards on the slot
+    /// existing first (needs the current value for the operation).
     fn lower_indexed_assignment(
         &mut self,
         base: VarId,
@@ -235,61 +238,68 @@ impl<'a> Lowerer<'a> {
         op: &ast::AssignmentOp,
         value: &ast::Expression,
     ) -> VarId {
-        // Check if the slot exists by indexing first
-        let slot_check = self.new_temp(TypeSet::all());
-        self.emit(Instruction::Index {
-            dest: slot_check,
-            base,
-            key,
-        });
-
-        // Short-circuit: only evaluate rhs if lvalue is defined
-        let defined_bb = self.fresh_block();
-        let undefined_bb = self.fresh_block();
-        let join_bb = self.fresh_block();
-
-        self.finish_block(Terminator::Guard {
-            value: slot_check,
-            defined: defined_bb,
-            undefined: undefined_bb,
-            span: self.current_span,
-        });
-
-        // Defined path: evaluate rhs and perform assignment
-        self.current_block = defined_bb;
-        self.current_instructions = Vec::new();
-
-        let rhs = self.lower_expression(value);
-        let final_value = if matches!(op, ast::AssignmentOp::Assign) {
+        if matches!(op, ast::AssignmentOp::Assign) {
+            // Plain assignment: SetIndex directly, no guard needed.
+            // Maps insert new keys; arrays update in-bounds (OOB is a no-op).
+            let rhs = self.lower_expression(value);
+            self.emit(Instruction::SetIndex {
+                base,
+                key,
+                value: rhs,
+            });
             rhs
         } else {
-            self.lower_compound_op(slot_check, op, rhs)
-        };
+            // Compound assignment: need the current value for the operation.
+            // Guard on the slot existing first.
+            let slot_check = self.new_temp(TypeSet::all());
+            self.emit(Instruction::Index {
+                dest: slot_check,
+                base,
+                key,
+            });
 
-        self.emit(Instruction::SetIndex {
-            base,
-            key,
-            value: final_value,
-        });
-        let defined_exit = self.current_block;
-        self.finish_block(Terminator::Jump { target: join_bb });
+            let defined_bb = self.fresh_block();
+            let undefined_bb = self.fresh_block();
+            let join_bb = self.fresh_block();
 
-        // Undefined path: skip rhs evaluation, return undefined
-        self.current_block = undefined_bb;
-        self.current_instructions = Vec::new();
-        let undef_result = self.new_temp(TypeSet::empty());
-        self.emit(Instruction::Undefined { dest: undef_result });
-        self.finish_block(Terminator::Jump { target: join_bb });
+            self.finish_block(Terminator::Guard {
+                value: slot_check,
+                defined: defined_bb,
+                undefined: undefined_bb,
+                span: self.current_span,
+            });
 
-        // Join with phi
-        self.current_block = join_bb;
-        self.current_instructions = Vec::new();
-        let result = self.new_temp(TypeSet::all());
-        self.emit(Instruction::Phi {
-            dest: result,
-            sources: vec![(defined_exit, final_value), (undefined_bb, undef_result)],
-        });
+            // Defined path: evaluate rhs, apply compound op, set
+            self.current_block = defined_bb;
+            self.current_instructions = Vec::new();
 
-        result
+            let rhs = self.lower_expression(value);
+            let final_value = self.lower_compound_op(slot_check, op, rhs);
+
+            self.emit(Instruction::SetIndex {
+                base,
+                key,
+                value: final_value,
+            });
+            let defined_exit = self.current_block;
+            self.finish_block(Terminator::Jump { target: join_bb });
+
+            // Undefined path: skip, return undefined
+            self.current_block = undefined_bb;
+            self.current_instructions = Vec::new();
+            let undef_result = self.new_temp(TypeSet::empty());
+            self.emit(Instruction::Undefined { dest: undef_result });
+            self.finish_block(Terminator::Jump { target: join_bb });
+
+            // Join with phi
+            self.current_block = join_bb;
+            self.current_instructions = Vec::new();
+            let result = self.new_temp(TypeSet::all());
+            self.emit(Instruction::Phi {
+                dest: result,
+                sources: vec![(defined_exit, final_value), (undefined_bb, undef_result)],
+            });
+            result
+        }
     }
 }

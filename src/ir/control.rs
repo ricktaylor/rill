@@ -21,6 +21,10 @@ impl<'a> Lowerer<'a> {
         let else_bb = self.fresh_block();
         let join_bb = self.fresh_block();
 
+        // Snapshot bindings before the if — used to detect variable
+        // modifications in branches and create phis at the join point.
+        let pre_if_snapshot = self.snapshot_scope();
+
         // Push scope for condition bindings (visible in then-block)
         self.push_scope();
 
@@ -73,6 +77,8 @@ impl<'a> Lowerer<'a> {
             self.emit(Instruction::Undefined { dest });
             dest
         };
+        // Capture post-then bindings before popping scope
+        let then_bindings = self.snapshot_scope();
         let then_exit_block = self.current_block;
         self.pop_scope(); // End condition bindings scope
         self.finish_block(Terminator::Jump { target: join_bb });
@@ -94,11 +100,13 @@ impl<'a> Lowerer<'a> {
             self.emit(Instruction::Undefined { dest });
             dest
         };
+        // Capture post-else bindings before popping scope
+        let else_bindings = self.snapshot_scope();
         let else_exit_block = self.current_block;
         self.pop_scope();
         self.finish_block(Terminator::Jump { target: join_bb });
 
-        // Join block with phi
+        // Join block with phi for the if expression result
         self.current_block = join_bb;
         self.current_instructions = Vec::new();
 
@@ -107,6 +115,18 @@ impl<'a> Lowerer<'a> {
             dest: result,
             sources: vec![(then_exit_block, then_value), (else_exit_block, else_value)],
         });
+
+        // Create phis for variables modified in either branch.
+        // For each variable in the pre-if snapshot, check if the then-branch
+        // or else-branch rebound it to a different VarId. If so, create a phi
+        // that merges the two and rebind in the enclosing scope.
+        self.merge_branch_bindings(
+            &pre_if_snapshot,
+            &then_bindings,
+            then_exit_block,
+            &else_bindings,
+            else_exit_block,
+        );
 
         result
     }
@@ -471,6 +491,97 @@ impl<'a> Lowerer<'a> {
                 self.error_invalid_pattern(&format!("unknown type '{}'", name), self.current_span);
                 None
             }
+        }
+    }
+
+    /// Create phis for variables modified in if/else or match branches.
+    ///
+    /// Compares the post-branch bindings against the pre-branch snapshot.
+    /// For any variable rebound in either branch, emits a Phi in the
+    /// current (join) block and rebinds the variable in the enclosing scope.
+    ///
+    /// Variables only introduced inside a branch (not in the pre-snapshot)
+    /// are ignored — they're local to that branch's scope and already popped.
+    fn merge_branch_bindings(
+        &mut self,
+        pre_snapshot: &[(ast::Identifier, VarId)],
+        then_bindings: &[(ast::Identifier, VarId)],
+        then_exit: BlockId,
+        else_bindings: &[(ast::Identifier, VarId)],
+        else_exit: BlockId,
+    ) {
+        for (name, pre_var) in pre_snapshot {
+            // Skip discard bindings
+            if name.0 == "_" {
+                continue;
+            }
+
+            // Find the variable's VarId after each branch
+            let then_var = then_bindings
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| *v)
+                .unwrap_or(*pre_var);
+            let else_var = else_bindings
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| *v)
+                .unwrap_or(*pre_var);
+
+            // If neither branch modified this variable, skip
+            if then_var == *pre_var && else_var == *pre_var {
+                continue;
+            }
+
+            // Create a phi to merge the two values
+            let phi_var = self.new_temp(TypeSet::all());
+            self.emit(Instruction::Phi {
+                dest: phi_var,
+                sources: vec![(then_exit, then_var), (else_exit, else_var)],
+            });
+
+            // Rebind in the enclosing scope
+            self.bind(name, phi_var);
+        }
+    }
+
+    /// Create phis for variables modified in any branch of a match expression.
+    ///
+    /// Like `merge_branch_bindings` but handles N branches instead of 2.
+    fn merge_multi_branch_bindings(
+        &mut self,
+        pre_snapshot: &[(ast::Identifier, VarId)],
+        branch_bindings: &[(Vec<(ast::Identifier, VarId)>, BlockId)],
+    ) {
+        for (name, pre_var) in pre_snapshot {
+            if name.0 == "_" {
+                continue;
+            }
+
+            // Collect the VarId for this variable from each branch
+            let sources: Vec<(BlockId, VarId)> = branch_bindings
+                .iter()
+                .map(|(bindings, exit_block)| {
+                    let var = bindings
+                        .iter()
+                        .find(|(n, _)| n == name)
+                        .map(|(_, v)| *v)
+                        .unwrap_or(*pre_var);
+                    (*exit_block, var)
+                })
+                .collect();
+
+            // If all branches kept the same VarId, no phi needed
+            if sources.iter().all(|(_, v)| *v == *pre_var) {
+                continue;
+            }
+
+            let phi_var = self.new_temp(TypeSet::all());
+            self.emit(Instruction::Phi {
+                dest: phi_var,
+                sources,
+            });
+            self.bind(name, phi_var);
         }
     }
 
@@ -1080,7 +1191,11 @@ impl<'a> Lowerer<'a> {
         let scrutinee = self.lower_expression(value);
         let exit_bb = self.fresh_block();
 
+        // Snapshot bindings before match — for detecting variable modifications
+        let pre_match_snapshot = self.snapshot_scope();
+
         let mut arm_results: Vec<(BlockId, VarId)> = Vec::new();
+        let mut arm_bindings: Vec<(Vec<(ast::Identifier, VarId)>, BlockId)> = Vec::new();
 
         for arm in arms {
             let next_bb = self.fresh_block();
@@ -1096,9 +1211,6 @@ impl<'a> Lowerer<'a> {
             self.push_scope();
 
             // Check pattern — on mismatch, jumps to next_bb
-            // No top-level ref_origin for match (the scrutinee is a value,
-            // not an indexed access). Element-level ref origins are created
-            // internally for Array/Map destructuring when mode is Reference.
             self.lower_if_pattern(&arm.pattern, scrutinee, mode, next_bb, None);
 
             // Check guard if present
@@ -1128,7 +1240,10 @@ impl<'a> Lowerer<'a> {
                 dest
             };
 
-            arm_results.push((self.current_block, arm_value));
+            let exit_block = self.current_block;
+            // Capture post-arm bindings before popping scope
+            arm_bindings.push((self.snapshot_scope(), exit_block));
+            arm_results.push((exit_block, arm_value));
             self.pop_scope();
             self.finish_block(Terminator::Jump { target: exit_bb });
 
@@ -1140,10 +1255,12 @@ impl<'a> Lowerer<'a> {
         // Final fallthrough (unreachable if patterns are exhaustive)
         let fallback = self.new_temp(TypeSet::empty());
         self.emit(Instruction::Undefined { dest: fallback });
-        arm_results.push((self.current_block, fallback));
+        let fallback_block = self.current_block;
+        arm_bindings.push((self.snapshot_scope(), fallback_block));
+        arm_results.push((fallback_block, fallback));
         self.finish_block(Terminator::Jump { target: exit_bb });
 
-        // Exit block with phi
+        // Exit block with phi for the match result
         self.current_block = exit_bb;
         self.current_instructions = Vec::new();
 
@@ -1152,6 +1269,10 @@ impl<'a> Lowerer<'a> {
             dest: result,
             sources: arm_results,
         });
+
+        // Create phis for variables modified in any arm
+        self.merge_multi_branch_bindings(&pre_match_snapshot, &arm_bindings);
+
         result
     }
 

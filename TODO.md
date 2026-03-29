@@ -128,6 +128,25 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
     - [ ] Forward compatibility: unknown top-level keys skipped gracefully
     - [ ] Debug info: present and absent cases
 
+### P1 — Known Bugs
+
+- [ ] **Multi-variable reassignment in for-loops** — when two or more variables
+      are reassigned inside a for-loop body (e.g., `a = b; b = next;` in iterative
+      fibonacci), the loop-carried phis may not propagate correctly across the
+      for-loop's seq/idx dispatch paths. Single-variable mutation (`x += 1`) works.
+      Affects: `fib_iter`, any swap/rotate pattern in for-loops.
+      Tests: `bench_for_fib_no_if`, `bench_fib_iter_inline`, `bench_fib_iterative`,
+      `bench_fib_iterative_50`, `bench_if_then_for` (all `#[ignore]`).
+- [ ] **In-place mutation not visible after for-loop dispatch** — when a collection
+      is mutated via SetIndex inside a for-loop body (`m[i] = v`), the mutation
+      may not be visible after the loop due to the seq/idx dispatch phi merging.
+      Affects: `build_map` pattern (loop inserting into a map).
+      Tests: `bench_map_operations` (`#[ignore]`).
+- [ ] **merge_branch_bindings may break if/else expression results** — the new
+      phi creation for modified variables in if/else branches may interfere with
+      nested if/else expressions used as function return values (e.g., ackermann).
+      Tests: `bench_ackermann` (`#[ignore]`).
+
 ### P2 — Optimization
 
 - [ ] **Tail-Call Optimization (TCO)** — rewrite tail calls to parameter overwrite
@@ -226,6 +245,14 @@ _Write-back paths (ref-backed mutations):_
 |---------|--------|-------|-------|---------|
 | Compute + write-back | `x += 1` (ref) | `AddUU` + `WriteRef` + `Copy` | `AddWriteRefUU { ... }` | 3→1 |
 | Const array literal | `[1, 2, 3]` | `Const` × 3 + `MakeArray` | `MakeArrayConst { values }` | 4→1 |
+
+_Destructure-collect patterns (sub-slicing):_
+
+| Pattern | Source | Steps | Fused | Savings |
+|---------|--------|-------|-------|---------|
+| Pop last | `let [..r, last] = a; a = collect(r)` | `ArraySeq` + `Collect` | `ArraySliceCopy { dest, src, start, end }` | 2→1 (one memcpy) |
+| Shift first | `let [first, ..r] = a; a = collect(r)` | `ArraySeq` + `Collect` | `ArraySliceCopy { dest, src, start, end }` | 2→1 (one memcpy) |
+| Sub-slice | `let [_, ..mid, _] = a; collect(mid)` | `ArraySeq` + `Collect` | `ArraySliceCopy { dest, src, start, end }` | 2→1 (one memcpy) |
 
 **Decision heuristic:** Only fuse when type-specialized variants exist
 (TypeAnalysis proves single type). Generic-typed sequences stay as

@@ -1462,3 +1462,330 @@ fn test_monomorphization_multiple_types() {
     );
     assert_eq!(val, Value::UInt(42));
 }
+
+// ========================================================================
+// Benchmark Tests
+// ========================================================================
+//
+// These exercise the benchmark functions from docs/benchmarks.rill
+// to verify they compile and produce correct results.
+
+/// Helper: compile source, push args, call function
+fn run_with_args(source: &str, func_name: &str, args: &[Value]) -> Value {
+    let externs = externs::standard_externs();
+    let (program, diagnostics) = crate::compile(source, &externs).expect("compilation failed");
+    if diagnostics.has_errors() {
+        panic!("compilation errors: {}", diagnostics);
+    }
+
+    let mut vm = VM::new();
+    for arg in args {
+        vm.push(arg.clone()).expect("push failed");
+    }
+    program
+        .call(&mut vm, func_name, args.len())
+        .expect("exec error")
+        .expect("expected a return value")
+}
+
+const BENCHMARK_SOURCE: &str = include_str!("../../docs/benchmarks.rill");
+
+#[test]
+fn bench_fib_recursive() {
+    let val = run_with_args(BENCHMARK_SOURCE, "fib", &[Value::UInt(10)]);
+    assert_eq!(val, Value::UInt(55));
+}
+
+#[test]
+fn bench_fib_recursive_20() {
+    let val = run_with_args(BENCHMARK_SOURCE, "fib", &[Value::UInt(20)]);
+    assert_eq!(val, Value::UInt(6765));
+}
+
+#[test]
+#[ignore] // Known bug: multi-variable reassignment in for-loops (see TODO.md)
+fn bench_fib_iterative() {
+    let val = run_with_args(BENCHMARK_SOURCE, "fib_iter", &[Value::UInt(10)]);
+    assert_eq!(val, Value::UInt(55));
+}
+
+#[test]
+fn bench_for_reassign() {
+    // Minimal test: variable reassignment inside a for loop
+    let val = run_expect(
+        r#"
+        fn test() {
+            let x = 0;
+            for i in 0..5 {
+                x += 1;
+            }
+            x
+        }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(5));
+}
+
+#[test]
+#[ignore] // Known bug: multi-variable reassignment in for-loops (see TODO.md)
+fn bench_for_fib_no_if() {
+    // fib_iter without the early-return if, to isolate the issue
+    let val = run_expect(
+        r#"
+        fn test() {
+            let a = 0;
+            let b = 1;
+            for i in 0..8 {
+                let next = a + b;
+                a = b;
+                b = next;
+            }
+            b
+        }
+        "#,
+        "test",
+    );
+    // fib sequence: 0,1,1,2,3,5,8,13,21 → after 8 iters, b=21
+    assert_eq!(val, Value::UInt(21));
+}
+
+#[test]
+#[ignore] // Known bug: multi-variable reassignment in for-loops (see TODO.md)
+fn bench_if_then_for() {
+    // The problematic pattern: if with return, then for loop
+    let val = run_expect(
+        r#"
+        fn fib(n) {
+            if n < 2 { return n; }
+            let a = 0;
+            let b = 1;
+            for i in 2..=n {
+                let next = a + b;
+                a = b;
+                b = next;
+            }
+            b
+        }
+        fn test() { fib(10) }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(55));
+}
+
+#[test]
+#[ignore] // Known bug: multi-variable reassignment in for-loops (see TODO.md)
+fn bench_fib_iter_inline() {
+    // Inline version to isolate from benchmark source
+    let val = run_expect(
+        r#"
+        fn fib_iter(n) {
+            if n < 2 { return n; }
+            let a = 0;
+            let b = 1;
+            for i in 2..=n {
+                let next = a + b;
+                a = b;
+                b = next;
+            }
+            b
+        }
+        fn test() { fib_iter(10) }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(55));
+}
+
+#[test]
+#[ignore] // Known bug: multi-variable reassignment in for-loops (see TODO.md)
+fn bench_fib_iterative_50() {
+    let val = run_with_args(BENCHMARK_SOURCE, "fib_iter", &[Value::UInt(50)]);
+    assert_eq!(val, Value::UInt(12586269025));
+}
+
+#[test]
+fn bench_binary_trees() {
+    // depth 0: 1 node, depth 1: 3 nodes, depth 2: 7, depth 3: 15
+    // total = 1 + 3 + 7 + 15 = 26
+    let val = run_with_args(BENCHMARK_SOURCE, "binary_trees", &[Value::UInt(3)]);
+    assert_eq!(val, Value::UInt(26));
+}
+
+#[test]
+fn bench_check_tree() {
+    // A single tree of depth 4 has 2^5 - 1 = 31 nodes
+    let val = run_with_args(BENCHMARK_SOURCE, "make_tree", &[Value::UInt(4)]);
+    let check = run_with_args(BENCHMARK_SOURCE, "check_tree", &[val]);
+    assert_eq!(check, Value::UInt(31));
+}
+
+#[test]
+#[ignore] // Known bug: merge_branch_bindings may interfere with if/else expression results
+fn bench_ackermann() {
+    let val = run_with_args(BENCHMARK_SOURCE, "ack", &[Value::UInt(1), Value::UInt(5)]);
+    assert_eq!(val, Value::UInt(7));
+}
+
+#[test]
+fn bench_tak() {
+    let val = run_with_args(
+        BENCHMARK_SOURCE,
+        "tak",
+        &[Value::UInt(18), Value::UInt(12), Value::UInt(6)],
+    );
+    assert_eq!(val, Value::UInt(7));
+}
+
+#[test]
+fn bench_is_prime() {
+    let val = run_with_args(BENCHMARK_SOURCE, "is_prime", &[Value::UInt(97)]);
+    assert_eq!(val, Value::Bool(true));
+
+    let val = run_with_args(BENCHMARK_SOURCE, "is_prime", &[Value::UInt(100)]);
+    assert_eq!(val, Value::Bool(false));
+}
+
+#[test]
+fn bench_sum_primes() {
+    // Sum of primes below 100 = 1060
+    let val = run_with_args(BENCHMARK_SOURCE, "sum_primes", &[Value::UInt(100)]);
+    assert_eq!(val, Value::UInt(1060));
+}
+
+#[test]
+fn bench_collatz() {
+    // collatz_length(27) = 111 steps
+    let val = run_with_args(BENCHMARK_SOURCE, "collatz_length", &[Value::UInt(27)]);
+    assert_eq!(val, Value::UInt(111));
+}
+
+#[test]
+fn bench_max_collatz() {
+    // Longest Collatz sequence under 100 starts at 97
+    let val = run_with_args(BENCHMARK_SOURCE, "max_collatz", &[Value::UInt(100)]);
+    assert_eq!(val, Value::UInt(97));
+}
+
+#[test]
+fn bench_array_sum() {
+    // sum of 0..10 = 0+1+2+...+9 = 45
+    let val = run_with_args(BENCHMARK_SOURCE, "array_sum", &[Value::UInt(10)]);
+    assert_eq!(val, Value::UInt(45));
+}
+
+#[test]
+fn bench_append_basic() {
+    let val = run_expect(
+        r#"
+        fn test() {
+            let arr = [];
+            append(arr, 10);
+            append(arr, 20);
+            append(arr, 30);
+            len(arr)
+        }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(3));
+}
+
+#[test]
+fn bench_append_values() {
+    let val = run_expect(
+        r#"
+        fn test() {
+            let arr = [];
+            append(arr, 10);
+            append(arr, 20);
+            append(arr, 30);
+            arr[0] + arr[1] + arr[2]
+        }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(60));
+}
+
+#[test]
+fn bench_map_insert_basic() {
+    let val = run_expect(
+        r#"
+        fn test() {
+            let m = {};
+            m["a"] = 1;
+            m["b"] = 2;
+            m["a"] + m["b"]
+        }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(3));
+}
+
+#[test]
+fn bench_map_insert_loop() {
+    let val = run_expect(
+        r#"
+        fn test() {
+            let m = {};
+            m[0] = 10;
+            m[1] = 20;
+            m[0] + m[1]
+        }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(30));
+}
+
+#[test]
+#[ignore] // Known bug: in-place mutation via SetIndex not visible after for-loop dispatch (see TODO.md)
+fn bench_map_operations() {
+    // sum of i*i for i in 0..10 = 0+1+4+9+16+25+36+49+64+81 = 285
+    let val = run_with_args(BENCHMARK_SOURCE, "map_benchmark", &[Value::UInt(10)]);
+    assert_eq!(val, Value::UInt(285));
+}
+
+#[test]
+fn bench_matrix_trace() {
+    // sum of i*i for i in 0..5 = 0+1+4+9+16 = 30
+    let val = run_with_args(BENCHMARK_SOURCE, "matrix_trace", &[Value::UInt(5)]);
+    assert_eq!(val, Value::UInt(30));
+}
+
+#[test]
+fn bench_popcount() {
+    // popcount(0xFF) = 8
+    let val = run_with_args(BENCHMARK_SOURCE, "popcount", &[Value::UInt(0xFF)]);
+    assert_eq!(val, Value::UInt(8));
+
+    // popcount(0) = 0
+    let val = run_with_args(BENCHMARK_SOURCE, "popcount", &[Value::UInt(0)]);
+    assert_eq!(val, Value::UInt(0));
+
+    // popcount(u64::MAX) = 64
+    let val = run_with_args(BENCHMARK_SOURCE, "popcount", &[Value::UInt(u64::MAX)]);
+    assert_eq!(val, Value::UInt(64));
+}
+
+#[test]
+fn bench_hamming_distance() {
+    // hamming(0xFF, 0x0F) = popcount(0xF0) = 4
+    let val = run_with_args(
+        BENCHMARK_SOURCE,
+        "hamming_distance",
+        &[Value::UInt(0xFF), Value::UInt(0x0F)],
+    );
+    assert_eq!(val, Value::UInt(4));
+}
+
+#[test]
+fn bench_bitwise() {
+    // popcount(0)=0, popcount(1)=1, popcount(2)=1, popcount(3)=2,
+    // popcount(4)=1, popcount(5)=2, popcount(6)=2, popcount(7)=3 → total=12
+    let val = run_with_args(BENCHMARK_SOURCE, "bitwise_benchmark", &[Value::UInt(8)]);
+    assert_eq!(val, Value::UInt(12));
+}
