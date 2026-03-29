@@ -1097,7 +1097,6 @@ mod tests {
         let program = IrProgram {
             functions: vec![callee, caller],
             constants: vec![],
-            imports: vec![],
         };
 
         let (param_types, param_defs) = collect_param_info(&program, None);

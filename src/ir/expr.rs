@@ -43,10 +43,16 @@ impl<'a> Lowerer<'a> {
             }
 
             ast::Expression::QualifiedName { namespace, name } => {
-                // QualifiedName is for accessing constants like `math::PI`
-                // Currently not supported - emit error
-                self.error_undefined_var(Some(namespace), name, self.current_span);
-                self.error_placeholder()
+                // Qualified constant access: ns::CONSTANT
+                // Look up via require aliases → extern namespace
+                if let Some(_extern_ns) = self.require_aliases.get(namespace) {
+                    // TODO: ExternRegistry doesn't yet support constant registration.
+                    // For now, treat as a zero-arg function call.
+                    self.lower_function_call(Some(namespace), name, &[])
+                } else {
+                    self.error_undefined_var(Some(namespace), name, self.current_span);
+                    self.error_placeholder()
+                }
             }
 
             ast::Expression::BinaryOp { left, op, right } => self.lower_binary_op(left, op, right),
@@ -440,17 +446,36 @@ impl<'a> Lowerer<'a> {
             return result;
         }
 
-        // Build the lookup name for the extern registry.
-        // The registry now contains only user-callable extern functions
-        // (no core:: prefix needed).
-        let lookup_name = if let Some(ns) = namespace {
+        // Resolve the extern function.
+        //
+        // For qualified calls (ns::func): look up the alias in require_aliases
+        // to find the extern namespace, then look up the function in that namespace.
+        //
+        // For unqualified calls: check global externs first, then merged externs
+        // (from `require ns as _`), then fall through to user function resolution.
+        let extern_def = if let Some(ns) = namespace {
+            // Qualified call: ns::func()
+            if let Some(extern_ns) = self.require_aliases.get(ns) {
+                self.externs.get_in(extern_ns, name)
+            } else {
+                // No matching require — will be checked against user functions later
+                None
+            }
+        } else {
+            // Unqualified call: check globals, then merged externs
+            self.externs.get(name).or_else(|| {
+                self.merged_externs
+                    .get(name)
+                    .and_then(|ns| self.externs.get_in(ns, name))
+            })
+        };
+
+        // Build the lookup name for the link phase.
+        let _lookup_name = if let Some(ns) = namespace {
             format!("{ns}::{name}")
         } else {
             name.to_string()
         };
-
-        // Check if the function exists in the registry
-        let extern_def = self.externs.get(&lookup_name);
 
         let param_specs = extern_def.map(|b| &b.meta.params);
 

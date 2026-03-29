@@ -27,8 +27,8 @@ type BoxedParser<'a, T> = Boxed<'a, 'a, &'a str, T, Extra<'a>>;
 // ============================================================================
 
 const KEYWORDS: &[&str] = &[
-    "fn", "import", "as", "const", "let", "with", "if", "else", "match", "while", "loop", "for",
-    "in", "return", "break", "continue", "true", "false", "bytes",
+    "fn", "import", "require", "as", "const", "let", "with", "if", "else", "match", "while",
+    "loop", "for", "in", "return", "break", "continue", "true", "false", "bytes",
 ];
 
 // ============================================================================
@@ -1276,27 +1276,37 @@ fn statement_inner<'a>(expr: BoxedParser<'a, Expression>) -> BoxedParser<'a, Sta
 // Top-level
 // ============================================================================
 
-fn import_path<'a>() -> BoxedParser<'a, ImportPath> {
-    let file_path = string_literal().map(ImportPath::File);
-
-    let stdlib_path = ident()
-        .separated_by(just('.'))
-        .at_least(1)
-        .collect::<Vec<_>>()
-        .map(ImportPath::Stdlib);
-
-    file_path.or(stdlib_path).padded_by(whitespace()).boxed()
+/// Parse an alias: `as identifier` or `as _`
+fn alias<'a>() -> BoxedParser<'a, Identifier> {
+    kw("as")
+        .ignore_then(
+            just('_')
+                .padded_by(whitespace())
+                .to(Identifier("_".to_string()))
+                .or(ident()),
+        )
+        .boxed()
 }
 
+/// Parse: `import "path/to/file.rill" [as alias | as _] ;`
 fn import<'a>() -> BoxedParser<'a, ast::Spanned<Import>> {
-    let alias = kw("as").ignore_then(ident());
-
     kw("import")
-        .ignore_then(import_path())
-        .then(alias.or_not())
+        .ignore_then(string_literal().padded_by(whitespace()))
+        .then(alias().or_not())
         .then_ignore(just(';').padded_by(whitespace()))
         .map(|(path, alias)| Import { path, alias })
         .map_with(|imp, extra| ast::Spanned::new(imp, extra.span()))
+        .boxed()
+}
+
+/// Parse: `require namespace [as alias | as _] ;`
+fn require<'a>() -> BoxedParser<'a, ast::Spanned<ast::Require>> {
+    kw("require")
+        .ignore_then(ident())
+        .then(alias().or_not())
+        .then_ignore(just(';').padded_by(whitespace()))
+        .map(|(namespace, alias)| ast::Require { namespace, alias })
+        .map_with(|req, extra| ast::Spanned::new(req, extra.span()))
         .boxed()
 }
 
@@ -1403,6 +1413,7 @@ fn function<'a>() -> BoxedParser<'a, ast::Spanned<Function>> {
 #[derive(Clone)]
 enum TopLevel {
     Import(ast::Spanned<Import>),
+    Require(ast::Spanned<ast::Require>),
     Constant(ast::Spanned<Constant>),
     Function(ast::Spanned<Function>),
 }
@@ -1410,6 +1421,7 @@ enum TopLevel {
 fn program<'a>() -> BoxedParser<'a, AstProgram> {
     let top_level = choice((
         import().map(TopLevel::Import),
+        require().map(TopLevel::Require),
         constant().map(TopLevel::Constant),
         function().map(TopLevel::Function),
     ))
@@ -1420,12 +1432,14 @@ fn program<'a>() -> BoxedParser<'a, AstProgram> {
         .then_ignore(end())
         .map(|items| {
             let mut imports: Vec<ast::Spanned<Import>> = Vec::new();
+            let mut requires: Vec<ast::Spanned<ast::Require>> = Vec::new();
             let mut constants: Vec<ast::Spanned<Constant>> = Vec::new();
             let mut functions: Vec<ast::Spanned<Function>> = Vec::new();
 
             for item in items {
                 match item {
                     TopLevel::Import(i) => imports.push(i),
+                    TopLevel::Require(r) => requires.push(r),
                     TopLevel::Constant(c) => constants.push(c),
                     TopLevel::Function(f) => functions.push(f),
                 }
@@ -1433,6 +1447,7 @@ fn program<'a>() -> BoxedParser<'a, AstProgram> {
 
             AstProgram {
                 imports,
+                requires,
                 constants,
                 functions,
             }
@@ -1853,8 +1868,8 @@ mod tests {
     #[test]
     fn test_parse_program() {
         let input = r#"
-            import std.bpsec;
-            import "../common/utils.flt" as utils;
+            require bpsec;
+            import "../common/utils.rill" as utils;
 
             const MAX_HOPS = 16;
 
@@ -1871,7 +1886,8 @@ mod tests {
         let result = try_parse(input);
         assert!(result.is_ok(), "Parse error");
         let program = result.unwrap();
-        assert_eq!(program.imports.len(), 2);
+        assert_eq!(program.requires.len(), 1);
+        assert_eq!(program.imports.len(), 1);
         assert_eq!(program.constants.len(), 1);
         assert_eq!(program.functions.len(), 2);
     }

@@ -613,11 +613,9 @@ pub struct Param {
 
 /// Complete IR program
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct IrProgram {
     pub functions: Vec<Function>,
     pub constants: Vec<ConstBinding>,
-    pub imports: Vec<Import>,
 }
 
 /// A constant binding (result of const pattern matching)
@@ -626,14 +624,6 @@ pub struct IrProgram {
 pub struct ConstBinding {
     pub name: ast::Identifier,
     pub value: ConstValue,
-}
-
-/// Import declaration for module resolution
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct Import {
-    pub namespace: ast::Identifier,
-    pub path: ast::ImportPath,
 }
 
 /// Compile-time evaluated constant value

@@ -22,17 +22,19 @@
 //! ```ignore
 //! let mut registry = ExternRegistry::new();
 //!
-//! registry.register(
-//!     ExternDef::new("send_report", my_send_impl)
-//!         .param("data", TypeSet::bytes())
-//!         .returns(TypeSet::bool())
-//!         .impure()
-//! );
-//!
+//! // Global extern — available without `require`
 //! registry.register(
 //!     ExternDef::new("exit", my_exit_impl)
 //!         .param_optional("code", TypeSet::uint())
-//!         .exits(TypeSet::uint())  // Diverges, implicitly Impure
+//!         .exits(TypeSet::uint())
+//! )?;
+//!
+//! // Namespaced extern — requires `require cbor;` in script
+//! registry.register_in("cbor",
+//!     ExternDef::new("decode", my_decode_impl)
+//!         .param("data", TypeSet::bytes())
+//!         .returns(TypeSet::all())
+//!         .pure()
 //! );
 //! ```
 
@@ -569,61 +571,167 @@ impl ExternDef {
 // Extern Registry
 // ============================================================================
 
+/// Error returned when extern registration fails.
+#[derive(Debug, thiserror::Error)]
+pub enum RegistryError {
+    /// Global extern name clashes with a built-in intrinsic.
+    #[error("cannot register global extern `{name}`: clashes with built-in intrinsic")]
+    IntrinsicClash { name: String },
+
+    /// Global extern name was already registered.
+    #[error("global extern `{name}` is already registered")]
+    DuplicateGlobal { name: String },
+
+    /// Function name was already registered in this namespace.
+    #[error("extern `{name}` is already registered in namespace `{namespace}`")]
+    DuplicateInNamespace { namespace: String, name: String },
+}
+
 /// Registry of extern functions
 ///
-/// Contains extern functions (stdlib and embedder-provided) that a Rill
-/// script can invoke by name. Language-defined operators are handled as
-/// `IntrinsicOp` (core intrinsics) and do not appear here.
+/// Contains embedder-provided functions that Rill scripts can call.
+/// Functions are either **global** (available without `require`) or
+/// **namespaced** (grouped under a namespace, require a `require`
+/// declaration in the script).
 ///
-/// Used by the compiler for lowering decisions and by the VM for execution.
+/// Language-defined operators are handled as `IntrinsicOp` (core
+/// intrinsics) and do not appear here.
 #[derive(Debug, Default)]
 pub struct ExternRegistry {
-    externs: HashMap<String, ExternDef>,
+    /// Global externs — available unqualified without `require`
+    globals: HashMap<String, ExternDef>,
+    /// Namespaced externs — namespace → (function name → def)
+    namespaces: HashMap<String, HashMap<String, ExternDef>>,
 }
 
 impl ExternRegistry {
     /// Create an empty registry
     pub fn new() -> Self {
         ExternRegistry {
-            externs: HashMap::new(),
+            globals: HashMap::new(),
+            namespaces: HashMap::new(),
         }
     }
 
-    /// Register an extern function
-    pub fn register(&mut self, def: ExternDef) {
-        self.externs.insert(def.name.clone(), def);
-    }
+    /// Names reserved by the compiler — cannot be used for global externs.
+    const RESERVED_NAMES: &[&str] = &["len", "collect"];
 
-    /// Look up an extern by name
-    pub fn get(&self, name: &str) -> Option<&ExternDef> {
-        self.externs.get(name)
-    }
-
-    /// Look up an extern by function reference
+    /// Register a global extern function (available without `require`).
     ///
-    /// Uses the qualified name (e.g., "str::len") for lookup.
+    /// Global externs are callable unqualified: `exit(0)`, `print("hello")`.
+    ///
+    /// Returns an error if the name clashes with a built-in intrinsic
+    /// or is already registered.
+    pub fn register(&mut self, def: ExternDef) -> Result<(), RegistryError> {
+        if Self::RESERVED_NAMES.contains(&def.name.as_str()) {
+            return Err(RegistryError::IntrinsicClash {
+                name: def.name.clone(),
+            });
+        }
+        if self.globals.contains_key(&def.name) {
+            return Err(RegistryError::DuplicateGlobal {
+                name: def.name.clone(),
+            });
+        }
+        self.globals.insert(def.name.clone(), def);
+        Ok(())
+    }
+
+    /// Register an extern function in a namespace.
+    ///
+    /// Namespaced externs require `require namespace;` in the script and
+    /// are called qualified: `cbor::decode(bytes)`.
+    ///
+    /// Returns an error if the function name is already registered in
+    /// this namespace.
+    ///
+    /// ```ignore
+    /// registry.register_in("cbor", ExternDef::new("decode", decode_fn))?;
+    /// registry.register_in("cbor", ExternDef::new("encode", encode_fn))?;
+    /// ```
+    pub fn register_in(&mut self, namespace: &str, def: ExternDef) -> Result<(), RegistryError> {
+        let ns = self.namespaces.entry(namespace.to_string()).or_default();
+        if ns.contains_key(&def.name) {
+            return Err(RegistryError::DuplicateInNamespace {
+                namespace: namespace.to_string(),
+                name: def.name.clone(),
+            });
+        }
+        ns.insert(def.name.clone(), def);
+        Ok(())
+    }
+
+    /// Look up a global extern by name.
+    pub fn get(&self, name: &str) -> Option<&ExternDef> {
+        self.globals.get(name)
+    }
+
+    /// Look up a namespaced extern by namespace and function name.
+    pub fn get_in(&self, namespace: &str, name: &str) -> Option<&ExternDef> {
+        self.namespaces.get(namespace)?.get(name)
+    }
+
+    /// Look up an extern by function reference.
+    ///
+    /// Checks namespaced externs first (if qualified), then globals.
     pub fn lookup(&self, func: &FunctionRef) -> Option<&ExternDef> {
-        self.externs.get(&func.qualified_name())
+        if let Some(ns) = &func.namespace {
+            self.get_in(ns, &func.name)
+        } else {
+            self.get(func.name.as_ref())
+        }
     }
 
-    /// Check if a name is a registered extern
+    /// Check if a global extern with this name exists.
     pub fn contains(&self, name: &str) -> bool {
-        self.externs.contains_key(name)
+        self.globals.contains_key(name)
     }
 
-    /// Iterate over all registered externs
-    pub fn iter(&self) -> impl Iterator<Item = (&String, &ExternDef)> {
-        self.externs.iter()
+    /// Check if a namespace has been registered.
+    pub fn has_namespace(&self, namespace: &str) -> bool {
+        self.namespaces.contains_key(namespace)
     }
 
-    /// Get the number of registered externs
+    /// Get the names of all registered namespaces.
+    pub fn namespace_names(&self) -> impl Iterator<Item = &str> {
+        self.namespaces.keys().map(|s| s.as_str())
+    }
+
+    /// Iterate over all externs in a namespace.
+    pub fn namespace_iter(&self, namespace: &str) -> impl Iterator<Item = (&String, &ExternDef)> {
+        self.namespaces
+            .get(namespace)
+            .into_iter()
+            .flat_map(|ns| ns.iter())
+    }
+
+    /// Iterate over all global externs.
+    pub fn globals_iter(&self) -> impl Iterator<Item = (&String, &ExternDef)> {
+        self.globals.iter()
+    }
+
+    /// Iterate over all registered externs (globals + all namespaces).
+    ///
+    /// Yields `(qualified_name, def)` where qualified_name is `"func"` for
+    /// globals and `"ns::func"` for namespaced externs.
+    pub fn iter(&self) -> impl Iterator<Item = (String, &ExternDef)> {
+        let globals = self.globals.iter().map(|(k, v)| (k.clone(), v));
+        let namespaced = self.namespaces.iter().flat_map(|(ns, funcs)| {
+            funcs
+                .iter()
+                .map(move |(name, def)| (format!("{ns}::{name}"), def))
+        });
+        globals.chain(namespaced)
+    }
+
+    /// Get the total number of registered externs.
     pub fn len(&self) -> usize {
-        self.externs.len()
+        self.globals.len() + self.namespaces.values().map(|ns| ns.len()).sum::<usize>()
     }
 
-    /// Check if the registry is empty
+    /// Check if the registry is empty.
     pub fn is_empty(&self) -> bool {
-        self.externs.is_empty()
+        self.globals.is_empty() && self.namespaces.is_empty()
     }
 }
 
@@ -756,13 +864,91 @@ mod tests {
         let mut registry = ExternRegistry::new();
         assert!(registry.is_empty());
 
-        registry.register(ExternDef::new("foo", dummy));
+        registry.register(ExternDef::new("foo", dummy)).unwrap();
         assert_eq!(registry.len(), 1);
         assert!(registry.contains("foo"));
         assert!(!registry.contains("bar"));
 
         let def = registry.get("foo").unwrap();
         assert_eq!(def.name, "foo");
+    }
+
+    #[test]
+    fn test_register_intrinsic_clash() {
+        fn dummy(_vm: &mut VM, _argc: usize) -> Result<ExecResult, ExecError> {
+            Ok(ExecResult::Return(None))
+        }
+
+        let mut registry = ExternRegistry::new();
+        let result = registry.register(ExternDef::new("len", dummy));
+        assert!(matches!(result, Err(RegistryError::IntrinsicClash { .. })));
+
+        let result = registry.register(ExternDef::new("collect", dummy));
+        assert!(matches!(result, Err(RegistryError::IntrinsicClash { .. })));
+
+        // Non-reserved name succeeds
+        registry.register(ExternDef::new("exit", dummy)).unwrap();
+    }
+
+    #[test]
+    fn test_register_duplicate_global() {
+        fn dummy(_vm: &mut VM, _argc: usize) -> Result<ExecResult, ExecError> {
+            Ok(ExecResult::Return(None))
+        }
+
+        let mut registry = ExternRegistry::new();
+        registry.register(ExternDef::new("exit", dummy)).unwrap();
+
+        let result = registry.register(ExternDef::new("exit", dummy));
+        assert!(matches!(result, Err(RegistryError::DuplicateGlobal { .. })));
+    }
+
+    #[test]
+    fn test_register_duplicate_in_namespace() {
+        fn dummy(_vm: &mut VM, _argc: usize) -> Result<ExecResult, ExecError> {
+            Ok(ExecResult::Return(None))
+        }
+
+        let mut registry = ExternRegistry::new();
+        registry
+            .register_in("cbor", ExternDef::new("decode", dummy))
+            .unwrap();
+
+        let result = registry.register_in("cbor", ExternDef::new("decode", dummy));
+        assert!(matches!(
+            result,
+            Err(RegistryError::DuplicateInNamespace { .. })
+        ));
+
+        // Same name in different namespace is fine
+        registry
+            .register_in("json", ExternDef::new("decode", dummy))
+            .unwrap();
+    }
+
+    #[test]
+    fn test_namespaced_lookup() {
+        fn dummy(_vm: &mut VM, _argc: usize) -> Result<ExecResult, ExecError> {
+            Ok(ExecResult::Return(None))
+        }
+
+        let mut registry = ExternRegistry::new();
+        registry
+            .register_in("cbor", ExternDef::new("decode", dummy))
+            .unwrap();
+        registry
+            .register_in("cbor", ExternDef::new("encode", dummy))
+            .unwrap();
+
+        assert!(registry.has_namespace("cbor"));
+        assert!(!registry.has_namespace("json"));
+
+        assert!(registry.get_in("cbor", "decode").is_some());
+        assert!(registry.get_in("cbor", "encode").is_some());
+        assert!(registry.get_in("cbor", "validate").is_none());
+        assert!(registry.get_in("json", "decode").is_none());
+
+        assert_eq!(registry.namespace_iter("cbor").count(), 2);
     }
 
     #[test]

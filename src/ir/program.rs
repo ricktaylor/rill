@@ -14,14 +14,25 @@ impl<'a> Lowerer<'a> {
     pub fn lower_program(&mut self, program: &ast::AstProgram) -> Option<IrProgram> {
         let mut functions = Vec::new();
         let mut constants = Vec::new();
-        let mut imports = Vec::new();
 
         let errors_before = self.diagnostics.error_count();
 
-        // Lower imports (imports can't fail currently)
-        for import in &program.imports {
-            imports.push(self.lower_import(&import.node));
+        // Validate require declarations against the extern registry
+        for req in &program.requires {
+            self.set_span(req.span);
+            self.validate_require(&req.node);
         }
+
+        // Build the namespace alias table from require declarations
+        self.build_require_aliases(&program.requires);
+
+        // Note: imports (source files) are not yet implemented — they are
+        // collected but not loaded. Phase 2 of the module system will add
+        // SourceLoader support.
+
+        // Validate function and constant names for clashes
+        let function_names = self.check_function_names(&program.functions);
+        self.check_constant_names(&program.constants, &function_names);
 
         // Lower constants (may emit errors but we continue)
         for constant in &program.constants {
@@ -47,32 +58,204 @@ impl<'a> Lowerer<'a> {
         Some(IrProgram {
             functions,
             constants,
-            imports,
         })
     }
 
-    /// Lower an import declaration
-    fn lower_import(&mut self, import: &ast::Import) -> Import {
-        let namespace = match &import.alias {
-            Some(alias) => alias.clone(),
-            None => match &import.path {
-                ast::ImportPath::Stdlib(parts) => parts
-                    .last()
-                    .cloned()
-                    .unwrap_or(ast::Identifier("_".to_string())),
-                ast::ImportPath::File(path) => {
-                    let name = std::path::Path::new(path)
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("_");
-                    ast::Identifier(name.to_string())
-                }
-            },
-        };
+    /// Check all function names for clashes with intrinsics, global externs,
+    /// merged externs (`as _`), and duplicate definitions.
+    ///
+    /// Returns the set of valid function names (for cross-checking with constants).
+    fn check_function_names(
+        &mut self,
+        functions: &[ast::Spanned<ast::Function>],
+    ) -> HashMap<ast::Identifier, ast::Span> {
+        let mut seen: HashMap<ast::Identifier, ast::Span> = HashMap::new();
 
-        Import {
-            namespace,
-            path: import.path.clone(),
+        for func in functions {
+            let name = &func.node.name;
+            let span = func.span;
+
+            if let Some(msg) = self.check_name_clash(name, "function") {
+                self.diagnostics
+                    .error(DiagnosticCode::E400_DuplicateDefinition, span, msg);
+                continue;
+            }
+
+            if let Some(prev_span) = seen.get(name) {
+                self.diagnostics
+                    .error(
+                        DiagnosticCode::E400_DuplicateDefinition,
+                        span,
+                        format!("duplicate function `{}`", name),
+                    )
+                    .note(*prev_span, "previously defined here");
+                continue;
+            }
+
+            seen.insert(name.clone(), span);
+        }
+
+        seen
+    }
+
+    /// Check all constant names for clashes with intrinsics, global externs,
+    /// merged externs, function names, and duplicate definitions.
+    fn check_constant_names(
+        &mut self,
+        constants: &[ast::Spanned<ast::Constant>],
+        function_names: &HashMap<ast::Identifier, ast::Span>,
+    ) {
+        for constant in constants {
+            self.check_constant_pattern_names(
+                &constant.node.pattern.node,
+                constant.span,
+                function_names,
+            );
+        }
+    }
+
+    /// Check a single constant pattern for name clashes.
+    fn check_constant_pattern_names(
+        &mut self,
+        pattern: &ast::Pattern,
+        span: ast::Span,
+        function_names: &HashMap<ast::Identifier, ast::Span>,
+    ) {
+        match pattern {
+            ast::Pattern::Variable(name) => {
+                if let Some(msg) = self.check_name_clash(name, "constant") {
+                    self.diagnostics
+                        .error(DiagnosticCode::E400_DuplicateDefinition, span, msg);
+                } else if let Some(fn_span) = function_names.get(name) {
+                    self.diagnostics
+                        .error(
+                            DiagnosticCode::E400_DuplicateDefinition,
+                            span,
+                            format!("constant `{}` clashes with function of the same name", name),
+                        )
+                        .note(*fn_span, "function defined here");
+                }
+            }
+            ast::Pattern::Array(pats) => {
+                for pat in pats {
+                    self.check_constant_pattern_names(&pat.node, span, function_names);
+                }
+            }
+            ast::Pattern::ArrayRest {
+                before,
+                rest,
+                after,
+            } => {
+                for pat in before.iter().chain(after.iter()) {
+                    self.check_constant_pattern_names(&pat.node, span, function_names);
+                }
+                if let Some(name) = rest {
+                    self.check_constant_pattern_names(
+                        &ast::Pattern::Variable(name.clone()),
+                        span,
+                        function_names,
+                    );
+                }
+            }
+            ast::Pattern::Map(entries) => {
+                for (_, val_pat) in entries {
+                    self.check_constant_pattern_names(&val_pat.node, span, function_names);
+                }
+            }
+            // Wildcards, literals, type patterns — no names to check
+            _ => {}
+        }
+    }
+
+    /// Check a name against intrinsics, global externs, and merged externs.
+    ///
+    /// Returns `Some(message)` if there's a clash, `None` if clean.
+    fn check_name_clash(&self, name: &ast::Identifier, kind: &str) -> Option<String> {
+        if intrinsic_by_name(name).is_some() {
+            return Some(format!(
+                "{} `{}` clashes with built-in intrinsic",
+                kind, name
+            ));
+        }
+        if self.externs.contains(name) {
+            return Some(format!("{} `{}` clashes with global extern", kind, name));
+        }
+        if let Some(ns) = self.merged_externs.get(name) {
+            return Some(format!(
+                "{} `{}` clashes with extern from namespace `{}`",
+                kind, name, ns
+            ));
+        }
+        None
+    }
+
+    /// Validate a `require` declaration against the extern registry.
+    fn validate_require(&mut self, req: &ast::Require) {
+        if !self.externs.has_namespace(&req.namespace) {
+            self.diagnostics.error(
+                DiagnosticCode::E500_UndefinedExternal,
+                self.current_span,
+                format!(
+                    "extern namespace `{}` not provided by embedder",
+                    req.namespace
+                ),
+            );
+        }
+    }
+
+    /// Build the alias table from require declarations.
+    ///
+    /// Maps call-site alias → extern namespace name. Detects duplicate aliases.
+    fn build_require_aliases(&mut self, requires: &[ast::Spanned<ast::Require>]) {
+        for req in requires {
+            let alias = match &req.node.alias {
+                Some(a) if a == "_" => {
+                    // `as _` — merge all functions into root scope (no namespace)
+                    // Register each function in the namespace as a "global-like" lookup
+                    self.require_merge_to_root(&req.node.namespace, req.span);
+                    continue;
+                }
+                Some(a) => a.clone(),
+                None => req.node.namespace.clone(),
+            };
+
+            if self.require_aliases.contains_key(&alias) {
+                self.diagnostics.error(
+                    DiagnosticCode::E400_DuplicateDefinition,
+                    req.span,
+                    format!("duplicate namespace alias `{}`", alias),
+                );
+                continue;
+            }
+
+            self.require_aliases
+                .insert(alias, req.node.namespace.clone());
+        }
+    }
+
+    /// Merge all functions from a required namespace into the root scope.
+    ///
+    /// Called when `require ns as _;` is used. Functions become available
+    /// unqualified.
+    fn require_merge_to_root(&mut self, namespace: &ast::Identifier, span: ast::Span) {
+        for (name, _) in self.externs.namespace_iter(namespace) {
+            let name = ast::Identifier(name.clone());
+            use std::collections::hash_map::Entry;
+            match self.merged_externs.entry(name) {
+                Entry::Occupied(e) => {
+                    self.diagnostics.error(
+                        DiagnosticCode::E400_DuplicateDefinition,
+                        span,
+                        format!(
+                            "extern function `{}` (from namespace `{}`) clashes with another definition",
+                            e.key(), namespace
+                        ),
+                    );
+                }
+                Entry::Vacant(e) => {
+                    e.insert(namespace.clone());
+                }
+            }
         }
     }
 

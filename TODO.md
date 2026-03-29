@@ -45,21 +45,23 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
 ### P1 — Core Functionality
 
 - [ ] **Module system** — `import` for source files, `require` for extern namespaces
-  - Phase 1: ExternRegistry namespaces + `require`
-    - [ ] `ExternRegistry::register_in(namespace, def)` — namespaced extern registration
-    - [ ] `ExternRegistry::namespaces()` — list registered namespace names (for validation)
-    - [ ] Update parser: add `require` keyword, parse `require ident [as (ident / "_")] ;`
-    - [ ] Update parser: `import` takes only quoted string path (remove `ImportPath::Stdlib`)
-    - [ ] Update parser: `import` supports `as _` (merge into root scope)
-    - [ ] Update AST: replace `Import`/`ImportPath` with separate `Import` (file) and `Require` (extern) types
-    - [ ] Update `AstProgram` to include `requires: Vec<Spanned<Require>>`
-    - [ ] Update lowerer: validate `require` namespaces against ExternRegistry
-    - [ ] Update lowerer: resolve `ns::func()` calls against required extern namespaces
-    - [ ] Update lowerer: resolve `ns::CONST` against required extern namespaces
-    - [ ] Update lowerer: `as _` requires merge extern functions into root scope
-    - [ ] Diagnostic: "extern namespace `X` not provided by embedder"
-    - [ ] Diagnostic: duplicate namespace alias error
-    - [ ] Diagnostic: namespace alias clashes with global extern error
+  - Phase 1: ExternRegistry namespaces + `require` — **done**
+    - [x] `ExternRegistry` restructured: `globals` + `namespaces` maps
+    - [x] `register_in(namespace, def)` for namespaced externs
+    - [x] `register()` / `register_in()` return `Result<(), RegistryError>`
+    - [x] `RegistryError` enum (thiserror): `IntrinsicClash`, `DuplicateGlobal`, `DuplicateInNamespace`
+    - [x] `has_namespace()`, `get_in()`, `namespace_iter()`, `globals_iter()`
+    - [x] Parser: `require` keyword, `require ident [as (ident / "_")] ;`
+    - [x] Parser: `import` takes only quoted string path (removed `ImportPath::Stdlib`)
+    - [x] Parser: `import` and `require` support `as _` (merge into root scope)
+    - [x] AST: separate `Import` (file path) and `Require` (extern namespace) types
+    - [x] `AstProgram.requires` field
+    - [x] Lowerer: validate `require` namespaces against ExternRegistry
+    - [x] Lowerer: `require_aliases` map for namespace resolution
+    - [x] Lowerer: resolve `ns::func()` calls against required extern namespaces
+    - [x] Lowerer: resolve `ns::CONST` against required extern namespaces
+    - [x] Lowerer: `as _` merges extern functions into root scope (`merged_externs`)
+    - [x] Removed IR `Import` type and `IrProgram.imports` (no longer needed)
   - Phase 2: Source file imports
     - [ ] `SourceLoader` trait — `load()` for imports, `preamble()` for standard prelude
     - [ ] `compile()` signature: add `Option<&dyn SourceLoader>` parameter
@@ -71,12 +73,14 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
     - [ ] Private imports: each file's imports are invisible to its importers
     - [ ] Diagnostic: "source file not found" (via SourceLoader::load error)
     - [ ] Diagnostic: duplicate namespace alias (import vs import, import vs require)
-  - Phase 3: Name clash enforcement
-    - [ ] Duplicate function/constant name in root scope → error (any origin)
-    - [ ] Function/constant name vs intrinsic (`len`, `collect`) → error
-    - [ ] Function/constant name vs global extern → error
-    - [ ] `as _` import/require name vs local name → error
-    - [ ] Global extern name vs intrinsic → error at registration
+  - Phase 3: Name clash enforcement — **done**
+    - [x] Duplicate function name in same file → error (with note pointing to first definition)
+    - [x] Function/constant name vs intrinsic (`len`, `collect`) → error
+    - [x] Function/constant name vs global extern → error
+    - [x] Function/constant name vs merged extern (`as _`) → error
+    - [x] Constant name vs function name → error (with note)
+    - [x] Global extern name vs intrinsic → `RegistryError` at registration time
+    - [x] Shared `check_name_clash()` helper for consistent error messages
   - Phase 4: Visibility and DCE
     - [ ] Track function origin: root file (public) vs imported file (private)
     - [ ] DCE: imported functions not referenced from root → eliminate

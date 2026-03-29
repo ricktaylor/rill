@@ -1395,14 +1395,16 @@ fn test_extern_variant_selection() {
     use crate::types::TypeSet;
 
     let mut externs = ExternRegistry::new();
-    externs.register(
-        ExternDef::new("classify", generic)
-            .param("x", TypeSet::numeric())
-            .returns(TypeSet::uint())
-            .pure_infallible()
-            .variant(&[TypeSet::uint()], TypeSet::uint(), uint_variant)
-            .variant(&[TypeSet::int()], TypeSet::uint(), int_variant),
-    );
+    externs
+        .register(
+            ExternDef::new("classify", generic)
+                .param("x", TypeSet::numeric())
+                .returns(TypeSet::uint())
+                .pure_infallible()
+                .variant(&[TypeSet::uint()], TypeSet::uint(), uint_variant)
+                .variant(&[TypeSet::int()], TypeSet::uint(), int_variant),
+        )
+        .unwrap();
 
     // Compile with the custom registry
     let source = r#"

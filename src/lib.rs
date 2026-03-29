@@ -10,7 +10,7 @@ pub mod types;
 // Re-export key types for convenient access
 pub use diagnostics::{Diagnostics, LineCol, offset_to_line_col, span_to_line_col};
 pub use exec::{ExecError, VM, Value};
-pub use externs::ExternRegistry;
+pub use externs::{ExternRegistry, RegistryError};
 pub use types::{BaseType, TypeSet};
 
 /// Compiled Rill program, ready for execution.

@@ -111,6 +111,14 @@ pub struct Lowerer<'a> {
 
     /// Stack of (break_target, continue_target) for nested loops
     pub loop_stack: Vec<LoopContext>,
+
+    /// Namespace aliases from `require` declarations.
+    /// Maps call-site alias → extern namespace name.
+    pub require_aliases: HashMap<ast::Identifier, ast::Identifier>,
+
+    /// Extern functions merged into root scope via `require ns as _`.
+    /// Maps function name → source namespace (for diagnostics).
+    pub merged_externs: HashMap<ast::Identifier, ast::Identifier>,
 }
 
 /// Context for a loop (for break/continue)
@@ -137,6 +145,8 @@ impl<'a> Lowerer<'a> {
             current_instructions: Vec::new(),
             current_span: ast::Span::default(),
             loop_stack: Vec::new(),
+            require_aliases: HashMap::new(),
+            merged_externs: HashMap::new(),
         }
     }
 

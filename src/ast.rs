@@ -96,6 +96,7 @@ pub type Pat = Spanned<Pattern>;
 
 pub struct AstProgram {
     pub imports: Vec<Spanned<Import>>,
+    pub requires: Vec<Spanned<Require>>,
     pub constants: Vec<Spanned<Constant>>,
     pub functions: Vec<Spanned<Function>>,
 }
@@ -106,19 +107,27 @@ pub struct Constant {
     pub value: Expression, // Compiler verifies const-evaluability
 }
 
+/// Source file import: `import "path/to/file.rill" [as alias];`
+///
+/// Loads a .rill source file. Namespace defaults to filename stem.
+/// `as _` merges functions into the root scope (no namespace).
+///
+/// Note: source file loading is not yet implemented (Phase 2 of module system).
+/// The parser accepts the syntax but the lowerer does not process imports.
 #[derive(Debug, Clone)]
 pub struct Import {
-    pub path: ImportPath,
-    pub alias: Option<Identifier>, // None = use default name, Some = explicit alias
+    pub path: String,              // Quoted file path
+    pub alias: Option<Identifier>, // None = filename stem, Some = explicit, "_" = merge into root
 }
 
+/// Extern dependency: `require namespace [as alias];`
+///
+/// Declares that the script needs an embedder-provided extern namespace.
+/// `as _` merges functions into the root scope (no namespace).
 #[derive(Debug, Clone)]
-pub enum ImportPath {
-    // Standard library: std.bpsec, std.cbor.utils
-    Stdlib(Vec<Identifier>),
-
-    // File path: "../common/bundle_age.flt"
-    File(String),
+pub struct Require {
+    pub namespace: Identifier,     // The extern namespace name
+    pub alias: Option<Identifier>, // None = use namespace name, Some = explicit, "_" = merge into root
 }
 
 // ============================================================================
