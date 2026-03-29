@@ -298,7 +298,7 @@ impl Slot {
 /// Sequences are single-pass lazy values. Advancing a sequence is a mutation
 /// on the shared HeapVal — all references to the same sequence see the
 /// same position.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SeqState {
     /// Range over unsigned integers
     RangeUInt {
@@ -417,52 +417,6 @@ impl SeqState {
                 }
             }
             SeqState::ArraySlice { start, end, .. } => Some(end.saturating_sub(*start)),
-        }
-    }
-}
-
-impl PartialEq for SeqState {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (
-                SeqState::RangeUInt {
-                    current: a,
-                    end: b,
-                    inclusive: c,
-                },
-                SeqState::RangeUInt {
-                    current: d,
-                    end: e,
-                    inclusive: f,
-                },
-            ) => a == d && b == e && c == f,
-            (
-                SeqState::RangeInt {
-                    current: a,
-                    end: b,
-                    inclusive: c,
-                },
-                SeqState::RangeInt {
-                    current: d,
-                    end: e,
-                    inclusive: f,
-                },
-            ) => a == d && b == e && c == f,
-            (
-                SeqState::ArraySlice {
-                    source: a,
-                    start: b,
-                    end: c,
-                    mutable: m1,
-                },
-                SeqState::ArraySlice {
-                    source: d,
-                    start: e,
-                    end: f,
-                    mutable: m2,
-                },
-            ) => a == d && b == e && c == f && m1 == m2,
-            _ => false,
         }
     }
 }
