@@ -320,12 +320,7 @@ impl<'a> Lowerer<'a> {
     }
 
     /// Emit a binary intrinsic operation.
-    pub(crate) fn emit_binary_intrinsic(
-        &mut self,
-        op: IntrinsicOp,
-        lhs: VarId,
-        rhs: VarId,
-    ) -> VarId {
+    pub fn emit_binary_intrinsic(&mut self, op: IntrinsicOp, lhs: VarId, rhs: VarId) -> VarId {
         let dest = self.new_temp(op.result_type());
         self.emit(Instruction::Intrinsic {
             dest,
@@ -336,7 +331,7 @@ impl<'a> Lowerer<'a> {
     }
 
     /// Emit a unary intrinsic operation.
-    pub(crate) fn emit_unary_intrinsic(&mut self, op: IntrinsicOp, arg: VarId) -> VarId {
+    pub fn emit_unary_intrinsic(&mut self, op: IntrinsicOp, arg: VarId) -> VarId {
         let dest = self.new_temp(op.result_type());
         self.emit(Instruction::Intrinsic {
             dest,

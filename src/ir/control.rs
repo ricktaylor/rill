@@ -457,10 +457,7 @@ impl<'a> Lowerer<'a> {
 
     /// Convert type name to BaseType
     /// Returns None and emits diagnostic for unknown types
-    pub(crate) fn type_name_to_base_type(
-        &mut self,
-        name: &ast::Identifier,
-    ) -> Option<types::BaseType> {
+    pub fn type_name_to_base_type(&mut self, name: &ast::Identifier) -> Option<types::BaseType> {
         match name.as_ref() {
             "Bool" => Some(types::BaseType::Bool),
             "UInt" => Some(types::BaseType::UInt),

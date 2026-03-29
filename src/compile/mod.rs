@@ -68,13 +68,13 @@ pub struct CompiledProgram {
 pub(crate) struct CompiledFunction {
     /// All step closures for all blocks, flattened into a single contiguous array.
     /// Block boundaries are recorded in `block_starts`.
-    pub(crate) steps: Vec<Step>,
+    pub steps: Vec<Step>,
     /// Offset into `steps` where each block begins.
     /// `block_starts[i]` is the index of the first step in block i.
-    pub(crate) block_starts: Vec<usize>,
-    pub(crate) entry: usize, // index into block_starts
-    pub(crate) frame_size: usize,
-    pub(crate) param_count: usize,
+    pub block_starts: Vec<usize>,
+    pub entry: usize, // index into block_starts
+    pub frame_size: usize,
+    pub param_count: usize,
 }
 
 /// A step closure. Captures operands, operates on VM.
@@ -263,12 +263,12 @@ fn link_functions(
 /// Metadata for a reference created by MakeRef — used by WriteRef at compile time
 /// to determine how to emit the write-back.
 pub(crate) struct RefMeta {
-    pub(crate) base_var: VarId,
-    pub(crate) key_slot: Option<usize>,
+    pub base_var: VarId,
+    pub key_slot: Option<usize>,
 }
 
 impl RefMeta {
-    pub(crate) fn base_slot(&self) -> usize {
+    pub fn base_slot(&self) -> usize {
         slot(self.base_var)
     }
 }
