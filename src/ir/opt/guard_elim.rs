@@ -157,12 +157,9 @@ fn merge_block_chains(function: &mut Function) {
             }
 
             // Check if predecessor has unconditional jump to this block
-            let pred_idx = function.blocks.iter().position(|b| b.id == pred_id);
-            if pred_idx.is_none() {
+            let Some(pred_idx) = function.blocks.iter().position(|b| b.id == pred_id) else {
                 continue;
-            }
-
-            let pred_idx = pred_idx.unwrap();
+            };
             if !matches!(
                 &function.blocks[pred_idx].terminator,
                 Terminator::Jump { target } if *target == block_id
