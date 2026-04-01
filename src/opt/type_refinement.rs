@@ -11,9 +11,9 @@
 //! - Const instructions: produce known single types
 //! - Call instructions: use extern metadata for return types
 
-use super::{BlockId, CallArg, Function, FunctionRef, Instruction, Terminator, VarId};
 use crate::externs::ExternRegistry;
-use crate::ir::types::{BaseType, TypeSet};
+use crate::ir::{BlockId, CallArg, Function, FunctionRef, Instruction, Terminator, VarId};
+use crate::types::{BaseType, TypeSet};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 // ============================================================================
@@ -184,6 +184,10 @@ fn transfer_instruction(
 
         // Drop doesn't produce a value
         Instruction::Drop { .. } => {}
+
+        Instruction::Assign { .. } | Instruction::Read { .. } => {
+            unreachable!("pre-SSA instruction; removed by mem2reg")
+        }
     }
 }
 
@@ -345,7 +349,7 @@ pub type ParamTypes = HashMap<String, Vec<TypeSet>>;
 
 /// Inferred parameter definedness for user-defined functions.
 /// Maps function name → Vec of Definedness (one per parameter, positional).
-pub type ParamDefinedness = HashMap<String, Vec<crate::ir::opt::Definedness>>;
+pub type ParamDefinedness = HashMap<String, Vec<crate::opt::Definedness>>;
 
 /// Infer the return type of a function from its Return terminators.
 ///

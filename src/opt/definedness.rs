@@ -17,9 +17,11 @@
 //! This is sufficient because the actual error is at the use site, not the call
 //! site - passing undefined to a function that ignores the argument is harmless.
 
-use super::{BlockId, CallArg, Function, FunctionRef, Instruction, IntrinsicOp, Terminator, VarId};
 use crate::diagnostics::{DiagnosticCode, Diagnostics};
 use crate::externs::ExternRegistry;
+use crate::ir::{
+    BlockId, CallArg, Function, FunctionRef, Instruction, IntrinsicOp, Terminator, VarId,
+};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 // ============================================================================
@@ -321,6 +323,10 @@ fn transfer_instruction(
 
         // Drop doesn't produce a value
         Instruction::Drop { .. } => {}
+
+        Instruction::Assign { .. } | Instruction::Read { .. } => {
+            unreachable!("pre-SSA instruction; removed by mem2reg")
+        }
     }
 }
 
@@ -979,6 +985,10 @@ fn check_instruction_uses(
         | Instruction::Undefined { .. }
         | Instruction::Copy { .. }
         | Instruction::Phi { .. } => {}
+
+        Instruction::Assign { .. } | Instruction::Read { .. } => {
+            unreachable!("pre-SSA instruction; removed by mem2reg")
+        }
     }
 }
 

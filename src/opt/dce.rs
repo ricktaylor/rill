@@ -12,8 +12,8 @@
 //! - Everything else (Const, Copy, Undefined, Index, Intrinsic, Phi, MakeRef)
 //!   is removed if its dest is unused
 
-use super::{Function, Instruction, Terminator, VarId};
 use crate::externs::ExternRegistry;
+use crate::ir::{Function, Instruction, Terminator, VarId};
 use std::collections::HashSet;
 
 /// Eliminate dead instructions. Returns the number removed.
@@ -119,6 +119,10 @@ fn collect_reads(inst: &Instruction, used: &mut HashSet<VarId>) {
                 used.insert(*v);
             }
         }
+
+        Instruction::Assign { .. } | Instruction::Read { .. } => {
+            unreachable!("pre-SSA instruction; removed by mem2reg")
+        }
     }
 }
 
@@ -177,6 +181,10 @@ fn is_removable(
         | Instruction::WriteRef { .. }
         | Instruction::Append { .. }
         | Instruction::Drop { .. } => false,
+
+        Instruction::Assign { .. } | Instruction::Read { .. } => {
+            unreachable!("pre-SSA instruction; removed by mem2reg")
+        }
     }
 }
 
@@ -195,6 +203,10 @@ fn get_dest(inst: &Instruction) -> Option<VarId> {
 
         Instruction::SetIndex { .. } | Instruction::WriteRef { .. } | Instruction::Drop { .. } => {
             None
+        }
+
+        Instruction::Assign { .. } | Instruction::Read { .. } => {
+            unreachable!("pre-SSA instruction; removed by mem2reg")
         }
     }
 }

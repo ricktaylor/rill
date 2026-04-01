@@ -37,11 +37,11 @@ mod tests;
 use crate::diagnostics::Diagnostics;
 use crate::exec::{ExecError, Float, HeapVal, SeqState, VM, Value};
 use crate::externs::{ExecResult, ExternImpl, ExternRegistry};
-use crate::ir::opt::TypeAnalysis;
 use crate::ir::{
     BasicBlock, BlockId, Function, Instruction, IntrinsicOp, IrProgram, Literal, MatchPattern,
     Terminator, VarId,
 };
+use crate::opt::TypeAnalysis;
 use crate::types::{BaseType, TypeSet};
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
@@ -320,10 +320,10 @@ fn compile_function(func: &Function, link_map: &LinkMap) -> Result<CompiledFunct
     // Type analysis for specialization — when both operands of an arithmetic
     // op are provably the same type, the compiler emits a direct closure
     // instead of the 10-way type dispatch.
-    let types = crate::ir::opt::analyze_types(func, None);
+    let types = crate::opt::analyze_types(func, None);
 
     // Definedness analysis for skipping None checks on provably-defined args
-    let defs = crate::ir::opt::analyze_definedness(func, None);
+    let defs = crate::opt::analyze_definedness(func, None);
 
     // Collect constant UInt values for Cast/Widen target resolution at compile time
     let const_uint_map = build_const_uint_map(&func.blocks);
@@ -420,7 +420,7 @@ fn compile_block(
     link_map: &LinkMap,
     ref_map: &HashMap<VarId, RefMeta>,
     types: &TypeAnalysis,
-    defs: &crate::ir::opt::DefinednessAnalysis,
+    defs: &crate::opt::DefinednessAnalysis,
     consts: &HashMap<VarId, u64>,
 ) -> Result<Vec<Step>, ExecError> {
     let mut steps: Vec<Step> = Vec::new();
@@ -459,7 +459,7 @@ fn compile_instruction(
     link_map: &LinkMap,
     ref_map: &HashMap<VarId, RefMeta>,
     types: &TypeAnalysis,
-    defs: &crate::ir::opt::DefinednessAnalysis,
+    defs: &crate::opt::DefinednessAnalysis,
     block_id: BlockId,
     consts: &HashMap<VarId, u64>,
 ) -> Result<Option<Step>, ExecError> {
@@ -541,7 +541,7 @@ fn compile_instruction(
         Instruction::Copy { dest, src } => {
             let d = slot(*dest);
             let s = slot(*src);
-            if defs.get_at_exit(block_id, *src) == crate::ir::opt::Definedness::Defined {
+            if defs.get_at_exit(block_id, *src) == crate::opt::Definedness::Defined {
                 Box::new(move |vm: &mut VM, _prog| {
                     let val = vm.local(s).unwrap().clone();
                     vm.set_local(d, val);
@@ -841,7 +841,7 @@ fn compile_instruction(
             // If all args are provably defined, skip Option unwraps at runtime.
             let all_defined = args
                 .iter()
-                .all(|v| defs.get_at_exit(block_id, *v) == crate::ir::opt::Definedness::Defined);
+                .all(|v| defs.get_at_exit(block_id, *v) == crate::opt::Definedness::Defined);
             compile_intrinsic_dispatch(op, arg_slots, d, all_defined)
         }
 
@@ -1019,6 +1019,10 @@ fn compile_instruction(
 
         // Phi is handled separately in compile_block
         Instruction::Phi { .. } => return Ok(None),
+
+        Instruction::Assign { .. } | Instruction::Read { .. } => {
+            unreachable!("pre-SSA instruction; removed by mem2reg")
+        }
     }))
 }
 

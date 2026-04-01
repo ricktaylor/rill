@@ -4,7 +4,9 @@ pub mod diagnostics;
 pub mod exec;
 pub mod externs;
 mod ir;
+mod opt;
 mod parser;
+mod ssa;
 pub mod types;
 
 // Re-export key types for convenient access
@@ -113,7 +115,7 @@ pub fn compile(
         None => return Err(diagnostics),
     };
 
-    ir::opt::optimize(&mut ir_program, externs, &mut diagnostics);
+    opt::optimize(&mut ir_program, externs, &mut diagnostics);
 
     // Compile IR to closure-threaded code (includes link phase)
     let mut compiled = match compile::compile_program(&ir_program, externs) {

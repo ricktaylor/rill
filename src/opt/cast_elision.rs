@@ -6,8 +6,8 @@
 //! Runs after type refinement (needs TypeAnalysis). Returns the number
 //! of instructions rewritten, for fixpoint integration.
 
-use super::{Function, Instruction, IntrinsicOp, VarId};
 use crate::ir::Literal;
+use crate::ir::{Function, Instruction, IntrinsicOp, VarId};
 use crate::types::BaseType;
 use std::collections::HashMap;
 
@@ -86,8 +86,8 @@ pub fn elide_identity_casts(
 mod tests {
     use super::*;
     use crate::ast;
-    use crate::ir::opt::analyze_types;
     use crate::ir::{BasicBlock, BlockId, Literal, Terminator, Var};
+    use crate::opt::analyze_types;
     use crate::types::TypeSet;
 
     fn var(id: u32) -> VarId {

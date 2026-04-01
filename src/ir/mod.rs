@@ -33,9 +33,6 @@ mod pattern;
 mod program;
 mod stmt;
 
-// Optimization passes
-pub mod opt;
-
 // Re-export all IR types
 pub use types::*;
 

@@ -6,7 +6,7 @@
 //! 2. Simplify the resulting CFG by merging blocks and removing unreachable code
 
 use super::definedness::{Definedness, DefinednessAnalysis};
-use super::{BlockId, Function, Instruction, Terminator};
+use crate::ir::{BlockId, Function, Instruction, Terminator};
 use std::collections::{HashMap, HashSet};
 
 // ============================================================================
@@ -230,8 +230,8 @@ fn merge_block_chains(function: &mut Function) {
 mod tests {
     use super::*;
     use crate::ast;
-    use crate::ir::opt::analyze_definedness;
     use crate::ir::{BasicBlock, Instruction, Literal, Param, SpannedInst, VarId};
+    use crate::opt::analyze_definedness;
 
     fn var(id: u32) -> VarId {
         VarId(id)

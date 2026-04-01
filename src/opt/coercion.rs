@@ -19,10 +19,10 @@
 //! `Widen(Const(42_u64), 2)` → `Const(42_i64)`, definedness sees the new
 //! `Undefined` instructions, guard elim + CFG simplify clean up dead branches.
 
-use super::{BlockId, Function, Instruction, IntrinsicOp, VarId};
 use crate::ast;
-use crate::ir::opt::type_refinement::TypeAnalysis;
+use crate::ir::{BlockId, Function, Instruction, IntrinsicOp, VarId};
 use crate::ir::{Literal, SpannedInst, Var};
+use crate::opt::type_refinement::TypeAnalysis;
 use crate::types::{BaseType, TypeSet};
 use std::collections::HashMap;
 
@@ -338,8 +338,8 @@ pub fn elide_coercions(function: &mut Function) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::opt::analyze_types;
     use crate::ir::{BasicBlock, Param, Terminator};
+    use crate::opt::analyze_types;
 
     fn var(id: u32) -> VarId {
         VarId(id)

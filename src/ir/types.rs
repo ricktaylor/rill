@@ -441,6 +441,19 @@ pub enum Instruction {
         value: VarId,
     },
 
+    /// Write a named variable (pre-SSA form).
+    ///
+    /// Records that `name` holds `value` at this point. Consumed by mem2reg,
+    /// which converts these to SSA VarIds with Phi nodes.
+    Assign { name: ast::Identifier, value: VarId },
+
+    /// Read a named variable (pre-SSA form).
+    ///
+    /// Produces the current value of `name` into `dest`. Consumed by mem2reg,
+    /// which resolves each Read to the reaching definition (possibly through
+    /// Phi nodes at merge points).
+    Read { name: ast::Identifier, dest: VarId },
+
     /// Mark end of variable scope - slots can be reclaimed (planned)
     #[allow(dead_code)]
     Drop { vars: Vec<VarId> },

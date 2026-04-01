@@ -11,8 +11,8 @@
 //! Runs in the Phase 1 fixpoint loop. Copy propagation + DCE clean up
 //! the resulting Copy + dead original instruction.
 
-use super::{Function, Instruction, IntrinsicOp, VarId};
 use crate::externs::ExternRegistry;
+use crate::ir::{Function, Instruction, IntrinsicOp, VarId};
 use std::collections::{HashMap, HashSet};
 
 /// A hashable key representing a computation.

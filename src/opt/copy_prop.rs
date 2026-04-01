@@ -11,7 +11,7 @@
 //! Runs in the Phase 1 fixpoint loop. Feeds DCE: after propagation,
 //! the Copy's dest has zero uses and can be removed.
 
-use super::{Function, Instruction, Terminator, VarId};
+use crate::ir::{Function, Instruction, Terminator, VarId};
 use std::collections::HashMap;
 
 /// Propagate copies: replace uses of `Copy(dest, src)` dest with src.
@@ -190,6 +190,10 @@ fn replace_vars_in_instruction(inst: &mut Instruction, map: &HashMap<VarId, VarI
                     count += 1;
                 }
             }
+        }
+
+        Instruction::Assign { .. } | Instruction::Read { .. } => {
+            unreachable!("pre-SSA instruction; removed by mem2reg")
         }
     }
 

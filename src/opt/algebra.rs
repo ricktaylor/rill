@@ -20,9 +20,9 @@
 //! - `x - x` → `Const(dest, 0)` (same type)
 //! - `x == x` → `Const(dest, true)`
 
-use super::{Function, Instruction, IntrinsicOp, VarId};
 use crate::ir::Literal;
-use crate::ir::opt::type_refinement::TypeAnalysis;
+use crate::ir::{Function, Instruction, IntrinsicOp, VarId};
+use crate::opt::type_refinement::TypeAnalysis;
 use crate::types::BaseType;
 use std::collections::HashMap;
 
@@ -307,8 +307,8 @@ fn shift_right(
 mod tests {
     use super::*;
     use crate::ast;
-    use crate::ir::opt::analyze_types;
     use crate::ir::{BasicBlock, BlockId, Terminator, Var};
+    use crate::opt::analyze_types;
     use crate::types::TypeSet;
 
     fn var(id: u32) -> VarId {

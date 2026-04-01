@@ -13,12 +13,12 @@
 //! - After DCE (may expose new constants)
 //! - After inlining (arguments become constants in inlined code)
 
-use super::{BlockId, Function, FunctionRef, Instruction, Terminator, VarId};
 use crate::diagnostics::{DiagnosticCode, Diagnostics};
 use crate::externs::ExternRegistry;
 use crate::ir::const_eval::{
     const_index, const_to_literal, eval_extern_const, eval_intrinsic_const, literal_to_const,
 };
+use crate::ir::{BlockId, Function, FunctionRef, Instruction, Terminator, VarId};
 use crate::ir::{ConstValue, IntrinsicOp};
 use std::collections::HashMap;
 

@@ -19,7 +19,7 @@
 //! new opportunities as other passes (const fold, DCE, guard elim) remove WriteRefs
 //! or MakeRefs.
 
-use super::{Function, Instruction, VarId};
+use crate::ir::{Function, Instruction, VarId};
 use std::collections::{HashMap, HashSet};
 
 /// Metadata for a MakeRef instruction.

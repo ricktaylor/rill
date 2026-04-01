@@ -4,7 +4,7 @@ pub(super) fn compile_terminator(
     term: &Terminator,
     block_map: &HashMap<BlockId, usize>,
     types: &TypeAnalysis,
-    defs: &crate::ir::opt::DefinednessAnalysis,
+    defs: &crate::opt::DefinednessAnalysis,
     block_id: BlockId,
 ) -> Result<Step, ExecError> {
     Ok(match term {
@@ -40,7 +40,7 @@ pub(super) fn compile_terminator(
             // Provably Bool and Defined → skip null + type checks
             if cond_type.is_single()
                 && cond_type.contains(BaseType::Bool)
-                && cond_def == crate::ir::opt::Definedness::Defined
+                && cond_def == crate::opt::Definedness::Defined
             {
                 return Ok(Box::new(move |vm: &mut VM, _prog| {
                     let is_true = match vm.local(cond_slot).unwrap() {
@@ -80,7 +80,7 @@ pub(super) fn compile_terminator(
             // Guards with known definedness should have been folded to Jump
             // by the optimizer's eliminate_guards pass.
             debug_assert!(
-                defs.get_at_exit(block_id, *value) == crate::ir::opt::Definedness::MaybeDefined,
+                defs.get_at_exit(block_id, *value) == crate::opt::Definedness::MaybeDefined,
                 "Guard on {:?} with definedness {:?} should have been eliminated by optimizer",
                 value,
                 defs.get_at_exit(block_id, *value)

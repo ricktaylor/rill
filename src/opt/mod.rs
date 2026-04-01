@@ -42,9 +42,8 @@ pub use type_refinement::{
 };
 
 // Import IR types from parent module
-use super::{
-    BlockId, CallArg, Function, FunctionRef, Instruction, IntrinsicOp, IrProgram, Literal,
-    MatchPattern, Terminator, VarId,
+use crate::ir::{
+    BlockId, Function, Instruction, IntrinsicOp, IrProgram, Literal, MatchPattern, Terminator,
 };
 
 // Import externs for metadata lookup
@@ -791,7 +790,7 @@ fn check_condition_types(
 mod tests {
     use super::*;
     use crate::ast;
-    use crate::ir::{BasicBlock, Literal, Var};
+    use crate::ir::{BasicBlock, BlockId, Instruction, Literal, Var, VarId};
     use crate::types::TypeSet;
 
     fn var(id: u32) -> VarId {
