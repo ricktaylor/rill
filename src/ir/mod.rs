@@ -340,7 +340,7 @@ mod tests {
 
     fn try_parse(source: &str) -> ast::AstProgram {
         let mut diags = Diagnostics::new();
-        parser::parse(source, &mut diags).expect("parse failed")
+        crate::ast::parser::parse(source, &mut diags).expect("parse failed")
     }
 
     fn try_lower(ast: &ast::AstProgram, registry: &externs::ExternRegistry) -> IrProgram {

@@ -5,7 +5,6 @@ pub mod exec;
 pub mod externs;
 mod ir;
 mod opt;
-mod parser;
 mod ssa;
 pub mod types;
 
@@ -105,7 +104,7 @@ pub fn compile(
 ) -> Result<(Program, Diagnostics), Diagnostics> {
     let mut diagnostics = Diagnostics::new();
 
-    let ast = match parser::parse(source, &mut diagnostics) {
+    let ast = match ast::parser::parse(source, &mut diagnostics) {
         Some(ast) => ast,
         None => return Err(diagnostics),
     };

@@ -7,17 +7,17 @@
 // compilation memory usage. Without boxing, chumsky's deeply nested
 // impl Trait types can cause the compiler to run out of memory.
 
+use super::Spanned;
 use super::*;
-use ast::*;
+use crate::diagnostics::{Diagnostic, DiagnosticCode, Diagnostics};
 use chumsky::prelude::*;
-use diagnostics::{Diagnostic, DiagnosticCode, Diagnostics};
 
 // ============================================================================
 // Type Aliases
 // ============================================================================
 
 // Use extra state for better error messages
-type Extra<'a> = extra::Err<Rich<'a, char, ast::Span>>;
+type Extra<'a> = extra::Err<Rich<'a, char, Span>>;
 
 // Boxed parser type for reduced type complexity
 type BoxedParser<'a, T> = Boxed<'a, 'a, &'a str, T, Extra<'a>>;
@@ -810,7 +810,7 @@ fn block_body<'a>(
                         } else {
                             // Mid-block expression without ; → void statement
                             let span = chumsky::span::Span::new((), 0..0);
-                            statements.push(ast::Spanned::new(Statement::Expression(expr), span));
+                            statements.push(Spanned::new(Statement::Expression(expr), span));
                         }
                     }
                 }
@@ -863,7 +863,7 @@ fn if_expr<'a>(expr: BoxedParser<'a, Expression>) -> BoxedParser<'a, Expression>
         let else_branch = kw("else").ignore_then(
             if_e.map_with(|e, extra| {
                 // else if: wrap in a spanned statement, no final expr
-                let stmt = ast::Spanned::new(Statement::Expression(e), extra.span());
+                let stmt = Spanned::new(Statement::Expression(e), extra.span());
                 (vec![stmt], None)
             })
             .or(block_body(expr.clone())),
@@ -969,7 +969,7 @@ fn pattern_inner<'a>() -> BoxedParser<'a, Pat> {
     recursive(|pat| {
         // Helper to wrap a Pattern with span
         let spanned = |p: BoxedParser<'a, Pattern>| -> BoxedParser<'a, Pat> {
-            p.map_with(|node, extra| ast::Spanned::new(node, extra.span()))
+            p.map_with(|node, extra| Spanned::new(node, extra.span()))
                 .boxed()
         };
 
@@ -1048,7 +1048,7 @@ fn pattern_inner<'a>() -> BoxedParser<'a, Pat> {
                     Ok(Pattern::Variable(id))
                 }
             })
-            .map_with(|node, extra| ast::Spanned::new(node, extra.span()))
+            .map_with(|node, extra| Spanned::new(node, extra.span()))
             .boxed();
 
         // Rest capture: ..identifier or just .. (with optional whitespace)
@@ -1115,7 +1115,7 @@ fn pattern_inner<'a>() -> BoxedParser<'a, Pat> {
                     Pattern::Array(before)
                 }
             })
-            .map_with(|node, extra| ast::Spanned::new(node, extra.span()))
+            .map_with(|node, extra| Spanned::new(node, extra.span()))
             .boxed();
 
         let map_entry = pat_boxed
@@ -1133,7 +1133,7 @@ fn pattern_inner<'a>() -> BoxedParser<'a, Pat> {
                 just('}').padded_by(whitespace()),
             )
             .map(Pattern::Map)
-            .map_with(|node, extra| ast::Spanned::new(node, extra.span()))
+            .map_with(|node, extra| Spanned::new(node, extra.span()))
             .boxed();
 
         choice((
@@ -1218,7 +1218,7 @@ fn statement<'a>(expr: BoxedParser<'a, Expression>) -> BoxedParser<'a, Stmt> {
     let with_stmt = with_statement(expr.clone());
 
     choice((var_decl, with_stmt, statement_inner(expr)))
-        .map_with(|stmt, extra| ast::Spanned::new(stmt, extra.span()))
+        .map_with(|stmt, extra| Spanned::new(stmt, extra.span()))
         .boxed()
 }
 
@@ -1277,28 +1277,28 @@ fn alias<'a>() -> BoxedParser<'a, Identifier> {
 }
 
 /// Parse: `import "path/to/file.rill" [as alias | as _] ;`
-fn import<'a>() -> BoxedParser<'a, ast::Spanned<Import>> {
+fn import<'a>() -> BoxedParser<'a, Spanned<Import>> {
     kw("import")
         .ignore_then(string_literal().padded_by(whitespace()))
         .then(alias().or_not())
         .then_ignore(just(';').padded_by(whitespace()))
         .map(|(path, alias)| Import { path, alias })
-        .map_with(|imp, extra| ast::Spanned::new(imp, extra.span()))
+        .map_with(|imp, extra| Spanned::new(imp, extra.span()))
         .boxed()
 }
 
 /// Parse: `require namespace [as alias | as _] ;`
-fn require<'a>() -> BoxedParser<'a, ast::Spanned<ast::Require>> {
+fn require<'a>() -> BoxedParser<'a, Spanned<Require>> {
     kw("require")
         .ignore_then(ident())
         .then(alias().or_not())
         .then_ignore(just(';').padded_by(whitespace()))
-        .map(|(namespace, alias)| ast::Require { namespace, alias })
-        .map_with(|req, extra| ast::Spanned::new(req, extra.span()))
+        .map(|(namespace, alias)| Require { namespace, alias })
+        .map_with(|req, extra| Spanned::new(req, extra.span()))
         .boxed()
 }
 
-fn constant<'a>() -> BoxedParser<'a, ast::Spanned<Constant>> {
+fn constant<'a>() -> BoxedParser<'a, Spanned<Constant>> {
     // const pattern = expression;
     // Compiler validates const-evaluability; pattern match failure is compile error
     kw("const")
@@ -1307,7 +1307,7 @@ fn constant<'a>() -> BoxedParser<'a, ast::Spanned<Constant>> {
         .then(expression())
         .then_ignore(just(';').padded_by(whitespace()))
         .map(|(pattern, value)| Constant { pattern, value })
-        .map_with(|c, extra| ast::Spanned::new(c, extra.span()))
+        .map_with(|c, extra| Spanned::new(c, extra.span()))
         .boxed()
 }
 
@@ -1323,10 +1323,10 @@ fn binding_mode<'a>() -> BoxedParser<'a, Option<bool>> {
 
 /// Parse a single function parameter: ["let" / "with"] identifier
 /// `let` = by-value, `with` or default = by-reference
-fn function_param<'a>() -> BoxedParser<'a, ast::FunctionParam> {
+fn function_param<'a>() -> BoxedParser<'a, FunctionParam> {
     binding_mode()
         .then(ident())
-        .map(|(binding_mode, name)| ast::FunctionParam {
+        .map(|(binding_mode, name)| FunctionParam {
             name,
             is_value: binding_mode.unwrap_or(false), // default = by-reference
         })
@@ -1335,11 +1335,11 @@ fn function_param<'a>() -> BoxedParser<'a, ast::FunctionParam> {
 
 /// Parse a rest parameter: ["let" / "with"] ".." identifier
 /// Captures excess arguments as an Array
-fn rest_param<'a>() -> BoxedParser<'a, ast::FunctionParam> {
+fn rest_param<'a>() -> BoxedParser<'a, FunctionParam> {
     binding_mode()
         .then_ignore(just('.').then(just('.')).padded_by(whitespace()))
         .then(ident())
-        .map(|(binding_mode, name)| ast::FunctionParam {
+        .map(|(binding_mode, name)| FunctionParam {
             name,
             is_value: binding_mode.unwrap_or(false), // default = by-reference
         })
@@ -1348,7 +1348,7 @@ fn rest_param<'a>() -> BoxedParser<'a, ast::FunctionParam> {
 
 /// Parse function parameter list: regular params optionally followed by rest param
 /// Returns (regular_params, rest_param)
-fn param_list<'a>() -> BoxedParser<'a, (Vec<ast::FunctionParam>, Option<ast::FunctionParam>)> {
+fn param_list<'a>() -> BoxedParser<'a, (Vec<FunctionParam>, Option<FunctionParam>)> {
     // Regular params separated by commas
     let regular_params = function_param()
         .separated_by(just(',').padded_by(whitespace()))
@@ -1373,7 +1373,7 @@ fn param_list<'a>() -> BoxedParser<'a, (Vec<ast::FunctionParam>, Option<ast::Fun
 // Functions
 // ============================================================================
 
-fn function<'a>() -> BoxedParser<'a, ast::Spanned<Function>> {
+fn function<'a>() -> BoxedParser<'a, Spanned<Function>> {
     kw("fn")
         .ignore_then(ident())
         .then(param_list().delimited_by(
@@ -1390,7 +1390,7 @@ fn function<'a>() -> BoxedParser<'a, ast::Spanned<Function>> {
                 final_expr: final_expr.map(Box::new),
             },
         )
-        .map_with(|f, extra| ast::Spanned::new(f, extra.span()))
+        .map_with(|f, extra| Spanned::new(f, extra.span()))
         .boxed()
 }
 
@@ -1400,10 +1400,10 @@ fn function<'a>() -> BoxedParser<'a, ast::Spanned<Function>> {
 
 #[derive(Clone)]
 enum TopLevel {
-    Import(ast::Spanned<Import>),
-    Require(ast::Spanned<ast::Require>),
-    Constant(ast::Spanned<Constant>),
-    Function(ast::Spanned<Function>),
+    Import(Spanned<Import>),
+    Require(Spanned<Require>),
+    Constant(Spanned<Constant>),
+    Function(Spanned<Function>),
 }
 
 fn program<'a>() -> BoxedParser<'a, AstProgram> {
@@ -1419,10 +1419,10 @@ fn program<'a>() -> BoxedParser<'a, AstProgram> {
         .ignore_then(top_level.repeated().collect::<Vec<_>>())
         .then_ignore(end())
         .map(|items| {
-            let mut imports: Vec<ast::Spanned<Import>> = Vec::new();
-            let mut requires: Vec<ast::Spanned<ast::Require>> = Vec::new();
-            let mut constants: Vec<ast::Spanned<Constant>> = Vec::new();
-            let mut functions: Vec<ast::Spanned<Function>> = Vec::new();
+            let mut imports: Vec<Spanned<Import>> = Vec::new();
+            let mut requires: Vec<Spanned<Require>> = Vec::new();
+            let mut constants: Vec<Spanned<Constant>> = Vec::new();
+            let mut functions: Vec<Spanned<Function>> = Vec::new();
 
             for item in items {
                 match item {
