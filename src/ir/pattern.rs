@@ -129,12 +129,13 @@ impl<'a> Lowerer<'a> {
                 let length = self.emit_unary_intrinsic(IntrinsicOp::Len, value);
 
                 // Bind rest variable as a zero-copy Sequence over the source array.
-                // ArraySeq(array, start, end, mutable) -> Sequence(ArraySlice)
+                // ArraySeq(mode, [array, start, end]) -> Sequence(ArraySlice)
                 //
-                // Mutability follows the binding mode:
-                //   let [a, ..rest] = arr   → mutable=false, iteration is by-value
-                //   with [a, ..rest] = arr  → mutable=true, for-loop uses MakeRef
+                // SliceMode follows the binding mode:
+                //   let [a, ..rest] = arr   → ReadOnly, iteration is by-value
+                //   with [a, ..rest] = arr  → Mutable, for-loop uses MakeRef
                 //                             so mutations write back to arr
+                // A start < end guard produces undefined for empty slices.
                 if let Some(rest_name) = rest {
                     let start = self.new_temp(TypeSet::single(types::BaseType::UInt));
                     self.emit(Instruction::Const {
@@ -149,17 +150,50 @@ impl<'a> Lowerer<'a> {
                     });
                     let end = self.emit_binary_intrinsic(IntrinsicOp::Sub, length, after_len);
 
-                    let is_mutable = self.new_temp(TypeSet::single(types::BaseType::Bool));
-                    self.emit(Instruction::Const {
-                        dest: is_mutable,
-                        value: Literal::Bool(matches!(mode, BindingMode::Reference)),
+                    let slice_mode = if matches!(mode, BindingMode::Reference) {
+                        types::SliceMode::Mutable
+                    } else {
+                        types::SliceMode::ReadOnly
+                    };
+
+                    // Guard: start < end — empty slices produce undefined
+                    let valid = self.emit_binary_intrinsic(IntrinsicOp::Lt, start, end);
+                    let seq_bb = self.fresh_block();
+                    let undef_bb = self.fresh_block();
+                    let join_bb = self.fresh_block();
+                    let rest_val = self.new_temp(TypeSet::single(types::BaseType::Sequence));
+
+                    self.finish_block(Terminator::If {
+                        condition: valid,
+                        then_target: seq_bb,
+                        else_target: undef_bb,
+                        span: self.current_span,
                     });
 
-                    let rest_val = self.new_temp(TypeSet::single(types::BaseType::Sequence));
+                    // Then: create the slice sequence
+                    self.current_block = seq_bb;
+                    self.current_instructions = Vec::new();
+                    let seq_val = self.new_temp(TypeSet::single(types::BaseType::Sequence));
                     self.emit(Instruction::Intrinsic {
+                        dest: seq_val,
+                        op: IntrinsicOp::ArraySeq(slice_mode),
+                        args: vec![value, start, end],
+                    });
+                    self.finish_block(Terminator::Jump { target: join_bb });
+
+                    // Else: undefined
+                    self.current_block = undef_bb;
+                    self.current_instructions = Vec::new();
+                    let undef_val = self.new_temp(TypeSet::single(types::BaseType::Sequence));
+                    self.emit(Instruction::Undefined { dest: undef_val });
+                    self.finish_block(Terminator::Jump { target: join_bb });
+
+                    // Join: phi
+                    self.current_block = join_bb;
+                    self.current_instructions = Vec::new();
+                    self.emit(Instruction::Phi {
                         dest: rest_val,
-                        op: IntrinsicOp::ArraySeq,
-                        args: vec![value, start, end, is_mutable],
+                        sources: vec![(seq_bb, seq_val), (undef_bb, undef_val)],
                     });
 
                     let rest_var = self.new_var(

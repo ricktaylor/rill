@@ -310,21 +310,13 @@ pub enum SeqState {
     /// Zero-copy slice of an array (e.g., from `..rest` patterns).
     ///
     /// Holds a refcounted reference to the source array — no element copying.
-    ///
-    /// Mutability is controlled by `mutable`:
-    /// - `false` (`let` binding): elements yielded by-value, no write-back
-    /// - `true` (`with` binding): for-loop uses source-relative MakeRef,
-    ///   mutations through the loop variable write back to the source array
-    ///
-    /// ```text
-    /// let [first, ..rest] = arr;   // rest.mutable = false
-    /// with [first, ..rest] = arr;  // rest.mutable = true, first is also by-ref
-    /// ```
+    /// Mutability (by-value vs write-back) is handled at the IR level via
+    /// `SliceMode` on the `ArraySeq` intrinsic — the runtime slice doesn't
+    /// need to know.
     ArraySlice {
         source: HeapVal<Vec<Value>>,
         start: usize,
         end: usize,
-        mutable: bool,
     },
 }
 
@@ -341,9 +333,7 @@ impl SeqState {
                 *current += 1;
                 Some(val)
             }
-            SeqState::ArraySlice {
-                source, start, end, ..
-            } => {
+            SeqState::ArraySlice { source, start, end } => {
                 if *start >= *end {
                     return None;
                 }
@@ -373,13 +363,7 @@ impl Hash for SeqState {
                 current.hash(state);
                 end.hash(state);
             }
-            SeqState::ArraySlice {
-                source,
-                start,
-                end,
-                mutable,
-            } => {
-                mutable.hash(state);
+            SeqState::ArraySlice { source, start, end } => {
                 // Hash the visible slice contents for value equality
                 for val in source.iter().skip(*start).take(*end - *start) {
                     val.hash(state);

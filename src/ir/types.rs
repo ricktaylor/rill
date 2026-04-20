@@ -14,7 +14,7 @@
 use super::*;
 
 // Re-export types from the shared types module
-pub use crate::types::{BaseType, ConvertMode, NumericType, TypeSet};
+pub use crate::types::{BaseType, ConvertMode, NumericType, SliceMode, TypeSet};
 
 // ============================================================================
 // Intrinsic Operations
@@ -71,7 +71,9 @@ pub enum IntrinsicOp {
     /// `end + 1` (checked Add) before `MakeSeq`, so overflow on
     /// `0..=u64::MAX` produces undefined naturally.
     MakeSeq,
-    ArraySeq,
+    /// Create a zero-copy array slice sequence. The `SliceMode` determines
+    /// mutability — known at compile time from `let` vs `with` binding.
+    ArraySeq(SliceMode),
     SeqNext,
 
     // -- Collection/Sequence --
@@ -113,7 +115,7 @@ impl IntrinsicOp {
             Self::MakeArray => false,
             Self::MakeMap => true, // odd arg count
             // Sequence
-            Self::MakeSeq | Self::ArraySeq => false,
+            Self::MakeSeq | Self::ArraySeq(_) => false,
             Self::SeqNext => true,  // exhausted → undefined
             Self::Collect => false, // always succeeds (empty seq → empty array)
             // Checked UInt→Int can overflow (u64::MAX > i64::MAX), all others are infallible
@@ -159,7 +161,7 @@ impl IntrinsicOp {
 
             // Sequence
             Self::MakeSeq => TypeSet::uint(), // start, end
-            Self::ArraySeq => TypeSet::all(),
+            Self::ArraySeq(_) => TypeSet::all(),
             Self::SeqNext => TypeSet::single(BaseType::Sequence), // arg must be Sequence
             Self::Collect => TypeSet::single(BaseType::Sequence),
             // Conversion: single arg (the value to convert)
@@ -184,7 +186,7 @@ impl IntrinsicOp {
             | Self::Len => TypeSet::uint(),
             Self::MakeArray => TypeSet::single(BaseType::Array),
             Self::MakeMap => TypeSet::single(BaseType::Map),
-            Self::MakeSeq | Self::ArraySeq => TypeSet::single(BaseType::Sequence),
+            Self::MakeSeq | Self::ArraySeq(_) => TypeSet::single(BaseType::Sequence),
             Self::SeqNext => TypeSet::all(), // element could be any type
             Self::Collect => TypeSet::single(BaseType::Array),
             Self::Convert(t, _) => TypeSet::single(BaseType::from(t)),

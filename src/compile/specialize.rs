@@ -529,7 +529,7 @@ pub(super) fn compile_intrinsic_dispatch(
         IntrinsicOp::MakeArray => emit_try!(|vm: &mut VM| { exec_make_array(&arg_slots, vm) }),
         IntrinsicOp::MakeMap => emit_try!(|vm: &mut VM| { exec_make_map(&arg_slots, vm) }),
         IntrinsicOp::MakeSeq => emit!(|vm: &mut VM| { exec_make_seq(&arg_slots, vm) }),
-        IntrinsicOp::ArraySeq => emit!(|vm: &mut VM| { exec_array_seq(&arg_slots, vm) }),
+        IntrinsicOp::ArraySeq(_) => emit!(|vm: &mut VM| { exec_array_seq(&arg_slots, vm) }),
         IntrinsicOp::SeqNext => Box::new(move |vm: &mut VM, _prog| {
             match vm.seq_next(vm.bp() + arg_slots[0])? {
                 Some(val) => vm.set_local(d, val),

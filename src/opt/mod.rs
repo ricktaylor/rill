@@ -579,7 +579,7 @@ fn check_intrinsic_types(
             // Skip variadic ops where param_type doesn't apply per-arg
             if matches!(
                 op,
-                IntrinsicOp::MakeArray | IntrinsicOp::MakeMap | IntrinsicOp::ArraySeq
+                IntrinsicOp::MakeArray | IntrinsicOp::MakeMap | IntrinsicOp::ArraySeq(_)
             ) {
                 continue;
             }

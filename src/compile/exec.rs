@@ -298,17 +298,12 @@ pub(super) fn exec_array_seq(arg_slots: &[usize], vm: &mut VM) -> Option<Value> 
         Some(Value::UInt(n)) => *n as usize,
         _ => return None,
     };
-    let mutable = match vm.local(arg_slots[3]) {
-        Some(Value::Bool(b)) => *b,
-        _ => false,
-    };
     match vm.local(arg_slots[0]) {
         Some(Value::Array(arr)) => {
             let state = SeqState::ArraySlice {
                 source: arr.clone(),
                 start,
                 end,
-                mutable,
             };
             HeapVal::new(state, vm.heap()).ok().map(Value::Sequence)
         }

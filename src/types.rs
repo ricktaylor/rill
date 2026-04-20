@@ -134,6 +134,19 @@ pub enum ConvertMode {
     Unchecked,
 }
 
+/// Mutability mode for array slice sequences.
+///
+/// Controls whether a `..rest` destructuring pattern yields elements
+/// by value or by reference (with write-back to the source array).
+/// Known at compile time from the binding mode (`let` vs `with`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SliceMode {
+    /// `let [a, ..rest] = arr` — elements yielded by value, no write-back
+    ReadOnly,
+    /// `with [a, ..rest] = arr` — for-loop uses MakeRef, mutations write back
+    Mutable,
+}
+
 impl From<NumericType> for BaseType {
     fn from(nt: NumericType) -> BaseType {
         match nt {
