@@ -150,10 +150,10 @@ impl<'a> Lowerer<'a> {
                 let undefined_bb = self.fresh_block();
                 let join_bb = self.fresh_block();
 
-                self.finish_block(Terminator::Guard {
+                self.finish_block(Terminator::Match {
                     value: bit_check,
-                    defined: defined_bb,
-                    undefined: undefined_bb,
+                    arms: vec![(MatchPattern::Type(types::BaseType::Undefined), undefined_bb)],
+                    default: defined_bb,
                     span: self.current_span,
                 });
 
@@ -183,7 +183,10 @@ impl<'a> Lowerer<'a> {
                 self.current_block = undefined_bb;
                 self.current_instructions = Vec::new();
                 let undef_result = self.new_temp(TypeSet::empty());
-                self.emit(Instruction::Undefined { dest: undef_result });
+                self.emit(Instruction::Const {
+                    dest: undef_result,
+                    value: Literal::Undefined,
+                });
                 self.finish_block(Terminator::Jump { target: join_bb });
 
                 // Join with phi
@@ -255,10 +258,10 @@ impl<'a> Lowerer<'a> {
             let undefined_bb = self.fresh_block();
             let join_bb = self.fresh_block();
 
-            self.finish_block(Terminator::Guard {
+            self.finish_block(Terminator::Match {
                 value: slot_check,
-                defined: defined_bb,
-                undefined: undefined_bb,
+                arms: vec![(MatchPattern::Type(types::BaseType::Undefined), undefined_bb)],
+                default: defined_bb,
                 span: self.current_span,
             });
 
@@ -281,7 +284,10 @@ impl<'a> Lowerer<'a> {
             self.current_block = undefined_bb;
             self.current_instructions = Vec::new();
             let undef_result = self.new_temp(TypeSet::empty());
-            self.emit(Instruction::Undefined { dest: undef_result });
+            self.emit(Instruction::Const {
+                dest: undef_result,
+                value: Literal::Undefined,
+            });
             self.finish_block(Terminator::Jump { target: join_bb });
 
             // Join with phi

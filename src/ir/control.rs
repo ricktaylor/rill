@@ -70,7 +70,10 @@ impl<'a> Lowerer<'a> {
             self.lower_expression(expr)
         } else {
             let dest = self.new_temp(TypeSet::empty());
-            self.emit(Instruction::Undefined { dest });
+            self.emit(Instruction::Const {
+                dest,
+                value: Literal::Undefined,
+            });
             dest
         };
         let then_exit_block = self.current_block;
@@ -91,7 +94,10 @@ impl<'a> Lowerer<'a> {
             self.lower_expression(expr)
         } else {
             let dest = self.new_temp(TypeSet::empty());
-            self.emit(Instruction::Undefined { dest });
+            self.emit(Instruction::Const {
+                dest,
+                value: Literal::Undefined,
+            });
             dest
         };
         let else_exit_block = self.current_block;
@@ -315,7 +321,10 @@ impl<'a> Lowerer<'a> {
                     self.current_block = undef_bb;
                     self.current_instructions = Vec::new();
                     let undef_val = self.new_temp(TypeSet::single(types::BaseType::Sequence));
-                    self.emit(Instruction::Undefined { dest: undef_val });
+                    self.emit(Instruction::Const {
+                        dest: undef_val,
+                        value: Literal::Undefined,
+                    });
                     self.finish_block(Terminator::Jump { target: join_bb });
 
                     // Join: phi
@@ -445,10 +454,10 @@ impl<'a> Lowerer<'a> {
     /// On undefined: jumps to fail_bb
     fn emit_guard(&mut self, value: VarId, fail_bb: BlockId) {
         let ok_bb = self.fresh_block();
-        self.finish_block(Terminator::Guard {
+        self.finish_block(Terminator::Match {
             value,
-            defined: ok_bb,
-            undefined: fail_bb,
+            arms: vec![(MatchPattern::Type(types::BaseType::Undefined), fail_bb)],
+            default: ok_bb,
             span: self.current_span,
         });
         self.current_block = ok_bb;
@@ -569,7 +578,10 @@ impl<'a> Lowerer<'a> {
             TypeSet::all()
         });
         if break_values.is_empty() {
-            self.emit(Instruction::Undefined { dest: result });
+            self.emit(Instruction::Const {
+                dest: result,
+                value: Literal::Undefined,
+            });
         } else {
             self.emit(Instruction::Phi {
                 dest: result,
@@ -621,7 +633,10 @@ impl<'a> Lowerer<'a> {
 
         let result = self.new_temp(TypeSet::all());
         if break_values.is_empty() {
-            self.emit(Instruction::Undefined { dest: result });
+            self.emit(Instruction::Const {
+                dest: result,
+                value: Literal::Undefined,
+            });
         } else {
             self.emit(Instruction::Phi {
                 dest: result,
@@ -679,7 +694,10 @@ impl<'a> Lowerer<'a> {
         self.current_instructions = Vec::new();
 
         let result = self.new_temp(TypeSet::empty());
-        self.emit(Instruction::Undefined { dest: result });
+        self.emit(Instruction::Const {
+            dest: result,
+            value: Literal::Undefined,
+        });
         result
     }
 
@@ -903,10 +921,10 @@ impl<'a> Lowerer<'a> {
             args: vec![seq_var],
         });
 
-        self.finish_block(Terminator::Guard {
+        self.finish_block(Terminator::Match {
             value: elem,
-            defined: body_bb,
-            undefined: exit_bb,
+            arms: vec![(MatchPattern::Type(types::BaseType::Undefined), exit_bb)],
+            default: body_bb,
             span: self.current_span,
         });
 
@@ -934,7 +952,10 @@ impl<'a> Lowerer<'a> {
                 self.bind(val_name, var);
                 // Key is undefined for sequences (no natural index)
                 let undef = self.new_temp(TypeSet::empty());
-                self.emit(Instruction::Undefined { dest: undef });
+                self.emit(Instruction::Const {
+                    dest: undef,
+                    value: Literal::Undefined,
+                });
                 let key_var = self.new_var(key_name.clone(), TypeSet::all());
                 self.emit(Instruction::Copy {
                     dest: key_var,
@@ -1017,7 +1038,10 @@ impl<'a> Lowerer<'a> {
                 self.lower_expression(expr)
             } else {
                 let dest = self.new_temp(TypeSet::empty());
-                self.emit(Instruction::Undefined { dest });
+                self.emit(Instruction::Const {
+                    dest,
+                    value: Literal::Undefined,
+                });
                 dest
             };
 
@@ -1033,7 +1057,10 @@ impl<'a> Lowerer<'a> {
 
         // Final fallthrough (unreachable if patterns are exhaustive)
         let fallback = self.new_temp(TypeSet::empty());
-        self.emit(Instruction::Undefined { dest: fallback });
+        self.emit(Instruction::Const {
+            dest: fallback,
+            value: Literal::Undefined,
+        });
         let fallback_block = self.current_block;
         arm_results.push((fallback_block, fallback));
         self.finish_block(Terminator::Jump { target: exit_bb });
@@ -1113,7 +1140,10 @@ impl<'a> Lowerer<'a> {
         self.current_block = undef_bb;
         self.current_instructions = Vec::new();
         let undef_val = self.new_temp(TypeSet::single(types::BaseType::Sequence));
-        self.emit(Instruction::Undefined { dest: undef_val });
+        self.emit(Instruction::Const {
+            dest: undef_val,
+            value: Literal::Undefined,
+        });
         self.finish_block(Terminator::Jump { target: join_bb });
 
         // Join: phi

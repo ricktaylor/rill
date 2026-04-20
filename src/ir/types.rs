@@ -4,7 +4,7 @@
 //!
 //! Design Philosophy:
 //! - All pattern matching (let, with, if let, if with, for, match) lowers to
-//!   control flow primitives: Match (type dispatch), Guard (presence check),
+//!   control flow primitives: Match (type dispatch, including Undefined checks),
 //!   If (boolean branch), plus Index and Phi
 //! - This enables standard optimizations: const-folding, dead code elimination,
 //!   branch elimination, type narrowing
@@ -353,11 +353,8 @@ pub enum Instruction {
     /// Copy a value (for let bindings, parameter passing)
     Copy { dest: VarId, src: VarId },
 
-    /// Load a constant
+    /// Load a constant (including `Literal::Undefined` for absent values)
     Const { dest: VarId, value: Literal },
-
-    /// Load the "undefined" value
-    Undefined { dest: VarId },
 
     /// Index into a collection: dest = base[key]
     Index {
@@ -491,6 +488,7 @@ pub enum Literal {
     Float(f64),
     Text(String),
     Bytes(Vec<u8>),
+    Undefined,
 }
 
 // ============================================================================
@@ -534,14 +532,6 @@ pub enum Terminator {
         span: crate::ast::Span,
     },
 
-    /// Branch on presence (for if let/if with, is_some checks)
-    Guard {
-        value: VarId,
-        defined: BlockId,
-        undefined: BlockId,
-        span: crate::ast::Span,
-    },
-
     /// Return from function
     Return { value: Option<VarId> },
 
@@ -568,9 +558,6 @@ impl Terminator {
                 succs.push(*default);
                 succs
             }
-            Terminator::Guard {
-                defined, undefined, ..
-            } => vec![*defined, *undefined],
             Terminator::Return { .. } | Terminator::Exit { .. } | Terminator::Unreachable => {
                 vec![]
             }

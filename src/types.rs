@@ -10,9 +10,7 @@
 /// - Text, Bytes: string-like types
 /// - Array, Map: collection types
 /// - Sequence: internal lazy iterator (not user-visible)
-///
-/// Note: "missing" is not a type — it's tracked orthogonally (Option<Value> at runtime,
-/// Definedness lattice at compile time).
+/// - Undefined: absence of a value (failed operations, missing data)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum BaseType {
     Bool,
@@ -24,6 +22,7 @@ pub enum BaseType {
     Array,
     Map,
     Sequence,
+    Undefined,
 }
 
 impl core::fmt::Display for BaseType {
@@ -38,6 +37,7 @@ impl core::fmt::Display for BaseType {
             BaseType::Array => "Array",
             BaseType::Map => "Map",
             BaseType::Sequence => "Sequence",
+            BaseType::Undefined => "Undefined",
         })
     }
 }
@@ -81,7 +81,7 @@ impl BaseType {
     }
 
     /// All base type variants, for iteration
-    const ALL: [BaseType; 9] = [
+    const ALL: [BaseType; 10] = [
         BaseType::Bool,
         BaseType::UInt,
         BaseType::Int,
@@ -91,6 +91,7 @@ impl BaseType {
         BaseType::Array,
         BaseType::Map,
         BaseType::Sequence,
+        BaseType::Undefined,
     ];
 }
 
@@ -179,11 +180,13 @@ impl From<BaseType> for NumericType {
 /// - IR type analysis and refinement
 /// - Type checking and inference
 ///
-/// Internally uses a `u16` with one bit per `BaseType` (9 types = 9 bits).
+/// Internally uses a `u16` with one bit per `BaseType` (10 types = 10 bits).
 /// All operations are O(1) with no heap allocation.
 ///
-/// Note: Definedness (whether a value might be undefined/missing) is tracked
-/// orthogonally via the Definedness lattice, not in TypeSet.
+/// Undefined is a type in the set. `TypeSet::defined()` is the set of all
+/// value types (excludes Undefined). `TypeSet::any()` is the true top
+/// (includes Undefined). Specific constructors like `numeric()`, `bool()`
+/// etc. exclude Undefined — they imply definedness.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct TypeSet {
     bits: u16,
@@ -220,8 +223,9 @@ impl TypeSet {
         TypeSet { bits }
     }
 
-    /// Create a type set containing all types
-    pub const fn all() -> Self {
+    /// All value types, excluding Undefined. Use when a value must be
+    /// defined but could be any type (e.g. Eq operands, collection elements).
+    pub const fn defined() -> Self {
         TypeSet {
             bits: BaseType::Bool.bit()
                 | BaseType::UInt.bit()
@@ -233,6 +237,27 @@ impl TypeSet {
                 | BaseType::Map.bit()
                 | BaseType::Sequence.bit(),
         }
+    }
+
+    /// True top — any type including Undefined. Use for uninitialized
+    /// variables or values whose definedness is unknown.
+    pub const fn any() -> Self {
+        TypeSet {
+            bits: Self::defined().bits | BaseType::Undefined.bit(),
+        }
+    }
+
+    /// Provably undefined — exactly `{Undefined}`.
+    pub const fn undefined() -> Self {
+        Self::single(BaseType::Undefined)
+    }
+
+    /// Temporary alias during migration — will be removed once all call
+    /// sites are reviewed and switched to `defined()` or `any()`.
+    /// Uses `any()` (includes Undefined) so that unknown variables are
+    /// correctly modeled as possibly-undefined by type analysis.
+    pub const fn all() -> Self {
+        Self::any()
     }
 
     // Convenience constructors
@@ -347,6 +372,16 @@ impl TypeSet {
     /// Check if this is a boolean type (exactly Bool)
     pub const fn is_bool(&self) -> bool {
         self.bits == BaseType::Bool.bit()
+    }
+
+    /// Check if this type set excludes Undefined (value is provably defined)
+    pub const fn is_defined(&self) -> bool {
+        self.bits & BaseType::Undefined.bit() == 0 && self.bits != 0
+    }
+
+    /// Check if this might be undefined
+    pub const fn may_be_undefined(&self) -> bool {
+        self.bits & BaseType::Undefined.bit() != 0
     }
 
     /// Check if all types are numeric

@@ -297,9 +297,9 @@ impl ExternMeta {
 /// Result of executing code (externs, functions, or entire programs)
 #[derive(Debug)]
 pub enum ExecResult {
-    /// Normal return - value goes to caller
-    /// None means undefined (operation failed, e.g., overflow, type mismatch)
-    Return(Option<Value>),
+    /// Normal return - value goes to caller.
+    /// `Value::Undefined` means the operation failed (overflow, type mismatch, etc.)
+    Return(Value),
 
     /// Hard exit - value goes to driver, never returns to caller
     /// Used by diverging externs like exit()
@@ -326,8 +326,8 @@ impl ExecResult {
 /// Access args via `vm.arg(i)`:
 /// ```ignore
 /// fn my_extern(vm: &mut VM, argc: usize) -> Result<ExecResult, ExecError> {
-///     let x = vm.arg(0).cloned().unwrap_or(Value::UInt(0));
-///     Ok(ExecResult::Return(Some(x)))
+///     let x = vm.arg(0).clone();
+///     Ok(ExecResult::Return(x))
 /// }
 /// ```
 pub type ExternFn = fn(&mut VM, usize) -> Result<ExecResult, ExecError>;
@@ -838,7 +838,7 @@ mod tests {
     #[test]
     fn test_builder_pattern() {
         fn dummy(_vm: &mut VM, _argc: usize) -> Result<ExecResult, ExecError> {
-            Ok(ExecResult::Return(None))
+            Ok(ExecResult::Return(Value::Undefined))
         }
 
         let def = ExternDef::new("test", dummy)
@@ -858,7 +858,7 @@ mod tests {
     #[test]
     fn test_registry() {
         fn dummy(_vm: &mut VM, _argc: usize) -> Result<ExecResult, ExecError> {
-            Ok(ExecResult::Return(None))
+            Ok(ExecResult::Return(Value::Undefined))
         }
 
         let mut registry = ExternRegistry::new();
@@ -876,7 +876,7 @@ mod tests {
     #[test]
     fn test_register_intrinsic_clash() {
         fn dummy(_vm: &mut VM, _argc: usize) -> Result<ExecResult, ExecError> {
-            Ok(ExecResult::Return(None))
+            Ok(ExecResult::Return(Value::Undefined))
         }
 
         let mut registry = ExternRegistry::new();
@@ -893,7 +893,7 @@ mod tests {
     #[test]
     fn test_register_duplicate_global() {
         fn dummy(_vm: &mut VM, _argc: usize) -> Result<ExecResult, ExecError> {
-            Ok(ExecResult::Return(None))
+            Ok(ExecResult::Return(Value::Undefined))
         }
 
         let mut registry = ExternRegistry::new();
@@ -906,7 +906,7 @@ mod tests {
     #[test]
     fn test_register_duplicate_in_namespace() {
         fn dummy(_vm: &mut VM, _argc: usize) -> Result<ExecResult, ExecError> {
-            Ok(ExecResult::Return(None))
+            Ok(ExecResult::Return(Value::Undefined))
         }
 
         let mut registry = ExternRegistry::new();
@@ -929,7 +929,7 @@ mod tests {
     #[test]
     fn test_namespaced_lookup() {
         fn dummy(_vm: &mut VM, _argc: usize) -> Result<ExecResult, ExecError> {
-            Ok(ExecResult::Return(None))
+            Ok(ExecResult::Return(Value::Undefined))
         }
 
         let mut registry = ExternRegistry::new();
@@ -954,13 +954,13 @@ mod tests {
     #[test]
     fn test_variant_selection() {
         fn generic(_vm: &mut VM, _argc: usize) -> Result<ExecResult, ExecError> {
-            Ok(ExecResult::Return(Some(Value::UInt(0))))
+            Ok(ExecResult::Return(Value::UInt(0)))
         }
         fn uint_variant(_vm: &mut VM, _argc: usize) -> Result<ExecResult, ExecError> {
-            Ok(ExecResult::Return(Some(Value::UInt(1))))
+            Ok(ExecResult::Return(Value::UInt(1)))
         }
         fn float_variant(_vm: &mut VM, _argc: usize) -> Result<ExecResult, ExecError> {
-            Ok(ExecResult::Return(Some(Value::UInt(2))))
+            Ok(ExecResult::Return(Value::UInt(2)))
         }
 
         let def = ExternDef::new("sqrt", generic)

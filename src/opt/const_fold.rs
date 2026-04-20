@@ -78,7 +78,9 @@ fn collect_constants(function: &Function, constants: &mut ConstantMap, externs: 
         for spanned_inst in &block.instructions {
             match &spanned_inst.node {
                 Instruction::Const { dest, value } => {
-                    constants.insert(*dest, literal_to_const(value));
+                    if let Some(cv) = literal_to_const(value) {
+                        constants.insert(*dest, cv);
+                    }
                 }
 
                 Instruction::Copy { dest, src } => {
@@ -224,28 +226,6 @@ fn try_simplify_terminator(
             }
         }
 
-        Terminator::Guard {
-            value,
-            defined,
-            span,
-            ..
-        } => {
-            // If we know the value is a constant, it's definitely defined
-            if constants.contains_key(value) {
-                diagnostics.warning(
-                    DiagnosticCode::W005_RedundantGuard,
-                    *span,
-                    format!(
-                        "in function `{}`: guard on value that is always defined",
-                        func_name
-                    ),
-                );
-                Some(Terminator::Jump { target: *defined })
-            } else {
-                None
-            }
-        }
-
         // Match with constant scrutinee
         Terminator::Match {
             value,
@@ -300,7 +280,7 @@ fn pattern_matches(pattern: &crate::ir::MatchPattern, value: &ConstValue) -> boo
     use crate::ir::MatchPattern;
 
     match (pattern, value) {
-        (MatchPattern::Literal(lit), cv) => literal_to_const(lit) == *cv,
+        (MatchPattern::Literal(lit), cv) => literal_to_const(lit).as_ref() == Some(cv),
         (MatchPattern::Type(base_type), cv) => {
             use crate::types::BaseType;
             match (base_type, cv) {
@@ -527,6 +507,9 @@ mod tests {
 
     #[test]
     fn test_fold_guard_on_constant() {
+        use crate::ir::MatchPattern;
+        use crate::types::BaseType;
+
         let externs = standard_externs();
         let blocks = vec![
             BasicBlock {
@@ -535,10 +518,10 @@ mod tests {
                     dest: var(0),
                     value: Literal::UInt(42),
                 })],
-                terminator: Terminator::Guard {
+                terminator: Terminator::Match {
                     value: var(0),
-                    defined: block(1),
-                    undefined: block(2),
+                    arms: vec![(MatchPattern::Type(BaseType::Undefined), block(2))],
+                    default: block(1),
                     span: ast::Span::default(),
                 },
             },
@@ -558,7 +541,7 @@ mod tests {
         let mut diags = Diagnostics::new();
         fold_constants(&mut func, &externs, &mut diags);
 
-        // Constants are always defined, so jump to defined branch
+        // Constants are always defined (UInt, not Undefined), so jump to default (block 1)
         assert!(matches!(
             func.blocks[0].terminator,
             Terminator::Jump { target } if target == block(1)

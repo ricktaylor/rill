@@ -93,7 +93,10 @@ impl<'a> Lowerer<'a> {
                     self.lower_expression(expr)
                 } else {
                     let dest = self.new_temp(TypeSet::empty());
-                    self.emit(Instruction::Undefined { dest });
+                    self.emit(Instruction::Const {
+                        dest,
+                        value: Literal::Undefined,
+                    });
                     dest
                 };
                 self.pop_scope();
@@ -160,7 +163,10 @@ impl<'a> Lowerer<'a> {
                 );
                 // Return undefined — error already emitted
                 let dest = self.new_temp(TypeSet::empty());
-                self.emit(Instruction::Undefined { dest });
+                self.emit(Instruction::Const {
+                    dest,
+                    value: Literal::Undefined,
+                });
                 return dest;
             }
         };
@@ -559,7 +565,10 @@ impl<'a> Lowerer<'a> {
             self.current_block = skip_bb;
             self.current_instructions = Vec::new();
             let undef_dest = self.new_temp(TypeSet::empty());
-            self.emit(Instruction::Undefined { dest: undef_dest });
+            self.emit(Instruction::Const {
+                dest: undef_dest,
+                value: Literal::Undefined,
+            });
             let skip_exit = self.current_block;
             self.finish_block(Terminator::Jump { target: join_bb });
 

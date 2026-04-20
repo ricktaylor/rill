@@ -62,7 +62,7 @@ fn collect_used_vars(function: &Function) -> HashSet<VarId> {
 /// Collect VarIds read by an instruction (not the dest).
 fn collect_reads(inst: &Instruction, used: &mut HashSet<VarId>) {
     match inst {
-        Instruction::Const { .. } | Instruction::Undefined { .. } => {}
+        Instruction::Const { .. } => {}
 
         Instruction::Copy { src, .. } => {
             used.insert(*src);
@@ -135,9 +135,6 @@ fn collect_terminator_reads(term: &Terminator, used: &mut HashSet<VarId>) {
         Terminator::Match { value, .. } => {
             used.insert(*value);
         }
-        Terminator::Guard { value, .. } => {
-            used.insert(*value);
-        }
         Terminator::Return { value: Some(v) } => {
             used.insert(*v);
         }
@@ -158,7 +155,6 @@ fn is_removable(
         // Pure instructions with a dest — safe to remove
         Instruction::Const { .. }
         | Instruction::Copy { .. }
-        | Instruction::Undefined { .. }
         | Instruction::Index { .. }
         | Instruction::Intrinsic { .. }
         | Instruction::Phi { .. }
@@ -193,7 +189,6 @@ fn get_dest(inst: &Instruction) -> Option<VarId> {
     match inst {
         Instruction::Const { dest, .. }
         | Instruction::Copy { dest, .. }
-        | Instruction::Undefined { dest }
         | Instruction::Index { dest, .. }
         | Instruction::Intrinsic { dest, .. }
         | Instruction::Phi { dest, .. }

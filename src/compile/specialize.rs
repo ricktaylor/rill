@@ -107,7 +107,7 @@ pub(super) fn try_specialize_convert(
                 Some(Box::new(move |vm: &mut VM, _| {
                     let n = expect_uint(vm, src);
                     if n > i64::MAX as u64 {
-                        vm.set_local_uninit(d);
+                        vm.set_local(d, Value::Undefined);
                     } else {
                         vm.set_local(d, Value::Int(n as i64));
                     }
@@ -130,7 +130,7 @@ pub(super) fn try_specialize_convert(
                 let n = expect_uint(vm, src);
                 match Float::new(n as f64) {
                     Some(f) => vm.set_local(d, Value::Float(f)),
-                    None => vm.set_local_uninit(d),
+                    None => vm.set_local(d, Value::Undefined),
                 }
                 Ok(Action::Continue)
             })),
@@ -138,13 +138,13 @@ pub(super) fn try_specialize_convert(
                 let n = expect_int(vm, src);
                 match Float::new(n as f64) {
                     Some(f) => vm.set_local(d, Value::Float(f)),
-                    None => vm.set_local_uninit(d),
+                    None => vm.set_local(d, Value::Undefined),
                 }
                 Ok(Action::Continue)
             })),
             // Anything else → undefined
             _ => Some(Box::new(move |vm: &mut VM, _| {
-                vm.set_local_uninit(d);
+                vm.set_local(d, Value::Undefined);
                 Ok(Action::Continue)
             })),
         };
@@ -154,64 +154,53 @@ pub(super) fn try_specialize_convert(
     Some(match (target, checked) {
         (NumericType::UInt, false) => Box::new(move |vm: &mut VM, _| {
             let result = match vm.local(src) {
-                Some(Value::UInt(n)) => Some(Value::UInt(*n)),
-                Some(Value::Int(n)) => Some(Value::UInt(*n as u64)),
-                _ => None,
+                Value::UInt(n) => Value::UInt(*n),
+                Value::Int(n) => Value::UInt(*n as u64),
+                _ => Value::Undefined,
             };
-            match result {
-                Some(v) => vm.set_local(d, v),
-                None => vm.set_local_uninit(d),
-            }
+            vm.set_local(d, result);
             Ok(Action::Continue)
         }),
         (NumericType::UInt, true) => Box::new(move |vm: &mut VM, _| {
-            match vm.local(src) {
-                Some(Value::UInt(n)) => vm.set_local(d, Value::UInt(*n)),
-                _ => vm.set_local_uninit(d),
-            }
+            let result = match vm.local(src) {
+                Value::UInt(n) => Value::UInt(*n),
+                _ => Value::Undefined,
+            };
+            vm.set_local(d, result);
             Ok(Action::Continue)
         }),
         (NumericType::Int, false) => Box::new(move |vm: &mut VM, _| {
             let result = match vm.local(src) {
-                Some(Value::UInt(n)) => Some(Value::Int(*n as i64)),
-                Some(Value::Int(n)) => Some(Value::Int(*n)),
-                _ => None,
+                Value::UInt(n) => Value::Int(*n as i64),
+                Value::Int(n) => Value::Int(*n),
+                _ => Value::Undefined,
             };
-            match result {
-                Some(v) => vm.set_local(d, v),
-                None => vm.set_local_uninit(d),
-            }
+            vm.set_local(d, result);
             Ok(Action::Continue)
         }),
         (NumericType::Int, true) => Box::new(move |vm: &mut VM, _| {
             let result = match vm.local(src) {
-                Some(Value::UInt(n)) => {
+                Value::UInt(n) => {
                     if *n > i64::MAX as u64 {
-                        None
+                        Value::Undefined
                     } else {
-                        Some(Value::Int(*n as i64))
+                        Value::Int(*n as i64)
                     }
                 }
-                Some(Value::Int(n)) => Some(Value::Int(*n)),
-                _ => None,
+                Value::Int(n) => Value::Int(*n),
+                _ => Value::Undefined,
             };
-            match result {
-                Some(v) => vm.set_local(d, v),
-                None => vm.set_local_uninit(d),
-            }
+            vm.set_local(d, result);
             Ok(Action::Continue)
         }),
         (NumericType::Float, _) => Box::new(move |vm: &mut VM, _| {
             let result = match vm.local(src) {
-                Some(Value::UInt(n)) => Float::new(*n as f64).map(Value::Float),
-                Some(Value::Int(n)) => Float::new(*n as f64).map(Value::Float),
-                Some(Value::Float(f)) => Some(Value::Float(*f)),
-                _ => None,
+                Value::UInt(n) => Float::new(*n as f64).map_or(Value::Undefined, Value::Float),
+                Value::Int(n) => Float::new(*n as f64).map_or(Value::Undefined, Value::Float),
+                Value::Float(f) => Value::Float(*f),
+                _ => Value::Undefined,
             };
-            match result {
-                Some(v) => vm.set_local(d, v),
-                None => vm.set_local_uninit(d),
-            }
+            vm.set_local(d, result);
             Ok(Action::Continue)
         }),
     })
@@ -223,21 +212,21 @@ pub(super) fn try_specialize_convert(
 // immediately during testing.
 
 pub(super) fn expect_uint(vm: &VM, slot: usize) -> u64 {
-    match vm.local(slot).expect("specialized: slot must be defined") {
+    match vm.local(slot) {
         Value::UInt(n) => *n,
         other => panic!("specialized: expected UInt, got {:?}", other),
     }
 }
 
 pub(super) fn expect_int(vm: &VM, slot: usize) -> i64 {
-    match vm.local(slot).expect("specialized: slot must be defined") {
+    match vm.local(slot) {
         Value::Int(n) => *n,
         other => panic!("specialized: expected Int, got {:?}", other),
     }
 }
 
 pub(super) fn expect_float(vm: &VM, slot: usize) -> f64 {
-    match vm.local(slot).expect("specialized: slot must be defined") {
+    match vm.local(slot) {
         Value::Float(f) => f.get(),
         other => panic!("specialized: expected Float, got {:?}", other),
     }
@@ -250,7 +239,7 @@ pub(super) fn specialize_uint(op: IntrinsicOp, a: usize, b: usize, d: usize) -> 
             let (x, y) = (expect_uint(vm, a), expect_uint(vm, b));
             match x.checked_add(y) {
                 Some(r) => vm.set_local(d, Value::UInt(r)),
-                None => vm.set_local_uninit(d),
+                None => vm.set_local(d, Value::Undefined),
             }
             Ok(Action::Continue)
         }),
@@ -258,7 +247,7 @@ pub(super) fn specialize_uint(op: IntrinsicOp, a: usize, b: usize, d: usize) -> 
             let (x, y) = (expect_uint(vm, a), expect_uint(vm, b));
             match x.checked_sub(y) {
                 Some(r) => vm.set_local(d, Value::UInt(r)),
-                None => vm.set_local_uninit(d),
+                None => vm.set_local(d, Value::Undefined),
             }
             Ok(Action::Continue)
         }),
@@ -266,7 +255,7 @@ pub(super) fn specialize_uint(op: IntrinsicOp, a: usize, b: usize, d: usize) -> 
             let (x, y) = (expect_uint(vm, a), expect_uint(vm, b));
             match x.checked_mul(y) {
                 Some(r) => vm.set_local(d, Value::UInt(r)),
-                None => vm.set_local_uninit(d),
+                None => vm.set_local(d, Value::Undefined),
             }
             Ok(Action::Continue)
         }),
@@ -274,7 +263,7 @@ pub(super) fn specialize_uint(op: IntrinsicOp, a: usize, b: usize, d: usize) -> 
             let (x, y) = (expect_uint(vm, a), expect_uint(vm, b));
             match x.checked_div(y) {
                 Some(r) => vm.set_local(d, Value::UInt(r)),
-                None => vm.set_local_uninit(d),
+                None => vm.set_local(d, Value::Undefined),
             }
             Ok(Action::Continue)
         }),
@@ -282,7 +271,7 @@ pub(super) fn specialize_uint(op: IntrinsicOp, a: usize, b: usize, d: usize) -> 
             let (x, y) = (expect_uint(vm, a), expect_uint(vm, b));
             match x.checked_rem(y) {
                 Some(r) => vm.set_local(d, Value::UInt(r)),
-                None => vm.set_local_uninit(d),
+                None => vm.set_local(d, Value::Undefined),
             }
             Ok(Action::Continue)
         }),
@@ -307,7 +296,7 @@ pub(super) fn specialize_int(op: IntrinsicOp, a: usize, b: usize, d: usize) -> S
             let (x, y) = (expect_int(vm, a), expect_int(vm, b));
             match x.checked_add(y) {
                 Some(r) => vm.set_local(d, Value::Int(r)),
-                None => vm.set_local_uninit(d),
+                None => vm.set_local(d, Value::Undefined),
             }
             Ok(Action::Continue)
         }),
@@ -315,7 +304,7 @@ pub(super) fn specialize_int(op: IntrinsicOp, a: usize, b: usize, d: usize) -> S
             let (x, y) = (expect_int(vm, a), expect_int(vm, b));
             match x.checked_sub(y) {
                 Some(r) => vm.set_local(d, Value::Int(r)),
-                None => vm.set_local_uninit(d),
+                None => vm.set_local(d, Value::Undefined),
             }
             Ok(Action::Continue)
         }),
@@ -323,7 +312,7 @@ pub(super) fn specialize_int(op: IntrinsicOp, a: usize, b: usize, d: usize) -> S
             let (x, y) = (expect_int(vm, a), expect_int(vm, b));
             match x.checked_mul(y) {
                 Some(r) => vm.set_local(d, Value::Int(r)),
-                None => vm.set_local_uninit(d),
+                None => vm.set_local(d, Value::Undefined),
             }
             Ok(Action::Continue)
         }),
@@ -331,7 +320,7 @@ pub(super) fn specialize_int(op: IntrinsicOp, a: usize, b: usize, d: usize) -> S
             let (x, y) = (expect_int(vm, a), expect_int(vm, b));
             match x.checked_div(y) {
                 Some(r) => vm.set_local(d, Value::Int(r)),
-                None => vm.set_local_uninit(d),
+                None => vm.set_local(d, Value::Undefined),
             }
             Ok(Action::Continue)
         }),
@@ -339,7 +328,7 @@ pub(super) fn specialize_int(op: IntrinsicOp, a: usize, b: usize, d: usize) -> S
             let (x, y) = (expect_int(vm, a), expect_int(vm, b));
             match x.checked_rem(y) {
                 Some(r) => vm.set_local(d, Value::Int(r)),
-                None => vm.set_local_uninit(d),
+                None => vm.set_local(d, Value::Undefined),
             }
             Ok(Action::Continue)
         }),
@@ -364,7 +353,7 @@ pub(super) fn specialize_float(op: IntrinsicOp, a: usize, b: usize, d: usize) ->
             let (x, y) = (expect_float(vm, a), expect_float(vm, b));
             match Float::new(x + y) {
                 Some(r) => vm.set_local(d, Value::Float(r)),
-                None => vm.set_local_uninit(d),
+                None => vm.set_local(d, Value::Undefined),
             }
             Ok(Action::Continue)
         }),
@@ -372,7 +361,7 @@ pub(super) fn specialize_float(op: IntrinsicOp, a: usize, b: usize, d: usize) ->
             let (x, y) = (expect_float(vm, a), expect_float(vm, b));
             match Float::new(x - y) {
                 Some(r) => vm.set_local(d, Value::Float(r)),
-                None => vm.set_local_uninit(d),
+                None => vm.set_local(d, Value::Undefined),
             }
             Ok(Action::Continue)
         }),
@@ -380,7 +369,7 @@ pub(super) fn specialize_float(op: IntrinsicOp, a: usize, b: usize, d: usize) ->
             let (x, y) = (expect_float(vm, a), expect_float(vm, b));
             match Float::new(x * y) {
                 Some(r) => vm.set_local(d, Value::Float(r)),
-                None => vm.set_local_uninit(d),
+                None => vm.set_local(d, Value::Undefined),
             }
             Ok(Action::Continue)
         }),
@@ -388,7 +377,7 @@ pub(super) fn specialize_float(op: IntrinsicOp, a: usize, b: usize, d: usize) ->
             let (x, y) = (expect_float(vm, a), expect_float(vm, b));
             match Float::new(x / y) {
                 Some(r) => vm.set_local(d, Value::Float(r)),
-                None => vm.set_local_uninit(d),
+                None => vm.set_local(d, Value::Undefined),
             }
             Ok(Action::Continue)
         }),
@@ -396,7 +385,7 @@ pub(super) fn specialize_float(op: IntrinsicOp, a: usize, b: usize, d: usize) ->
             let (x, y) = (expect_float(vm, a), expect_float(vm, b));
             match Float::new(x % y) {
                 Some(r) => vm.set_local(d, Value::Float(r)),
-                None => vm.set_local_uninit(d),
+                None => vm.set_local(d, Value::Undefined),
             }
             Ok(Action::Continue)
         }),
@@ -417,21 +406,13 @@ pub(super) fn specialize_float(op: IntrinsicOp, a: usize, b: usize, d: usize) ->
 /// Compile-time dispatch: match on the IntrinsicOp and return a closure
 /// specific to that operation. Eliminates the runtime `match op` that
 /// `exec_intrinsic` would perform on every execution.
-pub(super) fn compile_intrinsic_dispatch(
-    op: IntrinsicOp,
-    arg_slots: Vec<usize>,
-    d: usize,
-    all_defined: bool,
-) -> Step {
+pub(super) fn compile_intrinsic_dispatch(op: IntrinsicOp, arg_slots: Vec<usize>, d: usize) -> Step {
     // Helper: wrap exec body in the standard result-to-slot pattern
     macro_rules! emit {
         ($body:expr) => {
             Box::new(move |vm: &mut VM, _prog| {
-                let result: Option<Value> = $body(vm);
-                match result {
-                    Some(val) => vm.set_local(d, val),
-                    None => vm.set_local_uninit(d),
-                }
+                let result = $body(vm);
+                vm.set_local(d, result);
                 Ok(Action::Continue)
             })
         };
@@ -440,50 +421,21 @@ pub(super) fn compile_intrinsic_dispatch(
     macro_rules! emit_try {
         ($body:expr) => {
             Box::new(move |vm: &mut VM, _prog| {
-                match $body(vm)? {
-                    Some(val) => vm.set_local(d, val),
-                    None => vm.set_local_uninit(d),
-                }
+                let result = $body(vm)?;
+                vm.set_local(d, result);
                 Ok(Action::Continue)
             })
         };
     }
 
-    // Helpers for binary/unary ops: when all_defined, skip the Option unwrap
-    // and pass &Value directly; otherwise gate on Some first.
     macro_rules! emit_binary {
         ($op_fn:ident) => {
-            if all_defined {
-                emit!(|vm: &mut VM| {
-                    let a = vm.local(arg_slots[0]).unwrap();
-                    let b = vm.local(arg_slots[1]).unwrap();
-                    $op_fn(a, b)
-                })
-            } else {
-                emit!(|vm: &mut VM| {
-                    match (vm.local(arg_slots[0]), vm.local(arg_slots[1])) {
-                        (Some(a), Some(b)) => $op_fn(a, b),
-                        _ => None,
-                    }
-                })
-            }
+            emit!(|vm: &mut VM| { $op_fn(vm.local(arg_slots[0]), vm.local(arg_slots[1])) })
         };
     }
     macro_rules! emit_unary {
         ($op_fn:ident) => {
-            if all_defined {
-                emit!(|vm: &mut VM| {
-                    let a = vm.local(arg_slots[0]).unwrap();
-                    $op_fn(a)
-                })
-            } else {
-                emit!(|vm: &mut VM| {
-                    match vm.local(arg_slots[0]) {
-                        Some(a) => $op_fn(a),
-                        None => None,
-                    }
-                })
-            }
+            emit!(|vm: &mut VM| { $op_fn(vm.local(arg_slots[0])) })
         };
     }
 
@@ -505,25 +457,13 @@ pub(super) fn compile_intrinsic_dispatch(
         IntrinsicOp::Shr => emit_binary!(exec_shr),
         IntrinsicOp::BitTest => emit_binary!(exec_bittest),
         IntrinsicOp::BitSet => {
-            if all_defined {
-                emit!(|vm: &mut VM| {
-                    let x = vm.local(arg_slots[0]).unwrap();
-                    let b = vm.local(arg_slots[1]).unwrap();
-                    let v = vm.local(arg_slots[2]).unwrap();
-                    exec_bitset(x, b, v)
-                })
-            } else {
-                emit!(|vm: &mut VM| {
-                    match (
-                        vm.local(arg_slots[0]),
-                        vm.local(arg_slots[1]),
-                        vm.local(arg_slots[2]),
-                    ) {
-                        (Some(x), Some(b), Some(v)) => exec_bitset(x, b, v),
-                        _ => None,
-                    }
-                })
-            }
+            emit!(|vm: &mut VM| {
+                exec_bitset(
+                    vm.local(arg_slots[0]),
+                    vm.local(arg_slots[1]),
+                    vm.local(arg_slots[2]),
+                )
+            })
         }
         IntrinsicOp::Len => emit_unary!(exec_len),
         IntrinsicOp::MakeArray => emit_try!(|vm: &mut VM| { exec_make_array(&arg_slots, vm) }),
@@ -533,14 +473,14 @@ pub(super) fn compile_intrinsic_dispatch(
         IntrinsicOp::SeqNext => Box::new(move |vm: &mut VM, _prog| {
             match vm.seq_next(vm.bp() + arg_slots[0])? {
                 Some(val) => vm.set_local(d, val),
-                None => vm.set_local_uninit(d),
+                None => vm.set_local(d, Value::Undefined),
             }
             Ok(Action::Continue)
         }),
         IntrinsicOp::Collect => Box::new(move |vm: &mut VM, _prog| {
             match vm.seq_collect(vm.bp() + arg_slots[0])? {
                 Some(val) => vm.set_local(d, val),
-                None => vm.set_local_uninit(d),
+                None => vm.set_local(d, Value::Undefined),
             }
             Ok(Action::Continue)
         }),

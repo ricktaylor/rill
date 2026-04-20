@@ -726,6 +726,7 @@ fn pattern_can_match(type_set: &crate::types::TypeSet, pattern: &MatchPattern) -
                 Literal::Float(_) => crate::types::BaseType::Float,
                 Literal::Text(_) => crate::types::BaseType::Text,
                 Literal::Bytes(_) => crate::types::BaseType::Bytes,
+                Literal::Undefined => crate::types::BaseType::Undefined,
             };
             type_set.contains(lit_type)
         }

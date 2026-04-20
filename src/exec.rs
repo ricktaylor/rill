@@ -263,14 +263,12 @@ pub struct FrameInfo {
 /// A slot on the VM stack.
 #[derive(Debug, Clone)]
 pub enum Slot {
-    /// An actual value
+    /// A value (including Value::Undefined for uninitialized slots)
     Val(Value),
     /// Reference to another stack slot (absolute index)
     Ref(usize),
     /// Saved frame info (slot 0 of each frame)
     Frame(Box<FrameInfo>),
-    /// Uninitialized slot (reserved but not yet assigned)
-    Uninit,
 }
 
 impl Slot {
@@ -402,9 +400,24 @@ pub enum Value {
 
     // --- Sequence type (single-pass lazy values, e.g. ranges) ---
     Sequence(HeapVal<SeqState>),
+
+    // --- Undefined (absence of value) ---
+    /// Represents the absence of a value. Produced by failed operations
+    /// (overflow, type mismatch, out of bounds) and propagated silently.
+    Undefined,
 }
 
 impl Value {
+    /// Check if this value is defined (not Undefined)
+    pub fn is_defined(&self) -> bool {
+        !matches!(self, Value::Undefined)
+    }
+
+    /// Check if this value is Undefined
+    pub fn is_undefined(&self) -> bool {
+        matches!(self, Value::Undefined)
+    }
+
     pub fn base_type(&self) -> BaseType {
         match self {
             Value::Bool(_) => BaseType::Bool,
@@ -416,6 +429,7 @@ impl Value {
             Value::Array(_) => BaseType::Array,
             Value::Map(_) => BaseType::Map,
             Value::Sequence(_) => BaseType::Sequence,
+            Value::Undefined => BaseType::Undefined,
         }
     }
 
@@ -461,6 +475,7 @@ impl Hash for Value {
                 }
             }
             Value::Sequence(it) => it.hash(state),
+            Value::Undefined => {} // discriminant already hashed
         }
     }
 }
@@ -560,7 +575,8 @@ impl VM {
         self.bp = self.stack.len();
 
         // Reserve entire frame at once
-        self.stack.resize(self.bp + frame_size, Slot::Uninit);
+        self.stack
+            .resize(self.bp + frame_size, Slot::Val(Value::Undefined));
 
         // Slot 0 is frame info (saved BP + return destination)
         self.stack[self.bp] = Slot::Frame(Box::new(FrameInfo {
@@ -600,7 +616,8 @@ impl VM {
         self.bp = args_base;
 
         // Extend to full frame size
-        self.stack.resize(self.bp + frame_size, Slot::Uninit);
+        self.stack
+            .resize(self.bp + frame_size, Slot::Val(Value::Undefined));
 
         // Shift args right by 1 to make room for Frame slot at bp.
         // rotate_right(1) on [bp..bp+argc+1] moves args from [bp..bp+argc]
@@ -695,14 +712,19 @@ impl VM {
         self.stack.get_mut(resolved).and_then(|s| s.as_value_mut())
     }
 
-    /// Get value at local offset (bp + offset), following refs
-    pub fn local(&self, offset: usize) -> Option<&Value> {
+    /// Get value at local offset (bp + offset), following refs.
+    ///
+    /// Variable slots are always `Slot::Val` — this panics if the resolved
+    /// slot is a Frame (compiler bug: slot 0 is never a variable).
+    pub fn local(&self, offset: usize) -> &Value {
         self.get(self.bp + offset)
+            .expect("local: resolved slot is not a value")
     }
 
     /// Get mutable value at local offset
-    pub fn local_mut(&mut self, offset: usize) -> Option<&mut Value> {
+    pub fn local_mut(&mut self, offset: usize) -> &mut Value {
         self.get_mut(self.bp + offset)
+            .expect("local_mut: resolved slot is not a value")
     }
 
     /// Set value at absolute index (resolves refs first)
@@ -729,21 +751,13 @@ impl VM {
     ///
     /// ```ignore
     /// fn my_extern(vm: &mut VM, argc: usize) -> Result<ExecResult, ExecError> {
-    ///     let x = vm.arg(0).cloned().unwrap_or(Value::UInt(0));
-    ///     let y = vm.arg(1).cloned().unwrap_or(Value::UInt(0));
-    ///     Ok(ExecResult::Return(Some(Value::UInt(x + y))))
+    ///     let x = vm.arg(0).clone();
+    ///     let y = vm.arg(1).clone();
+    ///     Ok(ExecResult::Return(Value::UInt(x + y)))
     /// }
     /// ```
-    pub fn arg(&self, index: usize) -> Option<&Value> {
+    pub fn arg(&self, index: usize) -> &Value {
         self.local(index + 1) // slot 0 = Frame, slot 1 = arg 0
-    }
-
-    /// Set a local slot to uninitialized (represents undefined)
-    pub fn set_local_uninit(&mut self, offset: usize) {
-        let idx = self.bp + offset;
-        if let Some(slot) = self.stack.get_mut(idx) {
-            *slot = Slot::Uninit;
-        }
     }
 
     /// Set a slot to be a reference to another slot

@@ -87,8 +87,8 @@ pub(crate) enum Action {
     Continue,
     /// Jump to another block
     NextBlock(usize),
-    /// Return from function
-    Return(Option<Value>),
+    /// Return from function. `Value::Undefined` for void/failed returns.
+    Return(Value),
     /// Hard exit to driver (diverging extern)
     Exit(Value),
 }
@@ -354,11 +354,7 @@ fn compile_function(func: &Function, link_map: &LinkMap) -> Result<CompiledFunct
                 block.insert(
                     insert_pos,
                     Box::new(move |vm: &mut VM, _prog| {
-                        if let Some(val) = vm.local(s).cloned() {
-                            vm.set_local(d, val);
-                        } else {
-                            vm.set_local_uninit(d);
-                        }
+                        vm.set_local(d, vm.local(s).clone());
                         Ok(Action::Continue)
                     }),
                 );
@@ -472,7 +468,7 @@ fn compile_instruction(
                         None => {
                             // NaN → undefined
                             Box::new(move |vm: &mut VM, _prog| {
-                                vm.set_local_uninit(d);
+                                vm.set_local(d, Value::Undefined);
                                 Ok(Action::Continue)
                             })
                         }
@@ -505,6 +501,10 @@ fn compile_instruction(
                         Ok(Action::Continue)
                     })
                 }
+                Literal::Undefined => Box::new(move |vm: &mut VM, _prog| {
+                    vm.set_local(d, Value::Undefined);
+                    Ok(Action::Continue)
+                }),
             }
         }
 
@@ -513,26 +513,16 @@ fn compile_instruction(
             let s = slot(*src);
             if defs.get_at_exit(block_id, *src) == crate::opt::Definedness::Defined {
                 Box::new(move |vm: &mut VM, _prog| {
-                    let val = vm.local(s).unwrap().clone();
+                    let val = vm.local(s).clone();
                     vm.set_local(d, val);
                     Ok(Action::Continue)
                 })
             } else {
                 Box::new(move |vm: &mut VM, _prog| {
-                    if let Some(val) = vm.local(s).cloned() {
-                        vm.set_local(d, val);
-                    }
+                    vm.set_local(d, vm.local(s).clone());
                     Ok(Action::Continue)
                 })
             }
-        }
-
-        Instruction::Undefined { dest } => {
-            let d = slot(*dest);
-            Box::new(move |vm: &mut VM, _prog| {
-                vm.set_local_uninit(d);
-                Ok(Action::Continue)
-            })
         }
 
         Instruction::Index { dest, base, key } => {
@@ -546,57 +536,55 @@ fn compile_instruction(
             if base_type.is_some_and(|t| t.contains(BaseType::Array)) {
                 Box::new(move |vm: &mut VM, _prog| {
                     let result = match (vm.local(b), vm.local(k)) {
-                        (Some(Value::Array(arr)), Some(Value::UInt(idx))) => {
-                            arr.get(*idx as usize).cloned()
-                        }
-                        (Some(Value::Array(arr)), Some(Value::Int(idx))) if *idx >= 0 => {
+                        (Value::Array(arr), Value::UInt(idx)) => arr.get(*idx as usize).cloned(),
+                        (Value::Array(arr), Value::Int(idx)) if *idx >= 0 => {
                             arr.get(*idx as usize).cloned()
                         }
                         _ => None,
                     };
                     match result {
                         Some(val) => vm.set_local(d, val),
-                        None => vm.set_local_uninit(d),
+                        None => vm.set_local(d, Value::Undefined),
                     }
                     Ok(Action::Continue)
                 })
             } else if base_type.is_some_and(|t| t.contains(BaseType::Map)) {
                 Box::new(move |vm: &mut VM, _prog| {
                     let result = match (vm.local(b), vm.local(k)) {
-                        (Some(Value::Map(map)), Some(key_val)) => map.get(key_val).cloned(),
+                        (Value::Map(map), key_val) => map.get(key_val).cloned(),
                         _ => None,
                     };
                     match result {
                         Some(val) => vm.set_local(d, val),
-                        None => vm.set_local_uninit(d),
+                        None => vm.set_local(d, Value::Undefined),
                     }
                     Ok(Action::Continue)
                 })
             } else if base_type.is_some_and(|t| t.contains(BaseType::Text)) {
                 Box::new(move |vm: &mut VM, _prog| {
                     let result = match (vm.local(b), vm.local(k)) {
-                        (Some(Value::Text(s)), Some(Value::UInt(idx))) => {
+                        (Value::Text(s), Value::UInt(idx)) => {
                             s.chars().nth(*idx as usize).map(|c| Value::UInt(c as u64))
                         }
                         _ => None,
                     };
                     match result {
                         Some(val) => vm.set_local(d, val),
-                        None => vm.set_local_uninit(d),
+                        None => vm.set_local(d, Value::Undefined),
                     }
                     Ok(Action::Continue)
                 })
             } else if base_type.is_some_and(|t| t.contains(BaseType::Bytes)) {
                 Box::new(move |vm: &mut VM, _prog| {
                     let result = match (vm.local(b), vm.local(k)) {
-                        (Some(Value::Bytes(bytes)), Some(Value::UInt(idx))) => bytes
+                        (Value::Bytes(bytes), Value::UInt(idx)) => bytes
                             .get(*idx as usize)
                             .map(|byte| Value::UInt(*byte as u64)),
                         _ => None,
                     };
                     match result {
                         Some(val) => vm.set_local(d, val),
-                        None => vm.set_local_uninit(d),
+                        None => vm.set_local(d, Value::Undefined),
                     }
                     Ok(Action::Continue)
                 })
@@ -604,13 +592,12 @@ fn compile_instruction(
                 // Unknown base: full runtime dispatch
                 Box::new(move |vm: &mut VM, _prog| {
                     let result = match (vm.local(b), vm.local(k)) {
-                        (Some(base_val), Some(key_val)) => index_value(base_val, key_val),
-                        _ => None,
+                        (base_val, key_val) if base_val.is_defined() => {
+                            index_value(base_val, key_val)
+                        }
+                        _ => Value::Undefined,
                     };
-                    match result {
-                        Some(val) => vm.set_local(d, val),
-                        None => vm.set_local_uninit(d),
-                    }
+                    vm.set_local(d, result);
                     Ok(Action::Continue)
                 })
             }
@@ -627,9 +614,8 @@ fn compile_instruction(
             if base_type.is_some_and(|t| t.contains(BaseType::Array)) {
                 // Array: key is UInt index
                 Box::new(move |vm: &mut VM, _prog| {
-                    if let (Some(Value::UInt(idx)), Some(new_val)) =
-                        (vm.local(k), vm.local(v).cloned())
-                    {
+                    if let Value::UInt(idx) = vm.local(k) {
+                        let new_val = vm.local(v).clone();
                         let _ = vm.set_array_elem(vm.bp() + b, *idx as usize, new_val);
                     }
                     Ok(Action::Continue)
@@ -637,26 +623,22 @@ fn compile_instruction(
             } else if base_type.is_some_and(|t| t.contains(BaseType::Map)) {
                 // Map: any key type
                 Box::new(move |vm: &mut VM, _prog| {
-                    if let (Some(key_val), Some(new_val)) =
-                        (vm.local(k).cloned(), vm.local(v).cloned())
-                    {
-                        let _ = vm.set_map_entry(vm.bp() + b, key_val, new_val);
-                    }
+                    let key_val = vm.local(k).clone();
+                    let new_val = vm.local(v).clone();
+                    let _ = vm.set_map_entry(vm.bp() + b, key_val, new_val);
                     Ok(Action::Continue)
                 })
             } else {
                 // Unknown base: dispatch on key type at runtime
                 Box::new(move |vm: &mut VM, _prog| {
-                    if let (Some(key_val), Some(new_val)) =
-                        (vm.local(k).cloned(), vm.local(v).cloned())
-                    {
-                        match &key_val {
-                            Value::UInt(idx) => {
-                                let _ = vm.set_array_elem(vm.bp() + b, *idx as usize, new_val);
-                            }
-                            _ => {
-                                let _ = vm.set_map_entry(vm.bp() + b, key_val, new_val);
-                            }
+                    let key_val = vm.local(k).clone();
+                    let new_val = vm.local(v).clone();
+                    match &key_val {
+                        Value::UInt(idx) => {
+                            let _ = vm.set_array_elem(vm.bp() + b, *idx as usize, new_val);
+                        }
+                        _ => {
+                            let _ = vm.set_map_entry(vm.bp() + b, key_val, new_val);
                         }
                     }
                     Ok(Action::Continue)
@@ -721,8 +703,7 @@ fn compile_instruction(
                         vm.ret();
 
                         match result? {
-                            ExecResult::Return(Some(val)) => vm.set_local(d, val),
-                            ExecResult::Return(None) => vm.set_local_uninit(d),
+                            ExecResult::Return(val) => vm.set_local(d, val),
                             ExecResult::Exit(val) => return Ok(Action::Exit(val)),
                         }
                         Ok(Action::Continue)
@@ -763,10 +744,7 @@ fn compile_instruction(
                             }
                         };
 
-                        match result {
-                            Some(val) => vm.set_local(d, val),
-                            None => vm.set_local_uninit(d),
-                        }
+                        vm.set_local(d, result);
                         Ok(Action::Continue)
                     })
                 }
@@ -774,7 +752,7 @@ fn compile_instruction(
                     // Unresolved — link phase should have caught this.
                     // Emit undefined as fallback.
                     Box::new(move |vm: &mut VM, _prog| {
-                        vm.set_local_uninit(d);
+                        vm.set_local(d, Value::Undefined);
                         Ok(Action::Continue)
                     })
                 }
@@ -805,11 +783,7 @@ fn compile_instruction(
 
             // Dispatch on op at compile time so each closure goes directly
             // to its operation's code — no runtime `match op` in exec_intrinsic.
-            // If all args are provably defined, skip Option unwraps at runtime.
-            let all_defined = args
-                .iter()
-                .all(|v| defs.get_at_exit(block_id, *v) == crate::opt::Definedness::Defined);
-            compile_intrinsic_dispatch(op, arg_slots, d, all_defined)
+            compile_intrinsic_dispatch(op, arg_slots, d)
         }
 
         Instruction::MakeRef { dest, base, key } => {
@@ -825,29 +799,29 @@ fn compile_instruction(
                     if base_type.is_some_and(|t| t.contains(BaseType::Array)) {
                         Box::new(move |vm: &mut VM, _prog| {
                             let result = match (vm.local(b), vm.local(k_slot)) {
-                                (Some(Value::Array(arr)), Some(Value::UInt(idx))) => {
+                                (Value::Array(arr), Value::UInt(idx)) => {
                                     arr.get(*idx as usize).cloned()
                                 }
-                                (Some(Value::Array(arr)), Some(Value::Int(idx))) if *idx >= 0 => {
+                                (Value::Array(arr), Value::Int(idx)) if *idx >= 0 => {
                                     arr.get(*idx as usize).cloned()
                                 }
                                 _ => None,
                             };
                             match result {
                                 Some(val) => vm.set_local(d, val),
-                                None => vm.set_local_uninit(d),
+                                None => vm.set_local(d, Value::Undefined),
                             }
                             Ok(Action::Continue)
                         })
                     } else if base_type.is_some_and(|t| t.contains(BaseType::Map)) {
                         Box::new(move |vm: &mut VM, _prog| {
                             let result = match (vm.local(b), vm.local(k_slot)) {
-                                (Some(Value::Map(map)), Some(key_val)) => map.get(key_val).cloned(),
+                                (Value::Map(map), key_val) => map.get(key_val).cloned(),
                                 _ => None,
                             };
                             match result {
                                 Some(val) => vm.set_local(d, val),
-                                None => vm.set_local_uninit(d),
+                                None => vm.set_local(d, Value::Undefined),
                             }
                             Ok(Action::Continue)
                         })
@@ -855,13 +829,12 @@ fn compile_instruction(
                         // Unknown base: full runtime dispatch
                         Box::new(move |vm: &mut VM, _prog| {
                             let result = match (vm.local(b), vm.local(k_slot)) {
-                                (Some(base_val), Some(key_val)) => index_value(base_val, key_val),
-                                _ => None,
+                                (base_val, key_val) if base_val.is_defined() => {
+                                    index_value(base_val, key_val)
+                                }
+                                _ => Value::Undefined,
                             };
-                            match result {
-                                Some(val) => vm.set_local(d, val),
-                                None => vm.set_local_uninit(d),
-                            }
+                            vm.set_local(d, result);
                             Ok(Action::Continue)
                         })
                     }
@@ -892,9 +865,8 @@ fn compile_instruction(
                         if base_type.is_some_and(|t| t.contains(BaseType::Array)) {
                             // Array: key is UInt index
                             Box::new(move |vm: &mut VM, _prog| {
-                                if let (Some(Value::UInt(idx)), Some(new_val)) =
-                                    (vm.local(key_slot), vm.local(v).cloned())
-                                {
+                                if let Value::UInt(idx) = vm.local(key_slot) {
+                                    let new_val = vm.local(v).clone();
                                     let _ = vm.set_array_elem(
                                         vm.bp() + base_slot,
                                         *idx as usize,
@@ -906,34 +878,27 @@ fn compile_instruction(
                         } else if base_type.is_some_and(|t| t.contains(BaseType::Map)) {
                             // Map: any key type
                             Box::new(move |vm: &mut VM, _prog| {
-                                if let (Some(key_val), Some(new_val)) =
-                                    (vm.local(key_slot).cloned(), vm.local(v).cloned())
-                                {
-                                    let _ = vm.set_map_entry(vm.bp() + base_slot, key_val, new_val);
-                                }
+                                let key_val = vm.local(key_slot).clone();
+                                let new_val = vm.local(v).clone();
+                                let _ = vm.set_map_entry(vm.bp() + base_slot, key_val, new_val);
                                 Ok(Action::Continue)
                             })
                         } else {
                             // Unknown base: dispatch on key type at runtime
                             Box::new(move |vm: &mut VM, _prog| {
-                                if let (Some(key_val), Some(new_val)) =
-                                    (vm.local(key_slot).cloned(), vm.local(v).cloned())
-                                {
-                                    match &key_val {
-                                        Value::UInt(idx) => {
-                                            let _ = vm.set_array_elem(
-                                                vm.bp() + base_slot,
-                                                *idx as usize,
-                                                new_val,
-                                            );
-                                        }
-                                        _ => {
-                                            let _ = vm.set_map_entry(
-                                                vm.bp() + base_slot,
-                                                key_val,
-                                                new_val,
-                                            );
-                                        }
+                                let key_val = vm.local(key_slot).clone();
+                                let new_val = vm.local(v).clone();
+                                match &key_val {
+                                    Value::UInt(idx) => {
+                                        let _ = vm.set_array_elem(
+                                            vm.bp() + base_slot,
+                                            *idx as usize,
+                                            new_val,
+                                        );
+                                    }
+                                    _ => {
+                                        let _ =
+                                            vm.set_map_entry(vm.bp() + base_slot, key_val, new_val);
                                     }
                                 }
                                 Ok(Action::Continue)
@@ -943,9 +908,8 @@ fn compile_instruction(
                     None => {
                         // Whole-value write-back: write to base's slot directly
                         Box::new(move |vm: &mut VM, _prog| {
-                            if let Some(val) = vm.local(v).cloned() {
-                                vm.set_local(base_slot, val);
-                            }
+                            let val = vm.local(v).clone();
+                            vm.set_local(base_slot, val);
                             Ok(Action::Continue)
                         })
                     }
@@ -962,18 +926,11 @@ fn compile_instruction(
             let a = slot(*arr);
             let v = slot(*value);
             Box::new(move |vm: &mut VM, _prog| {
-                if let Some(val) = vm.local(v).cloned() {
-                    if vm.array_append(vm.bp() + a, val)? {
-                        if let Some(arr_val) = vm.local(a).cloned() {
-                            vm.set_local(d, arr_val);
-                        } else {
-                            vm.set_local_uninit(d);
-                        }
-                    } else {
-                        vm.set_local_uninit(d);
-                    }
+                let val = vm.local(v).clone();
+                if val.is_defined() && vm.array_append(vm.bp() + a, val)? {
+                    vm.set_local(d, vm.local(a).clone());
                 } else {
-                    vm.set_local_uninit(d);
+                    vm.set_local(d, Value::Undefined);
                 }
                 Ok(Action::Continue)
             })
@@ -1009,7 +966,7 @@ pub fn execute(
     vm: &mut VM,
     func_name: &str,
     argc: usize,
-) -> Result<Option<Value>, ExecError> {
+) -> Result<Value, ExecError> {
     let func_idx = *program
         .func_index
         .get(func_name)
@@ -1025,7 +982,7 @@ pub fn execute_by_index(
     vm: &mut VM,
     func_idx: usize,
     argc: usize,
-) -> Result<Option<Value>, ExecError> {
+) -> Result<Value, ExecError> {
     let func = &program.functions[func_idx];
 
     // Adopt pushed args into the call frame (zero allocation)
@@ -1042,9 +999,9 @@ pub fn execute_by_index(
                 vm.ret();
                 return Ok(val);
             }
-            Action::Exit(_val) => {
+            Action::Exit(val) => {
                 vm.ret();
-                return Ok(None); // TODO: propagate exit to driver
+                return Ok(val);
             }
         }
     }

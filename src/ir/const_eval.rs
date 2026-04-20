@@ -20,15 +20,18 @@ use crate::ir::{ConstValue, FunctionRef, Literal};
 // ============================================================================
 
 /// Convert an IR Literal to a ConstValue
-pub fn literal_to_const(lit: &Literal) -> ConstValue {
-    match lit {
+/// Convert an IR Literal to a ConstValue.
+/// Returns `None` for `Literal::Undefined` (not representable as a const).
+pub fn literal_to_const(lit: &Literal) -> Option<ConstValue> {
+    Some(match lit {
         Literal::Bool(b) => ConstValue::Bool(*b),
         Literal::UInt(n) => ConstValue::UInt(*n),
         Literal::Int(n) => ConstValue::Int(*n),
         Literal::Float(f) => ConstValue::Float(*f),
         Literal::Text(s) => ConstValue::Text(s.clone()),
         Literal::Bytes(b) => ConstValue::Bytes(b.clone()),
-    }
+        Literal::Undefined => return None,
+    })
 }
 
 /// Convert a ConstValue to an IR Literal
@@ -458,14 +461,21 @@ mod tests {
     fn test_literal_to_const() {
         assert_eq!(
             literal_to_const(&Literal::Bool(true)),
-            ConstValue::Bool(true)
+            Some(ConstValue::Bool(true))
         );
-        assert_eq!(literal_to_const(&Literal::UInt(42)), ConstValue::UInt(42));
-        assert_eq!(literal_to_const(&Literal::Int(-5)), ConstValue::Int(-5));
+        assert_eq!(
+            literal_to_const(&Literal::UInt(42)),
+            Some(ConstValue::UInt(42))
+        );
+        assert_eq!(
+            literal_to_const(&Literal::Int(-5)),
+            Some(ConstValue::Int(-5))
+        );
         assert_eq!(
             literal_to_const(&Literal::Text("hello".to_string())),
-            ConstValue::Text("hello".to_string())
+            Some(ConstValue::Text("hello".to_string()))
         );
+        assert_eq!(literal_to_const(&Literal::Undefined), None);
     }
 
     #[test]

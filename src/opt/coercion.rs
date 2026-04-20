@@ -62,8 +62,13 @@ pub fn insert_coercions(function: &mut Function, types: &TypeAnalysis) -> usize 
                     let a_incompatible = a_numeric.is_empty() && !a_type.is_empty();
                     let b_incompatible = b_numeric.is_empty() && !b_type.is_empty();
                     if a_incompatible || b_incompatible {
-                        new_instructions
-                            .push(spanned(Instruction::Undefined { dest: *dest }, inst.span));
+                        new_instructions.push(spanned(
+                            Instruction::Const {
+                                dest: *dest,
+                                value: crate::ir::Literal::Undefined,
+                            },
+                            inst.span,
+                        ));
                         changes += 1;
                         continue;
                     }
@@ -471,7 +476,7 @@ mod tests {
         assert_eq!(changes, 1);
         assert!(matches!(
             &func.blocks[0].instructions[2].node,
-            Instruction::Undefined { dest } if *dest == var(2)
+            Instruction::Const { dest, value: Literal::Undefined } if *dest == var(2)
         ));
     }
 

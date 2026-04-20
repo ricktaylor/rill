@@ -2,7 +2,7 @@ use super::*;
 use crate::externs;
 
 /// Helper: compile source and execute a named function (no args)
-fn run(source: &str, func_name: &str) -> Result<Option<Value>, String> {
+fn run(source: &str, func_name: &str) -> Result<Value, String> {
     let externs = externs::standard_externs();
     let (program, diagnostics) =
         crate::compile(source, &externs).map_err(|d| format!("compilation failed: {}", d))?;
@@ -17,11 +17,11 @@ fn run(source: &str, func_name: &str) -> Result<Option<Value>, String> {
         .map_err(|e| format!("exec error: {}", e))
 }
 
-/// Helper: compile and run, expecting a Value back
+/// Helper: compile and run, expecting a defined Value back
 fn run_expect(source: &str, func_name: &str) -> Value {
-    run(source, func_name)
-        .expect("should not error")
-        .expect("should return a value")
+    let val = run(source, func_name).expect("should not error");
+    assert!(val.is_defined(), "expected a defined value, got Undefined");
+    val
 }
 
 // ========================================================================
@@ -43,7 +43,7 @@ fn test_return_bool() {
 #[test]
 fn test_return_no_value() {
     let result = run("fn test() { return; }", "test").unwrap();
-    assert!(result.is_none());
+    assert!(result.is_undefined());
 }
 
 #[test]
@@ -1015,7 +1015,7 @@ fn test_cast_const_fold() {
 
 #[test]
 fn test_collect_empty_range() {
-    // 5..3 is a reversed range → undefined (not an empty sequence)
+    // 5..3 is a reversed range → undefined (start < end guard fails)
     let result = run(
         r#"
             fn test() {
@@ -1025,7 +1025,7 @@ fn test_collect_empty_range() {
             "#,
         "test",
     );
-    assert_eq!(result.unwrap(), None);
+    assert_eq!(result.unwrap(), Value::Undefined);
 }
 
 // ================================================================
@@ -1476,13 +1476,13 @@ fn test_extern_variant_selection() {
     // Register an extern with type-specific variants.
     // The generic returns 0, uint variant returns 1, int variant returns 2.
     fn generic(_vm: &mut VM, _argc: usize) -> Result<ExecResult, ExecError> {
-        Ok(ExecResult::Return(Some(Value::UInt(0))))
+        Ok(ExecResult::Return(Value::UInt(0)))
     }
     fn uint_variant(_vm: &mut VM, _argc: usize) -> Result<ExecResult, ExecError> {
-        Ok(ExecResult::Return(Some(Value::UInt(1))))
+        Ok(ExecResult::Return(Value::UInt(1)))
     }
     fn int_variant(_vm: &mut VM, _argc: usize) -> Result<ExecResult, ExecError> {
-        Ok(ExecResult::Return(Some(Value::UInt(2))))
+        Ok(ExecResult::Return(Value::UInt(2)))
     }
 
     use crate::externs::{ExternDef, ExternRegistry};
@@ -1510,10 +1510,7 @@ fn test_extern_variant_selection() {
     let (program, _diagnostics) = crate::compile(source, &externs).expect("should compile");
 
     let mut vm = VM::new();
-    let result = program
-        .call(&mut vm, "test", 0)
-        .expect("should not error")
-        .expect("should return a value");
+    let result = program.call(&mut vm, "test", 0).expect("should not error");
 
     // 42 is UInt → uint_variant selected → returns 1
     assert_eq!(result, Value::UInt(1));
@@ -1576,10 +1573,11 @@ fn run_with_args(source: &str, func_name: &str, args: &[Value]) -> Value {
     for arg in args {
         vm.push(arg.clone()).expect("push failed");
     }
-    program
+    let val = program
         .call(&mut vm, func_name, args.len())
-        .expect("exec error")
-        .expect("expected a return value")
+        .expect("exec error");
+    assert!(val.is_defined(), "expected a defined value, got Undefined");
+    val
 }
 
 const BENCHMARK_SOURCE: &str = include_str!("../../docs/benchmarks.rill");

@@ -59,12 +59,7 @@ impl Program {
     ///
     /// For repeated calls to the same function, use [`function()`] to resolve
     /// the name once and then call the returned handle.
-    pub fn call(
-        &self,
-        vm: &mut VM,
-        func_name: &str,
-        argc: usize,
-    ) -> Result<Option<Value>, ExecError> {
+    pub fn call(&self, vm: &mut VM, func_name: &str, argc: usize) -> Result<Value, ExecError> {
         compile::execute(&self.compiled, vm, func_name, argc)
     }
 }
@@ -87,7 +82,7 @@ impl<'a> FunctionHandle<'a> {
     /// vm.push(value)?;
     /// let result = handle.call(&mut vm, 1)?;
     /// ```
-    pub fn call(&self, vm: &mut VM, argc: usize) -> Result<Option<Value>, ExecError> {
+    pub fn call(&self, vm: &mut VM, argc: usize) -> Result<Value, ExecError> {
         compile::execute_by_index(self.program, vm, self.func_idx, argc)
     }
 }

@@ -192,7 +192,10 @@ impl<'a> Lowerer<'a> {
     /// Create an undefined value as error recovery placeholder
     pub fn error_placeholder(&mut self) -> VarId {
         let dest = self.new_temp(TypeSet::empty());
-        self.emit(Instruction::Undefined { dest });
+        self.emit(Instruction::Const {
+            dest,
+            value: Literal::Undefined,
+        });
         dest
     }
 

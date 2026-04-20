@@ -146,9 +146,6 @@ fn terminator_successors(terminator: &Terminator) -> Vec<BlockId> {
             succs.push(*default);
             succs
         }
-        Terminator::Guard {
-            defined, undefined, ..
-        } => vec![*defined, *undefined],
         Terminator::Return { .. } | Terminator::Exit { .. } | Terminator::Unreachable => vec![],
     }
 }
@@ -186,16 +183,19 @@ fn transfer_instruction(
     const_uints: &HashMap<VarId, u64>,
 ) {
     match instruction {
+        // Const Undefined produces Undefined
+        Instruction::Const {
+            dest,
+            value: crate::ir::Literal::Undefined,
+        } => {
+            state.insert(*dest, Definedness::Undefined);
+            // Internal undefined - no meaningful provenance to track
+        }
+
         // Constants are always defined
         Instruction::Const { dest, .. } => {
             state.insert(*dest, Definedness::Defined);
             // No provenance for defined values
-        }
-
-        // Undefined instruction produces Undefined
-        Instruction::Undefined { dest } => {
-            state.insert(*dest, Definedness::Undefined);
-            // Internal undefined - no meaningful provenance to track
         }
 
         // Copy inherits from source
@@ -377,47 +377,52 @@ fn compute_call_definedness(
     }
 }
 
-/// Apply control flow refinement at Guard and Match terminators.
+/// Apply control flow refinement at Match terminators.
 ///
-/// Guard: defined branch → value is Defined, undefined branch → Undefined.
-/// Match: every arm → scrutinee is Defined (it matched a pattern, so it exists).
+/// Match arms: scrutinee is Defined (it matched a pattern, so it exists),
+/// except for `Type(Undefined)` arms where the scrutinee is Undefined.
+///
+/// Default branch: if any arm matches `Type(Undefined)`, then the default
+/// branch knows the value is Defined (it didn't match Undefined).
 fn apply_guard_refinement(
     terminator: &Terminator,
     state: &HashMap<VarId, Definedness>,
 ) -> HashMap<BlockId, HashMap<VarId, Definedness>> {
     let mut refined = HashMap::new();
 
-    match terminator {
-        Terminator::Guard {
-            value,
-            defined,
-            undefined,
-            ..
-        } => {
-            // Defined branch: value is Defined
-            let mut defined_state = state.clone();
-            defined_state.insert(*value, Definedness::Defined);
-            refined.insert(*defined, defined_state);
+    if let Terminator::Match {
+        value,
+        arms,
+        default,
+        ..
+    } = terminator
+    {
+        let mut has_undefined_arm = false;
 
-            // Undefined branch: value is Undefined
-            let mut undefined_state = state.clone();
-            undefined_state.insert(*value, Definedness::Undefined);
-            refined.insert(*undefined, undefined_state);
-        }
-
-        Terminator::Match { value, arms, .. } => {
-            // Every arm: the scrutinee matched, so it's Defined.
-            // (Undefined values don't match any pattern — they fall to default.)
-            for (_, target) in arms {
-                let mut arm_state = state.clone();
+        for (pattern, target) in arms {
+            let mut arm_state = state.clone();
+            if matches!(
+                pattern,
+                crate::ir::MatchPattern::Type(crate::types::BaseType::Undefined)
+            ) {
+                // Type(Undefined) arm: scrutinee is Undefined
+                arm_state.insert(*value, Definedness::Undefined);
+                has_undefined_arm = true;
+            } else {
+                // All other arms: scrutinee matched a pattern, so it's Defined
                 arm_state.insert(*value, Definedness::Defined);
-                refined.insert(*target, arm_state);
             }
-            // Default: scrutinee might be undefined (didn't match any arm)
-            // — no refinement, use normal state propagation.
+            refined.insert(*target, arm_state);
         }
 
-        _ => {}
+        // Default branch: if we had a Type(Undefined) arm, then the value
+        // reaching default did NOT match Undefined → it's Defined.
+        if has_undefined_arm {
+            let mut default_state = state.clone();
+            default_state.insert(*value, Definedness::Defined);
+            refined.insert(*default, default_state);
+        }
+        // Otherwise: default just means no arm matched — no definedness refinement.
     }
 
     refined
@@ -506,8 +511,7 @@ fn collect_guarded_indices(function: &Function) -> (GuardedIndices, HashMap<VarI
                 | Instruction::Index { dest, .. }
                 | Instruction::MakeRef { dest, .. }
                 | Instruction::Call { dest, .. }
-                | Instruction::Phi { dest, .. }
-                | Instruction::Undefined { dest } => {
+                | Instruction::Phi { dest, .. } => {
                     producers.insert(*dest, &inst.node);
                 }
                 _ => {}
@@ -981,10 +985,7 @@ fn check_instruction_uses(
         }
 
         // These don't use values in a way that requires definedness
-        Instruction::Const { .. }
-        | Instruction::Undefined { .. }
-        | Instruction::Copy { .. }
-        | Instruction::Phi { .. } => {}
+        Instruction::Const { .. } | Instruction::Copy { .. } | Instruction::Phi { .. } => {}
 
         Instruction::Assign { .. } | Instruction::Read { .. } => {
             unreachable!("pre-SSA instruction; removed by mem2reg")
@@ -1021,27 +1022,37 @@ fn check_terminator_uses(
             );
         }
 
-        Terminator::Match { value, span, .. } => {
-            // Match scrutinee IS control flow - error if undefined
-            check_var_use(
-                *value,
-                state,
-                "match scrutinee",
-                func_name,
-                provenance,
-                true,
-                *span,
-                diagnostics,
-            );
+        Terminator::Match {
+            value, arms, span, ..
+        } => {
+            // If this Match has a Type(Undefined) arm, it's acting as a guard
+            // and the scrutinee is *expected* to be possibly undefined — no diagnostic.
+            let has_undefined_arm = arms.iter().any(|(p, _)| {
+                matches!(
+                    p,
+                    crate::ir::MatchPattern::Type(crate::types::BaseType::Undefined)
+                )
+            });
+            if !has_undefined_arm {
+                // Match scrutinee IS control flow - error if undefined
+                check_var_use(
+                    *value,
+                    state,
+                    "match scrutinee",
+                    func_name,
+                    provenance,
+                    true,
+                    *span,
+                    diagnostics,
+                );
+            }
         }
 
         Terminator::Exit { .. } => {
             // Exit with undefined is valid - embedding application handles Option<ExitCode>
         }
 
-        // Guard explicitly checks definedness - no error to emit
-        // (the undefined branch handles the undefined case)
-        Terminator::Guard { .. } | Terminator::Jump { .. } | Terminator::Unreachable => {}
+        Terminator::Jump { .. } | Terminator::Unreachable => {}
     }
 }
 
@@ -1300,7 +1311,10 @@ mod tests {
         // fn test() { let x = undefined; }
         let blocks = vec![BasicBlock {
             id: block(0),
-            instructions: vec![si(Instruction::Undefined { dest: var(0) })],
+            instructions: vec![si(Instruction::Const {
+                dest: var(0),
+                value: Literal::Undefined,
+            })],
             terminator: Terminator::Return {
                 value: Some(var(0)),
             },
@@ -1370,7 +1384,10 @@ mod tests {
         let blocks = vec![BasicBlock {
             id: block(0),
             instructions: vec![
-                si(Instruction::Undefined { dest: var(0) }),
+                si(Instruction::Const {
+                    dest: var(0),
+                    value: Literal::Undefined,
+                }),
                 si(Instruction::Copy {
                     dest: var(1),
                     src: var(0),
@@ -1433,15 +1450,18 @@ mod tests {
 
     #[test]
     fn test_guard_refines_definedness() {
+        use crate::ir::MatchPattern;
+        use crate::types::BaseType;
+
         // fn test(x) {
-        //     if let y = x {  // Guard on x
-        //         // defined branch: x is Defined
+        //     if let y = x {  // Match with Type(Undefined) arm
+        //         // default (defined) branch: x is Defined
         //     } else {
-        //         // undefined branch: x is Undefined
+        //         // Undefined arm: x is Undefined
         //     }
         // }
         let blocks = vec![
-            // Block 0: Create maybe-defined value and guard on it
+            // Block 0: Create maybe-defined value and check with Match
             BasicBlock {
                 id: block(0),
                 instructions: vec![
@@ -1452,14 +1472,14 @@ mod tests {
                         key: var(0),
                     }),
                 ],
-                terminator: Terminator::Guard {
+                terminator: Terminator::Match {
                     value: var(1),
-                    defined: block(1),
-                    undefined: block(2),
+                    arms: vec![(MatchPattern::Type(BaseType::Undefined), block(2))],
+                    default: block(1),
                     span: ast::Span::default(),
                 },
             },
-            // Block 1: Defined branch
+            // Block 1: Defined branch (default)
             BasicBlock {
                 id: block(1),
                 instructions: vec![],
@@ -1467,7 +1487,7 @@ mod tests {
                     value: Some(var(1)),
                 },
             },
-            // Block 2: Undefined branch
+            // Block 2: Undefined arm
             BasicBlock {
                 id: block(2),
                 instructions: vec![],
@@ -1478,13 +1498,13 @@ mod tests {
         let func = make_function_with_param(var(0), blocks);
         let analysis = analyze_definedness(&func, None);
 
-        // In defined branch (block 1), var(1) should be Defined
+        // In defined branch (block 1, default), var(1) should be Defined
         assert_eq!(
             analysis.get_at_entry(block(1), var(1)),
             Definedness::Defined
         );
 
-        // In undefined branch (block 2), var(1) should be Undefined
+        // In undefined arm (block 2), var(1) should be Undefined
         assert_eq!(
             analysis.get_at_entry(block(2), var(1)),
             Definedness::Undefined
@@ -1519,7 +1539,10 @@ mod tests {
             // Block 2: Else branch - x = undefined
             BasicBlock {
                 id: block(2),
-                instructions: vec![si(Instruction::Undefined { dest: var(2) })],
+                instructions: vec![si(Instruction::Const {
+                    dest: var(2),
+                    value: Literal::Undefined,
+                })],
                 terminator: Terminator::Jump { target: block(3) },
             },
             // Block 3: Join with Phi
@@ -1836,7 +1859,10 @@ mod tests {
         let blocks = vec![
             BasicBlock {
                 id: block(0),
-                instructions: vec![si(Instruction::Undefined { dest: var(0) })],
+                instructions: vec![si(Instruction::Const {
+                    dest: var(0),
+                    value: Literal::Undefined,
+                })],
                 terminator: Terminator::If {
                     condition: var(0),
                     then_target: block(1),
@@ -1920,10 +1946,13 @@ mod tests {
 
     #[test]
     fn test_check_guarded_use_no_error() {
+        use crate::ir::MatchPattern;
+        use crate::types::BaseType;
+
         let mut diagnostics = Diagnostics::new();
 
         // fn test(x) {
-        //     if let y = x {  // Guard on x
+        //     if let y = x {  // Match with Type(Undefined) arm
         //         return y;   // y is Defined here
         //     }
         // }
@@ -1938,14 +1967,14 @@ mod tests {
                         key: var(0),
                     }),
                 ],
-                terminator: Terminator::Guard {
+                terminator: Terminator::Match {
                     value: var(1),
-                    defined: block(1),
-                    undefined: block(2),
+                    arms: vec![(MatchPattern::Type(BaseType::Undefined), block(2))],
+                    default: block(1),
                     span: ast::Span::default(),
                 },
             },
-            // Defined branch - var(1) is Defined here
+            // Defined branch (default) - var(1) is Defined here
             BasicBlock {
                 id: block(1),
                 instructions: vec![],
@@ -1953,7 +1982,7 @@ mod tests {
                     value: Some(var(1)),
                 },
             },
-            // Undefined branch
+            // Undefined arm
             BasicBlock {
                 id: block(2),
                 instructions: vec![],
@@ -1980,7 +2009,10 @@ mod tests {
         let blocks = vec![BasicBlock {
             id: block(0),
             instructions: vec![
-                si(Instruction::Undefined { dest: var(0) }),
+                si(Instruction::Const {
+                    dest: var(0),
+                    value: Literal::Undefined,
+                }),
                 si(Instruction::Call {
                     dest: var(1),
                     function: FunctionRef {

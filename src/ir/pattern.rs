@@ -185,7 +185,10 @@ impl<'a> Lowerer<'a> {
                     self.current_block = undef_bb;
                     self.current_instructions = Vec::new();
                     let undef_val = self.new_temp(TypeSet::single(types::BaseType::Sequence));
-                    self.emit(Instruction::Undefined { dest: undef_val });
+                    self.emit(Instruction::Const {
+                        dest: undef_val,
+                        value: Literal::Undefined,
+                    });
                     self.finish_block(Terminator::Jump { target: join_bb });
 
                     // Join: phi

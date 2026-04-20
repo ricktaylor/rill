@@ -93,7 +93,7 @@ fn replace_vars_in_instruction(inst: &mut Instruction, map: &HashMap<VarId, VarI
             }
         }
 
-        Instruction::Const { .. } | Instruction::Undefined { .. } => {}
+        Instruction::Const { .. } => {}
 
         Instruction::Intrinsic { args, .. } => {
             for arg in args.iter_mut() {
@@ -212,12 +212,6 @@ fn replace_vars_in_terminator(term: &mut Terminator, map: &HashMap<VarId, VarId>
             }
         }
         Terminator::Match { value, .. } => {
-            if let Some(&new) = map.get(value) {
-                *value = new;
-                count += 1;
-            }
-        }
-        Terminator::Guard { value, .. } => {
             if let Some(&new) = map.get(value) {
                 *value = new;
                 count += 1;

@@ -73,6 +73,14 @@ fn transfer_instruction(
     return_types: &ReturnTypes,
 ) {
     match instruction {
+        // Undefined produces only undefined (no concrete types)
+        Instruction::Const {
+            dest,
+            value: crate::ir::Literal::Undefined,
+        } => {
+            state.insert(*dest, TypeSet::empty());
+        }
+
         // Constants have known single types
         Instruction::Const { dest, value } => {
             let ty = match value {
@@ -82,13 +90,9 @@ fn transfer_instruction(
                 crate::ir::Literal::Float(_) => BaseType::Float,
                 crate::ir::Literal::Text(_) => BaseType::Text,
                 crate::ir::Literal::Bytes(_) => BaseType::Bytes,
+                crate::ir::Literal::Undefined => unreachable!(),
             };
             state.insert(*dest, TypeSet::single(ty));
-        }
-
-        // Undefined produces only undefined (no concrete types)
-        Instruction::Undefined { dest } => {
-            state.insert(*dest, TypeSet::empty());
         }
 
         // Copy inherits the type of the source
@@ -268,6 +272,7 @@ fn apply_match_refinement(
                         crate::ir::Literal::Float(_) => BaseType::Float,
                         crate::ir::Literal::Text(_) => BaseType::Text,
                         crate::ir::Literal::Bytes(_) => BaseType::Bytes,
+                        crate::ir::Literal::Undefined => BaseType::Undefined,
                     };
                     TypeSet::single(ty)
                 }
@@ -297,31 +302,6 @@ fn apply_match_refinement(
         }
         default_state.insert(*value, remaining);
         refined.insert(*default, default_state);
-    }
-
-    refined
-}
-
-/// Apply type refinement at a Guard terminator
-///
-/// Guard doesn't refine types - it only affects definedness which is
-/// tracked by the separate Definedness analysis. The TypeSet remains
-/// unchanged in both branches (the type of a value doesn't change based
-/// on whether it's defined or not).
-fn apply_guard_refinement(
-    terminator: &Terminator,
-    state: &HashMap<VarId, TypeSet>,
-) -> HashMap<BlockId, HashMap<VarId, TypeSet>> {
-    let mut refined = HashMap::new();
-
-    if let Terminator::Guard {
-        defined, undefined, ..
-    } = terminator
-    {
-        // Both branches keep the same type information
-        // (definedness is tracked separately)
-        refined.insert(*defined, state.clone());
-        refined.insert(*undefined, state.clone());
     }
 
     refined
@@ -445,14 +425,12 @@ pub fn analyze_types_full(
 
             // Apply control flow refinement
             let match_refined = apply_match_refinement(&block.terminator, &state);
-            let guard_refined = apply_guard_refinement(&block.terminator, &state);
 
             // Propagate to successors
             for succ_id in block.terminator.successors() {
                 // Compute new entry state for successor
                 let new_entry = match_refined
                     .get(&succ_id)
-                    .or_else(|| guard_refined.get(&succ_id))
                     .cloned()
                     .unwrap_or_else(|| state.clone());
 
@@ -573,7 +551,10 @@ mod tests {
     fn test_undefined_has_no_concrete_type() {
         let blocks = vec![BasicBlock {
             id: block(0),
-            instructions: vec![si(Instruction::Undefined { dest: var(0) })],
+            instructions: vec![si(Instruction::Const {
+                dest: var(0),
+                value: Literal::Undefined,
+            })],
             terminator: Terminator::Return {
                 value: Some(var(0)),
             },
@@ -681,9 +662,10 @@ mod tests {
     }
 
     #[test]
-    fn test_guard_does_not_refine_types() {
-        // Guard only affects definedness (tracked separately), not types
-        // guard x -> defined: block1, undefined: block2
+    fn test_guard_match_refines_types() {
+        // Match with Type(Undefined) arm refines types:
+        // - Undefined arm: var is Undefined
+        // - Default (defined) arm: var has all types except Undefined
         let blocks = vec![
             BasicBlock {
                 id: block(0),
@@ -692,10 +674,10 @@ mod tests {
                     base: var(0),
                     key: var(0),
                 })],
-                terminator: Terminator::Guard {
+                terminator: Terminator::Match {
                     value: var(1),
-                    defined: block(1),
-                    undefined: block(2),
+                    arms: vec![(MatchPattern::Type(BaseType::Undefined), block(2))],
+                    default: block(1),
                     span: ast::Span::default(),
                 },
             },
@@ -716,14 +698,15 @@ mod tests {
         let func = make_function_with_param(var(0), blocks);
         let analysis = analyze_types(&func, None);
 
-        // Both branches should have the same type for var(1)
-        // (definedness is tracked by Definedness analysis, not here)
+        // In the default (defined) branch, Undefined is excluded
         let type_1 = analysis.get_at_entry(block(1), var(1)).unwrap();
-        let type_2 = analysis.get_at_entry(block(2), var(1)).unwrap();
-
-        // Index returns all types (we don't know element type)
         assert!(!type_1.is_empty());
-        assert_eq!(type_1, type_2); // Same types in both branches
+        assert!(!type_1.contains(BaseType::Undefined));
+
+        // In the Undefined arm, var is Undefined
+        let type_2 = analysis.get_at_entry(block(2), var(1)).unwrap();
+        assert!(type_2.contains(BaseType::Undefined));
+        assert!(type_2.is_single());
     }
 
     #[test]

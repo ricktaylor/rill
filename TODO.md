@@ -16,6 +16,9 @@ The full compilation and execution pipeline is working end-to-end with 139+ test
   - `with` reference bindings (MakeRef/WriteRef), ref origin tracking
   - Constant expression lowering and compile-time evaluation
   - IntrinsicOp for all operators, `len`, collection construction
+  - Compile-time properties in op variants: `Convert(NumericType, ConvertMode)`, `MakeSeq`, `ArraySeq(SliceMode)`
+  - Range guard: `start < end` If check before MakeSeq/ArraySeq (reversed → undefined)
+  - Inclusive ranges normalized to exclusive via `end + 1` checked Add in lowerer
   - Extern param type guards (Match guards inserted before constrained calls)
 - **Optimizer** — 11 passes in two-phase pipeline (`src/ir/opt/`)
   - Phase 1 (fixpoint): const fold → CSE → copy prop → definedness → guard elim → CFG simplify → coercion elision → DCE
@@ -30,7 +33,7 @@ The full compilation and execution pipeline is working end-to-end with 139+ test
   - Link phase, phi elimination, flat PC executor
 - **Runtime** — stack-based VM with heap tracking (`src/exec.rs`)
   - CoW HeapVal, capacity-based heap accounting, configurable limits
-  - Sequence type (lazy ranges, zero-copy array slices with mutable flag)
+  - Sequence type (UInt ranges with exclusive end, zero-copy array slices)
   - For-loop type dispatch (Sequence → SeqNext path, default → index path)
   - For-loop pair binding (`for k, v in map`)
 - **Public API** — `compile()`, `Program::call()`, `FunctionHandle` for hot-path (`src/lib.rs`)
@@ -128,39 +131,23 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
     - [ ] Forward compatibility: unknown top-level keys skipped gracefully
     - [ ] Debug info: present and absent cases
 
-### P1 — SSA Construction (fixes all known phi bugs)
+### P1 — SSA Construction — Done (Phases 1–2), 2 ignored tests remain
 
-- [ ] **LLVM-style lowering + mem2reg split** — separate the lowerer from SSA
-      construction. Currently the lowerer does both AST→IR translation AND
-      manual phi insertion (snapshot_scope, merge_branch_bindings,
-      create_loop_phis, patch_loop_phis). This ad-hoc approach breaks for
-      multi-variable reassignment in for-loops, in-place mutation across
-      dispatch boundaries, and nested if/else expression results.
-  - Phase 1: Pre-SSA IR
-    - [ ] Add `Instruction::Assign { name, value }` and `Instruction::Read { name, dest }`
-    - [ ] Lowerer emits Assign/Read instead of managing VarIds and scopes
-    - [ ] Remove snapshot_scope, merge_branch_bindings, create_loop_phis,
-          patch_loop_phis, and all manual phi insertion from the lowerer
-  - Phase 2: mem2reg pass (Braun et al. 2013)
-    - [ ] Implement `readVariable(name, block)` — recursive predecessor lookup
-    - [ ] Implement `writeVariable(name, block, value)` — record definitions
-    - [ ] Sealed blocks: mark block as sealed when all predecessors known
-    - [ ] Phi insertion at control flow merge points (automatic)
-    - [ ] Trivial phi elimination (all operands same → use value directly)
-    - [ ] Convert Assign/Read to SSA VarIds with Phi nodes
-    - [ ] Reference: "Simple and Efficient Construction of Static Single
-          Assignment Form" (Braun, Buchwald, Hack, Leißa, Mallon, Zwinkau
-          — CC 2013)
-  - Phase 3: Validate
-    - [ ] Un-ignore all 7 benchmark tests (fib_iter, map_operations, ackermann, etc.)
-    - [ ] Add multi-variable loop reassignment tests
-    - [ ] Add nested if/else expression result tests
-
-  Known bugs fixed by this change:
-  - Multi-variable reassignment in for-loops (fib_iter doubling bug)
-  - In-place mutation not visible after for-loop dispatch (build_map bug)
-  - merge_branch_bindings breaking nested if/else results (ackermann bug)
-  - Tests: 7 `#[ignore]` benchmarks
+- [x] **LLVM-style lowering + mem2reg split** — lowerer emits Assign/Read,
+      `ssa/promote.rs` implements Braun et al. (2013) mem2reg. Old ad-hoc
+      phi insertion (snapshot_scope, merge_branch_bindings, etc.) removed.
+  - Phase 1: Pre-SSA IR — **done**
+    - [x] `Instruction::Assign { slot, value }` and `Instruction::Read { slot, dest }`
+    - [x] Lowerer emits Assign/Read instead of managing VarIds and scopes
+    - [x] Old manual phi insertion removed
+  - Phase 2: mem2reg pass (Braun et al. 2013) — **done** (`src/ssa/promote.rs`)
+    - [x] `read_variable(slot, block)` — recursive predecessor lookup
+    - [x] `write_variable` via `current_def` tracking
+    - [x] Phi insertion at control flow merge points
+    - [x] Trivial phi elimination
+  - Phase 3: Validate — **2 ignored tests remain**
+    - [ ] `bench_ackermann` — recursive if-else chains produce None
+    - [ ] `bench_map_operations` — in-place mutation via SetIndex not visible after for-loop dispatch
 
 ### P2 — Optimization
 
@@ -175,6 +162,15 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
       loop-external operands to pre-header. Requires loop detection, dominator tree.
 - [ ] **Dead write-back elimination** — a WriteRef exists but the base value is never
       read after the write-back point. Requires liveness analysis.
+
+### P2 — Architecture
+
+- [ ] **Unified type/definedness** — treat Undefined as `BaseType::Undefined`
+      in the TypeSet, eliminating the separate Definedness lattice and analysis
+      pass. See design notes below.
+- [ ] **Type guard insertion pass** — emit Guard + Match before intrinsics
+      based on `param_type()` constraints. Makes implicit runtime type dispatch
+      explicit in IR. Enables peephole fusion. See `docs/runtime_checks.md`.
 
 ### P2 — Diagnostics
 
@@ -291,6 +287,35 @@ Phase 2 (type-informed — on simplified CFG):
 The coercion pass bridges type analysis and definedness: it transforms type
 mismatches into explicit `Undefined` instructions that the existing definedness
 analysis can reason about — no new analysis infrastructure needed.
+
+### Unified Type/Definedness (P2)
+
+Undefined is really just a type. The separate `Definedness` lattice
+(`Defined | MaybeUndefined | Undefined`) and its dedicated analysis pass
+can be replaced by adding `BaseType::Undefined` to the TypeSet:
+
+```
+Definedness::Defined        →  !type.contains(Undefined)
+Definedness::MaybeUndefined →  type.contains(Undefined) && type.len() > 1
+Definedness::Undefined      →  type == TypeSet::single(Undefined)
+Guard { defined, undefined } →  Match { arms: [(Undefined, undef_bb)], default: ok_bb }
+Instruction::Undefined      →  Instruction::Const { Literal::Undefined }
+all_defined (compiler)      →  !type.contains(Undefined)  (same query as type analysis)
+```
+
+TypeSet naming:
+- `TypeSet::any()` — true top, all types including Undefined
+- `TypeSet::defined()` — any value type, excludes Undefined (replaces current `all()`)
+- `TypeSet::numeric()` etc. — excludes Undefined (implies defined)
+
+Runtime: `Option<Value>` becomes `Value` with an `Undefined` variant.
+Slots are always populated. The `all_defined` optimization becomes
+"type analysis proved no Undefined in the set" — the same pass that
+already narrows types.
+
+This eliminates: the `Definedness` enum, the `DefinednessAnalysis` pass,
+the `Guard` terminator variant, and the `Instruction::Undefined` variant.
+Guard becomes Match. Undefined becomes Const. One analysis instead of two.
 
 ## File Map
 

@@ -43,7 +43,7 @@ pub(super) fn compile_terminator(
                 && cond_def == crate::opt::Definedness::Defined
             {
                 return Ok(Box::new(move |vm: &mut VM, _prog| {
-                    let is_true = match vm.local(cond_slot).unwrap() {
+                    let is_true = match vm.local(cond_slot) {
                         Value::Bool(b) => *b,
                         _ => unreachable!(),
                     };
@@ -52,10 +52,7 @@ pub(super) fn compile_terminator(
             }
 
             Box::new(move |vm: &mut VM, _prog| {
-                let is_true = vm
-                    .local(cond_slot)
-                    .map(|v| matches!(v, Value::Bool(true)))
-                    .unwrap_or(false);
+                let is_true = matches!(vm.local(cond_slot), Value::Bool(true));
                 Ok(Action::NextBlock(if is_true { then_idx } else { else_idx }))
             })
         }
@@ -71,51 +68,22 @@ pub(super) fn compile_terminator(
             compile_match(val_slot, arms, default_idx, block_map)
         }
 
-        Terminator::Guard {
-            value,
-            defined,
-            undefined,
-            ..
-        } => {
-            // Guards with known definedness should have been folded to Jump
-            // by the optimizer's eliminate_guards pass.
-            debug_assert!(
-                defs.get_at_exit(block_id, *value) == crate::opt::Definedness::MaybeDefined,
-                "Guard on {:?} with definedness {:?} should have been eliminated by optimizer",
-                value,
-                defs.get_at_exit(block_id, *value)
-            );
-
-            let val_slot = slot(*value);
-            let def_idx = block_map[defined];
-            let undef_idx = block_map[undefined];
-            Box::new(move |vm: &mut VM, _prog| {
-                let is_defined = vm.local(val_slot).is_some();
-                Ok(Action::NextBlock(if is_defined {
-                    def_idx
-                } else {
-                    undef_idx
-                }))
-            })
-        }
-
         Terminator::Return { value } => {
             let val_slot = value.map(slot);
             Box::new(move |vm: &mut VM, _prog| {
-                let val = val_slot.and_then(|s| vm.local(s).cloned());
+                let val = val_slot
+                    .map(|s| vm.local(s).clone())
+                    .unwrap_or(Value::Undefined);
                 Ok(Action::Return(val))
             })
         }
 
         Terminator::Exit { value } => {
             let val_slot = slot(*value);
-            Box::new(move |vm: &mut VM, _prog| {
-                let val = vm.local(val_slot).cloned().unwrap_or(Value::UInt(0));
-                Ok(Action::Exit(val))
-            })
+            Box::new(move |vm: &mut VM, _prog| Ok(Action::Exit(vm.local(val_slot).clone())))
         }
 
-        Terminator::Unreachable => Box::new(|_vm, _prog| Ok(Action::Return(None))),
+        Terminator::Unreachable => Box::new(|_vm, _prog| Ok(Action::Return(Value::Undefined))),
     })
 }
 
@@ -149,11 +117,10 @@ pub(super) fn compile_match(
         .collect();
 
     Box::new(move |vm: &mut VM, _prog| {
-        if let Some(val) = vm.local(val_slot) {
-            for (predicate, target_idx) in &compiled_arms {
-                if predicate(val) {
-                    return Ok(Action::NextBlock(*target_idx));
-                }
+        let val = vm.local(val_slot);
+        for (predicate, target_idx) in &compiled_arms {
+            if predicate(val) {
+                return Ok(Action::NextBlock(*target_idx));
             }
         }
         Ok(Action::NextBlock(default_idx))
@@ -171,7 +138,7 @@ pub(super) fn compile_single_arm_match(
         MatchPattern::Type(base_type) => {
             let ty = *base_type;
             Box::new(move |vm: &mut VM, _prog| {
-                let matched = vm.local(val_slot).is_some_and(|v| v.base_type() == ty);
+                let matched = vm.local(val_slot).base_type() == ty;
                 Ok(Action::NextBlock(if matched {
                     target_idx
                 } else {
@@ -182,7 +149,7 @@ pub(super) fn compile_single_arm_match(
         MatchPattern::Literal(lit) => {
             let pred = compile_match_predicate(&MatchPattern::Literal(lit.clone()));
             Box::new(move |vm: &mut VM, _prog| {
-                let matched = vm.local(val_slot).is_some_and(&pred);
+                let matched = pred(vm.local(val_slot));
                 Ok(Action::NextBlock(if matched {
                     target_idx
                 } else {
@@ -193,9 +160,7 @@ pub(super) fn compile_single_arm_match(
         MatchPattern::Array(len) => {
             let expected = *len;
             Box::new(move |vm: &mut VM, _prog| {
-                let matched = vm
-                    .local(val_slot)
-                    .is_some_and(|v| matches!(v, Value::Array(a) if a.len() == expected));
+                let matched = matches!(vm.local(val_slot), Value::Array(a) if a.len() == expected);
                 Ok(Action::NextBlock(if matched {
                     target_idx
                 } else {
@@ -206,9 +171,7 @@ pub(super) fn compile_single_arm_match(
         MatchPattern::ArrayMin(min) => {
             let expected = *min;
             Box::new(move |vm: &mut VM, _prog| {
-                let matched = vm
-                    .local(val_slot)
-                    .is_some_and(|v| matches!(v, Value::Array(a) if a.len() >= expected));
+                let matched = matches!(vm.local(val_slot), Value::Array(a) if a.len() >= expected);
                 Ok(Action::NextBlock(if matched {
                     target_idx
                 } else {
@@ -253,6 +216,7 @@ pub(super) fn compile_match_predicate(pattern: &MatchPattern) -> Box<dyn Fn(&Val
                 let e = expected.clone();
                 Box::new(move |v| matches!(v, Value::Bytes(b) if **b == *e))
             }
+            Literal::Undefined => Box::new(|v| v.is_undefined()),
         },
         MatchPattern::Array(len) => {
             let expected = *len;
