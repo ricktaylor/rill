@@ -146,8 +146,8 @@ impl Purity {
     }
 }
 
-impl std::fmt::Debug for Purity {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for Purity {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Purity::Impure => write!(f, "Impure"),
             Purity::Pure { fallible } => write!(f, "Pure {{ fallible: {} }}", fallible),
@@ -342,8 +342,8 @@ pub enum ExternImpl {
     Closure(Box<dyn Fn(&mut VM, usize) -> Result<ExecResult, ExecError> + Send + Sync>),
 }
 
-impl std::fmt::Debug for ExternImpl {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for ExternImpl {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             ExternImpl::Native(_) => write!(f, "Native(fn)"),
             ExternImpl::Closure(_) => write!(f, "Closure(dyn Fn)"),
@@ -379,8 +379,8 @@ pub struct ExternVariant {
     pub implementation: ExternImpl,
 }
 
-impl std::fmt::Debug for ExternVariant {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for ExternVariant {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("ExternVariant")
             .field("param_types", &self.param_types)
             .field("returns", &self.returns)
@@ -400,8 +400,8 @@ pub struct ExternDef {
     pub variants: Vec<ExternVariant>,
 }
 
-impl std::fmt::Debug for ExternDef {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for ExternDef {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("ExternDef")
             .field("name", &self.name)
             .field("meta", &self.meta)

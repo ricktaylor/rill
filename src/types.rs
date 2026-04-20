@@ -26,10 +26,9 @@ pub enum BaseType {
     Sequence,
 }
 
-impl BaseType {
-    /// Returns the type name as used in source code (for error messages)
-    pub fn name(&self) -> &'static str {
-        match self {
+impl core::fmt::Display for BaseType {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
             BaseType::Bool => "Bool",
             BaseType::UInt => "UInt",
             BaseType::Int => "Int",
@@ -39,9 +38,11 @@ impl BaseType {
             BaseType::Array => "Array",
             BaseType::Map => "Map",
             BaseType::Sequence => "Sequence",
-        }
+        })
     }
+}
 
+impl BaseType {
     /// Check if this is a numeric type
     pub fn is_numeric(&self) -> bool {
         matches!(self, BaseType::UInt | BaseType::Int | BaseType::Float)
@@ -114,12 +115,12 @@ pub struct TypeSet {
     bits: u16,
 }
 
-impl std::fmt::Debug for TypeSet {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let types: Vec<&str> = BaseType::ALL
+impl core::fmt::Debug for TypeSet {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let types: Vec<_> = BaseType::ALL
             .iter()
             .filter(|t| self.contains(**t))
-            .map(|t| t.name())
+            .map(|t| t.to_string())
             .collect();
         write!(f, "TypeSet{{{}}}", types.join(", "))
     }
