@@ -59,8 +59,8 @@ pub fn insert_coercions(function: &mut Function, types: &TypeAnalysis) -> usize 
                     // Incompatible: if either arg is provably non-numeric
                     // (known type with no numeric intersection), the op
                     // always produces undefined.
-                    let a_incompatible = a_numeric.is_empty() && !a_type.is_empty();
-                    let b_incompatible = b_numeric.is_empty() && !b_type.is_empty();
+                    let a_incompatible = a_numeric.is_dead() && !a_type.is_dead();
+                    let b_incompatible = b_numeric.is_dead() && !b_type.is_dead();
                     if a_incompatible || b_incompatible {
                         new_instructions.push(spanned(
                             Instruction::Const {
@@ -145,7 +145,7 @@ fn lookup_type(types: &TypeAnalysis, block: BlockId, var: VarId) -> TypeSet {
     types
         .get_at_exit(block, var)
         .copied()
-        .unwrap_or(TypeSet::all())
+        .unwrap_or(TypeSet::any())
 }
 
 /// Extract the single numeric BaseType from a TypeSet, if it contains exactly one.
@@ -343,7 +343,7 @@ mod tests {
         let locals = vec![
             Var::new(var(0), ast::Identifier("a".into()), TypeSet::uint()),
             Var::new(var(1), ast::Identifier("b".into()), TypeSet::uint()),
-            Var::new(var(2), ast::Identifier("r".into()), TypeSet::all()),
+            Var::new(var(2), ast::Identifier("r".into()), TypeSet::any()),
         ];
         let blocks = vec![BasicBlock {
             id: block_id(0),
@@ -389,7 +389,7 @@ mod tests {
         let locals = vec![
             Var::new(var(0), ast::Identifier("a".into()), TypeSet::uint()),
             Var::new(var(1), ast::Identifier("b".into()), TypeSet::int()),
-            Var::new(var(2), ast::Identifier("r".into()), TypeSet::all()),
+            Var::new(var(2), ast::Identifier("r".into()), TypeSet::any()),
         ];
         let blocks = vec![BasicBlock {
             id: block_id(0),
@@ -445,7 +445,7 @@ mod tests {
         let locals = vec![
             Var::new(var(0), ast::Identifier("a".into()), TypeSet::bool()),
             Var::new(var(1), ast::Identifier("b".into()), TypeSet::uint()),
-            Var::new(var(2), ast::Identifier("r".into()), TypeSet::all()),
+            Var::new(var(2), ast::Identifier("r".into()), TypeSet::any()),
         ];
         let blocks = vec![BasicBlock {
             id: block_id(0),
@@ -486,7 +486,7 @@ mod tests {
         let locals = vec![
             Var::new(var(0), ast::Identifier("a".into()), TypeSet::int()),
             Var::new(var(1), ast::Identifier("b".into()), TypeSet::float()),
-            Var::new(var(2), ast::Identifier("r".into()), TypeSet::all()),
+            Var::new(var(2), ast::Identifier("r".into()), TypeSet::any()),
         ];
         let blocks = vec![BasicBlock {
             id: block_id(0),
@@ -529,9 +529,9 @@ mod tests {
     fn test_unknown_types_left_alone() {
         // Add(param, param) where types are unknown → no change
         let locals = vec![
-            Var::new(var(0), ast::Identifier("a".into()), TypeSet::all()),
-            Var::new(var(1), ast::Identifier("b".into()), TypeSet::all()),
-            Var::new(var(2), ast::Identifier("r".into()), TypeSet::all()),
+            Var::new(var(0), ast::Identifier("a".into()), TypeSet::any()),
+            Var::new(var(1), ast::Identifier("b".into()), TypeSet::any()),
+            Var::new(var(2), ast::Identifier("r".into()), TypeSet::any()),
         ];
         let blocks = vec![BasicBlock {
             id: block_id(0),

@@ -355,7 +355,7 @@ mod tests {
         let locals = vec![Var::new(
             var(0),
             ast::Identifier("r".into()),
-            TypeSet::all(),
+            TypeSet::any(),
         )];
         let blocks = vec![BasicBlock {
             id: block(0),
@@ -428,7 +428,7 @@ mod tests {
                 TypeSet::single(crate::types::BaseType::Array),
             ),
             Var::new(var(1), ast::Identifier("idx".into()), TypeSet::uint()),
-            Var::new(var(2), ast::Identifier("elem".into()), TypeSet::all()),
+            Var::new(var(2), ast::Identifier("elem".into()), TypeSet::any()),
         ];
         let blocks = vec![BasicBlock {
             id: block(0),
@@ -502,7 +502,7 @@ mod tests {
     fn test_keep_writeref() {
         // WriteRef has side effects — always keep
         let locals = vec![
-            Var::new(var(0), ast::Identifier("r".into()), TypeSet::all()),
+            Var::new(var(0), ast::Identifier("r".into()), TypeSet::any()),
             Var::new(var(1), ast::Identifier("v".into()), TypeSet::uint()),
         ];
         let blocks = vec![BasicBlock {

@@ -191,7 +191,7 @@ impl<'a> Lowerer<'a> {
 
     /// Create an undefined value as error recovery placeholder
     pub fn error_placeholder(&mut self) -> VarId {
-        let dest = self.new_temp(TypeSet::empty());
+        let dest = self.new_temp(TypeSet::undefined());
         self.emit(Instruction::Const {
             dest,
             value: Literal::Undefined,
@@ -281,7 +281,7 @@ impl<'a> Lowerer<'a> {
     /// Emit a `Read` instruction: read the current value of `slot` into a
     /// fresh VarId. Returns the dest VarId.
     pub fn emit_read(&mut self, slot: u32) -> VarId {
-        let dest = self.new_temp(TypeSet::all());
+        let dest = self.new_temp(TypeSet::any());
         self.emit(Instruction::Read { slot, dest });
         dest
     }

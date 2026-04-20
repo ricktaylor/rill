@@ -87,7 +87,7 @@ mod tests {
         // Convert(UInt, Unchecked, [UInt_var]) where source is UInt → Copy
         let locals = vec![
             Var::new(var(0), ast::Identifier("x".into()), TypeSet::uint()),
-            Var::new(var(1), ast::Identifier("r".into()), TypeSet::all()),
+            Var::new(var(1), ast::Identifier("r".into()), TypeSet::any()),
         ];
         let blocks = vec![BasicBlock {
             id: block(0),
@@ -123,7 +123,7 @@ mod tests {
         // Convert(Int, Unchecked, [UInt_var]) → not identity, keep
         let locals = vec![
             Var::new(var(0), ast::Identifier("x".into()), TypeSet::uint()),
-            Var::new(var(1), ast::Identifier("r".into()), TypeSet::all()),
+            Var::new(var(1), ast::Identifier("r".into()), TypeSet::any()),
         ];
         let blocks = vec![BasicBlock {
             id: block(0),
@@ -162,7 +162,7 @@ mod tests {
         // Convert(Int, Checked, [Int_var]) where source is Int → Copy
         let locals = vec![
             Var::new(var(0), ast::Identifier("x".into()), TypeSet::int()),
-            Var::new(var(1), ast::Identifier("r".into()), TypeSet::all()),
+            Var::new(var(1), ast::Identifier("r".into()), TypeSet::any()),
         ];
         let blocks = vec![BasicBlock {
             id: block(0),

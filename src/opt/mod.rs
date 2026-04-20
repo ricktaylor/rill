@@ -19,7 +19,9 @@ mod const_fold;
 mod copy_prop;
 mod cse;
 mod dce;
-mod definedness;
+// Definedness analysis removed — definedness is now tracked via BaseType::Undefined
+// in the TypeSet. Guard elimination handled by eliminate_dead_match_arms.
+// TODO: Re-add E200/E201 diagnostics via type-based checks.
 mod guard_elim;
 mod ref_elision;
 mod type_refinement;
@@ -31,14 +33,10 @@ pub use const_fold::fold_constants;
 pub use copy_prop::propagate_copies;
 pub use cse::eliminate_common_subexpressions;
 pub use dce::eliminate_dead_code;
-pub use definedness::{
-    Definedness, DefinednessAnalysis, analyze_definedness, analyze_definedness_full,
-    check_definedness,
-};
-pub use guard_elim::{eliminate_guards, simplify_cfg};
+pub use guard_elim::simplify_cfg;
 pub use ref_elision::elide_refs;
 pub use type_refinement::{
-    ParamDefinedness, ParamTypes, ReturnTypes, TypeAnalysis, analyze_types, infer_return_type,
+    ParamTypes, ReturnTypes, TypeAnalysis, analyze_types, infer_return_type,
 };
 
 // Import IR types from parent module
@@ -73,8 +71,8 @@ pub fn optimize(program: &mut IrProgram, externs: &ExternRegistry, diagnostics: 
     //
     // B1 and B2 iterate until stable (handles forward refs, recursion, mutual recursion).
 
-    // B1: Collect argument types, definedness, and purity from call sites
-    let (param_types, param_defs) = collect_param_info(program, Some(externs));
+    // B1: Collect argument types and purity from call sites
+    let param_types = collect_param_info(program, Some(externs));
     let pure_functions = collect_pure_functions(program, Some(externs));
 
     // B2: Return type inference (uses narrowed param types)
@@ -87,7 +85,7 @@ pub fn optimize(program: &mut IrProgram, externs: &ExternRegistry, diagnostics: 
             let old = return_types
                 .get(&name)
                 .copied()
-                .unwrap_or(crate::types::TypeSet::empty());
+                .unwrap_or(crate::types::TypeSet::none());
             if rt != old {
                 return_types.insert(name, rt);
                 changed = true;
@@ -104,8 +102,7 @@ pub fn optimize(program: &mut IrProgram, externs: &ExternRegistry, diagnostics: 
     if !return_types.is_empty() || !param_types.is_empty() {
         for function in &mut program.functions {
             let name = function.name.to_string();
-            let has_narrowed_params =
-                param_types.contains_key(name.as_str()) || param_defs.contains_key(name.as_str());
+            let has_narrowed_params = param_types.contains_key(name.as_str());
             let has_user_calls = function.blocks.iter().any(|block| {
                 block.instructions.iter().any(|inst| {
                     if let Instruction::Call {
@@ -134,8 +131,6 @@ pub fn optimize(program: &mut IrProgram, externs: &ExternRegistry, diagnostics: 
                 let dead_arms = eliminate_dead_match_arms(function, &types);
 
                 if coercions + cast_elisions + algebra + condition_folds + dead_arms > 0 {
-                    // Use interprocedural param definedness + purity in the fixpoint loop
-                    let pd = param_defs.get(name.as_str()).map(|v| v.as_slice());
                     loop {
                         let folded = fold_constants(function, externs, diagnostics);
                         let cse = cse::eliminate_common_subexpressions_with_purity(
@@ -151,10 +146,8 @@ pub fn optimize(program: &mut IrProgram, externs: &ExternRegistry, diagnostics: 
                         );
                         let refs = elide_refs(function);
                         let coerce = elide_coercions(function);
-                        let definedness = analyze_definedness_full(function, Some(externs), pd);
-                        let guards = eliminate_guards(function, &definedness);
                         let blocks = simplify_cfg(function);
-                        if folded + cse + copies + dead + refs + coerce + guards + blocks == 0 {
+                        if folded + cse + copies + dead + refs + coerce + blocks == 0 {
                             break;
                         }
                     }
@@ -274,7 +267,7 @@ fn monomorphize(program: &mut IrProgram, externs: &ExternRegistry) {
                             types
                                 .get_at_exit(block.id, a.value)
                                 .copied()
-                                .unwrap_or(crate::types::TypeSet::all())
+                                .unwrap_or(crate::types::TypeSet::any())
                         })
                         .collect();
 
@@ -401,10 +394,7 @@ fn monomorphize(program: &mut IrProgram, externs: &ExternRegistry) {
 /// For each user function, unions the argument TypeSets and meets the argument
 /// Definedness from all callers. If all callers pass Defined UInt for param 0,
 /// then param 0 narrows to `{UInt}` + `Defined`.
-fn collect_param_info(
-    program: &IrProgram,
-    externs: Option<&ExternRegistry>,
-) -> (ParamTypes, ParamDefinedness) {
+fn collect_param_info(program: &IrProgram, externs: Option<&ExternRegistry>) -> ParamTypes {
     // Build function name → param count map
     let func_param_counts: HashMap<String, usize> = program
         .functions
@@ -413,12 +403,9 @@ fn collect_param_info(
         .collect();
 
     let mut param_types = ParamTypes::new();
-    let mut param_defs = ParamDefinedness::new();
 
     for function in &program.functions {
-        // Run type + definedness analysis on this function
         let types = analyze_types(function, externs);
-        let defs = analyze_definedness(function, externs);
 
         for block in &function.blocks {
             for inst in &block.instructions {
@@ -437,24 +424,15 @@ fn collect_param_info(
 
                     let type_entry = param_types
                         .entry(callee_name.clone())
-                        .or_insert_with(|| vec![crate::types::TypeSet::empty(); param_count]);
-
-                    let def_entry = param_defs
-                        .entry(callee_name)
-                        .or_insert_with(|| vec![Definedness::Defined; param_count]);
+                        .or_insert_with(|| vec![crate::types::TypeSet::none(); param_count]);
 
                     for (i, arg) in args.iter().enumerate() {
                         if i < param_count {
-                            // Union types
                             let arg_type = types
                                 .get_at_exit(block.id, arg.value)
                                 .copied()
                                 .unwrap_or_else(type_refinement::all_types);
                             type_entry[i] = type_entry[i].union(&arg_type);
-
-                            // Meet definedness (most conservative across callers)
-                            let arg_def = defs.get_at_exit(block.id, arg.value);
-                            def_entry[i] = def_entry[i].meet(arg_def);
                         }
                     }
                 }
@@ -462,7 +440,7 @@ fn collect_param_info(
         }
     }
 
-    (param_types, param_defs)
+    param_types
 }
 
 /// Run all optimization passes on a single function
@@ -479,7 +457,6 @@ pub fn optimize_function(
     // new Defined values → guard elim removes guards → CFG simplify
     // removes dead blocks → Phi nodes lose sources → new constants.
 
-    let mut first_iteration = true;
     loop {
         let folded = fold_constants(function, externs, diagnostics);
         let cse = eliminate_common_subexpressions(function);
@@ -487,20 +464,9 @@ pub fn optimize_function(
         let dead = eliminate_dead_code(function);
         let refs = elide_refs(function);
         let coerce = elide_coercions(function);
-
-        let definedness = analyze_definedness(function, Some(externs));
-
-        // Emit definedness diagnostics only on the first iteration,
-        // before guard elimination reshapes the control flow.
-        if first_iteration {
-            check_definedness(function, &definedness, Some(externs), diagnostics);
-            first_iteration = false;
-        }
-
-        let guards = eliminate_guards(function, &definedness);
         let blocks = simplify_cfg(function);
 
-        if folded + cse + copies + dead + refs + coerce + guards + blocks == 0 {
+        if folded + cse + copies + dead + refs + coerce + blocks == 0 {
             break;
         }
     }
@@ -547,17 +513,19 @@ pub fn optimize_function(
             let dead = eliminate_dead_code(function);
             let refs = elide_refs(function);
             let coerce = elide_coercions(function);
-            let definedness = analyze_definedness(function, Some(externs));
-            let guards = eliminate_guards(function, &definedness);
             let blocks = simplify_cfg(function);
-            if folded + cse + copies + dead + refs + coerce + guards + blocks == 0 {
+            if folded + cse + copies + dead + refs + coerce + blocks == 0 {
                 break;
             }
         }
     }
 
-    // ── Phase 3: Cleanup ───────────────────────────────────────────────
-    // DCE runs in both fixpoint loops above. Nothing else needed here.
+    // ── Phase 3: Post-optimisation diagnostics ─────────────────────────
+    // Run after all optimisation passes so that dead code elimination,
+    // constant folding, and type narrowing have had a chance to prove
+    // definedness. Any Undefined that survives is genuinely reachable.
+    let final_types = analyze_types(function, Some(externs));
+    check_definedness_warnings(function, &final_types, diagnostics);
 }
 
 /// Warn when intrinsic operand types guarantee the result is always undefined.
@@ -589,9 +557,9 @@ fn check_intrinsic_types(
                 let actual = types
                     .get_at_exit(block.id, *arg)
                     .copied()
-                    .unwrap_or(crate::types::TypeSet::all());
+                    .unwrap_or(crate::types::TypeSet::any());
 
-                if actual.intersection(&required).is_empty() && !actual.is_empty() {
+                if actual.intersection(&required).is_dead() && !actual.is_dead() {
                     diagnostics.warning(
                         crate::diagnostics::DiagnosticCode::W009_TypeMismatch,
                         inst.span,
@@ -628,9 +596,9 @@ fn fold_non_bool_conditions(
                 let cond_type = types
                     .get_at_exit(block.id, *condition)
                     .copied()
-                    .unwrap_or(crate::types::TypeSet::all());
+                    .unwrap_or(crate::types::TypeSet::any());
 
-                if !cond_type.contains(crate::types::BaseType::Bool) && !cond_type.is_empty() {
+                if !cond_type.contains(crate::types::BaseType::Bool) && !cond_type.is_dead() {
                     (*else_target, *span)
                 } else {
                     continue;
@@ -673,7 +641,7 @@ fn eliminate_dead_match_arms(
         };
 
         let scrutinee_type = match types.get_at_exit(block.id, value) {
-            Some(ts) if !ts.is_empty() => *ts,
+            Some(ts) if !ts.is_dead() => *ts,
             _ => continue, // unknown type — can't prune
         };
 
@@ -772,9 +740,9 @@ fn check_condition_types(
         let actual = types
             .get_at_exit(block.id, cond_var)
             .copied()
-            .unwrap_or(crate::types::TypeSet::all());
+            .unwrap_or(crate::types::TypeSet::any());
 
-        if !actual.contains(crate::types::BaseType::Bool) && !actual.is_empty() {
+        if !actual.contains(crate::types::BaseType::Bool) && !actual.is_dead() {
             diagnostics.warning(
                 crate::diagnostics::DiagnosticCode::W009_TypeMismatch,
                 span,
@@ -783,6 +751,65 @@ fn check_condition_types(
                     function.name, actual,
                 ),
             );
+        }
+    }
+}
+
+/// Warn when a possibly-undefined value is used as an intrinsic argument.
+///
+/// This replaces the old definedness pass's E201 warnings. The check is
+/// simpler: if the TypeSet at a use site contains `BaseType::Undefined`,
+/// the value might be undefined at runtime. After type refinement, Match
+/// arms with `Type(Undefined)` have already narrowed the type — so on the
+/// "defined" branch, Undefined is excluded and no warning is emitted.
+///
+/// Skips MakeArray/MakeMap (undefined elements are intentionally dropped)
+/// and SeqNext/Collect (inherently fallible).
+fn check_definedness_warnings(
+    function: &Function,
+    types: &type_refinement::TypeAnalysis,
+    diagnostics: &mut crate::diagnostics::Diagnostics,
+) {
+    for block in &function.blocks {
+        for inst in &block.instructions {
+            let (op_name, args, span) = match &inst.node {
+                Instruction::Intrinsic { op, args, .. } => {
+                    // Skip ops where undefined args are handled semantically
+                    if matches!(
+                        op,
+                        IntrinsicOp::MakeArray
+                            | IntrinsicOp::MakeMap
+                            | IntrinsicOp::Collect
+                            | IntrinsicOp::SeqNext
+                    ) {
+                        continue;
+                    }
+                    (format!("{:?}", op), args.as_slice(), inst.span)
+                }
+                _ => continue,
+            };
+
+            for (i, arg) in args.iter().enumerate() {
+                let arg_type = types
+                    .get_at_exit(block.id, *arg)
+                    .copied()
+                    .unwrap_or(crate::types::TypeSet::any());
+
+                if arg_type.may_be_undefined() {
+                    diagnostics.warning(
+                        crate::diagnostics::DiagnosticCode::E201_UseOfMaybeUndefined,
+                        span,
+                        format!(
+                            "use of possibly undefined value `_{:?}` as argument {} to \
+                             intrinsic `{}` in function `{}`; consider adding a guard",
+                            arg.0,
+                            i + 1,
+                            op_name,
+                            function.name,
+                        ),
+                    );
+                }
+            }
         }
     }
 }
@@ -923,7 +950,7 @@ mod tests {
         let locals = vec![Var::new(
             var(0),
             ast::Identifier("x".into()),
-            TypeSet::all(),
+            TypeSet::any(),
         )];
         let blocks = vec![BasicBlock {
             id: block(0),
@@ -1040,9 +1067,9 @@ mod tests {
             }],
             rest_param: None,
             locals: vec![
-                Var::new(var(0), ast::Identifier("x".into()), TypeSet::all()),
+                Var::new(var(0), ast::Identifier("x".into()), TypeSet::any()),
                 Var::new(var(1), ast::Identifier("one".into()), TypeSet::uint()),
-                Var::new(var(2), ast::Identifier("r".into()), TypeSet::all()),
+                Var::new(var(2), ast::Identifier("r".into()), TypeSet::any()),
             ],
             blocks: vec![BasicBlock {
                 id: block(0),
@@ -1070,7 +1097,7 @@ mod tests {
             rest_param: None,
             locals: vec![
                 Var::new(var(10), ast::Identifier("arg".into()), TypeSet::uint()),
-                Var::new(var(11), ast::Identifier("result".into()), TypeSet::all()),
+                Var::new(var(11), ast::Identifier("result".into()), TypeSet::any()),
             ],
             blocks: vec![BasicBlock {
                 id: block(0),
@@ -1103,17 +1130,13 @@ mod tests {
             constants: vec![],
         };
 
-        let (param_types, param_defs) = collect_param_info(&program, None);
+        let param_types = collect_param_info(&program, None);
 
-        // callee's param x should be {UInt}
+        // callee's param x should be {UInt} (and defined — no Undefined in the set)
         let callee_types = param_types.get("callee").unwrap();
         assert_eq!(callee_types.len(), 1);
         assert!(callee_types[0].is_single());
         assert!(callee_types[0].contains(crate::types::BaseType::UInt));
-
-        // callee's param x should be Defined
-        let callee_defs = param_defs.get("callee").unwrap();
-        assert_eq!(callee_defs.len(), 1);
-        assert_eq!(callee_defs[0], Definedness::Defined);
+        assert!(callee_types[0].is_defined());
     }
 }

@@ -30,7 +30,7 @@ impl<'a> Lowerer<'a> {
                         _ => None, // Array/Map constants can't be inlined as literals
                     };
                     if let Some(lit) = lit {
-                        let dest = self.new_temp(TypeSet::all());
+                        let dest = self.new_temp(TypeSet::any());
                         self.emit(Instruction::Const { dest, value: lit });
                         dest
                     } else {
@@ -68,7 +68,7 @@ impl<'a> Lowerer<'a> {
             ast::Expression::ArrayAccess { array, index } => {
                 let base = self.lower_expression(array);
                 let key = self.lower_expression(index);
-                let dest = self.new_temp(TypeSet::all());
+                let dest = self.new_temp(TypeSet::any());
                 self.emit(Instruction::Index { dest, base, key });
                 dest
             }
@@ -76,7 +76,7 @@ impl<'a> Lowerer<'a> {
             ast::Expression::MemberAccess { object, member } => {
                 let base = self.lower_expression(object);
                 let key = self.lower_expression(member);
-                let dest = self.new_temp(TypeSet::all());
+                let dest = self.new_temp(TypeSet::any());
                 self.emit(Instruction::Index { dest, base, key });
                 dest
             }
@@ -92,7 +92,7 @@ impl<'a> Lowerer<'a> {
                 let result = if let Some(expr) = final_expr {
                     self.lower_expression(expr)
                 } else {
-                    let dest = self.new_temp(TypeSet::empty());
+                    let dest = self.new_temp(TypeSet::undefined());
                     self.emit(Instruction::Const {
                         dest,
                         value: Literal::Undefined,
@@ -162,7 +162,7 @@ impl<'a> Lowerer<'a> {
                     ),
                 );
                 // Return undefined — error already emitted
-                let dest = self.new_temp(TypeSet::empty());
+                let dest = self.new_temp(TypeSet::undefined());
                 self.emit(Instruction::Const {
                     dest,
                     value: Literal::Undefined,
@@ -506,7 +506,7 @@ impl<'a> Lowerer<'a> {
         let has_type_guards = param_specs.is_some_and(|specs| {
             specs
                 .iter()
-                .any(|s| !s.type_sig.is_empty() && s.type_sig != TypeSet::all())
+                .any(|s| !s.type_sig.is_dead() && s.type_sig != TypeSet::any())
         });
 
         if has_type_guards {
@@ -519,9 +519,9 @@ impl<'a> Lowerer<'a> {
                 let type_sig = param_specs
                     .and_then(|specs| specs.get(i))
                     .map(|s| s.type_sig)
-                    .unwrap_or(TypeSet::all());
+                    .unwrap_or(TypeSet::any());
 
-                if type_sig.is_empty() || type_sig == TypeSet::all() {
+                if type_sig.is_dead() || type_sig == TypeSet::any() {
                     continue; // no constraint
                 }
 
@@ -549,7 +549,7 @@ impl<'a> Lowerer<'a> {
             // Call block
             self.current_block = call_bb;
             self.current_instructions = Vec::new();
-            let call_dest = self.new_temp(TypeSet::all());
+            let call_dest = self.new_temp(TypeSet::any());
             self.emit(Instruction::Call {
                 dest: call_dest,
                 function: FunctionRef {
@@ -564,7 +564,7 @@ impl<'a> Lowerer<'a> {
             // Skip block — type mismatch, result is undefined
             self.current_block = skip_bb;
             self.current_instructions = Vec::new();
-            let undef_dest = self.new_temp(TypeSet::empty());
+            let undef_dest = self.new_temp(TypeSet::undefined());
             self.emit(Instruction::Const {
                 dest: undef_dest,
                 value: Literal::Undefined,
@@ -575,7 +575,7 @@ impl<'a> Lowerer<'a> {
             // Join with phi
             self.current_block = join_bb;
             self.current_instructions = Vec::new();
-            let result = self.new_temp(TypeSet::all());
+            let result = self.new_temp(TypeSet::any());
             self.emit(Instruction::Phi {
                 dest: result,
                 sources: vec![(call_exit, call_dest), (skip_exit, undef_dest)],
@@ -583,7 +583,7 @@ impl<'a> Lowerer<'a> {
             result
         } else {
             // No type constraints — emit call directly
-            let dest = self.new_temp(TypeSet::all());
+            let dest = self.new_temp(TypeSet::any());
             self.emit(Instruction::Call {
                 dest,
                 function: FunctionRef {
@@ -640,7 +640,7 @@ impl<'a> Lowerer<'a> {
             ast::Expression::ArrayAccess { array, index } => {
                 let base = self.lower_expression(array);
                 let key = self.lower_expression(index);
-                let dest = self.new_temp(TypeSet::all());
+                let dest = self.new_temp(TypeSet::any());
                 self.emit(Instruction::MakeRef {
                     dest,
                     base,
@@ -653,7 +653,7 @@ impl<'a> Lowerer<'a> {
             ast::Expression::MemberAccess { object, member } => {
                 let base = self.lower_expression(object);
                 let key = self.lower_expression(member);
-                let dest = self.new_temp(TypeSet::all());
+                let dest = self.new_temp(TypeSet::any());
                 self.emit(Instruction::MakeRef {
                     dest,
                     base,
@@ -665,7 +665,7 @@ impl<'a> Lowerer<'a> {
 
             ast::Expression::Variable(name) => {
                 if let Some(var) = self.read_var(name) {
-                    let dest = self.new_temp(TypeSet::all());
+                    let dest = self.new_temp(TypeSet::any());
                     self.emit(Instruction::MakeRef {
                         dest,
                         base: var,

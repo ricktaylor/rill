@@ -304,9 +304,6 @@ fn compile_function(func: &Function, link_map: &LinkMap) -> Result<CompiledFunct
     // instead of the 10-way type dispatch.
     let types = crate::opt::analyze_types(func, None);
 
-    // Definedness analysis for skipping None checks on provably-defined args
-    let defs = crate::opt::analyze_definedness(func, None);
-
     // First pass: compile all blocks, collecting phi metadata
     let mut blocks = Vec::new();
     #[allow(clippy::type_complexity)]
@@ -337,7 +334,7 @@ fn compile_function(func: &Function, link_map: &LinkMap) -> Result<CompiledFunct
         }
 
         blocks.push(compile_block(
-            ir_block, &block_map, link_map, &ref_map, &types, &defs,
+            ir_block, &block_map, link_map, &ref_map, &types,
         )?);
     }
 
@@ -389,7 +386,6 @@ fn compile_block(
     link_map: &LinkMap,
     ref_map: &HashMap<VarId, RefMeta>,
     types: &TypeAnalysis,
-    defs: &crate::opt::DefinednessAnalysis,
 ) -> Result<Vec<Step>, ExecError> {
     let mut steps: Vec<Step> = Vec::new();
 
@@ -400,7 +396,7 @@ fn compile_block(
             Instruction::Phi { .. } => {}
             inst => {
                 if let Some(step) =
-                    compile_instruction(inst, block_map, link_map, ref_map, types, defs, block.id)?
+                    compile_instruction(inst, block_map, link_map, ref_map, types, block.id)?
                 {
                     steps.push(step);
                 }
@@ -413,7 +409,6 @@ fn compile_block(
         &block.terminator,
         block_map,
         types,
-        defs,
         block.id,
     )?);
 
@@ -426,7 +421,6 @@ fn compile_instruction(
     link_map: &LinkMap,
     ref_map: &HashMap<VarId, RefMeta>,
     types: &TypeAnalysis,
-    defs: &crate::opt::DefinednessAnalysis,
     block_id: BlockId,
 ) -> Result<Option<Step>, ExecError> {
     Ok(Some(match inst {
@@ -511,7 +505,10 @@ fn compile_instruction(
         Instruction::Copy { dest, src } => {
             let d = slot(*dest);
             let s = slot(*src);
-            if defs.get_at_exit(block_id, *src) == crate::opt::Definedness::Defined {
+            if types
+                .get_at_exit(block_id, *src)
+                .is_some_and(|t| t.is_defined())
+            {
                 Box::new(move |vm: &mut VM, _prog| {
                     let val = vm.local(s).clone();
                     vm.set_local(d, val);
@@ -667,7 +664,7 @@ fn compile_instruction(
                                 types
                                     .get_at_exit(block_id, a.value)
                                     .copied()
-                                    .unwrap_or(TypeSet::all())
+                                    .unwrap_or(TypeSet::any())
                             })
                             .collect();
                         variants
@@ -675,7 +672,7 @@ fn compile_instruction(
                             .find(|(param_types, _, _)| {
                                 param_types.len() == arg_types.len()
                                     && param_types.iter().zip(&arg_types).all(|(spec, actual)| {
-                                        !actual.is_empty() && actual.difference(spec).is_empty()
+                                        !actual.is_dead() && actual.difference(spec).is_dead()
                                     })
                             })
                             .map(|(_, _, vf)| *vf)

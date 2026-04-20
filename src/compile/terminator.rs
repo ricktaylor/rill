@@ -4,7 +4,6 @@ pub(super) fn compile_terminator(
     term: &Terminator,
     block_map: &HashMap<BlockId, usize>,
     types: &TypeAnalysis,
-    defs: &crate::opt::DefinednessAnalysis,
     block_id: BlockId,
 ) -> Result<Step, ExecError> {
     Ok(match term {
@@ -26,31 +25,20 @@ pub(super) fn compile_terminator(
             let cond_type = types
                 .get_at_exit(block_id, *condition)
                 .copied()
-                .unwrap_or(crate::types::TypeSet::all());
-            let cond_def = defs.get_at_exit(block_id, *condition);
+                .unwrap_or(crate::types::TypeSet::any());
 
             // Non-Bool conditions should have been folded to Jump(else) by the
-            // optimizer's fold_non_bool_conditions pass.
+            // optimizer's fold_non_bool_conditions pass. is_dead() = unreachable
+            // code where the type is bottom — not worth asserting on.
             debug_assert!(
-                cond_type.contains(BaseType::Bool) || cond_type.is_empty(),
+                cond_type.contains(BaseType::Bool)
+                    || cond_type.may_be_undefined()
+                    || cond_type.is_dead(),
                 "If condition with non-Bool type {:?} should have been folded by optimizer",
                 cond_type
             );
 
-            // Provably Bool and Defined → skip null + type checks
-            if cond_type.is_single()
-                && cond_type.contains(BaseType::Bool)
-                && cond_def == crate::opt::Definedness::Defined
-            {
-                return Ok(Box::new(move |vm: &mut VM, _prog| {
-                    let is_true = match vm.local(cond_slot) {
-                        Value::Bool(b) => *b,
-                        _ => unreachable!(),
-                    };
-                    Ok(Action::NextBlock(if is_true { then_idx } else { else_idx }))
-                }));
-            }
-
+            // All conditions go through the same path — Undefined is treated as false
             Box::new(move |vm: &mut VM, _prog| {
                 let is_true = matches!(vm.local(cond_slot), Value::Bool(true));
                 Ok(Action::NextBlock(if is_true { then_idx } else { else_idx }))

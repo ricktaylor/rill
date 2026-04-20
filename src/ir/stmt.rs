@@ -182,7 +182,7 @@ impl<'a> Lowerer<'a> {
                 // Undefined path: skip rhs evaluation, return undefined
                 self.current_block = undefined_bb;
                 self.current_instructions = Vec::new();
-                let undef_result = self.new_temp(TypeSet::empty());
+                let undef_result = self.new_temp(TypeSet::undefined());
                 self.emit(Instruction::Const {
                     dest: undef_result,
                     value: Literal::Undefined,
@@ -192,7 +192,7 @@ impl<'a> Lowerer<'a> {
                 // Join with phi
                 self.current_block = join_bb;
                 self.current_instructions = Vec::new();
-                let result = self.new_temp(TypeSet::all());
+                let result = self.new_temp(TypeSet::any());
                 self.emit(Instruction::Phi {
                     dest: result,
                     sources: vec![(defined_exit, set_result), (undefined_bb, undef_result)],
@@ -247,7 +247,7 @@ impl<'a> Lowerer<'a> {
         } else {
             // Compound assignment: need the current value for the operation.
             // Guard on the slot existing first.
-            let slot_check = self.new_temp(TypeSet::all());
+            let slot_check = self.new_temp(TypeSet::any());
             self.emit(Instruction::Index {
                 dest: slot_check,
                 base,
@@ -283,7 +283,7 @@ impl<'a> Lowerer<'a> {
             // Undefined path: skip, return undefined
             self.current_block = undefined_bb;
             self.current_instructions = Vec::new();
-            let undef_result = self.new_temp(TypeSet::empty());
+            let undef_result = self.new_temp(TypeSet::undefined());
             self.emit(Instruction::Const {
                 dest: undef_result,
                 value: Literal::Undefined,
@@ -293,7 +293,7 @@ impl<'a> Lowerer<'a> {
             // Join with phi
             self.current_block = join_bb;
             self.current_instructions = Vec::new();
-            let result = self.new_temp(TypeSet::all());
+            let result = self.new_temp(TypeSet::any());
             self.emit(Instruction::Phi {
                 dest: result,
                 sources: vec![(defined_exit, final_value), (undefined_bb, undef_result)],

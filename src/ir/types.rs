@@ -136,7 +136,7 @@ impl IntrinsicOp {
             Self::Neg => TypeSet::numeric(),
 
             // Comparison
-            Self::Eq => TypeSet::all(), // any two values can be compared
+            Self::Eq => TypeSet::any(), // any two values can be compared
             Self::Lt => TypeSet::numeric(),
 
             // Logical: Bool only
@@ -157,11 +157,11 @@ impl IntrinsicOp {
 
             // Collection
             Self::Len => TypeSet::collection(),
-            Self::MakeArray | Self::MakeMap => TypeSet::all(),
+            Self::MakeArray | Self::MakeMap => TypeSet::any(),
 
             // Sequence
             Self::MakeSeq => TypeSet::uint(), // start, end
-            Self::ArraySeq(_) => TypeSet::all(),
+            Self::ArraySeq(_) => TypeSet::any(),
             Self::SeqNext => TypeSet::single(BaseType::Sequence), // arg must be Sequence
             Self::Collect => TypeSet::single(BaseType::Sequence),
             // Conversion: single arg (the value to convert)
@@ -187,7 +187,7 @@ impl IntrinsicOp {
             Self::MakeArray => TypeSet::single(BaseType::Array),
             Self::MakeMap => TypeSet::single(BaseType::Map),
             Self::MakeSeq | Self::ArraySeq(_) => TypeSet::single(BaseType::Sequence),
-            Self::SeqNext => TypeSet::all(), // element could be any type
+            Self::SeqNext => TypeSet::any(), // element could be any type
             Self::Collect => TypeSet::single(BaseType::Array),
             Self::Convert(t, _) => TypeSet::single(BaseType::from(t)),
         }
@@ -270,7 +270,7 @@ fn numeric_result_type(a: TypeSet, b: TypeSet) -> TypeSet {
 
 /// Compute the union of possible promoted types when operands have multi-type sets.
 fn promote_union(a: TypeSet, b: TypeSet) -> TypeSet {
-    let mut result = TypeSet::empty();
+    let mut result = TypeSet::none();
 
     let a_u = a.contains(BaseType::UInt);
     let a_i = a.contains(BaseType::Int);
@@ -292,7 +292,7 @@ fn promote_union(a: TypeSet, b: TypeSet) -> TypeSet {
         result = result.union(&TypeSet::single(BaseType::Float));
     }
 
-    if result.is_empty() {
+    if result.is_dead() {
         TypeSet::numeric()
     } else {
         result

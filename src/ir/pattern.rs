@@ -41,7 +41,7 @@ impl<'a> Lowerer<'a> {
 
             ast::Pattern::Variable(name) => match mode {
                 BindingMode::Value => {
-                    let dest = self.new_var(name.clone(), TypeSet::all());
+                    let dest = self.new_var(name.clone(), TypeSet::any());
                     self.emit(Instruction::Copy { dest, src: value });
                     self.bind(name, dest);
                 }
@@ -68,7 +68,7 @@ impl<'a> Lowerer<'a> {
                     });
 
                     let (elem, elem_origin) = if matches!(mode, BindingMode::Reference) {
-                        let dest = self.new_temp(TypeSet::all());
+                        let dest = self.new_temp(TypeSet::any());
                         self.emit(Instruction::MakeRef {
                             dest,
                             base: value,
@@ -77,7 +77,7 @@ impl<'a> Lowerer<'a> {
                         let origin = RefOrigin { ref_var: dest };
                         (dest, Some(origin))
                     } else {
-                        let dest = self.new_temp(TypeSet::all());
+                        let dest = self.new_temp(TypeSet::any());
                         self.emit(Instruction::Index {
                             dest,
                             base: value,
@@ -104,7 +104,7 @@ impl<'a> Lowerer<'a> {
                     });
 
                     let (elem, elem_origin) = if matches!(mode, BindingMode::Reference) {
-                        let dest = self.new_temp(TypeSet::all());
+                        let dest = self.new_temp(TypeSet::any());
                         self.emit(Instruction::MakeRef {
                             dest,
                             base: value,
@@ -113,7 +113,7 @@ impl<'a> Lowerer<'a> {
                         let origin = RefOrigin { ref_var: dest };
                         (dest, Some(origin))
                     } else {
-                        let dest = self.new_temp(TypeSet::all());
+                        let dest = self.new_temp(TypeSet::any());
                         self.emit(Instruction::Index {
                             dest,
                             base: value,
@@ -229,7 +229,7 @@ impl<'a> Lowerer<'a> {
                         let idx = self.emit_binary_intrinsic(IntrinsicOp::Add, after_start, offset);
 
                         let (elem, elem_origin) = if matches!(mode, BindingMode::Reference) {
-                            let dest = self.new_temp(TypeSet::all());
+                            let dest = self.new_temp(TypeSet::any());
                             self.emit(Instruction::MakeRef {
                                 dest,
                                 base: value,
@@ -238,7 +238,7 @@ impl<'a> Lowerer<'a> {
                             let origin = RefOrigin { ref_var: dest };
                             (dest, Some(origin))
                         } else {
-                            let dest = self.new_temp(TypeSet::all());
+                            let dest = self.new_temp(TypeSet::any());
                             self.emit(Instruction::Index {
                                 dest,
                                 base: value,
@@ -279,7 +279,7 @@ impl<'a> Lowerer<'a> {
                     };
 
                     let (val, val_origin) = if matches!(mode, BindingMode::Reference) {
-                        let dest = self.new_temp(TypeSet::all());
+                        let dest = self.new_temp(TypeSet::any());
                         self.emit(Instruction::MakeRef {
                             dest,
                             base: value,
@@ -288,7 +288,7 @@ impl<'a> Lowerer<'a> {
                         let origin = RefOrigin { ref_var: dest };
                         (dest, Some(origin))
                     } else {
-                        let dest = self.new_temp(TypeSet::all());
+                        let dest = self.new_temp(TypeSet::any());
                         self.emit(Instruction::Index {
                             dest,
                             base: value,

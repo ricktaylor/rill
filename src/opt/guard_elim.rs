@@ -1,80 +1,17 @@
-//! Guard Elimination and CFG Simplification (Pass 2)
+//! CFG Simplification
 //!
-//! Uses the definedness analysis results to:
-//! 1. Replace Guard terminators with unconditional jumps when the guarded
-//!    value's definedness is known (Defined or Undefined)
-//! 2. Simplify the resulting CFG by merging blocks and removing unreachable code
+//! Simplifies the control flow graph after optimization passes by:
+//! 1. Removing unreachable blocks (no predecessors except entry)
+//! 2. Merging single-predecessor/single-successor block chains
 
-use super::definedness::{Definedness, DefinednessAnalysis};
 use crate::ir::{BlockId, Function, Instruction, Terminator};
 use std::collections::{HashMap, HashSet};
-
-// ============================================================================
-// Guard Elimination
-// ============================================================================
-
-/// Eliminate guard-like Match terminators where the guarded value's
-/// definedness is known.
-///
-/// A guard-like Match has a single arm matching `Type(Undefined)`.
-/// When the scrutinee's definedness is provably Defined or Undefined,
-/// the Match can be replaced with an unconditional Jump.
-///
-/// Returns the number of guards eliminated
-pub fn eliminate_guards(function: &mut Function, analysis: &DefinednessAnalysis) -> usize {
-    let mut eliminated = 0;
-
-    for block in &mut function.blocks {
-        // Check for guard-like Match: single arm matching Type(Undefined)
-        let (value, undefined_target, defined_target) = match &block.terminator {
-            Terminator::Match {
-                value,
-                arms,
-                default,
-                ..
-            } if arms.len() == 1
-                && matches!(
-                    &arms[0].0,
-                    crate::ir::MatchPattern::Type(crate::types::BaseType::Undefined)
-                ) =>
-            {
-                (*value, arms[0].1, *default)
-            }
-            _ => continue,
-        };
-
-        // Get the definedness of the guarded value at this block's exit
-        let definedness = analysis.get_at_exit(block.id, value);
-
-        match definedness {
-            Definedness::Defined => {
-                // Value is provably defined - jump directly to defined branch (default)
-                block.terminator = Terminator::Jump {
-                    target: defined_target,
-                };
-                eliminated += 1;
-            }
-            Definedness::Undefined => {
-                // Value is provably undefined - jump directly to undefined arm
-                block.terminator = Terminator::Jump {
-                    target: undefined_target,
-                };
-                eliminated += 1;
-            }
-            Definedness::MaybeDefined => {
-                // Need runtime check - keep the Match
-            }
-        }
-    }
-
-    eliminated
-}
 
 // ============================================================================
 // CFG Simplification
 // ============================================================================
 
-/// Simplify the CFG after guard elimination
+/// Simplify the CFG after optimization passes.
 ///
 /// Performs:
 /// 1. Remove unreachable blocks (no predecessors except entry)
@@ -272,10 +209,6 @@ fn merge_block_chains(function: &mut Function) {
 }
 
 // ============================================================================
-// Combined Pass
-// ============================================================================
-
-// ============================================================================
 // Tests
 // ============================================================================
 
@@ -283,9 +216,7 @@ fn merge_block_chains(function: &mut Function) {
 mod tests {
     use super::*;
     use crate::ast;
-    use crate::ir::{BasicBlock, Instruction, Literal, MatchPattern, Param, SpannedInst, VarId};
-    use crate::opt::analyze_definedness;
-    use crate::types::BaseType;
+    use crate::ir::{BasicBlock, Instruction, Literal, SpannedInst, VarId};
 
     fn var(id: u32) -> VarId {
         VarId(id)
@@ -295,7 +226,6 @@ mod tests {
         BlockId(id)
     }
 
-    /// Helper to wrap an instruction with a default span
     fn si(inst: Instruction) -> SpannedInst {
         ast::Spanned::new(inst, ast::Span::default())
     }
@@ -305,219 +235,6 @@ mod tests {
             blocks,
             ..Default::default()
         }
-    }
-
-    fn make_function_with_param(param_var: VarId, blocks: Vec<BasicBlock>) -> Function {
-        Function {
-            params: vec![Param {
-                var: param_var,
-                by_ref: false,
-            }],
-            blocks,
-            ..Default::default()
-        }
-    }
-
-    // ========================================================================
-    // Guard Elimination Tests
-    // ========================================================================
-
-    #[test]
-    fn test_eliminate_guard_on_const() {
-        // Guard on a constant should be eliminated (constants are Defined)
-        //
-        // Block 0: v0 = 42; Match v0 [Undefined->B2] default->B1
-        // Block 1: return v0
-        // Block 2: return undefined
-        let blocks = vec![
-            BasicBlock {
-                id: block(0),
-                instructions: vec![si(Instruction::Const {
-                    dest: var(0),
-                    value: Literal::UInt(42),
-                })],
-                terminator: Terminator::Match {
-                    value: var(0),
-                    arms: vec![(MatchPattern::Type(BaseType::Undefined), block(2))],
-                    default: block(1),
-                    span: ast::Span::default(),
-                },
-            },
-            BasicBlock {
-                id: block(1),
-                instructions: vec![],
-                terminator: Terminator::Return {
-                    value: Some(var(0)),
-                },
-            },
-            BasicBlock {
-                id: block(2),
-                instructions: vec![si(Instruction::Const {
-                    dest: var(1),
-                    value: Literal::Undefined,
-                })],
-                terminator: Terminator::Return {
-                    value: Some(var(1)),
-                },
-            },
-        ];
-
-        let mut func = make_function(blocks);
-        let analysis = analyze_definedness(&func, None);
-        let eliminated = eliminate_guards(&mut func, &analysis);
-
-        assert_eq!(eliminated, 1);
-        assert!(matches!(
-            func.blocks[0].terminator,
-            Terminator::Jump { target } if target == block(1)
-        ));
-    }
-
-    #[test]
-    fn test_eliminate_guard_on_undefined() {
-        // Guard on explicit undefined should jump to undefined arm
-        //
-        // Block 0: v0 = undefined; Match v0 [Undefined->B2] default->B1
-        let blocks = vec![
-            BasicBlock {
-                id: block(0),
-                instructions: vec![si(Instruction::Const {
-                    dest: var(0),
-                    value: Literal::Undefined,
-                })],
-                terminator: Terminator::Match {
-                    value: var(0),
-                    arms: vec![(MatchPattern::Type(BaseType::Undefined), block(2))],
-                    default: block(1),
-                    span: ast::Span::default(),
-                },
-            },
-            BasicBlock {
-                id: block(1),
-                instructions: vec![],
-                terminator: Terminator::Return {
-                    value: Some(var(0)),
-                },
-            },
-            BasicBlock {
-                id: block(2),
-                instructions: vec![],
-                terminator: Terminator::Return { value: None },
-            },
-        ];
-
-        let mut func = make_function(blocks);
-        let analysis = analyze_definedness(&func, None);
-        let eliminated = eliminate_guards(&mut func, &analysis);
-
-        assert_eq!(eliminated, 1);
-        assert!(matches!(
-            func.blocks[0].terminator,
-            Terminator::Jump { target } if target == block(2)
-        ));
-    }
-
-    #[test]
-    fn test_keep_guard_on_param() {
-        // Guard on parameter should be kept (MaybeDefined)
-        //
-        // Block 0: Match v0 [Undefined->B2] default->B1
-        let blocks = vec![
-            BasicBlock {
-                id: block(0),
-                instructions: vec![],
-                terminator: Terminator::Match {
-                    value: var(0),
-                    arms: vec![(MatchPattern::Type(BaseType::Undefined), block(2))],
-                    default: block(1),
-                    span: ast::Span::default(),
-                },
-            },
-            BasicBlock {
-                id: block(1),
-                instructions: vec![],
-                terminator: Terminator::Return {
-                    value: Some(var(0)),
-                },
-            },
-            BasicBlock {
-                id: block(2),
-                instructions: vec![],
-                terminator: Terminator::Return { value: None },
-            },
-        ];
-
-        let mut func = make_function_with_param(var(0), blocks);
-        let analysis = analyze_definedness(&func, None);
-        let eliminated = eliminate_guards(&mut func, &analysis);
-
-        assert_eq!(eliminated, 0);
-        assert!(matches!(
-            func.blocks[0].terminator,
-            Terminator::Match { .. }
-        ));
-    }
-
-    #[test]
-    fn test_eliminate_guard_after_guard() {
-        // Second guard on same value after first guard should be eliminated
-        //
-        // Block 0: Match v0 [Undefined->B2] default->B1
-        // Block 1: Match v0 [Undefined->B4] default->B3  (v0 is Defined here!)
-        let blocks = vec![
-            BasicBlock {
-                id: block(0),
-                instructions: vec![],
-                terminator: Terminator::Match {
-                    value: var(0),
-                    arms: vec![(MatchPattern::Type(BaseType::Undefined), block(2))],
-                    default: block(1),
-                    span: ast::Span::default(),
-                },
-            },
-            BasicBlock {
-                id: block(1),
-                instructions: vec![],
-                terminator: Terminator::Match {
-                    value: var(0),
-                    arms: vec![(MatchPattern::Type(BaseType::Undefined), block(4))],
-                    default: block(3),
-                    span: ast::Span::default(),
-                },
-            },
-            BasicBlock {
-                id: block(2),
-                instructions: vec![],
-                terminator: Terminator::Return { value: None },
-            },
-            BasicBlock {
-                id: block(3),
-                instructions: vec![],
-                terminator: Terminator::Return {
-                    value: Some(var(0)),
-                },
-            },
-            BasicBlock {
-                id: block(4),
-                instructions: vec![],
-                terminator: Terminator::Return { value: None },
-            },
-        ];
-
-        let mut func = make_function_with_param(var(0), blocks);
-        let analysis = analyze_definedness(&func, None);
-        let eliminated = eliminate_guards(&mut func, &analysis);
-
-        // First guard kept (param is MaybeDefined), second eliminated (Defined in B1)
-        assert_eq!(eliminated, 1);
-        assert!(matches!(
-            func.blocks[0].terminator,
-            Terminator::Match { .. }
-        ));
-        assert!(matches!(
-            func.blocks[1].terminator,
-            Terminator::Jump { target } if target == block(3)
-        ));
     }
 
     // ========================================================================
@@ -635,55 +352,6 @@ mod tests {
         // No blocks removed - B1 has multiple predecessors (both branches of If)
         assert_eq!(removed, 0);
         assert_eq!(func.blocks.len(), 2);
-    }
-
-    #[test]
-    fn test_guard_elim_enables_unreachable_removal() {
-        // After eliminating guard on const, undefined arm becomes unreachable
-        //
-        // Block 0: v0 = 42; Match v0 [Undefined->B2] default->B1
-        // Block 1: Return v0
-        // Block 2: Return undefined (unreachable after guard elim)
-        let blocks = vec![
-            BasicBlock {
-                id: block(0),
-                instructions: vec![si(Instruction::Const {
-                    dest: var(0),
-                    value: Literal::UInt(42),
-                })],
-                terminator: Terminator::Match {
-                    value: var(0),
-                    arms: vec![(MatchPattern::Type(BaseType::Undefined), block(2))],
-                    default: block(1),
-                    span: ast::Span::default(),
-                },
-            },
-            BasicBlock {
-                id: block(1),
-                instructions: vec![],
-                terminator: Terminator::Return {
-                    value: Some(var(0)),
-                },
-            },
-            BasicBlock {
-                id: block(2),
-                instructions: vec![si(Instruction::Const {
-                    dest: var(1),
-                    value: Literal::Undefined,
-                })],
-                terminator: Terminator::Return {
-                    value: Some(var(1)),
-                },
-            },
-        ];
-
-        let mut func = make_function(blocks);
-        let analysis = analyze_definedness(&func, None);
-        let guards = eliminate_guards(&mut func, &analysis);
-        let blocks_removed = simplify_cfg(&mut func);
-
-        assert_eq!(guards, 1);
-        assert!(blocks_removed >= 1); // At least B2 removed, possibly B0+B1 merged
     }
 
     #[test]

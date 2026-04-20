@@ -318,8 +318,8 @@ mod tests {
                 TypeSet::single(crate::types::BaseType::Array),
             ),
             Var::new(var(1), ast::Identifier("idx".into()), TypeSet::uint()),
-            Var::new(var(2), ast::Identifier("r1".into()), TypeSet::all()),
-            Var::new(var(3), ast::Identifier("r2".into()), TypeSet::all()),
+            Var::new(var(2), ast::Identifier("r1".into()), TypeSet::any()),
+            Var::new(var(3), ast::Identifier("r2".into()), TypeSet::any()),
         ];
         let blocks = vec![BasicBlock {
             id: block(0),

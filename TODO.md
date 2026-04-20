@@ -165,12 +165,19 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
 
 ### P2 — Architecture
 
-- [ ] **Unified type/definedness** — treat Undefined as `BaseType::Undefined`
-      in the TypeSet, eliminating the separate Definedness lattice and analysis
-      pass. See design notes below.
-- [ ] **Type guard insertion pass** — emit Guard + Match before intrinsics
+- [x] **Unified type/definedness** — `BaseType::Undefined` in TypeSet,
+      `Value::Undefined` at runtime, `Terminator::Guard` → Match,
+      `Instruction::Undefined` → `Const { Literal::Undefined }`,
+      definedness pass deleted. See `docs/unified_definedness_plan.md`.
+- [ ] **SSA type narrowing** — After Match narrows a type, insert a Copy
+      with the narrowed TypeSet on each arm. Makes type analysis one
+      TypeSet per VarId globally (no per-block tracking). Eliminates
+      `get_at_exit(block_id, var_id)` in favour of `get(var_id)`.
+- [ ] **Type guard insertion pass** — emit Match before intrinsics
       based on `param_type()` constraints. Makes implicit runtime type dispatch
       explicit in IR. Enables peephole fusion. See `docs/runtime_checks.md`.
+- [ ] **Delete `definedness.rs`** — file exists as dead code. Remove once
+      E200/E201 diagnostics are confirmed working via TypeSet checks.
 
 ### P2 — Diagnostics
 

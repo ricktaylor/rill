@@ -78,7 +78,7 @@ fn transfer_instruction(
             dest,
             value: crate::ir::Literal::Undefined,
         } => {
-            state.insert(*dest, TypeSet::empty());
+            state.insert(*dest, TypeSet::undefined());
         }
 
         // Constants have known single types
@@ -207,7 +207,7 @@ fn compute_call_type(
         // Not an extern — check inferred return types for user functions
         let name = function.qualified_name();
         if let Some(rt) = return_types.get(&name)
-            && !rt.is_empty()
+            && !rt.is_dead()
         {
             return *rt;
         }
@@ -221,7 +221,7 @@ fn compute_call_type(
 
     // If the function diverges, it never returns (empty type set)
     if def.meta.diverges() {
-        return TypeSet::empty();
+        return TypeSet::none();
     }
 
     // Get the return type signature and convert to TypeSet
@@ -232,7 +232,7 @@ fn compute_call_type(
 /// Convert an extern's TypeSet to analysis TypeSet
 /// (Now they're the same type, so just clone)
 fn type_sig_to_type_set(sig: &TypeSet) -> TypeSet {
-    if sig.is_empty() {
+    if sig.is_dead() {
         // Empty types means any type
         all_types()
     } else {
@@ -313,7 +313,7 @@ fn apply_match_refinement(
 
 /// Create a TypeSet containing all base types
 pub(super) fn all_types() -> TypeSet {
-    TypeSet::all()
+    TypeSet::any()
 }
 
 // ============================================================================
@@ -327,14 +327,10 @@ pub type ReturnTypes = HashMap<String, TypeSet>;
 /// Maps function name → Vec of TypeSets (one per parameter, positional).
 pub type ParamTypes = HashMap<String, Vec<TypeSet>>;
 
-/// Inferred parameter definedness for user-defined functions.
-/// Maps function name → Vec of Definedness (one per parameter, positional).
-pub type ParamDefinedness = HashMap<String, Vec<crate::opt::Definedness>>;
-
 /// Infer the return type of a function from its Return terminators.
 ///
 /// Runs type analysis, then unions the TypeSets of all Return values.
-/// Functions with no return value (all returns are `None`) produce `TypeSet::empty()`.
+/// Functions with no return value (all returns are `None`) produce `TypeSet::none()`.
 pub fn infer_return_type(
     function: &Function,
     externs: Option<&ExternRegistry>,
@@ -343,7 +339,7 @@ pub fn infer_return_type(
 ) -> TypeSet {
     let types = analyze_types_full(function, externs, return_types, param_types);
 
-    let mut result = TypeSet::empty();
+    let mut result = TypeSet::none();
     for block in &function.blocks {
         if let Terminator::Return { value: Some(v) } = &block.terminator
             && let Some(ts) = types.get_at_exit(block.id, *v)
@@ -382,7 +378,7 @@ pub fn analyze_types_full(
         // Use propagated type from call sites if available, else all types
         let ty = propagated
             .and_then(|pts| pts.get(i).copied())
-            .filter(|t| !t.is_empty())
+            .filter(|t| !t.is_dead())
             .unwrap_or_else(all_types);
         initial_state.insert(param.var, ty);
     }
@@ -548,7 +544,7 @@ mod tests {
     }
 
     #[test]
-    fn test_undefined_has_no_concrete_type() {
+    fn test_undefined_is_undefined_type() {
         let blocks = vec![BasicBlock {
             id: block(0),
             instructions: vec![si(Instruction::Const {
@@ -564,7 +560,9 @@ mod tests {
         let analysis = analyze_types(&func, None);
 
         let type_set = analysis.get_at_exit(block(0), var(0)).unwrap();
-        assert!(type_set.is_empty()); // No concrete types for undefined
+        assert_eq!(*type_set, TypeSet::undefined()); // Exactly {Undefined}
+        assert!(type_set.may_be_undefined());
+        assert!(!type_set.is_defined());
     }
 
     #[test]
@@ -700,7 +698,7 @@ mod tests {
 
         // In the default (defined) branch, Undefined is excluded
         let type_1 = analysis.get_at_entry(block(1), var(1)).unwrap();
-        assert!(!type_1.is_empty());
+        assert!(!type_1.is_dead());
         assert!(!type_1.contains(BaseType::Undefined));
 
         // In the Undefined arm, var is Undefined

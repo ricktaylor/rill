@@ -33,7 +33,7 @@
 //! registry.register_in("cbor",
 //!     ExternDef::new("decode", my_decode_impl)
 //!         .param("data", TypeSet::bytes())
-//!         .returns(TypeSet::all())
+//!         .returns(TypeSet::any())
 //!         .pure()
 //! );
 //! ```
@@ -417,7 +417,7 @@ impl ExternDef {
     pub fn new(name: impl Into<String>, f: ExternFn) -> Self {
         ExternDef {
             name: name.into(),
-            meta: ExternMeta::returning(TypeSet::all()),
+            meta: ExternMeta::returning(TypeSet::any()),
             implementation: ExternImpl::Native(f),
             variants: Vec::new(),
         }
@@ -431,7 +431,7 @@ impl ExternDef {
     {
         ExternDef {
             name: name.into(),
-            meta: ExternMeta::returning(TypeSet::all()),
+            meta: ExternMeta::returning(TypeSet::any()),
             implementation: ExternImpl::Closure(Box::new(f)),
             variants: Vec::new(),
         }
@@ -562,7 +562,7 @@ impl ExternDef {
                 && v.param_types
                     .iter()
                     .zip(arg_types)
-                    .all(|(spec, actual)| !actual.is_empty() && actual.difference(spec).is_empty())
+                    .all(|(spec, actual)| !actual.is_dead() && actual.difference(spec).is_dead())
         })
     }
 }
@@ -990,7 +990,7 @@ mod tests {
         assert!(v.is_none());
 
         // All types → no variant matches
-        let v = def.select_variant(&[TypeSet::all()]);
+        let v = def.select_variant(&[TypeSet::any()]);
         assert!(v.is_none());
 
         // Wrong arity → no match

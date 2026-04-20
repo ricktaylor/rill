@@ -441,7 +441,7 @@ impl PromoteCtx {
             function.locals.push(Var::new(
                 VarId(id),
                 ast::Identifier("_phi".to_string()),
-                TypeSet::all(),
+                TypeSet::any(),
             ));
         }
     }
@@ -522,8 +522,8 @@ mod tests {
                 },
             )],
             vec![
-                Var::new(VarId(0), ast::Identifier("v0".into()), TypeSet::all()),
-                Var::new(VarId(1), ast::Identifier("v1".into()), TypeSet::all()),
+                Var::new(VarId(0), ast::Identifier("v0".into()), TypeSet::any()),
+                Var::new(VarId(1), ast::Identifier("v1".into()), TypeSet::any()),
             ],
         );
 
@@ -586,9 +586,9 @@ mod tests {
             ],
             vec![
                 Var::new(VarId(0), ast::Identifier("cond".into()), TypeSet::bool()),
-                Var::new(VarId(1), ast::Identifier("v1".into()), TypeSet::all()),
-                Var::new(VarId(2), ast::Identifier("v2".into()), TypeSet::all()),
-                Var::new(VarId(3), ast::Identifier("v3".into()), TypeSet::all()),
+                Var::new(VarId(1), ast::Identifier("v1".into()), TypeSet::any()),
+                Var::new(VarId(2), ast::Identifier("v2".into()), TypeSet::any()),
+                Var::new(VarId(3), ast::Identifier("v3".into()), TypeSet::any()),
             ],
         );
 
@@ -657,10 +657,10 @@ mod tests {
                 ),
             ],
             vec![
-                Var::new(VarId(0), ast::Identifier("init".into()), TypeSet::all()),
-                Var::new(VarId(1), ast::Identifier("r1".into()), TypeSet::all()),
-                Var::new(VarId(2), ast::Identifier("body".into()), TypeSet::all()),
-                Var::new(VarId(3), ast::Identifier("r3".into()), TypeSet::all()),
+                Var::new(VarId(0), ast::Identifier("init".into()), TypeSet::any()),
+                Var::new(VarId(1), ast::Identifier("r1".into()), TypeSet::any()),
+                Var::new(VarId(2), ast::Identifier("body".into()), TypeSet::any()),
+                Var::new(VarId(3), ast::Identifier("r3".into()), TypeSet::any()),
                 Var::new(VarId(10), ast::Identifier("cond".into()), TypeSet::bool()),
             ],
         );
@@ -728,8 +728,8 @@ mod tests {
                 ),
             ],
             vec![
-                Var::new(VarId(0), ast::Identifier("v0".into()), TypeSet::all()),
-                Var::new(VarId(3), ast::Identifier("r3".into()), TypeSet::all()),
+                Var::new(VarId(0), ast::Identifier("v0".into()), TypeSet::any()),
+                Var::new(VarId(3), ast::Identifier("r3".into()), TypeSet::any()),
                 Var::new(VarId(10), ast::Identifier("cond".into()), TypeSet::bool()),
             ],
         );
@@ -805,9 +805,9 @@ mod tests {
                 ),
             ],
             vec![
-                Var::new(VarId(0), ast::Identifier("v0".into()), TypeSet::all()),
-                Var::new(VarId(1), ast::Identifier("v1".into()), TypeSet::all()),
-                Var::new(VarId(3), ast::Identifier("r3".into()), TypeSet::all()),
+                Var::new(VarId(0), ast::Identifier("v0".into()), TypeSet::any()),
+                Var::new(VarId(1), ast::Identifier("v1".into()), TypeSet::any()),
+                Var::new(VarId(3), ast::Identifier("r3".into()), TypeSet::any()),
                 Var::new(VarId(10), ast::Identifier("cond".into()), TypeSet::bool()),
             ],
         );

@@ -204,8 +204,9 @@ impl core::fmt::Debug for TypeSet {
 }
 
 impl TypeSet {
-    /// Create an empty type set (represents unreachable/bottom)
-    pub const fn empty() -> Self {
+    /// Bottom type set — no possible type, not even Undefined. Represents
+    /// unreachable/dead code or an accumulator identity for union.
+    pub const fn none() -> Self {
         TypeSet { bits: 0 }
     }
 
@@ -250,14 +251,6 @@ impl TypeSet {
     /// Provably undefined — exactly `{Undefined}`.
     pub const fn undefined() -> Self {
         Self::single(BaseType::Undefined)
-    }
-
-    /// Temporary alias during migration — will be removed once all call
-    /// sites are reviewed and switched to `defined()` or `any()`.
-    /// Uses `any()` (includes Undefined) so that unknown variables are
-    /// correctly modeled as possibly-undefined by type analysis.
-    pub const fn all() -> Self {
-        Self::any()
     }
 
     // Convenience constructors
@@ -351,8 +344,9 @@ impl TypeSet {
         self.bits & ty.bit() != 0
     }
 
-    /// Check if type set is empty (unreachable/bottom)
-    pub const fn is_empty(&self) -> bool {
+    /// Check if type set is bottom (unreachable/dead code — no possible type).
+    /// Not the same as undefined: `{Undefined}` is a valid single-type set.
+    pub const fn is_dead(&self) -> bool {
         self.bits == 0
     }
 

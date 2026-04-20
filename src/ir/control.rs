@@ -69,7 +69,7 @@ impl<'a> Lowerer<'a> {
         let then_value = if let Some(expr) = then_expr {
             self.lower_expression(expr)
         } else {
-            let dest = self.new_temp(TypeSet::empty());
+            let dest = self.new_temp(TypeSet::undefined());
             self.emit(Instruction::Const {
                 dest,
                 value: Literal::Undefined,
@@ -93,7 +93,7 @@ impl<'a> Lowerer<'a> {
         let else_value = if let Some(expr) = else_expr {
             self.lower_expression(expr)
         } else {
-            let dest = self.new_temp(TypeSet::empty());
+            let dest = self.new_temp(TypeSet::undefined());
             self.emit(Instruction::Const {
                 dest,
                 value: Literal::Undefined,
@@ -108,7 +108,7 @@ impl<'a> Lowerer<'a> {
         self.current_block = join_bb;
         self.current_instructions = Vec::new();
 
-        let result = self.new_temp(TypeSet::all());
+        let result = self.new_temp(TypeSet::any());
         self.emit(Instruction::Phi {
             dest: result,
             sources: vec![(then_exit_block, then_value), (else_exit_block, else_value)],
@@ -152,7 +152,7 @@ impl<'a> Lowerer<'a> {
                 // Bind the variable
                 match mode {
                     BindingMode::Value => {
-                        let dest = self.new_var(name.clone(), TypeSet::all());
+                        let dest = self.new_var(name.clone(), TypeSet::any());
                         self.emit(Instruction::Copy { dest, src: value });
                         self.bind(name, dest);
                     }
@@ -178,7 +178,7 @@ impl<'a> Lowerer<'a> {
                     });
 
                     let (elem, elem_origin) = if matches!(mode, BindingMode::Reference) {
-                        let dest = self.new_temp(TypeSet::all());
+                        let dest = self.new_temp(TypeSet::any());
                         self.emit(Instruction::MakeRef {
                             dest,
                             base: value,
@@ -187,7 +187,7 @@ impl<'a> Lowerer<'a> {
                         let origin = RefOrigin { ref_var: dest };
                         (dest, Some(origin))
                     } else {
-                        let dest = self.new_temp(TypeSet::all());
+                        let dest = self.new_temp(TypeSet::any());
                         self.emit(Instruction::Index {
                             dest,
                             base: value,
@@ -243,7 +243,7 @@ impl<'a> Lowerer<'a> {
                     });
 
                     let (elem, elem_origin) = if matches!(mode, BindingMode::Reference) {
-                        let dest = self.new_temp(TypeSet::all());
+                        let dest = self.new_temp(TypeSet::any());
                         self.emit(Instruction::MakeRef {
                             dest,
                             base: value,
@@ -252,7 +252,7 @@ impl<'a> Lowerer<'a> {
                         let origin = RefOrigin { ref_var: dest };
                         (dest, Some(origin))
                     } else {
-                        let dest = self.new_temp(TypeSet::all());
+                        let dest = self.new_temp(TypeSet::any());
                         self.emit(Instruction::Index {
                             dest,
                             base: value,
@@ -365,7 +365,7 @@ impl<'a> Lowerer<'a> {
                         let idx = self.emit_binary_intrinsic(IntrinsicOp::Add, after_start, offset);
 
                         let (elem, elem_origin) = if matches!(mode, BindingMode::Reference) {
-                            let dest = self.new_temp(TypeSet::all());
+                            let dest = self.new_temp(TypeSet::any());
                             self.emit(Instruction::MakeRef {
                                 dest,
                                 base: value,
@@ -374,7 +374,7 @@ impl<'a> Lowerer<'a> {
                             let origin = RefOrigin { ref_var: dest };
                             (dest, Some(origin))
                         } else {
-                            let dest = self.new_temp(TypeSet::all());
+                            let dest = self.new_temp(TypeSet::any());
                             self.emit(Instruction::Index {
                                 dest,
                                 base: value,
@@ -396,7 +396,7 @@ impl<'a> Lowerer<'a> {
                     let key_var = match &key_pat.node {
                         ast::Pattern::Literal(lit) => {
                             let lit_pattern = self.ast_literal_to_ir_literal(lit);
-                            let k = self.new_temp(TypeSet::all());
+                            let k = self.new_temp(TypeSet::any());
                             self.emit(Instruction::Const {
                                 dest: k,
                                 value: lit_pattern,
@@ -423,7 +423,7 @@ impl<'a> Lowerer<'a> {
                     };
 
                     let (val, val_origin) = if matches!(mode, BindingMode::Reference) {
-                        let dest = self.new_temp(TypeSet::all());
+                        let dest = self.new_temp(TypeSet::any());
                         self.emit(Instruction::MakeRef {
                             dest,
                             base: value,
@@ -432,7 +432,7 @@ impl<'a> Lowerer<'a> {
                         let origin = RefOrigin { ref_var: dest };
                         (dest, Some(origin))
                     } else {
-                        let dest = self.new_temp(TypeSet::all());
+                        let dest = self.new_temp(TypeSet::any());
                         self.emit(Instruction::Index {
                             dest,
                             base: value,
@@ -573,9 +573,9 @@ impl<'a> Lowerer<'a> {
         self.current_instructions = Vec::new();
 
         let result = self.new_temp(if break_values.is_empty() {
-            TypeSet::empty()
+            TypeSet::undefined()
         } else {
-            TypeSet::all()
+            TypeSet::any()
         });
         if break_values.is_empty() {
             self.emit(Instruction::Const {
@@ -631,7 +631,7 @@ impl<'a> Lowerer<'a> {
         self.current_block = exit_bb;
         self.current_instructions = Vec::new();
 
-        let result = self.new_temp(TypeSet::all());
+        let result = self.new_temp(TypeSet::any());
         if break_values.is_empty() {
             self.emit(Instruction::Const {
                 dest: result,
@@ -693,7 +693,7 @@ impl<'a> Lowerer<'a> {
         self.current_block = join_bb;
         self.current_instructions = Vec::new();
 
-        let result = self.new_temp(TypeSet::empty());
+        let result = self.new_temp(TypeSet::undefined());
         self.emit(Instruction::Const {
             dest: result,
             value: Literal::Undefined,
@@ -770,7 +770,7 @@ impl<'a> Lowerer<'a> {
         };
 
         let (elem, elem_origin) = if matches!(mode, BindingMode::Reference) {
-            let dest = self.new_temp(TypeSet::all());
+            let dest = self.new_temp(TypeSet::any());
             self.emit(Instruction::MakeRef {
                 dest,
                 base: iter_var,
@@ -779,7 +779,7 @@ impl<'a> Lowerer<'a> {
             let origin = RefOrigin { ref_var: dest };
             (dest, Some(origin))
         } else {
-            let dest = self.new_temp(TypeSet::all());
+            let dest = self.new_temp(TypeSet::any());
             self.emit(Instruction::Index {
                 dest,
                 base: iter_var,
@@ -791,7 +791,7 @@ impl<'a> Lowerer<'a> {
         match binding {
             ast::ForBinding::Single(name) => match mode {
                 BindingMode::Value => {
-                    let var = self.new_var(name.clone(), TypeSet::all());
+                    let var = self.new_var(name.clone(), TypeSet::any());
                     self.emit(Instruction::Copy {
                         dest: var,
                         src: elem,
@@ -806,7 +806,7 @@ impl<'a> Lowerer<'a> {
                 }
             },
             ast::ForBinding::Pair(key_name, val_name) => {
-                let key_var = self.new_var(key_name.clone(), TypeSet::all());
+                let key_var = self.new_var(key_name.clone(), TypeSet::any());
                 self.emit(Instruction::Copy {
                     dest: key_var,
                     src: i_var,
@@ -815,7 +815,7 @@ impl<'a> Lowerer<'a> {
 
                 match mode {
                     BindingMode::Value => {
-                        let var = self.new_var(val_name.clone(), TypeSet::all());
+                        let var = self.new_var(val_name.clone(), TypeSet::any());
                         self.emit(Instruction::Copy {
                             dest: var,
                             src: elem,
@@ -914,7 +914,7 @@ impl<'a> Lowerer<'a> {
         self.current_block = header_bb;
         self.current_instructions = Vec::new();
 
-        let elem = self.new_temp(TypeSet::all());
+        let elem = self.new_temp(TypeSet::any());
         self.emit(Instruction::Intrinsic {
             dest: elem,
             op: IntrinsicOp::SeqNext,
@@ -936,7 +936,7 @@ impl<'a> Lowerer<'a> {
         // Sequences are always by-value (no backing collection to write back to).
         match binding {
             ast::ForBinding::Single(name) => {
-                let var = self.new_var(name.clone(), TypeSet::all());
+                let var = self.new_var(name.clone(), TypeSet::any());
                 self.emit(Instruction::Copy {
                     dest: var,
                     src: elem,
@@ -944,19 +944,19 @@ impl<'a> Lowerer<'a> {
                 self.bind(name, var);
             }
             ast::ForBinding::Pair(key_name, val_name) => {
-                let var = self.new_var(val_name.clone(), TypeSet::all());
+                let var = self.new_var(val_name.clone(), TypeSet::any());
                 self.emit(Instruction::Copy {
                     dest: var,
                     src: elem,
                 });
                 self.bind(val_name, var);
                 // Key is undefined for sequences (no natural index)
-                let undef = self.new_temp(TypeSet::empty());
+                let undef = self.new_temp(TypeSet::undefined());
                 self.emit(Instruction::Const {
                     dest: undef,
                     value: Literal::Undefined,
                 });
-                let key_var = self.new_var(key_name.clone(), TypeSet::all());
+                let key_var = self.new_var(key_name.clone(), TypeSet::any());
                 self.emit(Instruction::Copy {
                     dest: key_var,
                     src: undef,
@@ -1037,7 +1037,7 @@ impl<'a> Lowerer<'a> {
             let arm_value = if let Some(ref expr) = arm.body_expr {
                 self.lower_expression(expr)
             } else {
-                let dest = self.new_temp(TypeSet::empty());
+                let dest = self.new_temp(TypeSet::undefined());
                 self.emit(Instruction::Const {
                     dest,
                     value: Literal::Undefined,
@@ -1056,7 +1056,7 @@ impl<'a> Lowerer<'a> {
         }
 
         // Final fallthrough (unreachable if patterns are exhaustive)
-        let fallback = self.new_temp(TypeSet::empty());
+        let fallback = self.new_temp(TypeSet::undefined());
         self.emit(Instruction::Const {
             dest: fallback,
             value: Literal::Undefined,
@@ -1069,7 +1069,7 @@ impl<'a> Lowerer<'a> {
         self.current_block = exit_bb;
         self.current_instructions = Vec::new();
 
-        let result = self.new_temp(TypeSet::all());
+        let result = self.new_temp(TypeSet::any());
         self.emit(Instruction::Phi {
             dest: result,
             sources: arm_results,
