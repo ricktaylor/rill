@@ -26,3 +26,5 @@
 //! all `Assign`/`Read` instructions with proper SSA VarIds and Phi nodes.
 
 mod promote;
+
+pub use promote::promote;

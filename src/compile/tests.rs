@@ -729,6 +729,100 @@ fn test_range_dynamic_bounds() {
 }
 
 #[test]
+fn test_range_with_array_access_literal_bounds() {
+    // Minimal case: range with literal bounds + arr[i] in body
+    let val = run_expect(
+        r#"
+            fn test() {
+                let arr = [10, 20, 30];
+                let sum = 0;
+                for i in 0..3 {
+                    sum = sum + arr[i];
+                };
+                return sum;
+            }
+            "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(60));
+}
+
+#[test]
+fn test_range_with_outer_var() {
+    // Minimal case: range loop accessing outer variable (no indexing)
+    let val = run_expect(
+        r#"
+            fn test() {
+                let x = 42;
+                let sum = 0;
+                for i in 0..3 {
+                    sum = sum + x;
+                };
+                return sum;
+            }
+            "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(126));
+}
+
+#[test]
+fn test_range_empty_body_outer_var() {
+    // Empty for-loop body, return outer variable
+    let val = run_expect(
+        r#"
+            fn test() {
+                let x = 42;
+                for i in 0..3 {
+                };
+                return x;
+            }
+            "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(42));
+}
+
+#[test]
+fn test_range_two_outer_vars() {
+    // Range loop body reads one outer var, writes another
+    let val = run_expect(
+        r#"
+            fn test() {
+                let x = 42;
+                let sum = 0;
+                for i in 0..3 {
+                    sum = x;
+                };
+                return sum;
+            }
+            "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(42));
+}
+
+#[test]
+fn test_outer_loop_accumulation_no_nesting() {
+    // Same arithmetic as test_for_nested but without the inner loop
+    let val = run_expect(
+        r#"
+            fn test() {
+                let a = [1, 2];
+                let sum = 0;
+                for x in a {
+                    sum = sum + x * 10 + x * 20;
+                };
+                return sum;
+            }
+            "#,
+        "test",
+    );
+    // 1*10 + 1*20 + 2*10 + 2*20 = 90
+    assert_eq!(val, Value::UInt(90));
+}
+
+#[test]
 fn test_range_as_value() {
     // Store a range in a variable, then iterate — type dispatch
     // selects the sequence path at runtime.
@@ -1503,7 +1597,6 @@ fn bench_fib_recursive_20() {
 }
 
 #[test]
-#[ignore] // Known bug: multi-variable reassignment in for-loops (see TODO.md)
 fn bench_fib_iterative() {
     let val = run_with_args(BENCHMARK_SOURCE, "fib_iter", &[Value::UInt(10)]);
     assert_eq!(val, Value::UInt(55));
@@ -1528,7 +1621,6 @@ fn bench_for_reassign() {
 }
 
 #[test]
-#[ignore] // Known bug: multi-variable reassignment in for-loops (see TODO.md)
 fn bench_for_fib_no_if() {
     // fib_iter without the early-return if, to isolate the issue
     let val = run_expect(
@@ -1546,12 +1638,11 @@ fn bench_for_fib_no_if() {
         "#,
         "test",
     );
-    // fib sequence: 0,1,1,2,3,5,8,13,21 → after 8 iters, b=21
-    assert_eq!(val, Value::UInt(21));
+    // fib sequence: after 8 iters starting from (a=0, b=1), b=fib(9)=34
+    assert_eq!(val, Value::UInt(34));
 }
 
 #[test]
-#[ignore] // Known bug: multi-variable reassignment in for-loops (see TODO.md)
 fn bench_if_then_for() {
     // The problematic pattern: if with return, then for loop
     let val = run_expect(
@@ -1575,7 +1666,6 @@ fn bench_if_then_for() {
 }
 
 #[test]
-#[ignore] // Known bug: multi-variable reassignment in for-loops (see TODO.md)
 fn bench_fib_iter_inline() {
     // Inline version to isolate from benchmark source
     let val = run_expect(
@@ -1599,7 +1689,6 @@ fn bench_fib_iter_inline() {
 }
 
 #[test]
-#[ignore] // Known bug: multi-variable reassignment in for-loops (see TODO.md)
 fn bench_fib_iterative_50() {
     let val = run_with_args(BENCHMARK_SOURCE, "fib_iter", &[Value::UInt(50)]);
     assert_eq!(val, Value::UInt(12586269025));
@@ -1622,7 +1711,7 @@ fn bench_check_tree() {
 }
 
 #[test]
-#[ignore] // Known bug: merge_branch_bindings may interfere with if/else expression results
+#[ignore] // Separate issue: recursive if-else chains produce None (not loop-related)
 fn bench_ackermann() {
     let val = run_with_args(BENCHMARK_SOURCE, "ack", &[Value::UInt(1), Value::UInt(5)]);
     assert_eq!(val, Value::UInt(7));

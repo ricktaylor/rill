@@ -21,10 +21,6 @@ impl<'a> Lowerer<'a> {
         let else_bb = self.fresh_block();
         let join_bb = self.fresh_block();
 
-        // Snapshot bindings before the if — used to detect variable
-        // modifications in branches and create phis at the join point.
-        let pre_if_snapshot = self.snapshot_scope();
-
         // Push scope for condition bindings (visible in then-block)
         self.push_scope();
 
@@ -77,8 +73,6 @@ impl<'a> Lowerer<'a> {
             self.emit(Instruction::Undefined { dest });
             dest
         };
-        // Capture post-then bindings before popping scope
-        let then_bindings = self.snapshot_scope();
         let then_exit_block = self.current_block;
         self.pop_scope(); // End condition bindings scope
         self.finish_block(Terminator::Jump { target: join_bb });
@@ -100,8 +94,6 @@ impl<'a> Lowerer<'a> {
             self.emit(Instruction::Undefined { dest });
             dest
         };
-        // Capture post-else bindings before popping scope
-        let else_bindings = self.snapshot_scope();
         let else_exit_block = self.current_block;
         self.pop_scope();
         self.finish_block(Terminator::Jump { target: join_bb });
@@ -116,17 +108,7 @@ impl<'a> Lowerer<'a> {
             sources: vec![(then_exit_block, then_value), (else_exit_block, else_value)],
         });
 
-        // Create phis for variables modified in either branch.
-        // For each variable in the pre-if snapshot, check if the then-branch
-        // or else-branch rebound it to a different VarId. If so, create a phi
-        // that merges the two and rebind in the enclosing scope.
-        self.merge_branch_bindings(
-            &pre_if_snapshot,
-            &then_bindings,
-            then_exit_block,
-            &else_bindings,
-            else_exit_block,
-        );
+        // Variable phis are handled by mem2reg — no manual merge needed.
 
         result
     }
@@ -494,174 +476,6 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// Create phis for variables modified in if/else or match branches.
-    ///
-    /// Compares the post-branch bindings against the pre-branch snapshot.
-    /// For any variable rebound in either branch, emits a Phi in the
-    /// current (join) block and rebinds the variable in the enclosing scope.
-    ///
-    /// Variables only introduced inside a branch (not in the pre-snapshot)
-    /// are ignored — they're local to that branch's scope and already popped.
-    fn merge_branch_bindings(
-        &mut self,
-        pre_snapshot: &[(ast::Identifier, VarId)],
-        then_bindings: &[(ast::Identifier, VarId)],
-        then_exit: BlockId,
-        else_bindings: &[(ast::Identifier, VarId)],
-        else_exit: BlockId,
-    ) {
-        for (name, pre_var) in pre_snapshot {
-            // Skip discard bindings
-            if name.0 == "_" {
-                continue;
-            }
-
-            // Find the variable's VarId after each branch
-            let then_var = then_bindings
-                .iter()
-                .find(|(n, _)| n == name)
-                .map(|(_, v)| *v)
-                .unwrap_or(*pre_var);
-            let else_var = else_bindings
-                .iter()
-                .find(|(n, _)| n == name)
-                .map(|(_, v)| *v)
-                .unwrap_or(*pre_var);
-
-            // If neither branch modified this variable, skip
-            if then_var == *pre_var && else_var == *pre_var {
-                continue;
-            }
-
-            // Create a phi to merge the two values
-            let phi_var = self.new_temp(TypeSet::all());
-            self.emit(Instruction::Phi {
-                dest: phi_var,
-                sources: vec![(then_exit, then_var), (else_exit, else_var)],
-            });
-
-            // Rebind in the enclosing scope
-            self.bind(name, phi_var);
-        }
-    }
-
-    /// Create phis for variables modified in any branch of a match expression.
-    ///
-    /// Like `merge_branch_bindings` but handles N branches instead of 2.
-    fn merge_multi_branch_bindings(
-        &mut self,
-        pre_snapshot: &[(ast::Identifier, VarId)],
-        branch_bindings: &[(Vec<(ast::Identifier, VarId)>, BlockId)],
-    ) {
-        for (name, pre_var) in pre_snapshot {
-            if name.0 == "_" {
-                continue;
-            }
-
-            // Collect the VarId for this variable from each branch
-            let sources: Vec<(BlockId, VarId)> = branch_bindings
-                .iter()
-                .map(|(bindings, exit_block)| {
-                    let var = bindings
-                        .iter()
-                        .find(|(n, _)| n == name)
-                        .map(|(_, v)| *v)
-                        .unwrap_or(*pre_var);
-                    (*exit_block, var)
-                })
-                .collect();
-
-            // If all branches kept the same VarId, no phi needed
-            if sources.iter().all(|(_, v)| *v == *pre_var) {
-                continue;
-            }
-
-            let phi_var = self.new_temp(TypeSet::all());
-            self.emit(Instruction::Phi {
-                dest: phi_var,
-                sources,
-            });
-            self.bind(name, phi_var);
-        }
-    }
-
-    /// Snapshot all variable bindings in the current scope stack.
-    /// Returns (name, VarId) pairs for all visible variables.
-    fn snapshot_scope(&self) -> Vec<(ast::Identifier, VarId)> {
-        let mut seen = std::collections::HashSet::new();
-        let mut result = Vec::new();
-        // Walk scopes from innermost to outermost (same as lookup order)
-        for scope in self.scopes.iter().rev() {
-            for (name, &var) in scope {
-                if seen.insert(name.clone()) {
-                    result.push((name.clone(), var));
-                }
-            }
-        }
-        result
-    }
-
-    /// Construct loop-carried phi nodes for a while/loop.
-    ///
-    /// Before the header: create a phi for each in-scope variable, bind the
-    /// variable to the phi result. After the body: patch each phi with the
-    /// post-body VarId. Variables not modified in the body get identity phis
-    /// (same VarId for both sources) which the closure compiler eliminates.
-    ///
-    /// Returns the list of (phi_var, pre_loop_var, variable_name) for patching.
-    fn create_loop_phis(
-        &mut self,
-        pre_header_bb: BlockId,
-        scope_snapshot: &[(ast::Identifier, VarId)],
-    ) -> Vec<(VarId, VarId, ast::Identifier)> {
-        let mut phis = Vec::new();
-        for (name, pre_loop_var) in scope_snapshot {
-            let phi_var = self.new_temp(TypeSet::all());
-            // Placeholder phi — body source added later
-            self.emit(Instruction::Phi {
-                dest: phi_var,
-                sources: vec![(pre_header_bb, *pre_loop_var)],
-            });
-            // Rebind variable to phi result — header uses this VarId
-            self.bind(name, phi_var);
-            phis.push((phi_var, *pre_loop_var, name.clone()));
-        }
-        phis
-    }
-
-    /// Patch loop-carried phis after the body is lowered.
-    /// Adds the post-body VarId as a second source for each phi.
-    fn patch_loop_phis(
-        &mut self,
-        header_bb: BlockId,
-        body_exit_bb: BlockId,
-        phis: &[(VarId, VarId, ast::Identifier)],
-    ) {
-        // For each phi, find the current VarId for the variable (post-body)
-        // and add it as a source from the body exit block
-        let post_body_vars: Vec<(VarId, VarId)> = phis
-            .iter()
-            .map(|(phi_var, _pre_var, name)| {
-                let post_var = self.lookup(name).unwrap_or(*phi_var);
-                (*phi_var, post_var)
-            })
-            .collect();
-
-        // Find the header block and patch each phi
-        if let Some(header_block) = self.blocks.iter_mut().find(|b| b.id == header_bb) {
-            for inst in &mut header_block.instructions {
-                if let Instruction::Phi { dest, sources } = &mut inst.node {
-                    for (phi_var, post_var) in &post_body_vars {
-                        if *dest == *phi_var {
-                            sources.push((body_exit_bb, *post_var));
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     /// Lower a while loop
     pub fn lower_while(
         &mut self,
@@ -673,15 +487,11 @@ impl<'a> Lowerer<'a> {
         let body_bb = self.fresh_block();
         let exit_bb = self.fresh_block();
 
-        // Snapshot scope and jump to header
-        let scope_snapshot = self.snapshot_scope();
-        let pre_header_bb = self.current_block;
         self.finish_block(Terminator::Jump { target: header_bb });
 
-        // Header: create loop-carried phis, then evaluate condition
+        // Header: evaluate condition
         self.current_block = header_bb;
         self.current_instructions = Vec::new();
-        let loop_phis = self.create_loop_phis(pre_header_bb, &scope_snapshot);
 
         let cond = self.lower_expression(condition);
         self.finish_block(Terminator::If {
@@ -710,10 +520,6 @@ impl<'a> Lowerer<'a> {
         }
 
         let break_values = self.loop_stack.pop().unwrap().break_values;
-
-        // Patch phis with post-body variable values
-        let body_exit_bb = self.current_block;
-        self.patch_loop_phis(header_bb, body_exit_bb, &loop_phis);
 
         self.pop_scope();
 
@@ -748,15 +554,11 @@ impl<'a> Lowerer<'a> {
         let body_bb = self.fresh_block();
         let exit_bb = self.fresh_block();
 
-        // Snapshot scope and jump to body (which acts as the header for loop)
-        let scope_snapshot = self.snapshot_scope();
-        let pre_header_bb = self.current_block;
         self.finish_block(Terminator::Jump { target: body_bb });
 
-        // Body: create loop-carried phis, then execute body
+        // Body
         self.current_block = body_bb;
         self.current_instructions = Vec::new();
-        let loop_phis = self.create_loop_phis(pre_header_bb, &scope_snapshot);
 
         self.push_scope();
 
@@ -774,10 +576,6 @@ impl<'a> Lowerer<'a> {
         }
 
         let break_values = self.loop_stack.pop().unwrap().break_values;
-
-        // Patch phis with post-body variable values
-        let body_exit_bb = self.current_block;
-        self.patch_loop_phis(body_bb, body_exit_bb, &loop_phis);
 
         self.pop_scope();
 
@@ -806,9 +604,9 @@ impl<'a> Lowerer<'a> {
     /// - Default (Array, Map, etc.) → index-based iteration (Len + Lt + Index)
     ///
     /// Both paths lower the body independently (separate SSA variables).
-    /// Outer variables modified in the body are merged with Phis at the
-    /// shared exit block. When the iterable type is known at compile time,
-    /// the optimizer collapses the Match to a single path.
+    /// Variable-binding phis are handled by the mem2reg pass.
+    /// When the iterable type is known at compile time, the optimizer
+    /// collapses the Match to a single path.
     pub fn lower_for(
         &mut self,
         binding_is_value: bool,
@@ -823,10 +621,6 @@ impl<'a> Lowerer<'a> {
         let idx_bb = self.fresh_block();
         let join_bb = self.fresh_block();
 
-        // Snapshot outer scope — both paths start from the same bindings,
-        // and we merge their final values at the join block.
-        let outer_snapshot = self.snapshot_scope();
-
         self.finish_block(Terminator::Match {
             value: iter_var,
             arms: vec![(MatchPattern::Type(types::BaseType::Sequence), seq_bb)],
@@ -838,47 +632,17 @@ impl<'a> Lowerer<'a> {
         self.current_block = seq_bb;
         self.current_instructions = Vec::new();
         self.lower_for_seq(iter_var, binding_is_value, binding, body, body_expr);
-        let seq_exit_bb = self.current_block;
-        let seq_final_vars: Vec<VarId> = outer_snapshot
-            .iter()
-            .map(|(name, pre_var)| self.lookup(name).unwrap_or(*pre_var))
-            .collect();
         self.finish_block(Terminator::Jump { target: join_bb });
 
         // === Index path ===
-        // Restore pre-dispatch bindings so this path starts from the same state.
         self.current_block = idx_bb;
         self.current_instructions = Vec::new();
-        for (name, var) in &outer_snapshot {
-            self.bind(name, *var);
-        }
         self.lower_for_idx(iter_var, binding_is_value, binding, body, body_expr);
-        let idx_exit_bb = self.current_block;
-        let idx_final_vars: Vec<VarId> = outer_snapshot
-            .iter()
-            .map(|(name, pre_var)| self.lookup(name).unwrap_or(*pre_var))
-            .collect();
         self.finish_block(Terminator::Jump { target: join_bb });
 
         // === Join ===
         self.current_block = join_bb;
         self.current_instructions = Vec::new();
-
-        // Merge outer variables from both paths
-        for (i, (name, pre_var)) in outer_snapshot.iter().enumerate() {
-            let seq_var = seq_final_vars[i];
-            let idx_var = idx_final_vars[i];
-            // Skip Phi if both paths left the variable unchanged
-            if seq_var == *pre_var && idx_var == *pre_var {
-                continue;
-            }
-            let phi_var = self.new_temp(TypeSet::all());
-            self.emit(Instruction::Phi {
-                dest: phi_var,
-                sources: vec![(seq_exit_bb, seq_var), (idx_exit_bb, idx_var)],
-            });
-            self.bind(name, phi_var);
-        }
 
         let result = self.new_temp(TypeSet::empty());
         self.emit(Instruction::Undefined { dest: result });
@@ -896,8 +660,7 @@ impl<'a> Lowerer<'a> {
     /// exit:
     /// ```
     ///
-    /// After this returns, `self.current_block` is the exit block and
-    /// outer scope bindings reflect any modifications from the loop body.
+    /// After this returns, `self.current_block` is the exit block.
     fn lower_for_idx(
         &mut self,
         iter_var: VarId,
@@ -921,14 +684,12 @@ impl<'a> Lowerer<'a> {
         let latch_bb = self.fresh_block();
         let exit_bb = self.fresh_block();
 
-        let scope_snapshot = self.snapshot_scope();
         let pre_header_bb = self.current_block;
         self.finish_block(Terminator::Jump { target: header_bb });
 
-        // Header: loop-carried phis + index phi, then check i < length
+        // Header: index phi, then check i < length
         self.current_block = header_bb;
         self.current_instructions = Vec::new();
-        let loop_phis = self.create_loop_phis(pre_header_bb, &scope_snapshot);
 
         let i_var = self.new_temp(TypeSet::single(types::BaseType::UInt));
         let i_phi_idx = self.current_instructions.len();
@@ -1034,8 +795,6 @@ impl<'a> Lowerer<'a> {
 
         self.loop_stack.pop();
 
-        let body_exit_bb = self.current_block;
-        self.patch_loop_phis(header_bb, body_exit_bb, &loop_phis);
         self.pop_scope();
         self.finish_block(Terminator::Jump { target: latch_bb });
 
@@ -1049,8 +808,6 @@ impl<'a> Lowerer<'a> {
             value: Literal::UInt(1),
         });
         let i_next = self.emit_binary_intrinsic(IntrinsicOp::Add, i_var, one);
-
-        self.patch_loop_phis(header_bb, latch_bb, &loop_phis);
 
         let latch_exit_bb = self.current_block;
         self.finish_block(Terminator::Jump { target: header_bb });
@@ -1086,8 +843,7 @@ impl<'a> Lowerer<'a> {
     /// exit:
     /// ```
     ///
-    /// After this returns, `self.current_block` is the exit block and
-    /// outer scope bindings reflect any modifications from the loop body.
+    /// After this returns, `self.current_block` is the exit block.
     fn lower_for_seq(
         &mut self,
         seq_var: VarId,
@@ -1100,14 +856,11 @@ impl<'a> Lowerer<'a> {
         let body_bb = self.fresh_block();
         let exit_bb = self.fresh_block();
 
-        let scope_snapshot = self.snapshot_scope();
-        let pre_header_bb = self.current_block;
         self.finish_block(Terminator::Jump { target: header_bb });
 
-        // Header: loop-carried phis, then SeqNext + Guard
+        // Header: SeqNext + Guard
         self.current_block = header_bb;
         self.current_instructions = Vec::new();
-        let loop_phis = self.create_loop_phis(pre_header_bb, &scope_snapshot);
 
         let elem = self.new_temp(TypeSet::all());
         self.emit(Instruction::Intrinsic {
@@ -1172,8 +925,6 @@ impl<'a> Lowerer<'a> {
 
         self.loop_stack.pop();
 
-        let body_exit_bb = self.current_block;
-        self.patch_loop_phis(header_bb, body_exit_bb, &loop_phis);
         self.pop_scope();
         self.finish_block(Terminator::Jump { target: header_bb });
 
@@ -1191,11 +942,7 @@ impl<'a> Lowerer<'a> {
         let scrutinee = self.lower_expression(value);
         let exit_bb = self.fresh_block();
 
-        // Snapshot bindings before match — for detecting variable modifications
-        let pre_match_snapshot = self.snapshot_scope();
-
         let mut arm_results: Vec<(BlockId, VarId)> = Vec::new();
-        let mut arm_bindings: Vec<(Vec<(ast::Identifier, VarId)>, BlockId)> = Vec::new();
 
         for arm in arms {
             let next_bb = self.fresh_block();
@@ -1241,8 +988,6 @@ impl<'a> Lowerer<'a> {
             };
 
             let exit_block = self.current_block;
-            // Capture post-arm bindings before popping scope
-            arm_bindings.push((self.snapshot_scope(), exit_block));
             arm_results.push((exit_block, arm_value));
             self.pop_scope();
             self.finish_block(Terminator::Jump { target: exit_bb });
@@ -1256,7 +1001,6 @@ impl<'a> Lowerer<'a> {
         let fallback = self.new_temp(TypeSet::empty());
         self.emit(Instruction::Undefined { dest: fallback });
         let fallback_block = self.current_block;
-        arm_bindings.push((self.snapshot_scope(), fallback_block));
         arm_results.push((fallback_block, fallback));
         self.finish_block(Terminator::Jump { target: exit_bb });
 
@@ -1269,9 +1013,6 @@ impl<'a> Lowerer<'a> {
             dest: result,
             sources: arm_results,
         });
-
-        // Create phis for variables modified in any arm
-        self.merge_multi_branch_bindings(&pre_match_snapshot, &arm_bindings);
 
         result
     }

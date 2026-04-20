@@ -98,7 +98,7 @@ impl<'a> Lowerer<'a> {
                 let final_value = if matches!(op, ast::AssignmentOp::Assign) {
                     rhs
                 } else {
-                    if let Some(lhs) = self.lookup(name) {
+                    if let Some(lhs) = self.read_var(name) {
                         self.lower_compound_op(lhs, op, rhs)
                     } else {
                         self.error_undefined_var(None, name, self.current_span);
@@ -115,15 +115,8 @@ impl<'a> Lowerer<'a> {
                     });
                 }
 
-                // SSA: create a new VarId for each assignment, rebind the name.
-                // Loop-carried variables are handled by phi nodes constructed
-                // in the while/loop lowering.
-                let dest = self.new_temp(TypeSet::all());
-                self.emit(Instruction::Copy {
-                    dest,
-                    src: final_value,
-                });
-                self.bind(name, dest);
+                // Reassign the variable via its slot. mem2reg handles phis.
+                self.reassign(name, final_value);
                 final_value
             }
 

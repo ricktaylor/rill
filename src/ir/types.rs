@@ -441,18 +441,20 @@ pub enum Instruction {
         value: VarId,
     },
 
-    /// Write a named variable (pre-SSA form).
+    /// Write to a variable slot (pre-SSA form).
     ///
-    /// Records that `name` holds `value` at this point. Consumed by mem2reg,
-    /// which converts these to SSA VarIds with Phi nodes.
-    Assign { name: ast::Identifier, value: VarId },
+    /// Records that `slot` holds `value` at this point. Each binding site
+    /// (`let`, parameter, `for` variable) creates a unique slot ID. Reassignment
+    /// reuses the existing slot. Consumed by mem2reg, which converts these
+    /// to SSA VarIds with Phi nodes.
+    Assign { slot: u32, value: VarId },
 
-    /// Read a named variable (pre-SSA form).
+    /// Read from a variable slot (pre-SSA form).
     ///
-    /// Produces the current value of `name` into `dest`. Consumed by mem2reg,
+    /// Produces the current value of `slot` into `dest`. Consumed by mem2reg,
     /// which resolves each Read to the reaching definition (possibly through
     /// Phi nodes at merge points).
-    Read { name: ast::Identifier, dest: VarId },
+    Read { slot: u32, dest: VarId },
 
     /// Mark end of variable scope - slots can be reclaimed (planned)
     #[allow(dead_code)]

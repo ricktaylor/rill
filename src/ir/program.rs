@@ -274,6 +274,7 @@ impl<'a> Lowerer<'a> {
         self.blocks.clear();
         self.next_var_id = 0;
         self.next_block_id = 0;
+        self.next_slot_id = 0;
         self.loop_stack.clear();
 
         // Start with a fresh scope for parameters
@@ -327,13 +328,18 @@ impl<'a> Lowerer<'a> {
             return None;
         }
 
-        Some(Function {
+        let mut function = Function {
             name: func.name.clone(),
             params,
             rest_param,
             locals: std::mem::take(&mut self.vars),
             blocks: std::mem::take(&mut self.blocks),
             entry_block,
-        })
+        };
+
+        // Convert pre-SSA Assign/Read instructions to proper SSA with Phi nodes
+        crate::ssa::promote(&mut function);
+
+        Some(function)
     }
 }

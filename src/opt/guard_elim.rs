@@ -216,6 +216,40 @@ fn merge_block_chains(function: &mut Function) {
 
     // Remove merged blocks
     function.blocks.retain(|b| !merged.contains(&b.id));
+
+    // Convert phis that became fully self-referencing after merges.
+    //
+    // When block B is merged into predecessor A, phis from B that had source
+    // (A, val) end up as self-referencing: the phi is in A with source (A, val).
+    // The compiler handles phis by inserting copies into predecessor blocks.
+    // When a phi's source block IS its own block, the copy is inserted alongside
+    // other phi copies for downstream phis, creating ordering hazards (the
+    // downstream copy reads the stale value before the self-ref copy updates it).
+    //
+    // Fix: convert fully self-referencing phis to Copy instructions, which
+    // execute in the block's normal instruction sequence (before any phi copies).
+    for block in &mut function.blocks {
+        let block_id = block.id;
+        for inst in &mut block.instructions {
+            let replacement = match &inst.node {
+                Instruction::Phi { dest, sources }
+                    if !sources.is_empty()
+                        && sources.iter().all(|(src_block, _)| *src_block == block_id) =>
+                {
+                    // All sources are self-referencing — convert to Copy.
+                    // The value was computed earlier in this block (from a merged predecessor).
+                    Some(Instruction::Copy {
+                        dest: *dest,
+                        src: sources[0].1,
+                    })
+                }
+                _ => None,
+            };
+            if let Some(new_inst) = replacement {
+                inst.node = new_inst;
+            }
+        }
+    }
 }
 
 // ============================================================================

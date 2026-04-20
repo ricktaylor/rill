@@ -556,9 +556,9 @@ mod tests {
         assert_eq!(
             eval_intrinsic_const(
                 IntrinsicOp::Cast,
-                &[ConstValue::Float(3.14), ConstValue::UInt(3)]
+                &[ConstValue::Float(3.1), ConstValue::UInt(3)]
             ),
-            Some(ConstValue::Float(3.14))
+            Some(ConstValue::Float(3.1))
         );
     }
 
@@ -624,7 +624,7 @@ mod tests {
         assert_eq!(
             eval_intrinsic_const(
                 IntrinsicOp::Cast,
-                &[ConstValue::Float(3.14), ConstValue::UInt(1)]
+                &[ConstValue::Float(3.1), ConstValue::UInt(1)]
             ),
             None
         );

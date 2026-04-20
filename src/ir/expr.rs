@@ -16,7 +16,7 @@ impl<'a> Lowerer<'a> {
             ast::Expression::Literal(lit) => self.lower_literal(lit),
 
             ast::Expression::Variable(name) => {
-                if let Some(var) = self.lookup(name) {
+                if let Some(var) = self.read_var(name) {
                     var
                 } else if let Some(cv) = self.const_bindings.get(name).cloned() {
                     // Constant binding — emit inline literal
@@ -610,6 +610,11 @@ impl<'a> Lowerer<'a> {
                     arr,
                     value: val,
                 });
+                // Reassign the array slot — append mutates via CoW, so the
+                // slot must be updated to the post-mutation value.
+                if let ast::Expression::Variable(name) = &arguments[0] {
+                    self.reassign(name, dest);
+                }
                 Some(dest)
             }
             _ => None,
@@ -652,7 +657,7 @@ impl<'a> Lowerer<'a> {
             }
 
             ast::Expression::Variable(name) => {
-                if let Some(var) = self.lookup(name) {
+                if let Some(var) = self.read_var(name) {
                     let dest = self.new_temp(TypeSet::all());
                     self.emit(Instruction::MakeRef {
                         dest,

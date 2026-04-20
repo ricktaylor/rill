@@ -83,9 +83,15 @@ pub struct Lowerer<'a> {
     // ID generation
     pub next_var_id: u32,
     pub next_block_id: u32,
+    pub next_slot_id: u32,
 
-    /// Stack of scopes for variable name resolution
-    pub scopes: Vec<HashMap<ast::Identifier, VarId>>,
+    /// Stack of scopes for variable name resolution.
+    ///
+    /// Maps variable names to slot IDs. Each binding site (`let`, parameter,
+    /// `for` variable) creates a unique slot. Reassignment reuses the existing
+    /// slot. Shadowing (inner `let x`) creates a new slot; when the inner scope
+    /// is popped, the outer slot is restored.
+    pub scopes: Vec<HashMap<ast::Identifier, u32>>,
 
     /// Reference origin tracking (scoped like `scopes`).
     /// Maps variable names to their RefOrigin when bound via `with`.
@@ -134,6 +140,7 @@ impl<'a> Lowerer<'a> {
             const_bindings: HashMap::new(),
             next_var_id: 0,
             next_block_id: 0,
+            next_slot_id: 0,
             scopes: Vec::new(),
             ref_origins: Vec::new(),
             vars: Vec::new(),
@@ -233,25 +240,76 @@ impl<'a> Lowerer<'a> {
         self.ref_origins.pop();
     }
 
-    pub fn bind(&mut self, name: &ast::Identifier, var: VarId) {
-        // `_` is a discard binding — never enters scope, each use is
-        // a unique VarId that can't be referenced. The optimizer will
-        // DCE it if the assigned value has no side effects.
-        if name.0 == "_" {
-            return;
+    // ========================================================================
+    // Slot-based Variable Binding (pre-SSA)
+    // ========================================================================
+
+    /// Create a new variable slot and register it in the current scope.
+    ///
+    /// Each binding site (`let`, parameter, `for` variable, pattern binding)
+    /// creates a unique slot. Returns the slot ID.
+    pub fn new_slot(&mut self, name: &ast::Identifier) -> u32 {
+        let slot = self.next_slot_id;
+        self.next_slot_id += 1;
+        // `_` is a discard binding — don't enter scope
+        if name.0 != "_"
+            && let Some(scope) = self.scopes.last_mut()
+        {
+            scope.insert(name.clone(), slot);
         }
-        if let Some(scope) = self.scopes.last_mut() {
-            scope.insert(name.clone(), var);
-        }
+        slot
     }
 
-    pub fn lookup(&self, name: &ast::Identifier) -> Option<VarId> {
+    /// Look up the slot ID for a variable name without emitting any instructions.
+    pub fn lookup_slot(&self, name: &ast::Identifier) -> Option<u32> {
         for scope in self.scopes.iter().rev() {
-            if let Some(&var) = scope.get(name) {
-                return Some(var);
+            if let Some(&slot) = scope.get(name) {
+                return Some(slot);
             }
         }
         None
+    }
+
+    /// Emit an `Assign` instruction: write `value` to `slot`.
+    pub fn emit_assign(&mut self, slot: u32, value: VarId) {
+        self.emit(Instruction::Assign { slot, value });
+    }
+
+    /// Emit a `Read` instruction: read the current value of `slot` into a
+    /// fresh VarId. Returns the dest VarId.
+    pub fn emit_read(&mut self, slot: u32) -> VarId {
+        let dest = self.new_temp(TypeSet::all());
+        self.emit(Instruction::Read { slot, dest });
+        dest
+    }
+
+    /// Create a new binding and assign a value to it.
+    ///
+    /// Combines `new_slot` + `emit_assign`. Used for `let` bindings,
+    /// parameters, and pattern bindings.
+    pub fn bind(&mut self, name: &ast::Identifier, value: VarId) {
+        let slot = self.new_slot(name);
+        // Only emit Assign for non-discard bindings
+        if name.0 != "_" {
+            self.emit_assign(slot, value);
+        }
+    }
+
+    /// Read a variable by name. Emits a `Read` instruction and returns
+    /// the dest VarId. Returns `None` if the variable is not in scope.
+    pub fn read_var(&mut self, name: &ast::Identifier) -> Option<VarId> {
+        self.lookup_slot(name).map(|slot| self.emit_read(slot))
+    }
+
+    /// Reassign an existing variable by name. Emits an `Assign` instruction.
+    /// Returns the slot ID, or `None` if the variable is not in scope.
+    pub fn reassign(&mut self, name: &ast::Identifier, value: VarId) -> Option<u32> {
+        if let Some(slot) = self.lookup_slot(name) {
+            self.emit_assign(slot, value);
+            Some(slot)
+        } else {
+            None
+        }
     }
 
     // ========================================================================
