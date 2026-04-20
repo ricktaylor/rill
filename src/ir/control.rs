@@ -1019,8 +1019,14 @@ impl<'a> Lowerer<'a> {
 
     /// Lower a `..` / `..=` expression as a MakeSeq intrinsic.
     ///
-    /// Creates a Sequence value (lazy, O(1) memory). The `inclusive`
-    /// flag is passed as a Bool argument to handle both `..` and `..=`.
+    /// Creates a Sequence value (lazy, O(1) memory). MakeSeq always takes
+    /// an exclusive end. For inclusive ranges (`..=`), the lowerer emits
+    /// `end + 1` using checked Add — overflow on `0..=u64::MAX` produces
+    /// undefined naturally.
+    ///
+    /// A `start < end` guard is emitted so that reversed ranges produce
+    /// undefined, and the optimizer can prove the range is non-empty when
+    /// execution reaches the loop body.
     pub fn lower_range(
         &mut self,
         start: &ast::Expression,
@@ -1029,18 +1035,61 @@ impl<'a> Lowerer<'a> {
     ) -> VarId {
         let start_var = self.lower_expression(start);
         let end_var = self.lower_expression(end);
-        let inclusive_var = self.new_temp(TypeSet::single(types::BaseType::Bool));
-        self.emit(Instruction::Const {
-            dest: inclusive_var,
-            value: Literal::Bool(inclusive),
+
+        // For inclusive ranges, emit end_excl = end + 1 (checked)
+        let end_excl = if inclusive {
+            let one = self.new_temp(TypeSet::uint());
+            self.emit(Instruction::Const {
+                dest: one,
+                value: Literal::UInt(1),
+            });
+            self.emit_binary_intrinsic(IntrinsicOp::Add, end_var, one)
+        } else {
+            end_var
+        };
+
+        // Guard: start < end_excl — reversed ranges produce undefined
+        let valid = self.emit_binary_intrinsic(IntrinsicOp::Lt, start_var, end_excl);
+
+        let seq_bb = self.fresh_block();
+        let undef_bb = self.fresh_block();
+        let join_bb = self.fresh_block();
+
+        let result = self.new_temp(TypeSet::single(types::BaseType::Sequence));
+
+        self.finish_block(Terminator::If {
+            condition: valid,
+            then_target: seq_bb,
+            else_target: undef_bb,
+            span: self.current_span,
         });
 
-        let dest = self.new_temp(TypeSet::single(types::BaseType::Sequence));
+        // Then: create the sequence
+        self.current_block = seq_bb;
+        self.current_instructions = Vec::new();
+        let seq_val = self.new_temp(TypeSet::single(types::BaseType::Sequence));
         self.emit(Instruction::Intrinsic {
-            dest,
+            dest: seq_val,
             op: IntrinsicOp::MakeSeq,
-            args: vec![start_var, end_var, inclusive_var],
+            args: vec![start_var, end_excl],
         });
-        dest
+        self.finish_block(Terminator::Jump { target: join_bb });
+
+        // Else: undefined
+        self.current_block = undef_bb;
+        self.current_instructions = Vec::new();
+        let undef_val = self.new_temp(TypeSet::single(types::BaseType::Sequence));
+        self.emit(Instruction::Undefined { dest: undef_val });
+        self.finish_block(Terminator::Jump { target: join_bb });
+
+        // Join: phi
+        self.current_block = join_bb;
+        self.current_instructions = Vec::new();
+        self.emit(Instruction::Phi {
+            dest: result,
+            sources: vec![(seq_bb, seq_val), (undef_bb, undef_val)],
+        });
+
+        result
     }
 }

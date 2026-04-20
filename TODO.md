@@ -19,7 +19,7 @@ The full compilation and execution pipeline is working end-to-end with 139+ test
   - Extern param type guards (Match guards inserted before constrained calls)
 - **Optimizer** — 11 passes in two-phase pipeline (`src/ir/opt/`)
   - Phase 1 (fixpoint): const fold → CSE → copy prop → definedness → guard elim → CFG simplify → coercion elision → DCE
-  - Phase 2 (type-informed): type refinement → coercion insertion (Widen/Undefined) → algebraic simplification → cast elision → ref elision → dead arm elimination → re-run Phase 1
+  - Phase 2 (type-informed): type refinement → coercion insertion (Convert/Undefined) → algebraic simplification → cast elision → ref elision → dead arm elimination → re-run Phase 1
   - Interprocedural return type inference + argument type/definedness propagation
   - Function monomorphization (up to 4 variants per function)
   - Type mismatch warnings (W009), definedness diagnostics (E200/E201) with provenance tracking
@@ -282,7 +282,7 @@ Phase 1 (coarse — before type info):
   Const Fold → Definedness (coarse) → Diagnostics → Guard Elim → CFG Simplify
 
 Phase 2 (type-informed — on simplified CFG):
-  Type Refinement → Coercion Insertion (generates Match + Widen + Undefined)
+  Type Refinement → Coercion Insertion (generates Match + Convert + Undefined)
     → Definedness (fine — sees explicit Undefined from coercion)
       → Guard Elim → CFG Simplify → Const Fold → CFG Simplify
         → Type-aware closure compilation
@@ -300,11 +300,11 @@ src/
   compile/
     mod.rs            — Types, public API (compile_program, execute), link phase, compile_function/block/instruction
     terminator.rs     — compile_terminator, compile_match, match predicate compilation
-    specialize.rs     — try_specialize_binary/cast/widen, compile_intrinsic_dispatch, type-specialized closures
+    specialize.rs     — try_specialize_binary/convert, compile_intrinsic_dispatch, type-specialized closures
     exec.rs           — Per-op functions (exec_add etc.), index_value
     tests.rs          — Unit + end-to-end tests
   ast.rs              — AST node types, Span, Spanned
-  types.rs            — BaseType, TypeSet
+  types.rs            — BaseType, NumericType, ConvertMode, RangeEnd, TypeSet
   parser.rs           — Chumsky-based parser -> AST
   externs.rs         — ExternRegistry, Lua-style extern API: fn(&mut VM, usize)
   diagnostics.rs      — Error/warning accumulator with codes
@@ -324,10 +324,10 @@ src/
       const_fold.rs   — Constant folding pass
       ref_elision.rs  — Ref elision (MakeRef → Copy/Index, chain shortening)
       type_refinement.rs — Type set refinement
-      coercion.rs     — Coercion insertion (Widen for mixed types, Undefined for incompatible)
+      coercion.rs     — Coercion insertion (checked Convert for mixed types, Undefined for incompatible)
       guard_elim.rs   — Guard elimination + CFG simplification
       definedness.rs  — Definedness analysis
-      cast_elision.rs — Identity Cast/Widen → Copy
+      cast_elision.rs — Identity Convert → Copy
       copy_prop.rs    — Copy propagation (replace uses, remove dead Copies)
       dce.rs          — Dead code elimination (remove unused instructions)
       algebra.rs      — Algebraic simplification (identity, annihilation, strength reduction)

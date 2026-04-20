@@ -65,6 +65,11 @@ pub enum IntrinsicOp {
     MakeMap,
 
     // -- Sequence --
+    /// Create a lazy numeric sequence with exclusive end.
+    ///
+    /// Inclusive ranges (`..=`) are normalized by the lowerer: it emits
+    /// `end + 1` (checked Add) before `MakeSeq`, so overflow on
+    /// `0..=u64::MAX` produces undefined naturally.
     MakeSeq,
     ArraySeq,
     SeqNext,
@@ -153,10 +158,7 @@ impl IntrinsicOp {
             Self::MakeArray | Self::MakeMap => TypeSet::all(),
 
             // Sequence
-            Self::MakeSeq => match index {
-                0 | 1 => TypeSet::numeric(), // start, end
-                _ => TypeSet::bool(),        // inclusive flag
-            },
+            Self::MakeSeq => TypeSet::uint(), // start, end
             Self::ArraySeq => TypeSet::all(),
             Self::SeqNext => TypeSet::single(BaseType::Sequence), // arg must be Sequence
             Self::Collect => TypeSet::single(BaseType::Sequence),

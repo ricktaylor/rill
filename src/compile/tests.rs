@@ -1015,8 +1015,8 @@ fn test_cast_const_fold() {
 
 #[test]
 fn test_collect_empty_range() {
-    // collect(5..3) → empty array
-    let val = run_expect(
+    // 5..3 is a reversed range → undefined (not an empty sequence)
+    let result = run(
         r#"
             fn test() {
                 let arr = collect(5..3);
@@ -1025,7 +1025,7 @@ fn test_collect_empty_range() {
             "#,
         "test",
     );
-    assert_eq!(val, Value::UInt(0));
+    assert_eq!(result.unwrap(), None);
 }
 
 // ================================================================

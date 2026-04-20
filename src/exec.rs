@@ -300,18 +300,13 @@ impl Slot {
 /// same position.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SeqState {
-    /// Range over unsigned integers
-    RangeUInt {
-        current: u64,
-        end: u64,
-        inclusive: bool,
-    },
-    /// Range over signed integers
-    RangeInt {
-        current: i64,
-        end: i64,
-        inclusive: bool,
-    },
+    /// Range over unsigned integers, always exclusive.
+    ///
+    /// Inclusive ranges (`..=`) are normalized at construction time by
+    /// incrementing end via `saturating_add(1)`. This means `0..=u64::MAX`
+    /// saturates to `0..u64::MAX` (missing the last element) — a documented
+    /// limitation of the representation.
+    Range { current: u64, end: u64 },
     /// Zero-copy slice of an array (e.g., from `..rest` patterns).
     ///
     /// Holds a refcounted reference to the source array — no element copying.
@@ -338,38 +333,12 @@ impl SeqState {
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<Value> {
         match self {
-            SeqState::RangeUInt {
-                current,
-                end,
-                inclusive,
-            } => {
-                let done = if *inclusive {
-                    *current > *end
-                } else {
-                    *current >= *end
-                };
-                if done {
+            SeqState::Range { current, end } => {
+                if *current >= *end {
                     return None;
                 }
                 let val = Value::UInt(*current);
-                *current = current.saturating_add(1);
-                Some(val)
-            }
-            SeqState::RangeInt {
-                current,
-                end,
-                inclusive,
-            } => {
-                let done = if *inclusive {
-                    *current > *end
-                } else {
-                    *current >= *end
-                };
-                if done {
-                    return None;
-                }
-                let val = Value::Int(*current);
-                *current = current.saturating_add(1);
+                *current += 1;
                 Some(val)
             }
             SeqState::ArraySlice {
@@ -388,34 +357,7 @@ impl SeqState {
     /// Remaining length, if known.
     pub fn remaining(&self) -> Option<usize> {
         match self {
-            SeqState::RangeUInt {
-                current,
-                end,
-                inclusive,
-            } => {
-                let end_val = if *inclusive {
-                    end.saturating_add(1)
-                } else {
-                    *end
-                };
-                Some(end_val.saturating_sub(*current) as usize)
-            }
-            SeqState::RangeInt {
-                current,
-                end,
-                inclusive,
-            } => {
-                let end_val = if *inclusive {
-                    end.saturating_add(1)
-                } else {
-                    *end
-                };
-                if end_val <= *current {
-                    Some(0)
-                } else {
-                    Some((end_val - *current) as usize)
-                }
-            }
+            SeqState::Range { current, end } => Some(end.saturating_sub(*current) as usize),
             SeqState::ArraySlice { start, end, .. } => Some(end.saturating_sub(*start)),
         }
     }
@@ -427,23 +369,9 @@ impl Hash for SeqState {
     fn hash<H: Hasher>(&self, state: &mut H) {
         std::mem::discriminant(self).hash(state);
         match self {
-            SeqState::RangeUInt {
-                current,
-                end,
-                inclusive,
-            } => {
+            SeqState::Range { current, end } => {
                 current.hash(state);
                 end.hash(state);
-                inclusive.hash(state);
-            }
-            SeqState::RangeInt {
-                current,
-                end,
-                inclusive,
-            } => {
-                current.hash(state);
-                end.hash(state);
-                inclusive.hash(state);
             }
             SeqState::ArraySlice {
                 source,

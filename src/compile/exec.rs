@@ -278,36 +278,15 @@ pub(super) fn exec_make_map(arg_slots: &[usize], vm: &mut VM) -> Result<Option<V
 }
 
 pub(super) fn exec_make_seq(arg_slots: &[usize], vm: &mut VM) -> Option<Value> {
-    let inclusive = match vm.local(arg_slots[2]) {
-        Some(Value::Bool(b)) => *b,
-        _ => false,
+    let (start, end) = match (vm.local(arg_slots[0]), vm.local(arg_slots[1])) {
+        (Some(Value::UInt(s)), Some(Value::UInt(e))) => (*s, *e),
+        _ => return None,
     };
-    let seq = match (vm.local(arg_slots[0]), vm.local(arg_slots[1])) {
-        (Some(Value::UInt(start)), Some(Value::UInt(end))) => Some(SeqState::RangeUInt {
-            current: *start,
-            end: *end,
-            inclusive,
-        }),
-        (Some(Value::Int(start)), Some(Value::Int(end))) => Some(SeqState::RangeInt {
-            current: *start,
-            end: *end,
-            inclusive,
-        }),
-        (Some(Value::UInt(start)), Some(Value::Int(end))) => Some(SeqState::RangeInt {
-            current: *start as i64,
-            end: *end,
-            inclusive,
-        }),
-        (Some(Value::Int(start)), Some(Value::UInt(end))) => Some(SeqState::RangeInt {
-            current: *start,
-            end: *end as i64,
-            inclusive,
-        }),
-        _ => None,
+    let state = SeqState::Range {
+        current: start,
+        end,
     };
-    // HeapVal::new can fail, but for sequences this is infallible in practice.
-    // Use try_into pattern to avoid changing the return type.
-    seq.and_then(|state| HeapVal::new(state, vm.heap()).ok().map(Value::Sequence))
+    HeapVal::new(state, vm.heap()).ok().map(Value::Sequence)
 }
 
 pub(super) fn exec_array_seq(arg_slots: &[usize], vm: &mut VM) -> Option<Value> {
