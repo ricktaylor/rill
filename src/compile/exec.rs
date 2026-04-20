@@ -337,43 +337,36 @@ pub(super) fn exec_array_seq(arg_slots: &[usize], vm: &mut VM) -> Option<Value> 
     }
 }
 
-pub(super) fn exec_widen(arg_slots: &[usize], vm: &VM) -> Option<Value> {
-    let target = match vm.local(arg_slots[1]) {
-        Some(Value::UInt(t)) => *t,
-        _ => return None,
-    };
+pub(super) fn exec_convert(
+    target: NumericType,
+    mode: ConvertMode,
+    arg_slots: &[usize],
+    vm: &VM,
+) -> Option<Value> {
     let value = vm.local(arg_slots[0]);
-    match (value, target) {
-        (Some(Value::UInt(n)), 2) => {
-            let n = *n;
-            if n > i64::MAX as u64 {
+    match (value, target, mode) {
+        // Identity
+        (Some(Value::UInt(n)), NumericType::UInt, _) => Some(Value::UInt(*n)),
+        (Some(Value::Int(n)), NumericType::Int, _) => Some(Value::Int(*n)),
+        (Some(Value::Float(f)), NumericType::Float, _) => Some(Value::Float(*f)),
+        // UInt → Int: checked overflows, unchecked wraps
+        (Some(Value::UInt(n)), NumericType::Int, ConvertMode::Checked) => {
+            if *n > i64::MAX as u64 {
                 None
             } else {
-                Some(Value::Int(n as i64))
+                Some(Value::Int(*n as i64))
             }
         }
-        (Some(Value::Int(n)), 2) => Some(Value::Int(*n)),
-        (Some(Value::UInt(n)), 3) => Float::new(*n as f64).map(Value::Float),
-        (Some(Value::Int(n)), 3) => Float::new(*n as f64).map(Value::Float),
-        (Some(Value::Float(f)), 3) => Some(Value::Float(*f)),
-        _ => None,
-    }
-}
-
-pub(super) fn exec_cast(arg_slots: &[usize], vm: &VM) -> Option<Value> {
-    let target = match vm.local(arg_slots[1]) {
-        Some(Value::UInt(t)) => *t,
-        _ => return None,
-    };
-    let value = vm.local(arg_slots[0]);
-    match (value, target) {
-        (Some(Value::UInt(n)), 1) => Some(Value::UInt(*n)),
-        (Some(Value::Int(n)), 1) => Some(Value::UInt(*n as u64)),
-        (Some(Value::UInt(n)), 2) => Some(Value::Int(*n as i64)),
-        (Some(Value::Int(n)), 2) => Some(Value::Int(*n)),
-        (Some(Value::UInt(n)), 3) => Float::new(*n as f64).map(Value::Float),
-        (Some(Value::Int(n)), 3) => Float::new(*n as f64).map(Value::Float),
-        (Some(Value::Float(f)), 3) => Some(Value::Float(*f)),
+        (Some(Value::UInt(n)), NumericType::Int, ConvertMode::Unchecked) => {
+            Some(Value::Int(*n as i64))
+        }
+        // Int → UInt: unchecked only (bit reinterpret)
+        (Some(Value::Int(n)), NumericType::UInt, ConvertMode::Unchecked) => {
+            Some(Value::UInt(*n as u64))
+        }
+        // → Float: same for both modes
+        (Some(Value::UInt(n)), NumericType::Float, _) => Float::new(*n as f64).map(Value::Float),
+        (Some(Value::Int(n)), NumericType::Float, _) => Float::new(*n as f64).map(Value::Float),
         _ => None,
     }
 }

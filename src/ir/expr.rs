@@ -145,10 +145,10 @@ impl<'a> Lowerer<'a> {
         let val = self.lower_expression(value);
 
         // Validate target is a castable numeric type
-        let target_code = match target_type.as_ref() {
-            "UInt" => 1u64,  // BaseType::UInt discriminant
-            "Int" => 2u64,   // BaseType::Int discriminant
-            "Float" => 3u64, // BaseType::Float discriminant
+        let target = match target_type.as_ref() {
+            "UInt" => types::NumericType::UInt,
+            "Int" => types::NumericType::Int,
+            "Float" => types::NumericType::Float,
             other => {
                 self.diagnostics.error(
                     diagnostics::DiagnosticCode::E300_TypeMismatch,
@@ -165,12 +165,10 @@ impl<'a> Lowerer<'a> {
             }
         };
 
-        let target = self.new_temp(TypeSet::single(types::BaseType::UInt));
-        self.emit(Instruction::Const {
-            dest: target,
-            value: Literal::UInt(target_code),
-        });
-        self.emit_binary_intrinsic(IntrinsicOp::Cast, val, target)
+        self.emit_unary_intrinsic(
+            IntrinsicOp::Convert(target, types::ConvertMode::Unchecked),
+            val,
+        )
     }
 
     /// Lower a literal value

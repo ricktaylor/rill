@@ -514,13 +514,13 @@ pub fn optimize_function(
     check_intrinsic_types(function, &types, diagnostics);
     check_condition_types(function, &types, diagnostics);
 
-    // Coercion insertion: makes implicit numeric promotion explicit via Widen.
+    // Coercion insertion: makes implicit numeric promotion explicit via checked Convert.
     // Also replaces provably-incompatible operations with Undefined.
     let coercions = insert_coercions(function, &types);
 
-    // Identity cast/widen elimination: replaces Cast(v, T) and Widen(v, T)
-    // with Copy when source type already matches target. Catches user-written
-    // redundant casts (e.g. `x as UInt` where x is UInt) and Widens that
+    // Identity conversion elimination: replaces Convert(T, _, [v]) with Copy
+    // when source type already matches target. Catches user-written redundant
+    // casts (e.g. `x as UInt` where x is UInt) and checked conversions that
     // became identity after type narrowing.
     let cast_elisions = elide_identity_casts(function, &types);
 

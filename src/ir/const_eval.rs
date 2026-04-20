@@ -174,50 +174,33 @@ pub fn eval_intrinsic_const(op: crate::ir::IntrinsicOp, args: &[ConstValue]) -> 
         | IntrinsicOp::SeqNext
         | IntrinsicOp::Collect => None,
 
-        // Widen: numeric coercion along the promotion lattice
-        IntrinsicOp::Widen => {
+        // Numeric conversion (checked = overflow-checked, unchecked = bit-reinterpret)
+        IntrinsicOp::Convert(target, mode) => {
+            use crate::types::{ConvertMode, NumericType};
             let value = args.first()?;
-            let target = match args.get(1)? {
-                ConstValue::UInt(t) => *t,
-                _ => return None,
-            };
-            match (value, target) {
-                // Target = Int (BaseType::Int = 2)
-                (ConstValue::UInt(n), 2) => {
-                    let n = *n;
-                    if n > i64::MAX as u64 {
-                        None // overflow
+            match (value, target, mode) {
+                // Identity
+                (ConstValue::UInt(n), NumericType::UInt, _) => Some(ConstValue::UInt(*n)),
+                (ConstValue::Int(n), NumericType::Int, _) => Some(ConstValue::Int(*n)),
+                (ConstValue::Float(f), NumericType::Float, _) => Some(ConstValue::Float(*f)),
+                // UInt → Int: checked overflows, unchecked wraps
+                (ConstValue::UInt(n), NumericType::Int, ConvertMode::Checked) => {
+                    if *n > i64::MAX as u64 {
+                        None
                     } else {
-                        Some(ConstValue::Int(n as i64))
+                        Some(ConstValue::Int(*n as i64))
                     }
                 }
-                (ConstValue::Int(n), 2) => Some(ConstValue::Int(*n)), // identity
-                // Target = Float (BaseType::Float = 3)
-                (ConstValue::UInt(n), 3) => Some(ConstValue::Float(*n as f64)),
-                (ConstValue::Int(n), 3) => Some(ConstValue::Float(*n as f64)),
-                (ConstValue::Float(f), 3) => Some(ConstValue::Float(*f)), // identity
-                _ => None,
-            }
-        }
-
-        // Cast: infallible numeric reinterpretation / widening
-        IntrinsicOp::Cast => {
-            let value = args.first()?;
-            let target = match args.get(1)? {
-                ConstValue::UInt(t) => *t,
-                _ => return None,
-            };
-            match (value, target) {
-                // Target = UInt (1)
-                (ConstValue::UInt(n), 1) => Some(ConstValue::UInt(*n)),
-                (ConstValue::Int(n), 1) => Some(ConstValue::UInt(*n as u64)), // bit reinterpret
-                // Target = Int (2)
-                (ConstValue::UInt(n), 2) => Some(ConstValue::Int(*n as i64)), // bit reinterpret
-                (ConstValue::Int(n), 2) => Some(ConstValue::Int(*n)),
-                // Target = Float (3)
-                (ConstValue::UInt(n), 3) => Some(ConstValue::Float(*n as f64)),
-                (ConstValue::Int(n), 3) => Some(ConstValue::Float(*n as f64)),
-                (ConstValue::Float(f), 3) => Some(ConstValue::Float(*f)),
+                (ConstValue::UInt(n), NumericType::Int, ConvertMode::Unchecked) => {
+                    Some(ConstValue::Int(*n as i64))
+                }
+                // Int → UInt: only unchecked (bit reinterpret)
+                (ConstValue::Int(n), NumericType::UInt, ConvertMode::Unchecked) => {
+                    Some(ConstValue::UInt(*n as u64))
+                }
+                // → Float: same for both modes
+                (ConstValue::UInt(n), NumericType::Float, _) => Some(ConstValue::Float(*n as f64)),
+                (ConstValue::Int(n), NumericType::Float, _) => Some(ConstValue::Float(*n as f64)),
                 _ => None,
             }
         }
@@ -537,94 +520,117 @@ mod tests {
     }
 
     #[test]
-    fn test_const_cast_identity() {
-        // Identity casts: same type in, same type out
-        assert_eq!(
-            eval_intrinsic_const(
-                IntrinsicOp::Cast,
-                &[ConstValue::UInt(42), ConstValue::UInt(1)]
-            ),
-            Some(ConstValue::UInt(42))
-        );
-        assert_eq!(
-            eval_intrinsic_const(
-                IntrinsicOp::Cast,
-                &[ConstValue::Int(-5), ConstValue::UInt(2)]
-            ),
-            Some(ConstValue::Int(-5))
-        );
-        assert_eq!(
-            eval_intrinsic_const(
-                IntrinsicOp::Cast,
-                &[ConstValue::Float(3.1), ConstValue::UInt(3)]
-            ),
-            Some(ConstValue::Float(3.1))
-        );
+    fn test_const_convert_identity() {
+        use crate::types::{ConvertMode, NumericType};
+        // Identity conversions: same type in, same type out (both modes)
+        for mode in [ConvertMode::Checked, ConvertMode::Unchecked] {
+            assert_eq!(
+                eval_intrinsic_const(
+                    IntrinsicOp::Convert(NumericType::UInt, mode),
+                    &[ConstValue::UInt(42)]
+                ),
+                Some(ConstValue::UInt(42))
+            );
+            assert_eq!(
+                eval_intrinsic_const(
+                    IntrinsicOp::Convert(NumericType::Int, mode),
+                    &[ConstValue::Int(-5)]
+                ),
+                Some(ConstValue::Int(-5))
+            );
+            assert_eq!(
+                eval_intrinsic_const(
+                    IntrinsicOp::Convert(NumericType::Float, mode),
+                    &[ConstValue::Float(3.1)]
+                ),
+                Some(ConstValue::Float(3.1))
+            );
+        }
     }
 
     #[test]
-    fn test_const_cast_bit_reinterpret() {
+    fn test_const_convert_unchecked_reinterpret() {
+        use crate::types::{ConvertMode, NumericType};
+        let unchecked = ConvertMode::Unchecked;
         // Int → UInt: bit reinterpret
         assert_eq!(
             eval_intrinsic_const(
-                IntrinsicOp::Cast,
-                &[ConstValue::Int(-1), ConstValue::UInt(1)]
+                IntrinsicOp::Convert(NumericType::UInt, unchecked),
+                &[ConstValue::Int(-1)]
             ),
             Some(ConstValue::UInt(u64::MAX))
         );
-        // UInt → Int: bit reinterpret
+        // UInt → Int: bit reinterpret (wraps)
         assert_eq!(
             eval_intrinsic_const(
-                IntrinsicOp::Cast,
-                &[ConstValue::UInt(u64::MAX), ConstValue::UInt(2)]
+                IntrinsicOp::Convert(NumericType::Int, unchecked),
+                &[ConstValue::UInt(u64::MAX)]
             ),
             Some(ConstValue::Int(-1))
         );
     }
 
     #[test]
-    fn test_const_cast_widen_to_float() {
-        // UInt → Float
+    fn test_const_convert_checked_overflow() {
+        use crate::types::{ConvertMode, NumericType};
+        let checked = ConvertMode::Checked;
+        // UInt → Int checked: overflow returns None
         assert_eq!(
             eval_intrinsic_const(
-                IntrinsicOp::Cast,
-                &[ConstValue::UInt(42), ConstValue::UInt(3)]
+                IntrinsicOp::Convert(NumericType::Int, checked),
+                &[ConstValue::UInt(u64::MAX)]
             ),
-            Some(ConstValue::Float(42.0))
+            None
         );
-        // Int → Float
+        // UInt → Int checked: in-range succeeds
         assert_eq!(
             eval_intrinsic_const(
-                IntrinsicOp::Cast,
-                &[ConstValue::Int(-10), ConstValue::UInt(3)]
+                IntrinsicOp::Convert(NumericType::Int, checked),
+                &[ConstValue::UInt(42)]
             ),
-            Some(ConstValue::Float(-10.0))
+            Some(ConstValue::Int(42))
         );
     }
 
     #[test]
-    fn test_const_cast_invalid_source() {
-        // Bool → UInt: not a valid cast source
+    fn test_const_convert_to_float() {
+        use crate::types::{ConvertMode, NumericType};
+        // → Float: same for both modes
+        for mode in [ConvertMode::Checked, ConvertMode::Unchecked] {
+            assert_eq!(
+                eval_intrinsic_const(
+                    IntrinsicOp::Convert(NumericType::Float, mode),
+                    &[ConstValue::UInt(42)]
+                ),
+                Some(ConstValue::Float(42.0))
+            );
+            assert_eq!(
+                eval_intrinsic_const(
+                    IntrinsicOp::Convert(NumericType::Float, mode),
+                    &[ConstValue::Int(-10)]
+                ),
+                Some(ConstValue::Float(-10.0))
+            );
+        }
+    }
+
+    #[test]
+    fn test_const_convert_invalid_source() {
+        use crate::types::{ConvertMode, NumericType};
+        let unchecked = ConvertMode::Unchecked;
+        // Bool → UInt: not a valid source
         assert_eq!(
             eval_intrinsic_const(
-                IntrinsicOp::Cast,
-                &[ConstValue::Bool(true), ConstValue::UInt(1)]
-            ),
-            None
-        );
-        // Text → Int: not a valid cast source
-        assert_eq!(
-            eval_intrinsic_const(
-                IntrinsicOp::Cast,
-                &[ConstValue::Text("42".into()), ConstValue::UInt(2)]
+                IntrinsicOp::Convert(NumericType::UInt, unchecked),
+                &[ConstValue::Bool(true)]
             ),
             None
         );
         // Float → UInt: not supported (use floor/round/trunc)
         assert_eq!(
             eval_intrinsic_const(
-                IntrinsicOp::Cast,
-                &[ConstValue::Float(3.1), ConstValue::UInt(1)]
+                IntrinsicOp::Convert(NumericType::UInt, unchecked),
+                &[ConstValue::Float(3.1)]
             ),
             None
         );

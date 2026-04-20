@@ -1,6 +1,6 @@
 //! Coercion Insertion Pass
 //!
-//! Inserts explicit `Widen` instructions for mixed-type arithmetic operations,
+//! Inserts explicit checked `Convert` instructions for mixed-type arithmetic operations,
 //! using TypeAnalysis to determine operand types. This makes implicit numeric
 //! promotion visible in the IR, enabling the optimizer to fold, hoist, and
 //! eliminate coercions.
@@ -8,7 +8,7 @@
 //! **Transformations:**
 //!
 //! - **Same known type** (e.g. UInt+UInt): no change — already monomorphic.
-//! - **Mixed known types** (e.g. UInt+Int): insert `Widen` for the narrower
+//! - **Mixed known types** (e.g. UInt+Int): insert checked `Convert` for the narrower
 //!   operand, rewrite the op to use the widened value.
 //! - **Incompatible types** (e.g. Text+UInt): replace with `Undefined` — the
 //!   operation provably cannot succeed.
@@ -16,17 +16,17 @@
 //!
 //! Runs after type refinement (Phase 2). After coercion insertion, the Phase 1
 //! fixpoint loop re-runs on the expanded IR: const fold collapses
-//! `Widen(Const(42_u64), 2)` → `Const(42_i64)`, definedness sees the new
+//! `Convert(Int, Checked, [Const(42_u64)])` → `Const(42_i64)`, definedness sees the new
 //! `Undefined` instructions, guard elim + CFG simplify clean up dead branches.
 
 use crate::ast;
 use crate::ir::{BlockId, Function, Instruction, IntrinsicOp, VarId};
-use crate::ir::{Literal, SpannedInst, Var};
+use crate::ir::{SpannedInst, Var};
 use crate::opt::type_refinement::TypeAnalysis;
-use crate::types::{BaseType, TypeSet};
+use crate::types::{BaseType, ConvertMode, NumericType, TypeSet};
 use std::collections::HashMap;
 
-/// Insert explicit Widen instructions for mixed-type arithmetic.
+/// Insert explicit checked Convert instructions for mixed-type arithmetic.
 ///
 /// Returns the number of instructions modified.
 pub fn insert_coercions(function: &mut Function, types: &TypeAnalysis) -> usize {
@@ -169,8 +169,8 @@ fn promote(a: BaseType, b: BaseType) -> BaseType {
     }
 }
 
-/// Emit a Widen instruction sequence: Const(target) + Widen(value, target).
-/// Returns the widened VarId and the instructions to insert.
+/// Emit a checked Convert instruction for implicit numeric promotion.
+/// Returns the widened VarId and the instruction to insert.
 fn emit_widen(
     value: VarId,
     target: BaseType,
@@ -178,13 +178,7 @@ fn emit_widen(
     next_id: &mut u32,
     new_locals: &mut Vec<Var>,
 ) -> (VarId, Vec<SpannedInst>) {
-    let target_const = VarId(*next_id);
-    *next_id += 1;
-    new_locals.push(Var::new(
-        target_const,
-        ast::Identifier("$widen_target".to_string()),
-        TypeSet::uint(),
-    ));
+    let target_nt = NumericType::from(target);
 
     let widened = VarId(*next_id);
     *next_id += 1;
@@ -194,23 +188,14 @@ fn emit_widen(
         TypeSet::single(target),
     ));
 
-    let insts = vec![
-        spanned(
-            Instruction::Const {
-                dest: target_const,
-                value: Literal::UInt(target as u64),
-            },
-            span,
-        ),
-        spanned(
-            Instruction::Intrinsic {
-                dest: widened,
-                op: IntrinsicOp::Widen,
-                args: vec![value, target_const],
-            },
-            span,
-        ),
-    ];
+    let insts = vec![spanned(
+        Instruction::Intrinsic {
+            dest: widened,
+            op: IntrinsicOp::Convert(target_nt, ConvertMode::Checked),
+            args: vec![value],
+        },
+        span,
+    )];
 
     (widened, insts)
 }
@@ -223,61 +208,53 @@ fn spanned(inst: Instruction, span: ast::Span) -> SpannedInst {
 // Redundant Coercion Elimination
 // ============================================================================
 
-/// Metadata for a Widen instruction: what value it widens and to what target.
-struct WidenInfo {
-    /// The original input value (before widening)
+/// Metadata for a checked Convert instruction: what value it converts and to what target.
+struct ConvertInfo {
+    /// The original input value (before conversion)
     original: VarId,
-    /// The target type (BaseType discriminant as u64)
-    target: u64,
+    /// The target type
+    target: NumericType,
 }
 
-/// Eliminate redundant Widen instructions.
+/// Eliminate redundant checked Convert instructions.
 ///
 /// Two rewrites:
 ///
-/// 1. **Chain collapsing**: `Widen(Widen(x, _), Float)` → `Widen(x, Float)`.
-///    Skips the intermediate type — widening is transitive along the lattice.
+/// 1. **Chain collapsing**: `Convert(Float, Checked, [Convert(Int, Checked, [x])])`
+///    → `Convert(Float, Checked, [x])`. Skips the intermediate type — widening
+///    is transitive along the lattice.
 ///
-/// 2. **Identity elimination**: `Widen(v, T)` where `v` was produced by
-///    `Widen(_, T)` → `Copy(dest, v)`. The input is already the target type.
+/// 2. **Identity elimination**: `Convert(T, Checked, [v])` where `v` was produced
+///    by `Convert(T, Checked, _)` → `Copy(dest, v)`. Already the target type.
 ///
+/// Only operates on `Checked` conversions (compiler-inserted promotions).
 /// Runs in the Phase 1 fixpoint loop. No TypeAnalysis needed — works purely
 /// on instruction structure. Returns the number of instructions rewritten.
 pub fn elide_coercions(function: &mut Function) -> usize {
-    // Phase 1: Collect Widen metadata
-    let mut widen_info: HashMap<VarId, WidenInfo> = HashMap::new();
-    // Also collect constant values for target resolution
-    let mut const_values: HashMap<VarId, u64> = HashMap::new();
+    // Phase 1: Collect checked Convert metadata
+    let mut convert_info: HashMap<VarId, ConvertInfo> = HashMap::new();
 
     for block in &function.blocks {
         for inst in &block.instructions {
-            match &inst.node {
-                Instruction::Const {
-                    dest,
-                    value: Literal::UInt(n),
-                } => {
-                    const_values.insert(*dest, *n);
-                }
-                Instruction::Intrinsic {
-                    dest,
-                    op: IntrinsicOp::Widen,
-                    args,
-                } if args.len() == 2 => {
-                    let target = const_values.get(&args[1]).copied().unwrap_or(0);
-                    widen_info.insert(
-                        *dest,
-                        WidenInfo {
-                            original: args[0],
-                            target,
-                        },
-                    );
-                }
-                _ => {}
+            if let Instruction::Intrinsic {
+                dest,
+                op: IntrinsicOp::Convert(target, ConvertMode::Checked),
+                args,
+            } = &inst.node
+                && let Some(&input) = args.first()
+            {
+                convert_info.insert(
+                    *dest,
+                    ConvertInfo {
+                        original: input,
+                        target: *target,
+                    },
+                );
             }
         }
     }
 
-    if widen_info.is_empty() {
+    if convert_info.is_empty() {
         return 0;
     }
 
@@ -288,39 +265,33 @@ pub fn elide_coercions(function: &mut Function) -> usize {
         for inst in &mut block.instructions {
             let Instruction::Intrinsic {
                 dest,
-                op: IntrinsicOp::Widen,
+                op: IntrinsicOp::Convert(target, ConvertMode::Checked),
                 args,
             } = &inst.node
             else {
                 continue;
             };
-            if args.len() != 2 {
-                continue;
-            }
 
             let dest = *dest;
+            let target = *target;
             let input = args[0];
-            let target = const_values.get(&args[1]).copied().unwrap_or(0);
 
-            // Check if the input was produced by another Widen
-            if let Some(inner) = widen_info.get(&input) {
+            // Check if the input was produced by another checked Convert
+            if let Some(inner) = convert_info.get(&input) {
                 if inner.target == target {
-                    // Identity: input is already the target type.
-                    // Widen(Widen(x, T), T) → Copy(dest, input)
+                    // Identity: input is already the target type
                     inst.node = Instruction::Copy { dest, src: input };
                     changes += 1;
                 } else {
-                    // Chain: Widen(Widen(x, A), B) → Widen(x, B)
-                    // Follow transitively to the root
+                    // Chain: skip intermediate conversion
                     let mut root = inner.original;
-                    while let Some(deeper) = widen_info.get(&root) {
+                    while let Some(deeper) = convert_info.get(&root) {
                         root = deeper.original;
                     }
-                    let target_var = args[1];
                     inst.node = Instruction::Intrinsic {
                         dest,
-                        op: IntrinsicOp::Widen,
-                        args: vec![root, target_var],
+                        op: IntrinsicOp::Convert(target, ConvertMode::Checked),
+                        args: vec![root],
                     };
                     changes += 1;
                 }
@@ -338,7 +309,7 @@ pub fn elide_coercions(function: &mut Function) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{BasicBlock, Param, Terminator};
+    use crate::ir::{BasicBlock, Literal, Param, Terminator};
     use crate::opt::analyze_types;
 
     fn var(id: u32) -> VarId {
@@ -442,26 +413,20 @@ mod tests {
         let changes = insert_coercions(&mut func, &types);
 
         assert_eq!(changes, 1);
-        // Should have 5 instructions now: 2 Const + Const(target) + Widen + Add
-        assert_eq!(func.blocks[0].instructions.len(), 5);
+        // Should have 4 instructions now: 2 Const + Widen + Add
+        assert_eq!(func.blocks[0].instructions.len(), 4);
 
-        // The Widen should target Int (discriminant 2)
+        // The Widen should target Int
         assert!(matches!(
             &func.blocks[0].instructions[2].node,
-            Instruction::Const {
-                value: Literal::UInt(2),
-                ..
-            }
-        ));
-        assert!(matches!(
-            &func.blocks[0].instructions[3].node,
             Instruction::Intrinsic {
-                op: IntrinsicOp::Widen,
+                op: IntrinsicOp::Convert(NumericType::Int, ConvertMode::Checked),
+                args,
                 ..
-            }
+            } if args.len() == 1
         ));
         // The Add should use the widened arg for arg[0]
-        if let Instruction::Intrinsic { args, .. } = &func.blocks[0].instructions[4].node {
+        if let Instruction::Intrinsic { args, .. } = &func.blocks[0].instructions[3].node {
             assert_ne!(args[0], var(0)); // arg[0] is now the widened value
             assert_eq!(args[1], var(1)); // arg[1] unchanged
         } else {
@@ -545,11 +510,11 @@ mod tests {
         let changes = insert_coercions(&mut func, &types);
 
         assert_eq!(changes, 1);
-        // Widen target should be Float (discriminant 3)
+        // Widen target should be Float
         assert!(matches!(
             &func.blocks[0].instructions[2].node,
-            Instruction::Const {
-                value: Literal::UInt(3),
+            Instruction::Intrinsic {
+                op: IntrinsicOp::Convert(NumericType::Float, ConvertMode::Checked),
                 ..
             }
         ));
@@ -606,10 +571,8 @@ mod tests {
         // v1 is already Int, so widening to Int again is identity.
         let locals = vec![
             Var::new(var(0), ast::Identifier("a".into()), TypeSet::uint()),
-            Var::new(var(1), ast::Identifier("t1".into()), TypeSet::uint()),
-            Var::new(var(2), ast::Identifier("w1".into()), TypeSet::int()),
-            Var::new(var(3), ast::Identifier("t2".into()), TypeSet::uint()),
-            Var::new(var(4), ast::Identifier("w2".into()), TypeSet::int()),
+            Var::new(var(1), ast::Identifier("w1".into()), TypeSet::int()),
+            Var::new(var(2), ast::Identifier("w2".into()), TypeSet::int()),
         ];
         let blocks = vec![BasicBlock {
             id: block_id(0),
@@ -618,31 +581,21 @@ mod tests {
                     dest: var(0),
                     value: Literal::UInt(42),
                 }),
-                // target = Int (2)
-                si(Instruction::Const {
+                // v1 = Widen(v0, Int)
+                si(Instruction::Intrinsic {
                     dest: var(1),
-                    value: Literal::UInt(2),
+                    op: IntrinsicOp::Convert(NumericType::Int, ConvertMode::Checked),
+                    args: vec![var(0)],
                 }),
-                // v2 = Widen(v0, Int)
+                // v2 = Widen(v1, Int) — identity! v1 is already Int
                 si(Instruction::Intrinsic {
                     dest: var(2),
-                    op: IntrinsicOp::Widen,
-                    args: vec![var(0), var(1)],
-                }),
-                // target = Int (2) again
-                si(Instruction::Const {
-                    dest: var(3),
-                    value: Literal::UInt(2),
-                }),
-                // v4 = Widen(v2, Int) — identity! v2 is already Int
-                si(Instruction::Intrinsic {
-                    dest: var(4),
-                    op: IntrinsicOp::Widen,
-                    args: vec![var(2), var(3)],
+                    op: IntrinsicOp::Convert(NumericType::Int, ConvertMode::Checked),
+                    args: vec![var(1)],
                 }),
             ],
             terminator: Terminator::Return {
-                value: Some(var(4)),
+                value: Some(var(2)),
             },
         }];
 
@@ -650,11 +603,11 @@ mod tests {
         let changes = elide_coercions(&mut func);
 
         assert_eq!(changes, 1);
-        // v4 should now be Copy(v4, v2)
+        // v2 should now be Copy(v2, v1)
         assert!(matches!(
-            &func.blocks[0].instructions[4].node,
+            &func.blocks[0].instructions[2].node,
             Instruction::Copy { dest, src }
-                if *dest == var(4) && *src == var(2)
+                if *dest == var(2) && *src == var(1)
         ));
     }
 
@@ -663,10 +616,8 @@ mod tests {
         // Widen(Widen(v0, Int), Float) → Widen(v0, Float)
         let locals = vec![
             Var::new(var(0), ast::Identifier("a".into()), TypeSet::uint()),
-            Var::new(var(1), ast::Identifier("t1".into()), TypeSet::uint()),
-            Var::new(var(2), ast::Identifier("w1".into()), TypeSet::int()),
-            Var::new(var(3), ast::Identifier("t2".into()), TypeSet::uint()),
-            Var::new(var(4), ast::Identifier("w2".into()), TypeSet::float()),
+            Var::new(var(1), ast::Identifier("w1".into()), TypeSet::int()),
+            Var::new(var(2), ast::Identifier("w2".into()), TypeSet::float()),
         ];
         let blocks = vec![BasicBlock {
             id: block_id(0),
@@ -675,31 +626,21 @@ mod tests {
                     dest: var(0),
                     value: Literal::UInt(42),
                 }),
-                // target = Int (2)
-                si(Instruction::Const {
+                // v1 = Widen(v0, Int) — UInt → Int
+                si(Instruction::Intrinsic {
                     dest: var(1),
-                    value: Literal::UInt(2),
+                    op: IntrinsicOp::Convert(NumericType::Int, ConvertMode::Checked),
+                    args: vec![var(0)],
                 }),
-                // v2 = Widen(v0, Int) — UInt → Int
+                // v2 = Widen(v1, Float) — should become Widen(v0, Float)
                 si(Instruction::Intrinsic {
                     dest: var(2),
-                    op: IntrinsicOp::Widen,
-                    args: vec![var(0), var(1)],
-                }),
-                // target = Float (3)
-                si(Instruction::Const {
-                    dest: var(3),
-                    value: Literal::UInt(3),
-                }),
-                // v4 = Widen(v2, Float) — should become Widen(v0, Float)
-                si(Instruction::Intrinsic {
-                    dest: var(4),
-                    op: IntrinsicOp::Widen,
-                    args: vec![var(2), var(3)],
+                    op: IntrinsicOp::Convert(NumericType::Float, ConvertMode::Checked),
+                    args: vec![var(1)],
                 }),
             ],
             terminator: Terminator::Return {
-                value: Some(var(4)),
+                value: Some(var(2)),
             },
         }];
 
@@ -707,12 +648,14 @@ mod tests {
         let changes = elide_coercions(&mut func);
 
         assert_eq!(changes, 1);
-        // v4 should now be Widen(v0, Float) — skips v2
-        if let Instruction::Intrinsic { dest, op, args } = &func.blocks[0].instructions[4].node {
-            assert_eq!(*dest, var(4));
-            assert_eq!(*op, IntrinsicOp::Widen);
-            assert_eq!(args[0], var(0)); // original input, not v2
-            assert_eq!(args[1], var(3)); // target unchanged (Float)
+        // v2 should now be Widen(v0, Float) — skips v1
+        if let Instruction::Intrinsic { dest, op, args } = &func.blocks[0].instructions[2].node {
+            assert_eq!(*dest, var(2));
+            assert_eq!(
+                *op,
+                IntrinsicOp::Convert(NumericType::Float, ConvertMode::Checked)
+            );
+            assert_eq!(args[0], var(0)); // original input, not v1
         } else {
             panic!("expected Widen intrinsic");
         }

@@ -14,7 +14,7 @@
 use super::*;
 
 // Re-export types from the shared types module
-pub use crate::types::{BaseType, TypeSet};
+pub use crate::types::{BaseType, ConvertMode, NumericType, TypeSet};
 
 // ============================================================================
 // Intrinsic Operations
@@ -74,28 +74,16 @@ pub enum IntrinsicOp {
     Collect,
 
     // -- Coercion --
-    /// Explicit numeric type widening along the promotion lattice.
+    /// Numeric type conversion — single-arg intrinsic.
     ///
-    /// `Widen(value, target)` where target is a UInt constant encoding a BaseType:
-    /// - `1` (UInt) — no-op (identity)
-    /// - `2` (Int) — UInt→Int
-    /// - `3` (Float) — UInt→Float or Int→Float
+    /// `Convert(target, mode, [value])` — target type and mode are compile-time
+    /// properties of the instruction, not runtime operands.
     ///
-    /// Making coercion explicit enables the optimizer to fold, hoist, and
-    /// eliminate widening operations. Currently implicit inside each
-    /// arithmetic op's type dispatch.
-    Widen,
-
-    /// Infallible numeric cast (`value as Type`).
-    ///
-    /// `Cast(value, target)` where target is a UInt constant encoding a BaseType:
-    /// - `1` (UInt) — Int→UInt bit reinterpret, UInt identity
-    /// - `2` (Int) — UInt→Int bit reinterpret, Int identity
-    /// - `3` (Float) — UInt→Float or Int→Float widen, Float identity
-    ///
-    /// Unlike Widen (which is compiler-inserted and overflow-checked), Cast is
-    /// user-requested and always succeeds for valid numeric pairs.
-    Cast,
+    /// - `Checked`: compiler-inserted promotion (coercion pass). UInt→Int is
+    ///   overflow-checked. Only goes "up" the widening lattice.
+    /// - `Unchecked`: user `as Type` syntax. Bit-reinterprets Int↔UInt,
+    ///   always succeeds for valid numeric pairs.
+    Convert(NumericType, ConvertMode),
 }
 
 impl IntrinsicOp {
@@ -123,10 +111,9 @@ impl IntrinsicOp {
             Self::MakeSeq | Self::ArraySeq => false,
             Self::SeqNext => true,  // exhausted → undefined
             Self::Collect => false, // always succeeds (empty seq → empty array)
-            // Coercion: UInt→Int can overflow (u64::MAX > i64::MAX)
-            Self::Widen => true,
-            // Cast: infallible for valid numeric pairs
-            Self::Cast => false,
+            // Checked UInt→Int can overflow (u64::MAX > i64::MAX), all others are infallible
+            Self::Convert(NumericType::Int, ConvertMode::Checked) => true,
+            Self::Convert(..) => false,
         }
     }
 
@@ -173,15 +160,8 @@ impl IntrinsicOp {
             Self::ArraySeq => TypeSet::all(),
             Self::SeqNext => TypeSet::single(BaseType::Sequence), // arg must be Sequence
             Self::Collect => TypeSet::single(BaseType::Sequence),
-            // Coercion
-            Self::Widen => match index {
-                0 => TypeSet::numeric(), // value to widen
-                _ => TypeSet::uint(),    // target type code
-            },
-            Self::Cast => match index {
-                0 => TypeSet::numeric(), // value to cast
-                _ => TypeSet::uint(),    // target type code
-            },
+            // Conversion: single arg (the value to convert)
+            Self::Convert(..) => TypeSet::numeric(),
         }
     }
 
@@ -205,8 +185,7 @@ impl IntrinsicOp {
             Self::MakeSeq | Self::ArraySeq => TypeSet::single(BaseType::Sequence),
             Self::SeqNext => TypeSet::all(), // element could be any type
             Self::Collect => TypeSet::single(BaseType::Array),
-            Self::Widen => TypeSet::numeric(), // result is Int or Float
-            Self::Cast => TypeSet::numeric(),  // result is UInt, Int, or Float
+            Self::Convert(t, _) => TypeSet::single(BaseType::from(t)),
         }
     }
 

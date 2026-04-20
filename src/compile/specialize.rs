@@ -58,69 +58,75 @@ pub(super) fn try_specialize_binary(
     }
 }
 
-/// Try to emit a type-specialized closure for a Cast intrinsic.
+/// Try to emit a type-specialized closure for a Convert intrinsic.
 ///
-/// Consults TypeAnalysis for the source type and the const map for the target
-/// type code. Three levels of specialization:
+/// Target type and mode are part of the op variant. Two levels of specialization:
 ///
-/// 1. Source type + target both known → fully specialized (identity copy or
-///    single direct conversion, zero dispatch at runtime)
-/// 2. Target known, source unknown → target-specialized closure that only
-///    dispatches on source value type (eliminates target slot read + target match)
-/// 3. Neither known → falls through to `compile_intrinsic_dispatch`
-pub(super) fn try_specialize_cast(
+/// 1. Source type known → fully specialized (single direct conversion, zero dispatch)
+/// 2. Source type unknown → target-specialized closure (dispatches only on source value)
+pub(super) fn try_specialize_convert(
     op: IntrinsicOp,
     arg_slots: &[usize],
     dest_slot: usize,
     args: &[VarId],
     types: &TypeAnalysis,
     block_id: BlockId,
-    consts: &HashMap<VarId, u64>,
 ) -> Option<Step> {
-    if op != IntrinsicOp::Cast || args.len() != 2 {
-        return None;
-    }
+    let (target, mode) = match op {
+        IntrinsicOp::Convert(t, m) => (t, m),
+        _ => return None,
+    };
 
-    let target = *consts.get(&args[1])?;
     let src = arg_slots[0];
     let d = dest_slot;
+    let checked = mode == ConvertMode::Checked;
 
     // Check if source type is known
-    let src_code = types
+    let src_nt = types
         .get_at_exit(block_id, args[0])
         .filter(|t| t.is_single())
-        .and_then(|t| {
-            if t.contains(BaseType::UInt) {
-                Some(1u64)
-            } else if t.contains(BaseType::Int) {
-                Some(2u64)
-            } else if t.contains(BaseType::Float) {
-                Some(3u64)
-            } else {
-                None
-            }
-        });
+        .and_then(|t| t.as_single())
+        .filter(|bt| bt.is_numeric())
+        .map(NumericType::from);
 
-    if let Some(src_code) = src_code {
-        // === Level 1: both source type and target known ===
+    if let Some(src_nt) = src_nt {
+        // === Fully specialized: source type + target both known ===
 
-        // Identity casts should have been replaced with Copy by the
+        // Identity conversions should have been replaced with Copy by the
         // optimizer's elide_identity_casts pass.
         debug_assert!(
-            src_code != target,
-            "Identity Cast (src={}, target={}) should have been elided by optimizer",
-            src_code,
+            src_nt != target,
+            "Identity Convert (src={:?}, target={:?}) should have been elided by optimizer",
+            src_nt,
             target
         );
 
-        // Fully specialized conversion — no dispatch at runtime
-        return match (src_code, target) {
-            (1, 2) => Some(Box::new(move |vm: &mut VM, _| {
+        return match (src_nt, target) {
+            // UInt → Int: checked overflows, unchecked wraps
+            (NumericType::UInt, NumericType::Int) if checked => {
+                Some(Box::new(move |vm: &mut VM, _| {
+                    let n = expect_uint(vm, src);
+                    if n > i64::MAX as u64 {
+                        vm.set_local_uninit(d);
+                    } else {
+                        vm.set_local(d, Value::Int(n as i64));
+                    }
+                    Ok(Action::Continue)
+                }))
+            }
+            (NumericType::UInt, NumericType::Int) => Some(Box::new(move |vm: &mut VM, _| {
                 let n = expect_uint(vm, src);
                 vm.set_local(d, Value::Int(n as i64));
                 Ok(Action::Continue)
             })),
-            (1, 3) => Some(Box::new(move |vm: &mut VM, _| {
+            // Int → UInt: unchecked only (bit reinterpret)
+            (NumericType::Int, NumericType::UInt) => Some(Box::new(move |vm: &mut VM, _| {
+                let n = expect_int(vm, src);
+                vm.set_local(d, Value::UInt(n as u64));
+                Ok(Action::Continue)
+            })),
+            // → Float: same for both modes
+            (NumericType::UInt, NumericType::Float) => Some(Box::new(move |vm: &mut VM, _| {
                 let n = expect_uint(vm, src);
                 match Float::new(n as f64) {
                     Some(f) => vm.set_local(d, Value::Float(f)),
@@ -128,12 +134,7 @@ pub(super) fn try_specialize_cast(
                 }
                 Ok(Action::Continue)
             })),
-            (2, 1) => Some(Box::new(move |vm: &mut VM, _| {
-                let n = expect_int(vm, src);
-                vm.set_local(d, Value::UInt(n as u64));
-                Ok(Action::Continue)
-            })),
-            (2, 3) => Some(Box::new(move |vm: &mut VM, _| {
+            (NumericType::Int, NumericType::Float) => Some(Box::new(move |vm: &mut VM, _| {
                 let n = expect_int(vm, src);
                 match Float::new(n as f64) {
                     Some(f) => vm.set_local(d, Value::Float(f)),
@@ -141,19 +142,17 @@ pub(super) fn try_specialize_cast(
                 }
                 Ok(Action::Continue)
             })),
-            (3, _) => Some(Box::new(move |vm: &mut VM, _| {
+            // Anything else → undefined
+            _ => Some(Box::new(move |vm: &mut VM, _| {
                 vm.set_local_uninit(d);
                 Ok(Action::Continue)
             })),
-            _ => None,
         };
     }
 
-    // === Level 2: target known, source type unknown ===
-    // Emit a target-specific closure — eliminates target slot read and
-    // target match; only source value dispatch remains.
-    Some(match target {
-        1 => Box::new(move |vm: &mut VM, _| {
+    // === Source type unknown, target + mode known ===
+    Some(match (target, checked) {
+        (NumericType::UInt, false) => Box::new(move |vm: &mut VM, _| {
             let result = match vm.local(src) {
                 Some(Value::UInt(n)) => Some(Value::UInt(*n)),
                 Some(Value::Int(n)) => Some(Value::UInt(*n as u64)),
@@ -165,7 +164,14 @@ pub(super) fn try_specialize_cast(
             }
             Ok(Action::Continue)
         }),
-        2 => Box::new(move |vm: &mut VM, _| {
+        (NumericType::UInt, true) => Box::new(move |vm: &mut VM, _| {
+            match vm.local(src) {
+                Some(Value::UInt(n)) => vm.set_local(d, Value::UInt(*n)),
+                _ => vm.set_local_uninit(d),
+            }
+            Ok(Action::Continue)
+        }),
+        (NumericType::Int, false) => Box::new(move |vm: &mut VM, _| {
             let result = match vm.local(src) {
                 Some(Value::UInt(n)) => Some(Value::Int(*n as i64)),
                 Some(Value::Int(n)) => Some(Value::Int(*n)),
@@ -177,112 +183,7 @@ pub(super) fn try_specialize_cast(
             }
             Ok(Action::Continue)
         }),
-        3 => Box::new(move |vm: &mut VM, _| {
-            let result = match vm.local(src) {
-                Some(Value::UInt(n)) => Float::new(*n as f64).map(Value::Float),
-                Some(Value::Int(n)) => Float::new(*n as f64).map(Value::Float),
-                Some(Value::Float(f)) => Some(Value::Float(*f)),
-                _ => None,
-            };
-            match result {
-                Some(v) => vm.set_local(d, v),
-                None => vm.set_local_uninit(d),
-            }
-            Ok(Action::Continue)
-        }),
-        _ => return None,
-    })
-}
-
-/// Try to emit a target-specialized closure for a Widen intrinsic.
-///
-/// Same approach as `try_specialize_cast`: the target type code is always a
-/// compile-time constant. Unlike Cast, Widen is overflow-checked (UInt→Int
-/// fails if value > i64::MAX).
-pub(super) fn try_specialize_widen(
-    op: IntrinsicOp,
-    arg_slots: &[usize],
-    dest_slot: usize,
-    args: &[VarId],
-    types: &TypeAnalysis,
-    block_id: BlockId,
-    consts: &HashMap<VarId, u64>,
-) -> Option<Step> {
-    if op != IntrinsicOp::Widen || args.len() != 2 {
-        return None;
-    }
-
-    let target = *consts.get(&args[1])?;
-    let src = arg_slots[0];
-    let d = dest_slot;
-
-    // Check if source type is known
-    let src_code = types
-        .get_at_exit(block_id, args[0])
-        .filter(|t| t.is_single())
-        .and_then(|t| {
-            if t.contains(BaseType::UInt) {
-                Some(1u64)
-            } else if t.contains(BaseType::Int) {
-                Some(2u64)
-            } else if t.contains(BaseType::Float) {
-                Some(3u64)
-            } else {
-                None
-            }
-        });
-
-    if let Some(src_code) = src_code {
-        // === Fully specialized: source type + target both known ===
-
-        // Identity widens should have been replaced with Copy by the
-        // optimizer's elide_identity_casts pass.
-        debug_assert!(
-            src_code != target,
-            "Identity Widen (src={}, target={}) should have been elided by optimizer",
-            src_code,
-            target
-        );
-
-        return match (src_code, target) {
-            // UInt → Int: overflow-checked
-            (1, 2) => Some(Box::new(move |vm: &mut VM, _| {
-                let n = expect_uint(vm, src);
-                if n > i64::MAX as u64 {
-                    vm.set_local_uninit(d);
-                } else {
-                    vm.set_local(d, Value::Int(n as i64));
-                }
-                Ok(Action::Continue)
-            })),
-            // UInt → Float
-            (1, 3) => Some(Box::new(move |vm: &mut VM, _| {
-                let n = expect_uint(vm, src);
-                match Float::new(n as f64) {
-                    Some(f) => vm.set_local(d, Value::Float(f)),
-                    None => vm.set_local_uninit(d),
-                }
-                Ok(Action::Continue)
-            })),
-            // Int → Float
-            (2, 3) => Some(Box::new(move |vm: &mut VM, _| {
-                let n = expect_int(vm, src);
-                match Float::new(n as f64) {
-                    Some(f) => vm.set_local(d, Value::Float(f)),
-                    None => vm.set_local_uninit(d),
-                }
-                Ok(Action::Continue)
-            })),
-            _ => Some(Box::new(move |vm: &mut VM, _| {
-                vm.set_local_uninit(d);
-                Ok(Action::Continue)
-            })),
-        };
-    }
-
-    // === Target known, source unknown ===
-    Some(match target {
-        2 => Box::new(move |vm: &mut VM, _| {
+        (NumericType::Int, true) => Box::new(move |vm: &mut VM, _| {
             let result = match vm.local(src) {
                 Some(Value::UInt(n)) => {
                     if *n > i64::MAX as u64 {
@@ -300,7 +201,7 @@ pub(super) fn try_specialize_widen(
             }
             Ok(Action::Continue)
         }),
-        3 => Box::new(move |vm: &mut VM, _| {
+        (NumericType::Float, _) => Box::new(move |vm: &mut VM, _| {
             let result = match vm.local(src) {
                 Some(Value::UInt(n)) => Float::new(*n as f64).map(Value::Float),
                 Some(Value::Int(n)) => Float::new(*n as f64).map(Value::Float),
@@ -313,7 +214,6 @@ pub(super) fn try_specialize_widen(
             }
             Ok(Action::Continue)
         }),
-        _ => return None,
     })
 }
 
@@ -644,7 +544,8 @@ pub(super) fn compile_intrinsic_dispatch(
             }
             Ok(Action::Continue)
         }),
-        IntrinsicOp::Widen => emit!(|vm: &mut VM| { exec_widen(&arg_slots, vm) }),
-        IntrinsicOp::Cast => emit!(|vm: &mut VM| { exec_cast(&arg_slots, vm) }),
+        IntrinsicOp::Convert(target, mode) => {
+            emit!(|vm: &mut VM| { exec_convert(target, mode, &arg_slots, vm) })
+        }
     }
 }

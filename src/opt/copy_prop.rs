@@ -4,7 +4,7 @@
 //! replace all uses of `dest` with `src` and delete the Copy.
 //!
 //! This eliminates intermediate variables introduced by:
-//! - Identity cast/widen elision (Cast → Copy)
+//! - Identity conversion elision (Convert → Copy)
 //! - Read-only ref demotion (MakeRef → Copy)
 //! - Phi resolution (Copy inserted into predecessors)
 //!

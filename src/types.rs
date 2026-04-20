@@ -95,6 +95,67 @@ impl BaseType {
 }
 
 // ============================================================================
+// NumericType - Target type for numeric conversions
+// ============================================================================
+
+/// Target type for numeric conversion operations.
+///
+/// This is the numeric subset of `BaseType`, used as a compile-time parameter
+/// on the `IntrinsicOp::Convert` variant. The target type is always statically
+/// known at IR construction time — either from the `as Type` syntax or from
+/// the coercion pass's promotion lattice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NumericType {
+    UInt,
+    Int,
+    Float,
+}
+
+impl core::fmt::Display for NumericType {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            NumericType::UInt => "UInt",
+            NumericType::Int => "Int",
+            NumericType::Float => "Float",
+        })
+    }
+}
+
+/// Mode for numeric conversion operations.
+///
+/// - `Checked`: compiler-inserted promotion along the widening lattice
+///   (UInt < Int < Float). UInt→Int is overflow-checked — values > i64::MAX
+///   produce undefined. Only goes "up" the lattice.
+/// - `Unchecked`: user-requested via `value as Type`. Bit-reinterprets for
+///   Int↔UInt, always succeeds for valid numeric pairs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConvertMode {
+    Checked,
+    Unchecked,
+}
+
+impl From<NumericType> for BaseType {
+    fn from(nt: NumericType) -> BaseType {
+        match nt {
+            NumericType::UInt => BaseType::UInt,
+            NumericType::Int => BaseType::Int,
+            NumericType::Float => BaseType::Float,
+        }
+    }
+}
+
+impl From<BaseType> for NumericType {
+    fn from(bt: BaseType) -> NumericType {
+        match bt {
+            BaseType::UInt => NumericType::UInt,
+            BaseType::Int => NumericType::Int,
+            BaseType::Float => NumericType::Float,
+            _ => unreachable!("NumericType::from called with non-numeric BaseType::{bt}"),
+        }
+    }
+}
+
+// ============================================================================
 // TypeSet - Set of possible types
 // ============================================================================
 

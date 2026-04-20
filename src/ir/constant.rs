@@ -96,9 +96,9 @@ impl<'a> Lowerer<'a> {
             ast::Expression::Cast { value, target_type } => {
                 let val = self.const_eval_expr(value)?;
                 let target = match target_type.as_ref() {
-                    "UInt" => 1u64,
-                    "Int" => 2u64,
-                    "Float" => 3u64,
+                    "UInt" => crate::types::NumericType::UInt,
+                    "Int" => crate::types::NumericType::Int,
+                    "Float" => crate::types::NumericType::Float,
                     other => {
                         return Err(format!(
                             "cannot cast to '{}' (valid cast targets: UInt, Int, Float)",
@@ -107,8 +107,8 @@ impl<'a> Lowerer<'a> {
                     }
                 };
                 const_eval::eval_intrinsic_const(
-                    crate::ir::IntrinsicOp::Cast,
-                    &[val, ConstValue::UInt(target)],
+                    crate::ir::IntrinsicOp::Convert(target, crate::types::ConvertMode::Unchecked),
+                    &[val],
                 )
                 .ok_or_else(|| "cast failed: incompatible source type".to_string())
             }

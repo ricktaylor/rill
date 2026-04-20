@@ -42,7 +42,7 @@ use crate::ir::{
     Terminator, VarId,
 };
 use crate::opt::TypeAnalysis;
-use crate::types::{BaseType, TypeSet};
+use crate::types::{BaseType, ConvertMode, NumericType, TypeSet};
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 
@@ -292,24 +292,6 @@ fn build_ref_map(blocks: &[BasicBlock]) -> HashMap<VarId, RefMeta> {
     map
 }
 
-/// Build a map from VarId → constant UInt value for compile-time resolution
-/// of Cast/Widen target type codes.
-fn build_const_uint_map(blocks: &[BasicBlock]) -> HashMap<VarId, u64> {
-    let mut map = HashMap::new();
-    for block in blocks {
-        for inst in &block.instructions {
-            if let Instruction::Const {
-                dest,
-                value: Literal::UInt(n),
-            } = &inst.node
-            {
-                map.insert(*dest, *n);
-            }
-        }
-    }
-    map
-}
-
 fn compile_function(func: &Function, link_map: &LinkMap) -> Result<CompiledFunction, ExecError> {
     let block_map = build_block_map(&func.blocks);
     let frame_size = 1 + func.locals.len(); // slot 0 = Frame, then locals
@@ -324,9 +306,6 @@ fn compile_function(func: &Function, link_map: &LinkMap) -> Result<CompiledFunct
 
     // Definedness analysis for skipping None checks on provably-defined args
     let defs = crate::opt::analyze_definedness(func, None);
-
-    // Collect constant UInt values for Cast/Widen target resolution at compile time
-    let const_uint_map = build_const_uint_map(&func.blocks);
 
     // First pass: compile all blocks, collecting phi metadata
     let mut blocks = Vec::new();
@@ -358,13 +337,7 @@ fn compile_function(func: &Function, link_map: &LinkMap) -> Result<CompiledFunct
         }
 
         blocks.push(compile_block(
-            ir_block,
-            &block_map,
-            link_map,
-            &ref_map,
-            &types,
-            &defs,
-            &const_uint_map,
+            ir_block, &block_map, link_map, &ref_map, &types, &defs,
         )?);
     }
 
@@ -421,7 +394,6 @@ fn compile_block(
     ref_map: &HashMap<VarId, RefMeta>,
     types: &TypeAnalysis,
     defs: &crate::opt::DefinednessAnalysis,
-    consts: &HashMap<VarId, u64>,
 ) -> Result<Vec<Step>, ExecError> {
     let mut steps: Vec<Step> = Vec::new();
 
@@ -431,9 +403,9 @@ fn compile_block(
             // copies are inserted into predecessor blocks
             Instruction::Phi { .. } => {}
             inst => {
-                if let Some(step) = compile_instruction(
-                    inst, block_map, link_map, ref_map, types, defs, block.id, consts,
-                )? {
+                if let Some(step) =
+                    compile_instruction(inst, block_map, link_map, ref_map, types, defs, block.id)?
+                {
                     steps.push(step);
                 }
             }
@@ -452,7 +424,6 @@ fn compile_block(
     Ok(steps)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn compile_instruction(
     inst: &Instruction,
     _block_map: &HashMap<BlockId, usize>,
@@ -461,7 +432,6 @@ fn compile_instruction(
     types: &TypeAnalysis,
     defs: &crate::opt::DefinednessAnalysis,
     block_id: BlockId,
-    consts: &HashMap<VarId, u64>,
 ) -> Result<Option<Step>, ExecError> {
     Ok(Some(match inst {
         Instruction::Const { dest, value } => {
@@ -825,13 +795,10 @@ fn compile_instruction(
                 return Ok(Some(specialized));
             }
 
-            // Try type-specialized compilation for Cast and Widen.
-            // Target is always a compile-time constant, so these always
-            // succeed — eliminating target slot reads and target dispatch.
-            if let Some(specialized) = try_specialize_cast(
-                op, &arg_slots, d, args, types, block_id, consts,
-            )
-            .or_else(|| try_specialize_widen(op, &arg_slots, d, args, types, block_id, consts))
+            // Try type-specialized compilation for Convert.
+            // Target type and mode are part of the op variant.
+            if let Some(specialized) =
+                try_specialize_convert(op, &arg_slots, d, args, types, block_id)
             {
                 return Ok(Some(specialized));
             }

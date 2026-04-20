@@ -1,39 +1,23 @@
-//! Identity Cast/Widen Elimination
+//! Identity Convert Elimination
 //!
-//! Replaces `Cast(v, T)` and `Widen(v, T)` with `Copy(dest, v)` when
-//! type analysis proves the source value is already type T.
+//! Replaces `Convert(T, _, [v])` with `Copy(dest, v)` when type analysis
+//! proves the source value is already type T.
 //!
 //! Runs after type refinement (needs TypeAnalysis). Returns the number
 //! of instructions rewritten, for fixpoint integration.
 
-use crate::ir::Literal;
-use crate::ir::{Function, Instruction, IntrinsicOp, VarId};
+use crate::ir::{Function, Instruction, IntrinsicOp};
 use crate::types::BaseType;
-use std::collections::HashMap;
 
-/// Eliminate identity Cast and Widen instructions.
+/// Eliminate identity Convert instructions.
 ///
-/// Scans for `Intrinsic(Cast/Widen, [v, target_const])` where the source
-/// variable's type (from TypeAnalysis) already matches the target type.
+/// Scans for `Intrinsic(Convert(T, _), [v])` where the source variable's
+/// type (from TypeAnalysis) already matches the target type T.
 /// Rewrites to `Copy(dest, v)`.
 pub fn elide_identity_casts(
     function: &mut Function,
     types: &super::type_refinement::TypeAnalysis,
 ) -> usize {
-    // Collect constant UInt values for target resolution
-    let mut const_values: HashMap<VarId, u64> = HashMap::new();
-    for block in &function.blocks {
-        for inst in &block.instructions {
-            if let Instruction::Const {
-                dest,
-                value: Literal::UInt(n),
-            } = &inst.node
-            {
-                const_values.insert(*dest, *n);
-            }
-        }
-    }
-
     let mut changes = 0;
 
     for block_idx in 0..function.blocks.len() {
@@ -42,19 +26,13 @@ pub fn elide_identity_casts(
         for inst_idx in 0..function.blocks[block_idx].instructions.len() {
             let inst = &function.blocks[block_idx].instructions[inst_idx].node;
 
-            let (dest, src, target_var) = match inst {
+            let (dest, src, target_base) = match inst {
                 Instruction::Intrinsic {
                     dest,
-                    op: IntrinsicOp::Cast | IntrinsicOp::Widen,
+                    op: IntrinsicOp::Convert(t, _),
                     args,
-                } if args.len() == 2 => (*dest, args[0], args[1]),
+                } if !args.is_empty() => (*dest, args[0], BaseType::from(*t)),
                 _ => continue,
-            };
-
-            // Resolve the target type code
-            let target = match const_values.get(&target_var) {
-                Some(t) => *t,
-                None => continue,
             };
 
             // Get source type from analysis
@@ -64,14 +42,7 @@ pub fn elide_identity_casts(
             };
 
             // Check if source type matches target
-            let is_identity = match target {
-                1 => src_type.contains(BaseType::UInt),
-                2 => src_type.contains(BaseType::Int),
-                3 => src_type.contains(BaseType::Float),
-                _ => false,
-            };
-
-            if is_identity {
+            if src_type.contains(target_base) {
                 function.blocks[block_idx].instructions[inst_idx].node =
                     Instruction::Copy { dest, src };
                 changes += 1;
@@ -86,9 +57,9 @@ pub fn elide_identity_casts(
 mod tests {
     use super::*;
     use crate::ast;
-    use crate::ir::{BasicBlock, BlockId, Literal, Terminator, Var};
+    use crate::ir::{BasicBlock, BlockId, Literal, Terminator, Var, VarId};
     use crate::opt::analyze_types;
-    use crate::types::TypeSet;
+    use crate::types::{ConvertMode, NumericType, TypeSet};
 
     fn var(id: u32) -> VarId {
         VarId(id)
@@ -112,12 +83,11 @@ mod tests {
     }
 
     #[test]
-    fn test_identity_cast_eliminated() {
-        // Cast(UInt_var, 1) where source is UInt → should become Copy
+    fn test_identity_unchecked_eliminated() {
+        // Convert(UInt, Unchecked, [UInt_var]) where source is UInt → Copy
         let locals = vec![
             Var::new(var(0), ast::Identifier("x".into()), TypeSet::uint()),
-            Var::new(var(1), ast::Identifier("t".into()), TypeSet::uint()),
-            Var::new(var(2), ast::Identifier("r".into()), TypeSet::all()),
+            Var::new(var(1), ast::Identifier("r".into()), TypeSet::all()),
         ];
         let blocks = vec![BasicBlock {
             id: block(0),
@@ -126,18 +96,14 @@ mod tests {
                     dest: var(0),
                     value: Literal::UInt(42),
                 }),
-                si(Instruction::Const {
-                    dest: var(1),
-                    value: Literal::UInt(1), // target = UInt
-                }),
                 si(Instruction::Intrinsic {
-                    dest: var(2),
-                    op: IntrinsicOp::Cast,
-                    args: vec![var(0), var(1)],
+                    dest: var(1),
+                    op: IntrinsicOp::Convert(NumericType::UInt, ConvertMode::Unchecked),
+                    args: vec![var(0)],
                 }),
             ],
             terminator: Terminator::Return {
-                value: Some(var(2)),
+                value: Some(var(1)),
             },
         }];
 
@@ -147,18 +113,17 @@ mod tests {
 
         assert_eq!(changes, 1);
         assert!(matches!(
-            &func.blocks[0].instructions[2].node,
-            Instruction::Copy { dest, src } if *dest == var(2) && *src == var(0)
+            &func.blocks[0].instructions[1].node,
+            Instruction::Copy { dest, src } if *dest == var(1) && *src == var(0)
         ));
     }
 
     #[test]
-    fn test_non_identity_cast_kept() {
-        // Cast(UInt_var, 2) where source is UInt, target is Int → not identity, keep
+    fn test_non_identity_unchecked_kept() {
+        // Convert(Int, Unchecked, [UInt_var]) → not identity, keep
         let locals = vec![
             Var::new(var(0), ast::Identifier("x".into()), TypeSet::uint()),
-            Var::new(var(1), ast::Identifier("t".into()), TypeSet::uint()),
-            Var::new(var(2), ast::Identifier("r".into()), TypeSet::all()),
+            Var::new(var(1), ast::Identifier("r".into()), TypeSet::all()),
         ];
         let blocks = vec![BasicBlock {
             id: block(0),
@@ -167,18 +132,14 @@ mod tests {
                     dest: var(0),
                     value: Literal::UInt(42),
                 }),
-                si(Instruction::Const {
-                    dest: var(1),
-                    value: Literal::UInt(2), // target = Int
-                }),
                 si(Instruction::Intrinsic {
-                    dest: var(2),
-                    op: IntrinsicOp::Cast,
-                    args: vec![var(0), var(1)],
+                    dest: var(1),
+                    op: IntrinsicOp::Convert(NumericType::Int, ConvertMode::Unchecked),
+                    args: vec![var(0)],
                 }),
             ],
             terminator: Terminator::Return {
-                value: Some(var(2)),
+                value: Some(var(1)),
             },
         }];
 
@@ -188,21 +149,20 @@ mod tests {
 
         assert_eq!(changes, 0);
         assert!(matches!(
-            &func.blocks[0].instructions[2].node,
+            &func.blocks[0].instructions[1].node,
             Instruction::Intrinsic {
-                op: IntrinsicOp::Cast,
+                op: IntrinsicOp::Convert(NumericType::Int, ConvertMode::Unchecked),
                 ..
             }
         ));
     }
 
     #[test]
-    fn test_identity_widen_eliminated() {
-        // Widen(Int_var, 2) where source is Int → identity, should become Copy
+    fn test_identity_checked_eliminated() {
+        // Convert(Int, Checked, [Int_var]) where source is Int → Copy
         let locals = vec![
             Var::new(var(0), ast::Identifier("x".into()), TypeSet::int()),
-            Var::new(var(1), ast::Identifier("t".into()), TypeSet::uint()),
-            Var::new(var(2), ast::Identifier("r".into()), TypeSet::all()),
+            Var::new(var(1), ast::Identifier("r".into()), TypeSet::all()),
         ];
         let blocks = vec![BasicBlock {
             id: block(0),
@@ -211,18 +171,14 @@ mod tests {
                     dest: var(0),
                     value: Literal::Int(-5),
                 }),
-                si(Instruction::Const {
-                    dest: var(1),
-                    value: Literal::UInt(2), // target = Int
-                }),
                 si(Instruction::Intrinsic {
-                    dest: var(2),
-                    op: IntrinsicOp::Widen,
-                    args: vec![var(0), var(1)],
+                    dest: var(1),
+                    op: IntrinsicOp::Convert(NumericType::Int, ConvertMode::Checked),
+                    args: vec![var(0)],
                 }),
             ],
             terminator: Terminator::Return {
-                value: Some(var(2)),
+                value: Some(var(1)),
             },
         }];
 
@@ -232,8 +188,8 @@ mod tests {
 
         assert_eq!(changes, 1);
         assert!(matches!(
-            &func.blocks[0].instructions[2].node,
-            Instruction::Copy { dest, src } if *dest == var(2) && *src == var(0)
+            &func.blocks[0].instructions[1].node,
+            Instruction::Copy { dest, src } if *dest == var(1) && *src == var(0)
         ));
     }
 }
