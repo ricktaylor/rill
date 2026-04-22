@@ -196,15 +196,6 @@ fn replace_vars_in_instruction(inst: &mut Instruction, map: &HashMap<VarId, VarI
             }
         }
 
-        Instruction::Drop { vars } => {
-            for v in vars.iter_mut() {
-                if let Some(&new) = map.get(v) {
-                    *v = new;
-                    count += 1;
-                }
-            }
-        }
-
         Instruction::Assign { .. } | Instruction::Read { .. } => {
             unreachable!("pre-SSA instruction; removed by mem2reg")
         }
@@ -233,12 +224,6 @@ fn replace_vars_in_terminator(term: &mut Terminator, map: &HashMap<VarId, VarId>
         Terminator::Return { value: Some(v) } => {
             if let Some(&new) = map.get(v) {
                 *v = new;
-                count += 1;
-            }
-        }
-        Terminator::Exit { value } => {
-            if let Some(&new) = map.get(value) {
-                *value = new;
                 count += 1;
             }
         }

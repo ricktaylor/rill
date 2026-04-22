@@ -8,7 +8,7 @@
 //! - Impure `Call` is always kept (side effects)
 //! - Pure `Call` (extern with `is_pure()`, or user function proven pure)
 //!   can be removed if result is unused
-//! - `SetIndex`, `WriteRef`, `Drop` have no dest — always kept
+//! - `SetIndex`, `WriteRef` have no dest — always kept
 //! - Everything else (Const, Copy, Undefined, Index, Intrinsic, Phi, MakeRef)
 //!   is removed if its dest is unused
 
@@ -114,12 +114,6 @@ fn collect_reads(inst: &Instruction, used: &mut HashSet<VarId>) {
             used.insert(*value);
         }
 
-        Instruction::Drop { vars } => {
-            for v in vars {
-                used.insert(*v);
-            }
-        }
-
         Instruction::Assign { .. } | Instruction::Read { .. } => {
             unreachable!("pre-SSA instruction; removed by mem2reg")
         }
@@ -137,9 +131,6 @@ fn collect_terminator_reads(term: &Terminator, used: &mut HashSet<VarId>) {
         }
         Terminator::Return { value: Some(v) } => {
             used.insert(*v);
-        }
-        Terminator::Exit { value } => {
-            used.insert(*value);
         }
         Terminator::TailCall { args, .. } => {
             for v in args {
@@ -180,8 +171,7 @@ fn is_removable(
         // No dest or side effects — always keep
         Instruction::SetIndex { .. }
         | Instruction::WriteRef { .. }
-        | Instruction::Append { .. }
-        | Instruction::Drop { .. } => false,
+        | Instruction::Append { .. } => false,
 
         Instruction::Assign { .. } | Instruction::Read { .. } => {
             unreachable!("pre-SSA instruction; removed by mem2reg")
@@ -201,9 +191,7 @@ fn get_dest(inst: &Instruction) -> Option<VarId> {
         | Instruction::Append { dest, .. }
         | Instruction::Call { dest, .. } => Some(*dest),
 
-        Instruction::SetIndex { .. } | Instruction::WriteRef { .. } | Instruction::Drop { .. } => {
-            None
-        }
+        Instruction::SetIndex { .. } | Instruction::WriteRef { .. } => None,
 
         Instruction::Assign { .. } | Instruction::Read { .. } => {
             unreachable!("pre-SSA instruction; removed by mem2reg")

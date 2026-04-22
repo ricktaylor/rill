@@ -67,11 +67,6 @@ pub(super) fn compile_terminator(
             })
         }
 
-        Terminator::Exit { value } => {
-            let val_slot = slot(*value);
-            Box::new(move |vm: &mut VM, _prog| Ok(Action::Exit(vm.local(val_slot).clone())))
-        }
-
         Terminator::Unreachable => Box::new(|_vm, _prog| Ok(Action::Return(Value::Undefined))),
 
         Terminator::TailCall { args, .. } => {

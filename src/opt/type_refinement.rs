@@ -178,9 +178,6 @@ fn transfer_instruction(
             state.insert(*dest, TypeSet::single(BaseType::Array));
         }
 
-        // Drop doesn't produce a value
-        Instruction::Drop { .. } => {}
-
         Instruction::Assign { .. } | Instruction::Read { .. } => {
             unreachable!("pre-SSA instruction; removed by mem2reg")
         }
@@ -507,8 +504,7 @@ pub fn analyze_types_full(
                     | Instruction::Read { dest, .. } => Some(*dest),
                     Instruction::SetIndex { .. }
                     | Instruction::WriteRef { .. }
-                    | Instruction::Assign { .. }
-                    | Instruction::Drop { .. } => None,
+                    | Instruction::Assign { .. } => None,
                 };
 
                 if let Some(var) = dest

@@ -437,10 +437,6 @@ pub enum Instruction {
     /// which resolves each Read to the reaching definition (possibly through
     /// Phi nodes at merge points).
     Read { slot: u32, dest: VarId },
-
-    /// Mark end of variable scope - slots can be reclaimed (planned)
-    #[allow(dead_code)]
-    Drop { vars: Vec<VarId> },
 }
 
 /// Reference to a function (possibly namespaced)
@@ -552,10 +548,6 @@ pub enum Terminator {
     /// Return from function
     Return { value: Option<VarId> },
 
-    /// Hard exit to driver (from diverging externs like drop())
-    #[allow(dead_code)]
-    Exit { value: VarId },
-
     /// Unreachable code (placeholder after merging)
     Unreachable,
 
@@ -582,10 +574,7 @@ impl Terminator {
                 succs.push(*default);
                 succs
             }
-            Terminator::Return { .. }
-            | Terminator::Exit { .. }
-            | Terminator::Unreachable
-            | Terminator::TailCall { .. } => {
+            Terminator::Return { .. } | Terminator::Unreachable | Terminator::TailCall { .. } => {
                 vec![]
             }
         }

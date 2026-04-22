@@ -154,7 +154,6 @@ fn instruction_reads(inst: &Instruction) -> Vec<VarId> {
         Instruction::Append { arr, value, .. } => vec![*arr, *value],
         Instruction::Assign { value, .. } => vec![*value],
         Instruction::Read { .. } => vec![],
-        Instruction::Drop { vars } => vars.clone(),
     }
 }
 
@@ -164,7 +163,6 @@ fn terminator_reads(term: &Terminator) -> Vec<VarId> {
         Terminator::If { condition, .. } => vec![*condition],
         Terminator::Match { value, .. } => vec![*value],
         Terminator::Return { value: Some(v) } => vec![*v],
-        Terminator::Exit { value } => vec![*value],
         Terminator::TailCall { args, .. } => args.clone(),
         Terminator::Jump { .. } | Terminator::Return { value: None } | Terminator::Unreachable => {
             vec![]

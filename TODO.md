@@ -30,6 +30,7 @@ The full compilation and execution pipeline is working end-to-end with 270+ test
   - Function monomorphization (up to 4 variants per function)
   - Type mismatch warnings (W009), definedness warnings (W201) via TypeSet
   - Unified type/definedness: Undefined is a type, no separate definedness pass
+  - Phase T: tail-call optimization (self-recursive, backward phi-chain detection)
 - **Compiler** — closure-threaded with type specialization (`src/compile/`)
   - Type-specialized closures (direct `u64::checked_add` etc. when types provably known)
   - Extern monomorphism (variant selection at compile time)
@@ -41,6 +42,7 @@ The full compilation and execution pipeline is working end-to-end with 270+ test
   - For-loop pair binding (`for k, v in map`)
 - **Public API** — `compile()`, `Program::call()`, `FunctionHandle` for hot-path (`src/lib.rs`)
 - **Externs** — registry with purity tracking, monomorphic variants (`src/externs.rs`)
+  - `ExecResult::Exit(val)` → `Action::Exit` for embedder escape (no IR terminator needed)
 - **Diagnostics** — source spans, line:column formatting, error codes (`src/diagnostics.rs`)
 - **Docs** — ABNF grammar, design document, stdlib spec, examples, benchmarks
 
@@ -319,6 +321,9 @@ Phase 2 (type-informed — on simplified CFG):
 
 Phase 3 (post-optimisation):
   W201 definedness warnings (TypeSet-based)
+
+Phase T (tail-call):
+  Self-recursive tail call detection → TailCall rewrite → CFG Simplify
 ```
 
 Undefined is a type (`BaseType::Undefined`). No separate definedness pass.
@@ -341,7 +346,7 @@ src/
     parser.rs         — Chumsky-based parser → AST
   ir/
     mod.rs            — Lowerer state, scope/slot management, emit helpers, public lower() API
-    types.rs          — IR types: VarId, BlockId, Instruction, IntrinsicOp, Terminator, etc.
+    types.rs          — IR types: VarId, BlockId, Instruction, IntrinsicOp, Terminator (Jump/If/Match/Return/Unreachable/TailCall)
     program.rs        — Top-level program lowering (constants, functions)
     stmt.rs           — Statement lowering
     expr.rs           — Expression lowering (guarded expressions, binary/unary ops)

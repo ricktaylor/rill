@@ -925,11 +925,6 @@ fn compile_instruction(
             })
         }
 
-        Instruction::Drop { .. } => {
-            // No-op for now — slots are reclaimed when frame is popped
-            return Ok(None);
-        }
-
         // Phi is handled separately in compile_block
         Instruction::Phi { .. } => return Ok(None),
 

@@ -56,8 +56,9 @@ pub enum ReturnBehavior {
     /// Whether the return may be undefined is determined by Purity::may_return_undefined()
     Returns(TypeSet),
 
-    /// Never returns to caller - exits to driver with typed value
-    /// Lowers to Terminator::Exit
+    /// Never returns to caller - exits to driver with typed value.
+    /// At runtime, the extern returns ExecResult::Exit(val) which propagates
+    /// up through all call frames via Action::Exit.
     Exits(TypeSet),
     // Future: Yields(TypeSet) for generators/async
 }
