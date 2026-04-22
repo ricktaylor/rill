@@ -272,9 +272,9 @@ fn monomorphize(program: &mut IrProgram, externs: &ExternRegistry) {
 
                     let arg_types: Vec<crate::types::TypeSet> = args
                         .iter()
-                        .map(|a| {
+                        .map(|v| {
                             types
-                                .get(a.value)
+                                .get(*v)
                                 .copied()
                                 .unwrap_or(crate::types::TypeSet::any())
                         })
@@ -435,10 +435,10 @@ fn collect_param_info(program: &IrProgram, externs: Option<&ExternRegistry>) -> 
                         .entry(callee_name.clone())
                         .or_insert_with(|| vec![crate::types::TypeSet::none(); param_count]);
 
-                    for (i, arg) in args.iter().enumerate() {
+                    for (i, v) in args.iter().enumerate() {
                         if i < param_count {
                             let arg_type = types
-                                .get(arg.value)
+                                .get(*v)
                                 .copied()
                                 .unwrap_or_else(type_refinement::all_types);
                             type_entry[i] = type_entry[i].union(&arg_type);
@@ -1133,10 +1133,7 @@ mod tests {
                             namespace: None,
                             name: ast::Identifier("callee".into()),
                         },
-                        args: vec![crate::ir::CallArg {
-                            value: var(10),
-                            by_ref: false,
-                        }],
+                        args: vec![var(10)],
                     }),
                 ],
                 terminator: Terminator::Return {

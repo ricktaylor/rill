@@ -144,9 +144,9 @@ fn replace_vars_in_instruction(inst: &mut Instruction, map: &HashMap<VarId, VarI
         }
 
         Instruction::Call { args, .. } => {
-            for arg in args.iter_mut() {
-                if let Some(&new) = map.get(&arg.value) {
-                    arg.value = new;
+            for v in args.iter_mut() {
+                if let Some(&new) = map.get(v) {
+                    *v = new;
                     count += 1;
                 }
             }

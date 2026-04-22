@@ -92,8 +92,8 @@ fn collect_reads(inst: &Instruction, used: &mut HashSet<VarId>) {
         }
 
         Instruction::Call { args, .. } => {
-            for arg in args {
-                used.insert(arg.value);
+            for v in args {
+                used.insert(*v);
             }
         }
 

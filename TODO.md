@@ -98,11 +98,10 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
       containing is_defined, is_uint, is_int, ..., default, etc.
       Embedder includes via `SourceLoader::preamble()`.
       Not a language feature — an embedder API convenience.
-- [ ] **By-ref parameter passing across function calls** — `Param::by_ref` and
-      `CallArg::by_ref` are set but never read for user function calls. The compiler
-      ignores `_by_ref` when copying args into the callee's frame (compile/mod.rs:686).
-      Need to: emit `Slot::Ref` for by-ref params, ensure write-back propagates to caller.
-      Within-function `with` bindings (MakeRef/WriteRef) work; cross-function does not.
+- [x] **By-ref parameter passing across function calls** — `Param::by_ref` is the
+      callee's declaration, read at compile time via `CallTarget::UserFunction::param_by_ref`.
+      Compiler emits `Slot::Ref` for by-ref params, writes propagate to caller via `resolve()`.
+      Extern calls use `CallArg::by_ref` from the extern registry.
 - [ ] **Host sequence support** (`SeqState::Host` variant, defer trait design to embedder API)
 - [ ] **Bytecode format** — CBOR serialization of optimized IR (see `docs/bytecode_format.md`)
   - Phase 1: Encoding infrastructure
@@ -209,6 +208,21 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
 - [x] **Type guards for intrinsic args** — `emit_type_guard` checks args
       match `param_type()` via Match. Fallibility in `result_type()`.
       `is_fallible()` removed — folded into `result_type()` per-arm.
+
+### P1 — SSA Mutation Visibility
+
+- [ ] **SSA reload after mutation** — `WriteRef` and by-ref function calls mutate
+      values in-place, but SSA VarIds are unchanged. Type analysis after a mutation
+      site uses stale type information. Currently safe because no pass narrows types
+      based on array/map element content, but a latent bug for future GVN/value numbering.
+      Affects: `WriteRef` (with-binding write-back), by-ref function param mutation,
+      `SetIndex` (direct collection mutation), `Append`.
+  - [ ] Add `Instruction::Reload { dest, src }` — opaque to mem2reg, creates a new
+        VarId with `any()` type after mutation sites
+  - [ ] Lowerer: emit Reload + Assign after WriteRef/SetIndex/Append for the base variable
+  - [ ] Lowerer: emit Reload + Assign after Call for by-ref args from named variables
+  - [ ] Copy propagation: do not propagate through Reload (treat as barrier)
+  - [ ] Type analysis: Reload dest gets `any()` (conservative) or the source's container type
 
 ### P2 — Parser
 - [ ] **Optional braces in match arms** — allow `pattern => expr,` in addition to

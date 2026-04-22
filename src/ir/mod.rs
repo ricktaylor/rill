@@ -412,7 +412,7 @@ impl<'a> Lowerer<'a> {
 
     /// Emit a function call, returning the result temp.
     /// Uses the extern's declared return type if known, otherwise `any()`.
-    pub fn emit_call(&mut self, function: FunctionRef, args: Vec<CallArg>) -> VarId {
+    pub fn emit_call(&mut self, function: FunctionRef, args: Vec<VarId>) -> VarId {
         let return_type = self
             .externs
             .lookup(&function)

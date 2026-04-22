@@ -75,17 +75,21 @@ pub(super) fn compile_terminator(
             let entry_idx = block_map[&crate::ir::BlockId(0)];
 
             Box::new(move |vm: &mut VM, _prog| {
-                // Read all arg values before overwriting (handles param swap cases)
+                // Read all arg values before overwriting (handles param swap cases).
+                // vm.local() resolves refs, so by-ref args get the actual value.
                 let values: Vec<Value> = arg_slots.iter().map(|&s| vm.local(s).clone()).collect();
 
-                // Overwrite param slots (1-indexed)
+                // Overwrite param slots directly (1-indexed).
+                // Must use overwrite_local (not set_local) to replace Slot::Ref
+                // with Slot::Val — set_local would write through the ref and
+                // corrupt the caller's frame.
                 for (i, val) in values.into_iter().enumerate() {
-                    vm.set_local(i + 1, val);
+                    vm.overwrite_local(i + 1, val);
                 }
 
                 // Reset non-param locals to Undefined (match fresh frame semantics)
                 for i in (param_count + 1)..frame_size {
-                    vm.set_local(i, Value::Undefined);
+                    vm.overwrite_local(i, Value::Undefined);
                 }
 
                 // Jump to entry block — reuse current frame, no stack growth

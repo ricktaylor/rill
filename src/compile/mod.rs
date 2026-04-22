@@ -75,6 +75,8 @@ pub(crate) struct CompiledFunction {
     pub entry: usize, // index into block_starts
     pub frame_size: usize,
     pub param_count: usize,
+    /// Per-parameter by-ref flags, from the IR `Param::by_ref` declarations.
+    pub param_by_ref: Vec<bool>,
 }
 
 /// A step closure. Captures operands, operates on VM.
@@ -187,8 +189,11 @@ pub(crate) enum CallTarget {
         generic: crate::externs::ExternFn,
         /// Variants: (param TypeSets, return TypeSet, specialized fn pointer)
         variants: Vec<(Vec<TypeSet>, TypeSet, crate::externs::ExternFn)>,
+        /// Per-parameter by-ref flags from the extern's ParamSpec declarations.
+        param_by_ref: Vec<bool>,
     },
-    /// User-defined function — index into CompiledProgram.functions
+    /// User-defined function — index into CompiledProgram.functions.
+    /// By-ref param modes are read from `CompiledFunction::param_by_ref` at runtime.
     UserFunction(usize),
 }
 
@@ -219,11 +224,18 @@ fn link_functions(
                     }
                 })
                 .collect();
+            let param_by_ref = def
+                .meta
+                .params
+                .iter()
+                .map(|p| p.by_ref)
+                .collect();
             link_map.insert(
                 name.clone(),
                 CallTarget::Extern {
                     generic: *f,
                     variants,
+                    param_by_ref,
                 },
             );
         }
@@ -377,6 +389,7 @@ fn compile_function(func: &Function, link_map: &LinkMap) -> Result<CompiledFunct
         entry,
         frame_size,
         param_count: func.params.len(),
+        param_by_ref: func.params.iter().map(|p| p.by_ref).collect(),
     })
 }
 
@@ -648,18 +661,21 @@ fn compile_instruction(
             args,
         } => {
             let d = slot(*dest);
-            let arg_slots: Vec<(usize, bool)> =
-                args.iter().map(|a| (slot(a.value), a.by_ref)).collect();
+            let arg_slots: Vec<usize> = args.iter().map(|v| slot(*v)).collect();
             let func_name = function.qualified_name();
 
             // Resolve via link map (all references verified at link time)
             match link_map.get(&func_name).cloned() {
-                Some(CallTarget::Extern { generic, variants }) => {
+                Some(CallTarget::Extern {
+                    generic,
+                    variants,
+                    param_by_ref,
+                }) => {
                     // Try to select a type-specialized variant at compile time
                     let f = if !variants.is_empty() {
                         let arg_types: Vec<TypeSet> = args
                             .iter()
-                            .map(|a| types.get(a.value).copied().unwrap_or(TypeSet::any()))
+                            .map(|a| types.get(*a).copied().unwrap_or(TypeSet::any()))
                             .collect();
                         variants
                             .iter()
@@ -682,9 +698,14 @@ fn compile_instruction(
                         let frame_size = 1 + argc; // slot 0 = Frame, slots 1..=N = args
                         vm.call(frame_size, None)?;
 
-                        // Copy args from caller's slots into extern's frame
-                        for (i, (s, _by_ref)) in arg_slots.iter().enumerate() {
-                            if let Some(val) = vm.get(caller_bp + s).cloned() {
+                        // Copy args: by-ref from callee's param declaration creates
+                        // Slot::Ref; by-value clones the value.
+                        for (i, &s) in arg_slots.iter().enumerate() {
+                            let is_ref = param_by_ref.get(i).copied().unwrap_or(false);
+                            if is_ref {
+                                let target = vm.resolve(caller_bp + s);
+                                vm.set_local_ref(i + 1, target);
+                            } else if let Some(val) = vm.get(caller_bp + s).cloned() {
                                 vm.set_local(i + 1, val);
                             }
                         }
@@ -708,13 +729,18 @@ fn compile_instruction(
                         let caller_bp = vm.bp();
                         vm.call(func.frame_size, None)?;
 
-                        // Copy args directly from caller's slots into callee's param slots.
-                        // No intermediate Vec allocation.
-                        for (i, (s, _by_ref)) in arg_slots.iter().enumerate() {
-                            if i < func.param_count
-                                && let Some(val) = vm.get(caller_bp + s).cloned()
-                            {
-                                vm.set_local(i + 1, val);
+                        // Copy args into callee's param slots.
+                        // By-ref is read from the callee's CompiledFunction::param_by_ref
+                        // (source of truth: Param::by_ref in the IR).
+                        for (i, &s) in arg_slots.iter().enumerate() {
+                            if i < func.param_count {
+                                let is_ref = func.param_by_ref.get(i).copied().unwrap_or(false);
+                                if is_ref {
+                                    let target = vm.resolve(caller_bp + s);
+                                    vm.set_local_ref(i + 1, target);
+                                } else if let Some(val) = vm.get(caller_bp + s).cloned() {
+                                    vm.set_local(i + 1, val);
+                                }
                             }
                         }
 

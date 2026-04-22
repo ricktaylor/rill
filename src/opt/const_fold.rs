@@ -307,14 +307,14 @@ fn pattern_matches(pattern: &crate::ir::MatchPattern, value: &ConstValue) -> boo
 /// Try to fold an extern call with constant arguments
 fn try_fold_call(
     func_ref: &FunctionRef,
-    args: &[crate::ir::CallArg],
+    args: &[VarId],
     constants: &ConstantMap,
     externs: &ExternRegistry,
 ) -> Option<ConstValue> {
     // Collect constant arguments
     let const_args: Option<Vec<ConstValue>> = args
         .iter()
-        .map(|arg| constants.get(&arg.value).cloned())
+        .map(|arg| constants.get(arg).cloned())
         .collect();
 
     let const_args = const_args?;

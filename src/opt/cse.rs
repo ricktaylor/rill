@@ -83,8 +83,7 @@ pub fn eliminate_common_subexpressions_with_purity(
                         continue;
                     }
 
-                    let arg_vars: Vec<VarId> = args.iter().map(|a| a.value).collect();
-                    (*dest, ExprKey::Call(name, arg_vars))
+                    (*dest, ExprKey::Call(name, args.clone()))
                 }
 
                 _ => continue,

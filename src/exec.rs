@@ -735,9 +735,15 @@ impl VM {
         }
     }
 
-    /// Set value at local offset
+    /// Set value at local offset (resolves refs — writes through to target)
     pub fn set_local(&mut self, offset: usize, value: Value) {
         self.set(self.bp + offset, value);
+    }
+
+    /// Overwrite a local slot directly with a value, replacing any Ref.
+    /// Used by TailCall to reset param slots without writing through refs.
+    pub fn overwrite_local(&mut self, offset: usize, value: Value) {
+        self.stack[self.bp + offset] = Slot::Val(value);
     }
 
     // ========================================================================

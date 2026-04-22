@@ -12,7 +12,7 @@
 //! - Call instructions: use extern metadata for return types
 
 use crate::externs::ExternRegistry;
-use crate::ir::{BlockId, CallArg, Function, FunctionRef, Instruction, Terminator, VarId};
+use crate::ir::{BlockId, Function, FunctionRef, Instruction, Terminator, VarId};
 use crate::types::{BaseType, TypeSet};
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -187,7 +187,7 @@ fn transfer_instruction(
 /// Compute the return type of a function call using extern metadata
 fn compute_call_type(
     function: &FunctionRef,
-    _args: &[CallArg],
+    _args: &[VarId],
     _state: &HashMap<VarId, TypeSet>,
     externs: Option<&ExternRegistry>,
     return_types: &ReturnTypes,

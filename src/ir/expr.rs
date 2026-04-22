@@ -444,19 +444,12 @@ impl<'a> Lowerer<'a> {
 
         let param_specs = extern_def.map(|b| &b.meta.params);
 
-        let args: Vec<CallArg> = arguments
+        // By-ref is a callee declaration (Param::by_ref for user functions,
+        // ParamSpec::by_ref for externs). The compiler reads it from
+        // CallTarget::param_by_ref at compile time — not stored on the call.
+        let args: Vec<VarId> = arguments
             .iter()
-            .enumerate()
-            .map(|(i, arg)| {
-                let by_ref = param_specs
-                    .and_then(|specs| specs.get(i))
-                    .map(|spec| spec.by_ref)
-                    .unwrap_or(false);
-                CallArg {
-                    value: self.lower_expression(arg),
-                    by_ref,
-                }
-            })
+            .map(|arg| self.lower_expression(arg))
             .collect();
 
         // Insert type guards for extern params with type constraints.
@@ -494,7 +487,7 @@ impl<'a> Lowerer<'a> {
                     .collect();
 
                 self.finish_block(Terminator::Match {
-                    value: arg.value,
+                    value: *arg,
                     arms: match_arms,
                     default: skip_bb,
                     span: self.current_span,

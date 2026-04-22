@@ -382,7 +382,7 @@ pub enum Instruction {
     Call {
         dest: VarId,
         function: FunctionRef,
-        args: Vec<CallArg>,
+        args: Vec<VarId>,
     },
 
     /// Create a reference binding for `with` statements.
@@ -466,12 +466,6 @@ impl FunctionRef {
     }
 }
 
-/// Argument to a function call with binding mode
-#[derive(Debug, Clone)]
-pub struct CallArg {
-    pub value: VarId,
-    pub by_ref: bool,
-}
 
 // ============================================================================
 // Literals
@@ -676,7 +670,9 @@ impl Default for Function {
     }
 }
 
-/// Function parameter with binding mode
+/// Function parameter with binding mode.
+/// `by_ref` is the callee's declaration — propagated to `CompiledFunction::param_by_ref`
+/// and read at runtime when setting up callee frames.
 #[derive(Debug, Clone)]
 pub struct Param {
     pub var: VarId,

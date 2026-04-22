@@ -72,11 +72,6 @@ fn find_tail_call_candidates(function: &Function, self_name: &str) -> Vec<TailCa
                     continue;
                 }
 
-                // Must have all args by-value
-                if args.iter().any(|a| a.by_ref) {
-                    continue;
-                }
-
                 // Dest must be return-only (flows only to Return through Phis)
                 if !return_only.contains(dest) {
                     continue;
@@ -101,7 +96,7 @@ fn find_tail_call_candidates(function: &Function, self_name: &str) -> Vec<TailCa
                 candidates.push(TailCallCandidate {
                     call_block_id: block.id,
                     call_inst_index: inst_idx,
-                    args: args.iter().map(|a| a.value).collect(),
+                    args: args.clone(),
                 });
             }
         }
@@ -139,7 +134,7 @@ fn instruction_reads(inst: &Instruction) -> Vec<VarId> {
         Instruction::Index { base, key, .. } => vec![*base, *key],
         Instruction::SetIndex { base, key, value } => vec![*base, *key, *value],
         Instruction::Intrinsic { args, .. } => args.clone(),
-        Instruction::Call { args, .. } => args.iter().map(|a| a.value).collect(),
+        Instruction::Call { args, .. } => args.clone(),
         Instruction::MakeRef { base, key, .. } => {
             let mut reads = vec![*base];
             if let Some(k) = key {
