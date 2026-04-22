@@ -196,6 +196,13 @@ fn replace_vars_in_instruction(inst: &mut Instruction, map: &HashMap<VarId, VarI
             }
         }
 
+        Instruction::Reload { src, .. } => {
+            if let Some(&new) = map.get(src) {
+                *src = new;
+                count += 1;
+            }
+        }
+
         Instruction::Assign { .. } | Instruction::Read { .. } => {
             unreachable!("pre-SSA instruction; removed by mem2reg")
         }
@@ -259,12 +266,9 @@ mod tests {
     }
     fn make_function(blocks: Vec<BasicBlock>, locals: Vec<Var>) -> Function {
         Function {
-            name: ast::Identifier("test".into()),
-            params: vec![],
-            rest_param: None,
             blocks,
             locals,
-            entry_block: BlockId(0),
+            ..Default::default()
         }
     }
 

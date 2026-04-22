@@ -2021,6 +2021,7 @@ fn tco_deep_recursion() {
 fn tco_ackermann_deeper() {
     // ack(3,7) = 1021 — exercises deep recursion with partial TCO
     // (2 of 3 branches are tail calls, inner ack(m, n-1) is not)
+    // Uses `let` params — ack is a pure computation, no write-back needed.
     let val = run_with_args(
         r#"
         fn ack(m, n) {

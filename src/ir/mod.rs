@@ -59,10 +59,20 @@ pub enum BindingMode {
 /// Used by the lowerer to emit `WriteRef` instructions when a ref-backed
 /// variable is assigned. The `ref_var` is the dest of the MakeRef instruction;
 /// the compiler resolves it to (base, key) via `build_ref_map` at compile time.
+/// `base_name` is the named variable being mutated (for SSA Reload after WriteRef).
 #[derive(Clone)]
 pub struct RefOrigin {
     /// The MakeRef dest VarId (the reference variable)
     pub ref_var: VarId,
+    /// The MakeRef base VarId (the collection being referenced)
+    pub base_var: VarId,
+    /// The named variable holding the base (for Reload after WriteRef)
+    pub base_name: Option<ast::Identifier>,
+    /// True if this is a whole-value ref (MakeRef key: None).
+    /// Whole-value refs can change the base's type entirely on write,
+    /// so WriteRef needs Reload. Element refs (key: Some) only mutate
+    /// collection contents — container type is unchanged.
+    pub whole_value: bool,
 }
 
 // ============================================================================
@@ -128,6 +138,10 @@ pub struct Lowerer<'a> {
     /// jumping to this block if any arg is Undefined. All guards within
     /// an expression share the same fail block — no intermediate Phis.
     pub expr_guard_fail: Option<BlockId>,
+
+    /// User function parameter by-ref modes, collected from AST before lowering.
+    /// Used to emit Reload after calls for by-ref args from named variables.
+    pub user_fn_params: HashMap<ast::Identifier, Vec<bool>>,
 }
 
 /// Context for a loop (for break/continue)
@@ -158,6 +172,7 @@ impl<'a> Lowerer<'a> {
             require_aliases: HashMap::new(),
             merged_externs: HashMap::new(),
             expr_guard_fail: None,
+            user_fn_params: HashMap::new(),
         }
     }
 
@@ -430,6 +445,16 @@ impl<'a> Lowerer<'a> {
     /// Emit an Undefined constant.
     pub fn emit_undefined(&mut self) -> VarId {
         self.emit_const(Literal::Undefined)
+    }
+
+    /// Emit a Reload — SSA barrier after a mutation site.
+    /// Creates a fresh VarId so subsequent reads see a new SSA definition.
+    /// The source type is preserved (container type doesn't change, only contents).
+    pub fn emit_reload(&mut self, src: VarId) -> VarId {
+        let type_set = self.var_type(src);
+        let dest = self.new_temp(type_set);
+        self.emit(Instruction::Reload { dest, src });
+        dest
     }
 
     /// Emit a Phi node, computing the type as the union of source types.

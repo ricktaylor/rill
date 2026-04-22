@@ -135,12 +135,12 @@ pub struct Require {
 // ============================================================================
 
 /// Function parameter with binding mode
-/// Default is by-reference; `let` prefix makes it by-value
+/// Default is by-value (CoW makes clones cheap); `with` opts into by-reference
 #[derive(Debug, Clone)]
 pub struct FunctionParam {
     /// Parameter name
     pub name: Identifier,
-    /// true if `let` prefix (by-value copy), false for by-reference (default)
+    /// true for by-value (default or `let`), false for by-reference (`with`)
     pub is_value: bool,
 }
 

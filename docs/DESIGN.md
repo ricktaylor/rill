@@ -1766,17 +1766,18 @@ or address it.
 
 ### Binding Modes
 
-The language uses a consistent pattern: **default is by-reference**, use `let` to opt into by-value.
-The `with` keyword can be used explicitly for by-reference (same as default) for symmetry and clarity.
+The language uses a consistent pattern: **default is by-value** (CoW makes clones cheap),
+use `with` to opt into by-reference when mutation propagation is needed.
+The `let` keyword is redundant but can be used explicitly for clarity.
 
-| Context | by-ref (explicit) | by-ref (implicit) | by-value |
-|---------|-------------------|-------------------|----------|
-| Statement | `with x = expr` | — | `let x = expr` |
-| Conditional | `if with x = expr { }` | — | `if let x = expr { }` |
-| For loop (single) | `for with x in arr { }` | `for x in arr { }` | `for let x in arr { }` |
-| For loop (pair) | `for with k, v in map { }` | `for k, v in map { }` | `for let k, v in map { }` |
-| Match arm | `with pat => { }` | `pat => { }` | `let pat => { }` |
-| Function param | `fn foo(with x)` | `fn foo(x)` | `fn foo(let x)` |
+| Context | by-value (default) | by-value (explicit) | by-ref |
+|---------|-------------------|---------------------|--------|
+| Statement | — | `let x = expr` | `with x = expr` |
+| Conditional | — | `if let x = expr { }` | `if with x = expr { }` |
+| For loop (single) | `for x in arr { }` | `for let x in arr { }` | `for with x in arr { }` |
+| For loop (pair) | `for k, v in map { }` | `for let k, v in map { }` | `for with k, v in map { }` |
+| Match arm | `pat => { }` | `let pat => { }` | `with pat => { }` |
+| Function param | `fn foo(x)` | `fn foo(let x)` | `fn foo(with x)` |
 
 **For-loop pair binding:**
 
@@ -1800,8 +1801,8 @@ The compiler warns on mutations to non-ref-backed loop variables (dead stores).
 
 **Semantics:**
 
-- **By-reference** (`with` or default): Variable refers to original location; mutations flow back
-- **By-value** (`let`): Variable is a copy; mutations are local only
+- **By-value** (default or `let`): Variable is a copy (CoW clone — Rc increment); mutations are local only
+- **By-reference** (`with`): Variable refers to original location; mutations flow back to source
 
 **Why allow explicit `with`?** Self-documenting code. When you write `fn process(with data)`,
 it signals intent: "I will mutate this parameter." The explicit keyword is optional but encouraged

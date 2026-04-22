@@ -164,7 +164,12 @@ impl<'a> Lowerer<'a> {
                             base: value,
                             key: Some(idx),
                         });
-                        let origin = RefOrigin { ref_var: dest };
+                        let origin = RefOrigin {
+                            ref_var: dest,
+                            base_var: value,
+                            base_name: None,
+                            whole_value: false,
+                        };
                         (dest, Some(origin))
                     } else {
                         let dest = self.emit_index(value, idx);
@@ -220,7 +225,12 @@ impl<'a> Lowerer<'a> {
                             base: value,
                             key: Some(idx),
                         });
-                        let origin = RefOrigin { ref_var: dest };
+                        let origin = RefOrigin {
+                            ref_var: dest,
+                            base_var: value,
+                            base_name: None,
+                            whole_value: false,
+                        };
                         (dest, Some(origin))
                     } else {
                         let dest = self.emit_index(value, idx);
@@ -304,7 +314,12 @@ impl<'a> Lowerer<'a> {
                                 base: value,
                                 key: Some(idx),
                             });
-                            let origin = RefOrigin { ref_var: dest };
+                            let origin = RefOrigin {
+                                ref_var: dest,
+                                base_var: value,
+                                base_name: None,
+                                whole_value: false,
+                            };
                             (dest, Some(origin))
                         } else {
                             let dest = self.emit_index(value, idx);
@@ -348,7 +363,12 @@ impl<'a> Lowerer<'a> {
                             base: value,
                             key: Some(key_var),
                         });
-                        let origin = RefOrigin { ref_var: dest };
+                        let origin = RefOrigin {
+                            ref_var: dest,
+                            base_var: value,
+                            base_name: None,
+                            whole_value: false,
+                        };
                         (dest, Some(origin))
                     } else {
                         let dest = self.emit_index(value, key_var);
@@ -702,7 +722,12 @@ impl<'a> Lowerer<'a> {
                 base: iter_var,
                 key: Some(i_var),
             });
-            let origin = RefOrigin { ref_var: dest };
+            let origin = RefOrigin {
+                ref_var: dest,
+                base_var: iter_var,
+                base_name: None,
+                whole_value: false,
+            };
             (dest, Some(origin))
         } else {
             let raw = self.emit_index(iter_var, i_var);

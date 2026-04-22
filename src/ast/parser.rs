@@ -924,7 +924,7 @@ fn for_expr<'a>(expr: BoxedParser<'a, Expression>) -> BoxedParser<'a, Expression
         kw("with").to(false), // by-reference (explicit)
     ))
     .or_not()
-    .map(|opt| opt.unwrap_or(false)) // default = by-reference
+    .map(|opt| opt.unwrap_or(true)) // default = by-value (CoW makes clones cheap)
     .boxed();
 
     // Pair binding: for k, v in map { }
@@ -1156,7 +1156,7 @@ fn match_arm<'a>(expr: BoxedParser<'a, Expression>) -> BoxedParser<'a, MatchArm>
         kw("with").to(false), // by-reference (explicit)
     ))
     .or_not()
-    .map(|opt| opt.unwrap_or(false)) // default = by-reference
+    .map(|opt| opt.unwrap_or(true)) // default = by-value (CoW makes clones cheap)
     .boxed();
 
     let guard = kw("if").ignore_then(expr.clone().padded_by(whitespace()));
@@ -1321,26 +1321,26 @@ fn binding_mode<'a>() -> BoxedParser<'a, Option<bool>> {
 }
 
 /// Parse a single function parameter: ["let" / "with"] identifier
-/// `let` = by-value, `with` or default = by-reference
+/// Default is by-value (CoW makes clones cheap). `with` opts in to by-reference.
 fn function_param<'a>() -> BoxedParser<'a, FunctionParam> {
     binding_mode()
         .then(ident())
         .map(|(binding_mode, name)| FunctionParam {
             name,
-            is_value: binding_mode.unwrap_or(false), // default = by-reference
+            is_value: binding_mode.unwrap_or(true), // default = by-value
         })
         .boxed()
 }
 
 /// Parse a rest parameter: ["let" / "with"] ".." identifier
-/// Captures excess arguments as an Array
+/// Captures excess arguments as an Array. Default by-value.
 fn rest_param<'a>() -> BoxedParser<'a, FunctionParam> {
     binding_mode()
         .then_ignore(just('.').then(just('.')).padded_by(whitespace()))
         .then(ident())
         .map(|(binding_mode, name)| FunctionParam {
             name,
-            is_value: binding_mode.unwrap_or(false), // default = by-reference
+            is_value: binding_mode.unwrap_or(true), // default = by-value
         })
         .boxed()
 }

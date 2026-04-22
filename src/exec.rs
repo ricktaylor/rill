@@ -740,10 +740,14 @@ impl VM {
         self.set(self.bp + offset, value);
     }
 
-    /// Overwrite a local slot directly with a value, replacing any Ref.
-    /// Used by TailCall to reset param slots without writing through refs.
-    pub fn overwrite_local(&mut self, offset: usize, value: Value) {
-        self.stack[self.bp + offset] = Slot::Val(value);
+    /// Shallow-copy a slot from an absolute source address to a local destination.
+    /// Preserves Slot::Ref identity — if source is a Ref, dest becomes a Ref to
+    /// the same target. Used for uniform call arg setup (ref-agnostic).
+    pub fn copy_slot_from(&mut self, dst_offset: usize, src_abs: usize) {
+        let dst = self.bp + dst_offset;
+        if src_abs < self.stack.len() && dst < self.stack.len() {
+            self.stack[dst] = self.stack[src_abs].clone();
+        }
     }
 
     // ========================================================================

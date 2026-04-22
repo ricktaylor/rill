@@ -493,12 +493,9 @@ mod tests {
 
     fn make_function(blocks: Vec<BasicBlock>, locals: Vec<Var>) -> Function {
         Function {
-            name: ast::Identifier("test".to_string()),
-            params: Vec::new(),
-            rest_param: None,
-            locals,
             blocks,
-            entry_block: BlockId(0),
+            locals,
+            ..Default::default()
         }
     }
 

@@ -178,6 +178,14 @@ fn transfer_instruction(
             state.insert(*dest, TypeSet::single(BaseType::Array));
         }
 
+        // Reload: value may have been mutated in-place, use conservative any()
+        Instruction::Reload { dest, src } => {
+            // Use source type if known (the container type is unchanged even if
+            // contents mutated), otherwise any()
+            let src_type = state.get(src).copied().unwrap_or_else(all_types);
+            state.insert(*dest, src_type);
+        }
+
         Instruction::Assign { .. } | Instruction::Read { .. } => {
             unreachable!("pre-SSA instruction; removed by mem2reg")
         }
@@ -381,11 +389,11 @@ pub fn analyze_types_full(
             .and_then(|pts| pts.get(i).copied())
             .filter(|t| !t.is_empty())
             .unwrap_or_else(all_types);
-        initial_state.insert(param.var, ty);
+        initial_state.insert(*param, ty);
     }
     if let Some(ref rest_param) = function.rest_param {
         // Rest param is always an array
-        initial_state.insert(rest_param.var, TypeSet::single(BaseType::Array));
+        initial_state.insert(*rest_param, TypeSet::single(BaseType::Array));
     }
     entry_states.insert(function.entry_block, initial_state);
 
@@ -476,14 +484,14 @@ pub fn analyze_types_full(
     // Params: from entry block's exit state
     if let Some(entry_exit) = exit_states.get(&function.entry_block) {
         for param in &function.params {
-            if let Some(&ts) = entry_exit.get(&param.var) {
-                types.insert(param.var, ts);
+            if let Some(&ts) = entry_exit.get(param) {
+                types.insert(*param, ts);
             }
         }
         if let Some(ref rest) = function.rest_param
-            && let Some(&ts) = entry_exit.get(&rest.var)
+            && let Some(&ts) = entry_exit.get(rest)
         {
-            types.insert(rest.var, ts);
+            types.insert(*rest, ts);
         }
     }
 
@@ -501,7 +509,8 @@ pub fn analyze_types_full(
                     | Instruction::MakeRef { dest, .. }
                     | Instruction::Append { dest, .. }
                     | Instruction::Phi { dest, .. }
-                    | Instruction::Read { dest, .. } => Some(*dest),
+                    | Instruction::Read { dest, .. }
+                    | Instruction::Reload { dest, .. } => Some(*dest),
                     Instruction::SetIndex { .. }
                     | Instruction::WriteRef { .. }
                     | Instruction::Assign { .. } => None,
@@ -527,7 +536,7 @@ pub fn analyze_types_full(
 mod tests {
     use super::*;
     use crate::ast;
-    use crate::ir::{BasicBlock, Literal, MatchPattern, Param, SpannedInst, Var};
+    use crate::ir::{BasicBlock, Literal, MatchPattern, SpannedInst, Var};
 
     fn var(id: u32) -> VarId {
         VarId(id)
@@ -535,10 +544,6 @@ mod tests {
 
     fn block(id: u32) -> BlockId {
         BlockId(id)
-    }
-
-    fn ident(s: &str) -> ast::Identifier {
-        ast::Identifier(s.to_string())
     }
 
     /// Helper to wrap an instruction with a dummy span
@@ -555,10 +560,7 @@ mod tests {
 
     fn make_function_with_param(param_var: VarId, blocks: Vec<BasicBlock>) -> Function {
         Function {
-            params: vec![Param {
-                var: param_var,
-                by_ref: false,
-            }],
+            params: vec![param_var],
             blocks,
             ..Default::default()
         }
@@ -696,15 +698,10 @@ mod tests {
         ];
 
         let func = Function {
-            name: ast::Identifier("test".into()),
-            params: vec![Param {
-                var: var(0),
-                by_ref: false,
-            }],
-            rest_param: None,
+            params: vec![var(0)],
             blocks,
             locals,
-            entry_block: BlockId(0),
+            ..Default::default()
         };
         // mem2reg is not needed — IR is already in SSA form
         let analysis = analyze_types(&func, None);
@@ -769,15 +766,10 @@ mod tests {
         ];
 
         let func = Function {
-            name: ast::Identifier("test".into()),
-            params: vec![Param {
-                var: var(0),
-                by_ref: false,
-            }],
-            rest_param: None,
+            params: vec![var(0)],
             blocks,
             locals,
-            entry_block: BlockId(0),
+            ..Default::default()
         };
         let analysis = analyze_types(&func, None);
 
@@ -855,18 +847,10 @@ mod tests {
         }];
 
         let func = Function {
-            name: ident("test"),
-            params: vec![Param {
-                var: var(0),
-                by_ref: false,
-            }],
-            rest_param: Some(Param {
-                var: var(1),
-                by_ref: false,
-            }),
-            locals: vec![],
+            params: vec![var(0)],
+            rest_param: Some(var(1)),
             blocks,
-            entry_block: block(0),
+            ..Default::default()
         };
 
         let analysis = analyze_types(&func, None);

@@ -853,12 +853,9 @@ mod tests {
     }
     fn make_function(blocks: Vec<BasicBlock>, locals: Vec<Var>) -> Function {
         Function {
-            name: ast::Identifier("test".into()),
-            params: vec![],
-            rest_param: None,
             blocks,
             locals,
-            entry_block: BlockId(0),
+            ..Default::default()
         }
     }
 
@@ -1082,11 +1079,7 @@ mod tests {
         // → callee param x should be {UInt}, Defined
         let callee = Function {
             name: ast::Identifier("callee".into()),
-            params: vec![crate::ir::Param {
-                var: var(0),
-                by_ref: false,
-            }],
-            rest_param: None,
+            params: vec![var(0)],
             locals: vec![
                 Var::new(var(0), ast::Identifier("x".into()), TypeSet::any()),
                 Var::new(var(1), ast::Identifier("one".into()), TypeSet::uint()),
@@ -1109,13 +1102,11 @@ mod tests {
                     value: Some(var(2)),
                 },
             }],
-            entry_block: block(0),
+            ..Default::default()
         };
 
         let caller = Function {
             name: ast::Identifier("caller".into()),
-            params: vec![],
-            rest_param: None,
             locals: vec![
                 Var::new(var(10), ast::Identifier("arg".into()), TypeSet::uint()),
                 Var::new(var(11), ast::Identifier("result".into()), TypeSet::any()),
@@ -1140,7 +1131,7 @@ mod tests {
                     value: Some(var(11)),
                 },
             }],
-            entry_block: block(0),
+            ..Default::default()
         };
 
         let program = IrProgram {

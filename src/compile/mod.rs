@@ -75,8 +75,6 @@ pub(crate) struct CompiledFunction {
     pub entry: usize, // index into block_starts
     pub frame_size: usize,
     pub param_count: usize,
-    /// Per-parameter by-ref flags, from the IR `Param::by_ref` declarations.
-    pub param_by_ref: Vec<bool>,
 }
 
 /// A step closure. Captures operands, operates on VM.
@@ -189,11 +187,9 @@ pub(crate) enum CallTarget {
         generic: crate::externs::ExternFn,
         /// Variants: (param TypeSets, return TypeSet, specialized fn pointer)
         variants: Vec<(Vec<TypeSet>, TypeSet, crate::externs::ExternFn)>,
-        /// Per-parameter by-ref flags from the extern's ParamSpec declarations.
-        param_by_ref: Vec<bool>,
     },
     /// User-defined function — index into CompiledProgram.functions.
-    /// By-ref param modes are read from `CompiledFunction::param_by_ref` at runtime.
+    /// Copy-out for by-ref params is derived from Reload instructions in the IR.
     UserFunction(usize),
 }
 
@@ -224,18 +220,11 @@ fn link_functions(
                     }
                 })
                 .collect();
-            let param_by_ref = def
-                .meta
-                .params
-                .iter()
-                .map(|p| p.by_ref)
-                .collect();
             link_map.insert(
                 name.clone(),
                 CallTarget::Extern {
                     generic: *f,
                     variants,
-                    param_by_ref,
                 },
             );
         }
@@ -389,7 +378,6 @@ fn compile_function(func: &Function, link_map: &LinkMap) -> Result<CompiledFunct
         entry,
         frame_size,
         param_count: func.params.len(),
-        param_by_ref: func.params.iter().map(|p| p.by_ref).collect(),
     })
 }
 
@@ -666,11 +654,7 @@ fn compile_instruction(
 
             // Resolve via link map (all references verified at link time)
             match link_map.get(&func_name).cloned() {
-                Some(CallTarget::Extern {
-                    generic,
-                    variants,
-                    param_by_ref,
-                }) => {
+                Some(CallTarget::Extern { generic, variants }) => {
                     // Try to select a type-specialized variant at compile time
                     let f = if !variants.is_empty() {
                         let arg_types: Vec<TypeSet> = args
@@ -693,24 +677,16 @@ fn compile_instruction(
 
                     let argc = arg_slots.len();
                     Box::new(move |vm: &mut VM, _prog| {
-                        // Set up frame for extern (same convention as user functions)
                         let caller_bp = vm.bp();
-                        let frame_size = 1 + argc; // slot 0 = Frame, slots 1..=N = args
+                        let frame_size = 1 + argc;
                         vm.call(frame_size, None)?;
 
-                        // Copy args: by-ref from callee's param declaration creates
-                        // Slot::Ref; by-value clones the value.
+                        // Uniform shallow copy — Refs stay Refs, Vals stay Vals.
+                        // The lowerer already emitted MakeRef for by-ref args.
                         for (i, &s) in arg_slots.iter().enumerate() {
-                            let is_ref = param_by_ref.get(i).copied().unwrap_or(false);
-                            if is_ref {
-                                let target = vm.resolve(caller_bp + s);
-                                vm.set_local_ref(i + 1, target);
-                            } else if let Some(val) = vm.get(caller_bp + s).cloned() {
-                                vm.set_local(i + 1, val);
-                            }
+                            vm.copy_slot_from(i + 1, caller_bp + s);
                         }
 
-                        // Call extern — reads args via vm.arg(i)
                         let result = f(vm, argc);
                         vm.ret();
 
@@ -725,26 +701,18 @@ fn compile_instruction(
                     Box::new(move |vm: &mut VM, prog: &CompiledProgram| {
                         let func = &prog.functions[func_idx];
 
-                        // Save caller's bp, then set up callee frame
                         let caller_bp = vm.bp();
                         vm.call(func.frame_size, None)?;
 
-                        // Copy args into callee's param slots.
-                        // By-ref is read from the callee's CompiledFunction::param_by_ref
-                        // (source of truth: Param::by_ref in the IR).
+                        // Uniform shallow copy — ref-agnostic. The lowerer
+                        // already emitted MakeRef for by-ref args.
                         for (i, &s) in arg_slots.iter().enumerate() {
                             if i < func.param_count {
-                                let is_ref = func.param_by_ref.get(i).copied().unwrap_or(false);
-                                if is_ref {
-                                    let target = vm.resolve(caller_bp + s);
-                                    vm.set_local_ref(i + 1, target);
-                                } else if let Some(val) = vm.get(caller_bp + s).cloned() {
-                                    vm.set_local(i + 1, val);
-                                }
+                                vm.copy_slot_from(i + 1, caller_bp + s);
                             }
                         }
 
-                        // Execute callee: inline loop (same as execute_function)
+                        // Execute callee
                         let mut pc = func.block_starts[func.entry];
                         let result = loop {
                             match (func.steps[pc])(vm, prog)? {
@@ -760,7 +728,6 @@ fn compile_instruction(
                                 }
                             }
                         };
-
                         vm.set_local(d, result);
                         Ok(Action::Continue)
                     })
@@ -947,6 +914,16 @@ fn compile_instruction(
                 } else {
                     vm.set_local(d, Value::Undefined);
                 }
+                Ok(Action::Continue)
+            })
+        }
+
+        // Reload: read current slot value into a new slot (SSA barrier after mutation)
+        Instruction::Reload { dest, src } => {
+            let d = slot(*dest);
+            let s = slot(*src);
+            Box::new(move |vm: &mut VM, _prog| {
+                vm.set_local(d, vm.local(s).clone());
                 Ok(Action::Continue)
             })
         }

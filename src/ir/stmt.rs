@@ -113,6 +113,16 @@ impl<'a> Lowerer<'a> {
                         ref_var: origin.ref_var,
                         value: final_value,
                     });
+                    // Whole-value refs can change the base's type entirely
+                    // (e.g., `with y = x; y = "hello"` changes x from UInt to Text).
+                    // Reload creates a fresh SSA def so type analysis sees the change.
+                    // Element refs (arr[i] = val) don't change the container type.
+                    if origin.whole_value
+                        && let Some(base_name) = &origin.base_name
+                    {
+                        let reloaded = self.emit_reload(origin.base_var);
+                        self.reassign(base_name, reloaded);
+                    }
                 }
 
                 // Reassign the variable via its slot. mem2reg handles phis.

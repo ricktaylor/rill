@@ -444,19 +444,42 @@ impl<'a> Lowerer<'a> {
 
         let param_specs = extern_def.map(|b| &b.meta.params);
 
-        // By-ref is a callee declaration (Param::by_ref for user functions,
-        // ParamSpec::by_ref for externs). The compiler reads it from
-        // CallTarget::param_by_ref at compile time — not stored on the call.
+        // Collect by-ref modes BEFORE lowering args — needed to emit MakeRef
+        // for by-ref params at the call site (caller's responsibility).
+        let param_by_ref: Option<Vec<bool>> = if let Some(specs) = param_specs {
+            Some(specs.iter().map(|s| s.by_ref).collect())
+        } else {
+            self.user_fn_params.get(name).cloned()
+        };
+
+        // Lower each arg, wrapping in MakeRef for by-ref callee params.
+        // The caller emits the coercion: MakeRef for by-ref, plain value for by-val.
         let args: Vec<VarId> = arguments
             .iter()
-            .map(|arg| self.lower_expression(arg))
+            .enumerate()
+            .map(|(i, arg)| {
+                let arg_var = self.lower_expression(arg);
+                let is_ref = param_by_ref
+                    .as_ref()
+                    .and_then(|modes| modes.get(i))
+                    .copied()
+                    .unwrap_or(false);
+                if is_ref {
+                    // Wrap in MakeRef — creates Slot::Ref at runtime
+                    let ref_dest = self.new_temp(TypeSet::any());
+                    self.emit(Instruction::MakeRef {
+                        dest: ref_dest,
+                        base: arg_var,
+                        key: None,
+                    });
+                    ref_dest
+                } else {
+                    arg_var
+                }
+            })
             .collect();
 
         // Insert type guards for extern params with type constraints.
-        // Each constrained param gets a Match that checks the arg's type
-        // against the declared type_sig. On mismatch, the call is skipped
-        // and the result is undefined. The optimizer eliminates guards when
-        // types are statically known.
         let has_type_guards = param_specs.is_some_and(|specs| {
             specs
                 .iter()
@@ -508,8 +531,10 @@ impl<'a> Lowerer<'a> {
                     namespace: namespace.cloned(),
                     name: name.clone(),
                 },
-                args,
+                args.clone(),
             );
+            // Reload by-ref args after call
+            self.emit_byref_reloads(arguments, &args, &param_by_ref);
             let call_exit = self.current_block;
             self.finish_block(Terminator::Jump { target: join_bb });
 
@@ -526,13 +551,16 @@ impl<'a> Lowerer<'a> {
             self.emit_phi(vec![(call_exit, call_dest), (skip_exit, undef_dest)])
         } else {
             // No type constraints — emit call directly
-            self.emit_call(
+            let result = self.emit_call(
                 FunctionRef {
                     namespace: namespace.cloned(),
                     name: name.clone(),
                 },
-                args,
-            )
+                args.clone(),
+            );
+            // Reload by-ref args after call
+            self.emit_byref_reloads(arguments, &args, &param_by_ref);
+            result
         }
     }
 
@@ -578,6 +606,11 @@ impl<'a> Lowerer<'a> {
     pub fn lower_ref_expression(&mut self, expr: &ast::Expression) -> (VarId, Option<RefOrigin>) {
         match expr {
             ast::Expression::ArrayAccess { array, index } => {
+                let base_name = if let ast::Expression::Variable(name) = array.as_ref() {
+                    Some(name.clone())
+                } else {
+                    None
+                };
                 let base = self.lower_expression(array);
                 let key = self.lower_expression(index);
                 let dest = self.new_temp(TypeSet::any());
@@ -586,11 +619,21 @@ impl<'a> Lowerer<'a> {
                     base,
                     key: Some(key),
                 });
-                let origin = RefOrigin { ref_var: dest };
+                let origin = RefOrigin {
+                    ref_var: dest,
+                    base_var: base,
+                    base_name,
+                    whole_value: false,
+                };
                 (dest, Some(origin))
             }
 
             ast::Expression::MemberAccess { object, member } => {
+                let base_name = if let ast::Expression::Variable(name) = object.as_ref() {
+                    Some(name.clone())
+                } else {
+                    None
+                };
                 let base = self.lower_expression(object);
                 let key = self.lower_expression(member);
                 let dest = self.new_temp(TypeSet::any());
@@ -599,7 +642,12 @@ impl<'a> Lowerer<'a> {
                     base,
                     key: Some(key),
                 });
-                let origin = RefOrigin { ref_var: dest };
+                let origin = RefOrigin {
+                    ref_var: dest,
+                    base_var: base,
+                    base_name,
+                    whole_value: false,
+                };
                 (dest, Some(origin))
             }
 
@@ -611,7 +659,12 @@ impl<'a> Lowerer<'a> {
                         base: var,
                         key: None,
                     });
-                    let origin = RefOrigin { ref_var: dest };
+                    let origin = RefOrigin {
+                        ref_var: dest,
+                        base_var: var,
+                        base_name: Some(name.clone()),
+                        whole_value: true,
+                    };
                     (dest, Some(origin))
                 } else {
                     // Fall through to normal lowering (will emit error)
@@ -625,6 +678,35 @@ impl<'a> Lowerer<'a> {
             _ => {
                 let var = self.lower_expression(expr);
                 (var, None)
+            }
+        }
+    }
+
+    /// Emit Reload + Assign for by-ref args after a function call.
+    /// For each arg that is a named variable AND the callee param is by-ref,
+    /// emit a Reload to create a fresh SSA def (the callee may have mutated
+    /// the value in-place through the Slot::Ref).
+    fn emit_byref_reloads(
+        &mut self,
+        ast_args: &[ast::Expression],
+        ir_args: &[VarId],
+        param_by_ref: &Option<Vec<bool>>,
+    ) {
+        let Some(by_ref_modes) = param_by_ref else {
+            return;
+        };
+        for (i, ast_arg) in ast_args.iter().enumerate() {
+            let is_ref = by_ref_modes.get(i).copied().unwrap_or(false);
+            if !is_ref {
+                continue;
+            }
+            // Only reload named variables — computed expressions have no
+            // slot to reassign to.
+            if let ast::Expression::Variable(name) = ast_arg
+                && let Some(&arg_var) = ir_args.get(i)
+            {
+                let reloaded = self.emit_reload(arg_var);
+                self.reassign(name, reloaded);
             }
         }
     }

@@ -73,12 +73,9 @@ mod tests {
 
     fn make_function(blocks: Vec<BasicBlock>, locals: Vec<Var>) -> Function {
         Function {
-            name: ast::Identifier("test".into()),
-            params: vec![],
-            rest_param: None,
             blocks,
             locals,
-            entry_block: BlockId(0),
+            ..Default::default()
         }
     }
 

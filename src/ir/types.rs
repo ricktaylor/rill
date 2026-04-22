@@ -436,6 +436,14 @@ pub enum Instruction {
     /// which resolves each Read to the reaching definition (possibly through
     /// Phi nodes at merge points).
     Read { slot: u32, dest: VarId },
+
+    /// Reload a potentially-mutated value into a fresh VarId.
+    ///
+    /// Opaque to mem2reg — creates an SSA barrier so that subsequent reads
+    /// of the variable get a new VarId after a mutation site (WriteRef,
+    /// SetIndex, Append, or by-ref function call). At runtime, this is
+    /// a slot copy (reads the current value of src's slot).
+    Reload { dest: VarId, src: VarId },
 }
 
 /// Reference to a function (possibly namespaced)
@@ -465,7 +473,6 @@ impl FunctionRef {
         }
     }
 }
-
 
 // ============================================================================
 // Literals
@@ -596,8 +603,8 @@ pub enum MatchPattern {
 #[derive(Debug, Clone)]
 pub struct Function {
     pub name: ast::Identifier,
-    pub params: Vec<Param>,
-    pub rest_param: Option<Param>,
+    pub params: Vec<VarId>,
+    pub rest_param: Option<VarId>,
     pub locals: Vec<Var>,
     pub blocks: Vec<BasicBlock>,
     pub entry_block: BlockId,
@@ -668,15 +675,6 @@ impl Default for Function {
             entry_block: BlockId(0),
         }
     }
-}
-
-/// Function parameter with binding mode.
-/// `by_ref` is the callee's declaration — propagated to `CompiledFunction::param_by_ref`
-/// and read at runtime when setting up callee frames.
-#[derive(Debug, Clone)]
-pub struct Param {
-    pub var: VarId,
-    pub by_ref: bool,
 }
 
 /// Complete IR program

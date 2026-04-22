@@ -144,6 +144,7 @@ fn instruction_reads(inst: &Instruction) -> Vec<VarId> {
         }
         Instruction::WriteRef { ref_var, value } => vec![*ref_var, *value],
         Instruction::Append { arr, value, .. } => vec![*arr, *value],
+        Instruction::Reload { src, .. } => vec![*src],
         Instruction::Assign { value, .. } => vec![*value],
         Instruction::Read { .. } => vec![],
     }

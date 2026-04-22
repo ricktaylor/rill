@@ -311,7 +311,7 @@ pub fn elide_coercions(function: &mut Function) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{BasicBlock, Literal, Param, Terminator};
+    use crate::ir::{BasicBlock, Literal, Terminator};
     use crate::opt::analyze_types;
 
     fn var(id: u32) -> VarId {
@@ -544,16 +544,7 @@ mod tests {
 
         let mut func = make_function_with_locals(blocks, locals);
         let func_with_params = Function {
-            params: vec![
-                Param {
-                    var: var(0),
-                    by_ref: false,
-                },
-                Param {
-                    var: var(1),
-                    by_ref: false,
-                },
-            ],
+            params: vec![var(0), var(1)],
             ..func
         };
         func = func_with_params;

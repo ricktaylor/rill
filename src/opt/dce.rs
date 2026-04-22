@@ -114,6 +114,10 @@ fn collect_reads(inst: &Instruction, used: &mut HashSet<VarId>) {
             used.insert(*value);
         }
 
+        Instruction::Reload { src, .. } => {
+            used.insert(*src);
+        }
+
         Instruction::Assign { .. } | Instruction::Read { .. } => {
             unreachable!("pre-SSA instruction; removed by mem2reg")
         }
@@ -154,7 +158,8 @@ fn is_removable(
         | Instruction::Index { .. }
         | Instruction::Intrinsic { .. }
         | Instruction::Phi { .. }
-        | Instruction::MakeRef { .. } => true,
+        | Instruction::MakeRef { .. }
+        | Instruction::Reload { .. } => true,
 
         // Call: removable only if the callee is proven pure
         Instruction::Call { function, .. } => {
@@ -189,7 +194,8 @@ fn get_dest(inst: &Instruction) -> Option<VarId> {
         | Instruction::Phi { dest, .. }
         | Instruction::MakeRef { dest, .. }
         | Instruction::Append { dest, .. }
-        | Instruction::Call { dest, .. } => Some(*dest),
+        | Instruction::Call { dest, .. }
+        | Instruction::Reload { dest, .. } => Some(*dest),
 
         Instruction::SetIndex { .. } | Instruction::WriteRef { .. } => None,
 
@@ -243,12 +249,9 @@ mod tests {
     }
     fn make_function(blocks: Vec<BasicBlock>, locals: Vec<Var>) -> Function {
         Function {
-            name: ast::Identifier("test".into()),
-            params: vec![],
-            rest_param: None,
             blocks,
             locals,
-            entry_block: BlockId(0),
+            ..Default::default()
         }
     }
 

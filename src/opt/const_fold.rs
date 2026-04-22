@@ -312,10 +312,8 @@ fn try_fold_call(
     externs: &ExternRegistry,
 ) -> Option<ConstValue> {
     // Collect constant arguments
-    let const_args: Option<Vec<ConstValue>> = args
-        .iter()
-        .map(|arg| constants.get(arg).cloned())
-        .collect();
+    let const_args: Option<Vec<ConstValue>> =
+        args.iter().map(|arg| constants.get(arg).cloned()).collect();
 
     let const_args = const_args?;
 

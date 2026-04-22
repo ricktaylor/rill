@@ -132,6 +132,7 @@ FunctionRef {
   namespace: Option<String>,  ; extern namespace (None = global)
   name: String,               ; function name
   param_sigs: [<u16>, ...],   ; TypeSet bits for each parameter
+  param_refs: [bool, ...],    ; by-ref flag for each parameter
   return_sig: <u16>,          ; TypeSet bits for return type
   diverges: bool,             ; true if function exits (never returns)
 }
@@ -153,8 +154,9 @@ TypeSet bits (10):  HHHH LLLLLL
 ```
 
 The mangled extern reference is: `name$param1$param2$...$return`
-where each position is two base64 chars. Diverging functions use `!`
-for the return position.
+where each position is two base64 chars. By-ref parameters are prefixed
+with `&` (e.g., `&AO` for a by-ref numeric param). Diverging functions
+use `!` for the return position.
 
 | TypeSet | Bits | Encoded | Meaning |
 |---------|------|---------|---------|
@@ -179,6 +181,7 @@ decode$Ag$H/        ; decode(Bytes) -> defined()
 exit$AC$!           ; exit(UInt) -> diverges
 len$Bg$AC           ; len(collection) -> UInt  (collection = 0b0001110000)
 cbor::encode$H/$Ag  ; cbor::encode(defined) -> Bytes
+sort$&BA$BA         ; sort(by-ref Array) -> Array  (mutates in place)
 ```
 
 The `TypeSet` bit layout:
@@ -198,6 +201,7 @@ registry's current signatures using subset/superset rules:
 | Check | Rule | Rationale |
 |-------|------|-----------|
 | Param types | bytecode ⊆ registry | Bytecode passes narrower types; registry accepts wider — safe |
+| Param by-ref | must match | By-ref affects calling convention (copy-out); mismatch corrupts state |
 | Return type | registry ⊆ bytecode | Registry returns narrower types; bytecode handles wider — safe |
 | Param count | bytecode ≤ registry (with optional params) | Extra optional params are safe |
 | Diverges | must match | Diverging vs returning is a control flow difference |

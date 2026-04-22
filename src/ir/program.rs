@@ -42,6 +42,14 @@ impl<'a> Lowerer<'a> {
             }
         }
 
+        // Collect user function param by-ref modes before lowering bodies,
+        // so the lowerer can emit Reload after calls for by-ref args.
+        for function in &program.functions {
+            let modes: Vec<bool> = function.node.params.iter().map(|p| !p.is_value).collect();
+            self.user_fn_params
+                .insert(function.node.name.clone(), modes);
+        }
+
         // Lower functions (may emit errors but we continue)
         for function in &program.functions {
             self.set_span(function.span);
@@ -288,20 +296,14 @@ impl<'a> Lowerer<'a> {
         for param in &func.params {
             let var = self.new_var(param.name.clone(), TypeSet::any());
             self.bind(&param.name, var);
-            params.push(Param {
-                var,
-                by_ref: !param.is_value,
-            });
+            params.push(var);
         }
 
         // Lower rest parameter if present
         let rest_param = if let Some(ref rest) = func.rest_param {
             let var = self.new_var(rest.name.clone(), TypeSet::single(types::BaseType::Array));
             self.bind(&rest.name, var);
-            Some(Param {
-                var,
-                by_ref: !rest.is_value,
-            })
+            Some(var)
         } else {
             None
         };
