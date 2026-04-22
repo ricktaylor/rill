@@ -12,24 +12,24 @@
 
 mod algebra;
 mod cast_elision;
+mod cfg_simplify;
 mod coercion;
 mod const_fold;
 mod copy_prop;
 mod cse;
 mod dce;
-mod guard_elim;
 mod ref_elision;
 mod tail_call;
 mod type_refinement;
 
 pub use algebra::simplify_algebra;
 pub use cast_elision::elide_identity_casts;
+pub use cfg_simplify::simplify_cfg;
 pub use coercion::{elide_coercions, insert_coercions};
 pub use const_fold::fold_constants;
 pub use copy_prop::propagate_copies;
 pub use cse::eliminate_common_subexpressions;
 pub use dce::eliminate_dead_code;
-pub use guard_elim::simplify_cfg;
 pub use ref_elision::elide_refs;
 pub use tail_call::optimize_tail_calls;
 pub use type_refinement::{

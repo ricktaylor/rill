@@ -158,10 +158,9 @@ fn transfer_instruction(
             state.insert(*dest, result_type.unwrap_or(TypeSet::any()));
             // Only propagate element types if ALL sources have them.
             // If any source is unknown, the union is meaningless.
-            if all_have_elems
-                && let Some(elem) = result_elem {
-                    element_state.insert(*dest, elem);
-                }
+            if all_have_elems && let Some(elem) = result_elem {
+                element_state.insert(*dest, elem);
+            }
         }
 
         // Intrinsic: refine result type based on operand types.

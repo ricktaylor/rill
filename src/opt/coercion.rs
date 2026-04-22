@@ -16,11 +16,11 @@
 //!
 //! Runs after type refinement (Phase 2). After coercion insertion, the Phase 1
 //! fixpoint loop re-runs on the expanded IR: const fold collapses
-//! `Convert(Int, Checked, [Const(42_u64)])` → `Const(42_i64)`, definedness sees the new
-//! `Undefined` instructions, guard elim + CFG simplify clean up dead branches.
+//! `Convert(Int, Checked, [Const(42_u64)])` → `Const(42_i64)`, CFG simplify
+//! cleans up dead branches from incompatible-type `Undefined` replacements.
 
 use crate::ast;
-use crate::ir::{BlockId, Function, Instruction, IntrinsicOp, VarId};
+use crate::ir::{Function, Instruction, IntrinsicOp, VarId};
 use crate::ir::{SpannedInst, Var};
 use crate::opt::type_refinement::TypeAnalysis;
 use crate::types::{BaseType, ConvertMode, NumericType, TypeSet};
@@ -40,7 +40,6 @@ pub fn insert_coercions(function: &mut Function, types: &TypeAnalysis) -> usize 
     let mut new_locals: Vec<Var> = Vec::new();
 
     for block in &mut function.blocks {
-        let block_id = block.id;
         let old_instructions = std::mem::take(&mut block.instructions);
         let mut new_instructions: Vec<SpannedInst> = Vec::with_capacity(old_instructions.len());
 
@@ -49,8 +48,8 @@ pub fn insert_coercions(function: &mut Function, types: &TypeAnalysis) -> usize 
                 Instruction::Intrinsic { dest, op, args }
                     if is_coercible_binary(*op) && args.len() == 2 =>
                 {
-                    let a_type = lookup_type(types, block_id, args[0]);
-                    let b_type = lookup_type(types, block_id, args[1]);
+                    let a_type = types.get(args[0]).copied().unwrap_or(TypeSet::any());
+                    let b_type = types.get(args[1]).copied().unwrap_or(TypeSet::any());
 
                     let numeric = TypeSet::numeric();
                     let a_numeric = a_type.intersection(&numeric);
@@ -138,11 +137,6 @@ fn is_coercible_binary(op: IntrinsicOp) -> bool {
             | IntrinsicOp::Mod
             | IntrinsicOp::Lt
     )
-}
-
-/// Look up a variable's type from the analysis, defaulting to all types.
-fn lookup_type(types: &TypeAnalysis, _block: BlockId, var: VarId) -> TypeSet {
-    types.get(var).copied().unwrap_or(TypeSet::any())
 }
 
 /// Extract the single numeric BaseType from a TypeSet, if it contains exactly one.
@@ -311,7 +305,7 @@ pub fn elide_coercions(function: &mut Function) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{BasicBlock, Literal, Terminator};
+    use crate::ir::{BasicBlock, BlockId, Literal, Terminator};
     use crate::opt::analyze_types;
 
     fn var(id: u32) -> VarId {

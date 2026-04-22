@@ -8,8 +8,8 @@
 //! - Impure `Call` is always kept (side effects)
 //! - Pure `Call` (extern with `is_pure()`, or user function proven pure)
 //!   can be removed if result is unused
-//! - `SetIndex`, `WriteRef` have no dest — always kept
-//! - Everything else (Const, Copy, Undefined, Index, Intrinsic, Phi, MakeRef)
+//! - `SetIndex`, `WriteRef`, `Append` are side-effecting — always kept
+//! - Everything else (Const, Copy, Index, Intrinsic, Phi, MakeRef, Reload)
 //!   is removed if its dest is unused
 
 use crate::externs::ExternRegistry;

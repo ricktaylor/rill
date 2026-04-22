@@ -393,7 +393,7 @@ src/
     dce.rs            — Dead code elimination
     ref_elision.rs    — Ref elision (MakeRef → Copy/Index, chain shortening)
     coercion.rs       — Coercion insertion + elision (checked Convert for mixed types)
-    guard_elim.rs     — CFG simplification (unreachable block removal, jump threading)
+    cfg_simplify.rs   — CFG simplification (unreachable block removal, block merging)
     type_refinement.rs — Type analysis (per-VarId TypeSet, Match refinement)
     cast_elision.rs   — Identity Convert → Copy
     algebra.rs        — Algebraic simplification (identity, annihilation, strength reduction)

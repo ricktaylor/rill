@@ -16,7 +16,7 @@
 //!    to `Copy(dest, base)`. Eliminates the `Slot::Ref` indirection entirely.
 //!
 //! Safe to run repeatedly in the optimizer fixpoint loop — each pass may expose
-//! new opportunities as other passes (const fold, DCE, guard elim) remove WriteRefs
+//! new opportunities as other passes (const fold, DCE, CFG simplify) remove WriteRefs
 //! or MakeRefs.
 
 use crate::ir::{Function, Instruction, VarId};
