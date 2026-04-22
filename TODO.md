@@ -170,6 +170,16 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
       Compiled as param overwrite + `NextBlock(entry)` — no new frame, no stack growth.
       Enables unbounded recursion depth for tail-recursive functions (100K+ tested).
       Scope: self-recursive, by-value args only. See `src/opt/tail_call.rs`.
+- [x] **Element type tracking (Layer 1)** — `element_state` in type analysis tracks
+      union of all element types per collection VarId. Flows into Index/MakeRef result
+      types automatically (e.g., `[1,2,3][i]` → `UInt | Undefined` not `any()`).
+      Sources: MakeArray, MakeMap, Append, SetIndex, Phi (all-sources union), Copy, Reload.
+      Elements never include Undefined; Index adds it for OOB/missing key.
+- [ ] **Per-key type tracking (Layer 2)** — `HashMap<Value, TypeSet>` per collection
+      VarId for constant keys. Structural typing for maps: `config.timeout` → UInt,
+      `config.name` → Text. Only for constant keys (string/integer literals).
+      Variable-key access falls back to Layer 1 union type. Enables typed record
+      patterns for map-heavy code (DTN config processing).
 - [ ] **Function Inlining** — clone callee IR into call site for small pure
       functions. Works best after monomorphization: the inlined clone is
       already type-specialized, so the inlined body folds further via

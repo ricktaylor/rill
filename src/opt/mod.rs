@@ -440,7 +440,7 @@ fn collect_param_info(program: &IrProgram, externs: Option<&ExternRegistry>) -> 
                             let arg_type = types
                                 .get(*v)
                                 .copied()
-                                .unwrap_or_else(type_refinement::all_types);
+                                .unwrap_or(crate::types::TypeSet::any());
                             type_entry[i] = type_entry[i].union(&arg_type);
                         }
                     }

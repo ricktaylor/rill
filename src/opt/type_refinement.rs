@@ -6,13 +6,13 @@
 //! - Better optimization of type-specific operations
 //!
 //! Key refinement points:
-//! - Match terminators: each arm knows the matched type
-//! - Guard terminators: defined branch knows value is not undefined
+//! - Match terminators: each arm knows the matched type (including Undefined arms)
 //! - Const instructions: produce known single types
 //! - Call instructions: use extern metadata for return types
+//! - Collection literals: element types tracked for Index narrowing
 
 use crate::externs::ExternRegistry;
-use crate::ir::{BlockId, Function, FunctionRef, Instruction, Terminator, VarId};
+use crate::ir::{BlockId, Function, FunctionRef, Instruction, IntrinsicOp, Terminator, VarId};
 use crate::types::{BaseType, TypeSet};
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -25,6 +25,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 /// In SSA form, each VarId is defined exactly once, so its type is
 /// determined at its definition site. Type narrowing after Match arms
 /// is handled by narrowing copies (pi-nodes) that create new VarIds.
+///
+/// Element types for collections are tracked internally and flow into
+/// Index/MakeRef result types automatically (Layer 1 element tracking).
 #[derive(Debug)]
 pub struct TypeAnalysis {
     types: HashMap<VarId, TypeSet>,
@@ -59,6 +62,7 @@ fn build_block_index_map(function: &Function) -> HashMap<BlockId, usize> {
 fn transfer_instruction(
     instruction: &Instruction,
     state: &mut HashMap<VarId, TypeSet>,
+    element_state: &mut HashMap<VarId, TypeSet>,
     externs: Option<&ExternRegistry>,
     return_types: &ReturnTypes,
     declared_types: &HashMap<VarId, TypeSet>,
@@ -89,40 +93,75 @@ fn transfer_instruction(
         // Copy inherits the source type, constrained by the dest's declared type.
         // Narrowing copies (from emit_guard/emit_match) have a narrower declared
         // type — the intersection gives the correct narrowed result.
+        // Element types are inherited for collection copies.
         Instruction::Copy { dest, src } => {
-            let src_type = state.get(src).copied().unwrap_or_else(all_types);
-            let declared = declared_types.get(dest).copied().unwrap_or_else(all_types);
+            let src_type = state.get(src).copied().unwrap_or(TypeSet::any());
+            let declared = declared_types.get(dest).copied().unwrap_or(TypeSet::any());
             state.insert(*dest, src_type.intersection(&declared));
-        }
-
-        // Index result: element type of base
-        // Note: definedness (OOB) is tracked by definedness analysis, not here
-        Instruction::Index { dest, base, .. } => {
-            if let Some(base_type) = state.get(base)
-                && base_type.is_single()
-                && (base_type.contains(BaseType::Text) || base_type.contains(BaseType::Bytes))
-            {
-                // text[i] and bytes[i] both return UInt (code point / byte value)
-                state.insert(*dest, TypeSet::single(BaseType::UInt));
-            } else {
-                // Array/Map/unknown: result could be any type
-                state.insert(*dest, all_types());
+            if let Some(et) = element_state.get(src).copied() {
+                element_state.insert(*dest, et);
             }
         }
 
-        // SetIndex doesn't produce a value
-        Instruction::SetIndex { .. } => {}
+        // Index result: element type of base (if known)
+        Instruction::Index { dest, base, .. } => {
+            let element_types = if let Some(base_type) = state.get(base)
+                && base_type.is_single()
+                && (base_type.contains(BaseType::Text) || base_type.contains(BaseType::Bytes))
+            {
+                // text[i] and bytes[i] return UInt (code point / byte value)
+                &TypeSet::uint()
+            } else if let Some(elem_type) = element_state.get(base) {
+                // Collection with known element types — use them
+                elem_type
+            } else {
+                // Unknown element type: any defined value
+                &TypeSet::defined()
+            };
+            // Include Undefined (OOB access produces Undefined)
+            state.insert(*dest, element_types.union(&TypeSet::undefined()));
+        }
 
-        // Phi: union of all incoming types
+        // SetIndex doesn't produce a value, but updates element type of base.
+        // Strip Undefined — collection elements are always defined values.
+        Instruction::SetIndex { base, value, .. } => {
+            let val_type = state
+                .get(value)
+                .copied()
+                .unwrap_or(TypeSet::defined())
+                .difference(&TypeSet::undefined());
+            let existing = element_state.get(base).copied().unwrap_or(TypeSet::none());
+            element_state.insert(*base, existing.union(&val_type));
+        }
+
+        // Phi: union of all incoming types (and element types for collections)
         Instruction::Phi { dest, sources } => {
-            let result = sources.iter().fold(None, |acc: Option<TypeSet>, (_, var)| {
-                let var_type = state.get(var).cloned().unwrap_or_else(all_types);
-                match acc {
-                    None => Some(var_type),
-                    Some(prev) => Some(prev.union(&var_type)),
+            let mut result_type: Option<TypeSet> = None;
+            let mut result_elem: Option<TypeSet> = None;
+            let mut all_have_elems = true;
+            for (_, var) in sources {
+                let var_type = state.get(var).cloned().unwrap_or(TypeSet::any());
+                result_type = Some(match result_type {
+                    None => var_type,
+                    Some(prev) => prev.union(&var_type),
+                });
+                if let Some(et) = element_state.get(var) {
+                    result_elem = Some(match result_elem {
+                        None => *et,
+                        Some(prev) => prev.union(et),
+                    });
+                } else {
+                    // Source has no element type info — can't assume anything
+                    all_have_elems = false;
                 }
-            });
-            state.insert(*dest, result.unwrap_or_else(all_types));
+            }
+            state.insert(*dest, result_type.unwrap_or(TypeSet::any()));
+            // Only propagate element types if ALL sources have them.
+            // If any source is unknown, the union is meaningless.
+            if all_have_elems
+                && let Some(elem) = result_elem {
+                    element_state.insert(*dest, elem);
+                }
         }
 
         // Intrinsic: refine result type based on operand types.
@@ -131,9 +170,34 @@ fn transfer_instruction(
         Instruction::Intrinsic { dest, op, args } => {
             let arg_types: Vec<TypeSet> = args
                 .iter()
-                .map(|v| state.get(v).cloned().unwrap_or_else(all_types))
+                .map(|v| state.get(v).cloned().unwrap_or(TypeSet::any()))
                 .collect();
             state.insert(*dest, op.result_type_refined(&arg_types));
+
+            // Track element types for collection-producing intrinsics
+            match op {
+                IntrinsicOp::MakeArray => {
+                    // Element type = union of all arg types
+                    let elem = arg_types
+                        .iter()
+                        .fold(TypeSet::none(), |acc, t| acc.union(t));
+                    if !elem.is_empty() {
+                        element_state.insert(*dest, elem);
+                    }
+                }
+                IntrinsicOp::MakeMap => {
+                    // Element type = union of value arg types (odd-indexed: 1,3,5,...)
+                    let elem = arg_types
+                        .iter()
+                        .skip(1)
+                        .step_by(2)
+                        .fold(TypeSet::none(), |acc, t| acc.union(t));
+                    if !elem.is_empty() {
+                        element_state.insert(*dest, elem);
+                    }
+                }
+                _ => {}
+            }
         }
 
         // Call: use extern metadata if available
@@ -150,22 +214,24 @@ fn transfer_instruction(
         // Whole-value ref has the same type as its base.
         Instruction::MakeRef { dest, base, key } => {
             if key.is_some() {
-                // Element ref: same type narrowing as Index
-                if let Some(base_type) = state.get(base)
+                // Element ref: same pattern as Index
+                let element_types = if let Some(base_type) = state.get(base)
                     && base_type.is_single()
                     && (base_type.contains(BaseType::Text) || base_type.contains(BaseType::Bytes))
                 {
-                    // text[i] and bytes[i] both return UInt (code point / byte value)
-                    state.insert(*dest, TypeSet::single(BaseType::UInt));
-                    return;
-                }
-                state.insert(*dest, all_types());
+                    &TypeSet::uint()
+                } else if let Some(elem_type) = element_state.get(base) {
+                    elem_type
+                } else {
+                    &TypeSet::defined()
+                };
+                state.insert(*dest, element_types.union(&TypeSet::undefined()));
             } else {
                 // Whole-value ref: same type as base
                 if let Some(base_type) = state.get(base) {
                     state.insert(*dest, *base_type);
                 } else {
-                    state.insert(*dest, all_types());
+                    state.insert(*dest, TypeSet::any());
                 }
             }
         }
@@ -173,17 +239,30 @@ fn transfer_instruction(
         // WriteRef: side effect only (writes through a reference), no dest
         Instruction::WriteRef { .. } => {}
 
-        // Append: mutates array, result is Array type
-        Instruction::Append { dest, .. } => {
+        // Append: mutates array, result is Array type.
+        // Element type = union of arr's element type + appended value's type.
+        // Strip Undefined — collection elements are always defined values.
+        Instruction::Append { dest, arr, value } => {
             state.insert(*dest, TypeSet::single(BaseType::Array));
+            let val_type = state
+                .get(value)
+                .copied()
+                .unwrap_or(TypeSet::any())
+                .difference(&TypeSet::undefined());
+            let existing = element_state.get(arr).copied().unwrap_or(TypeSet::none());
+            element_state.insert(*dest, existing.union(&val_type));
         }
 
-        // Reload: value may have been mutated in-place, use conservative any()
+        // Reload: value may have been mutated through a Ref.
+        // Container type and element types are preserved (container type doesn't
+        // change from mutation; element types may have widened but we keep the
+        // best info we have).
         Instruction::Reload { dest, src } => {
-            // Use source type if known (the container type is unchanged even if
-            // contents mutated), otherwise any()
-            let src_type = state.get(src).copied().unwrap_or_else(all_types);
+            let src_type = state.get(src).copied().unwrap_or(TypeSet::any());
             state.insert(*dest, src_type);
+            if let Some(et) = element_state.get(src).copied() {
+                element_state.insert(*dest, et);
+            }
         }
 
         Instruction::Assign { .. } | Instruction::Read { .. } => {
@@ -213,7 +292,7 @@ fn compute_call_type(
         // During Phase B (interprocedural): recursive calls or functions
         // analyzed later in the iteration — conservatively return all types.
         // Truly undefined functions are caught by the link phase (E500).
-        return all_types();
+        return TypeSet::any();
     };
 
     // If the function diverges, it never returns (empty type set)
@@ -222,7 +301,6 @@ fn compute_call_type(
     }
 
     // Get the return type signature and convert to TypeSet
-    // Note: fallibility (may_return_undefined) is tracked by Definedness analysis
     type_sig_to_type_set(def.meta.returns.type_sig())
 }
 
@@ -231,7 +309,7 @@ fn compute_call_type(
 fn type_sig_to_type_set(sig: &TypeSet) -> TypeSet {
     if sig.is_empty() {
         // Empty types means any type
-        all_types()
+        TypeSet::any()
     } else {
         *sig
     }
@@ -254,7 +332,7 @@ fn apply_match_refinement(
     } = terminator
     {
         // Get the current type of the value
-        let current_type = state.get(value).cloned().unwrap_or_else(all_types);
+        let current_type = state.get(value).cloned().unwrap_or(TypeSet::any());
 
         // For each arm, refine to the matched type
         for (pattern, target) in arms {
@@ -310,15 +388,6 @@ fn apply_match_refinement(
     }
 
     refined
-}
-
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
-/// Create a TypeSet containing all base types
-pub(super) fn all_types() -> TypeSet {
-    TypeSet::any()
 }
 
 // ============================================================================
@@ -384,11 +453,11 @@ pub fn analyze_types_full(
     let mut initial_state = HashMap::new();
     let propagated = param_types.get(function.name.0.as_str());
     for (i, param) in function.params.iter().enumerate() {
-        // Use propagated type from call sites if available, else all types
+        // Use propagated type from call sites if available, else any()
         let ty = propagated
             .and_then(|pts| pts.get(i).copied())
             .filter(|t| !t.is_empty())
-            .unwrap_or_else(all_types);
+            .unwrap_or(TypeSet::any());
         initial_state.insert(*param, ty);
     }
     if let Some(ref rest_param) = function.rest_param {
@@ -396,6 +465,10 @@ pub fn analyze_types_full(
         initial_state.insert(*rest_param, TypeSet::single(BaseType::Array));
     }
     entry_states.insert(function.entry_block, initial_state);
+
+    // Element type tracking: per-VarId union of element types for collections.
+    // Persists across all blocks (SSA: each VarId defined once).
+    let mut elem_state: HashMap<VarId, TypeSet> = HashMap::new();
 
     // Worklist algorithm for forward dataflow
     let mut worklist: VecDeque<BlockId> = VecDeque::new();
@@ -421,6 +494,7 @@ pub fn analyze_types_full(
             transfer_instruction(
                 &spanned_inst.node,
                 &mut state,
+                &mut elem_state,
                 externs,
                 return_types,
                 &declared_types,
