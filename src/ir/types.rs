@@ -626,10 +626,10 @@ impl Function {
     /// For user variables, returns the name. For temps, traces back through
     /// SSA to describe the expression that produced the value.
     pub fn var_display_name(&self, var: VarId) -> String {
-        if let Some(v) = self.locals.get(var.0 as usize) {
-            if v.is_user_var() {
-                return v.display_name();
-            }
+        if let Some(v) = self.locals.get(var.0 as usize)
+            && v.is_user_var()
+        {
+            return v.display_name();
         }
         // Temp — find the defining instruction and describe it
         self.describe_var_origin(var)
@@ -648,9 +648,10 @@ impl Function {
                     Instruction::Intrinsic { dest, op, .. } => {
                         (*dest, format!("result of `{:?}`", op))
                     }
-                    Instruction::Call { dest, function, .. } => {
-                        (*dest, format!("result of call to `{}`", function.qualified_name()))
-                    }
+                    Instruction::Call { dest, function, .. } => (
+                        *dest,
+                        format!("result of call to `{}`", function.qualified_name()),
+                    ),
                     Instruction::Phi { dest, .. } => (*dest, "merged value".to_string()),
                     Instruction::MakeRef { dest, .. } => (*dest, "reference".to_string()),
                     Instruction::Append { dest, .. } => (*dest, "append result".to_string()),

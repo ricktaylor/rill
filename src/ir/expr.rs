@@ -100,15 +100,33 @@ impl<'a> Lowerer<'a> {
                 then_expr,
                 else_block,
                 else_expr,
-            } => self.lower_if(conditions, then_block, then_expr, else_block, else_expr),
+            } => {
+                // Clear guard scope — if-else creates control flow that
+                // can't share a fail_bb with the enclosing expression.
+                let saved = self.expr_guard_fail.take();
+                let result =
+                    self.lower_if(conditions, then_block, then_expr, else_block, else_expr);
+                self.expr_guard_fail = saved;
+                result
+            }
 
             ast::Expression::While {
                 condition,
                 body,
                 body_expr,
-            } => self.lower_while(condition, body, body_expr),
+            } => {
+                let saved = self.expr_guard_fail.take();
+                let result = self.lower_while(condition, body, body_expr);
+                self.expr_guard_fail = saved;
+                result
+            }
 
-            ast::Expression::Loop { body, body_expr } => self.lower_loop(body, body_expr),
+            ast::Expression::Loop { body, body_expr } => {
+                let saved = self.expr_guard_fail.take();
+                let result = self.lower_loop(body, body_expr);
+                self.expr_guard_fail = saved;
+                result
+            }
 
             ast::Expression::For {
                 binding_is_value,
@@ -116,9 +134,19 @@ impl<'a> Lowerer<'a> {
                 iterable,
                 body,
                 body_expr,
-            } => self.lower_for(*binding_is_value, binding, iterable, body, body_expr),
+            } => {
+                let saved = self.expr_guard_fail.take();
+                let result = self.lower_for(*binding_is_value, binding, iterable, body, body_expr);
+                self.expr_guard_fail = saved;
+                result
+            }
 
-            ast::Expression::Match { value, arms } => self.lower_match(value, arms),
+            ast::Expression::Match { value, arms } => {
+                let saved = self.expr_guard_fail.take();
+                let result = self.lower_match(value, arms);
+                self.expr_guard_fail = saved;
+                result
+            }
 
             ast::Expression::Range {
                 start,

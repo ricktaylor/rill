@@ -1708,8 +1708,97 @@ fn bench_check_tree() {
     assert_eq!(check, Value::UInt(31));
 }
 
+// Diagnostic tests for Ackermann: isolate the if-else expression issue
 #[test]
-#[ignore] // Separate issue: recursive if-else chains produce None (not loop-related)
+fn test_ack_simple_if_else() {
+    // Simplest if-else expression with params
+    let _val = run_expect(
+        r#"
+        fn test(m, n) {
+            if m == 0 { n + 1 } else { 42 }
+        }
+        "#,
+        "test",
+    );
+    // test() is called with no args → both params Undefined → should return Undefined
+    // But run_expect asserts defined... let me use run_with_args
+}
+
+#[test]
+fn test_ack_simple_if_else_with_args() {
+    let val = run_with_args(
+        r#"
+        fn test(m, n) {
+            if m == 0 { n + 1 } else { 42 }
+        }
+        "#,
+        "test",
+        &[Value::UInt(0), Value::UInt(5)],
+    );
+    assert_eq!(val, Value::UInt(6));
+}
+
+#[test]
+fn test_ack_else_if_with_args() {
+    let val = run_with_args(
+        r#"
+        fn test(m, n) {
+            if m == 0 {
+                n + 1
+            } else if n == 0 {
+                100
+            } else {
+                200
+            }
+        }
+        "#,
+        "test",
+        &[Value::UInt(1), Value::UInt(5)],
+    );
+    assert_eq!(val, Value::UInt(200));
+}
+
+#[test]
+fn test_ack_recursive_base() {
+    let val = run_with_args(
+        r#"
+        fn ack(m, n) {
+            if m == 0 {
+                n + 1
+            } else if n == 0 {
+                ack(m - 1, 1)
+            } else {
+                ack(m - 1, ack(m, n - 1))
+            }
+        }
+        "#,
+        "ack",
+        &[Value::UInt(0), Value::UInt(5)],
+    );
+    assert_eq!(val, Value::UInt(6));
+}
+
+#[test]
+fn test_ack_one_level() {
+    let val = run_with_args(
+        r#"
+        fn ack(m, n) {
+            if m == 0 {
+                n + 1
+            } else if n == 0 {
+                ack(m - 1, 1)
+            } else {
+                ack(m - 1, ack(m, n - 1))
+            }
+        }
+        "#,
+        "ack",
+        &[Value::UInt(1), Value::UInt(0)],
+    );
+    assert_eq!(val, Value::UInt(2));
+}
+
+#[test]
 fn bench_ackermann() {
     let val = run_with_args(BENCHMARK_SOURCE, "ack", &[Value::UInt(1), Value::UInt(5)]);
     assert_eq!(val, Value::UInt(7));

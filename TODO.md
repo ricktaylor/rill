@@ -7,9 +7,9 @@ Architecture: Source → Parser (chumsky) → AST → Lower (operators → Intri
 
 ## What's Done
 
-The full compilation and execution pipeline is working end-to-end with 139+ tests passing.
+The full compilation and execution pipeline is working end-to-end with 260+ tests passing.
 
-- **Parser** — chumsky-based, implicit return support (`src/parser.rs`)
+- **Parser** — chumsky-based, implicit return support (`src/ast/parser.rs`)
 - **AST** — type definitions, `TypeSet` as `u16` bitfield (`src/ast.rs`, `src/types.rs`)
 - **IR lowering** — AST → SSA IR with loop-carried phis (`src/ir/`)
   - Statement, expression, control flow, pattern destructuring lowering
@@ -131,7 +131,7 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
     - [ ] Forward compatibility: unknown top-level keys skipped gracefully
     - [ ] Debug info: present and absent cases
 
-### P1 — SSA Construction — Done (Phases 1–2), 2 ignored tests remain
+### P1 — SSA Construction — Done
 
 - [x] **LLVM-style lowering + mem2reg split** — lowerer emits Assign/Read,
       `ssa/promote.rs` implements Braun et al. (2013) mem2reg. Old ad-hoc
@@ -145,8 +145,10 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
     - [x] `write_variable` via `current_def` tracking
     - [x] Phi insertion at control flow merge points
     - [x] Trivial phi elimination
-  - Phase 3: Validate — **1 ignored test remains**
-    - [ ] `bench_ackermann` — recursive if-else chains produce None
+  - Phase 3: Validate — **done**
+    - [x] `bench_ackermann` — was failing due to parser bug in `else if` chains
+          (inner `if` result discarded as statement instead of flowing as expression).
+          Fixed in parser: `else if` now emits the inner `if` as `else_expr`.
     - [x] `bench_map_operations` — fixed by LowerVar refactor (redundant Copy removal)
 
 ### P2 — Optimization
@@ -325,34 +327,38 @@ src/
     specialize.rs     — try_specialize_binary/convert, compile_intrinsic_dispatch, type-specialized closures
     exec.rs           — Per-op functions (exec_add etc.), index_value
     tests.rs          — Unit + end-to-end tests
-  ast.rs              — AST node types, Span, Spanned
-  types.rs            — BaseType, NumericType, ConvertMode, RangeEnd, TypeSet
-  parser.rs           — Chumsky-based parser -> AST
+  ast/
+    types.rs          — AST node types, Span, Spanned
+    parser.rs         — Chumsky-based parser -> AST
+  types.rs            — BaseType, NumericType, ConvertMode, SliceMode, TypeSet
   externs.rs         — ExternRegistry, Lua-style extern API: fn(&mut VM, usize)
   diagnostics.rs      — Error/warning accumulator with codes
   exec.rs             — VM, Heap, HeapVal, Value, Slot, Float
   ir/
-    mod.rs            — Lowerer state, scope management, public lower() API
+    mod.rs            — Lowerer state, scope management, emit helpers, public lower() API
     types.rs          — IR types: VarId, BlockId, Instruction, IntrinsicOp, Terminator, etc.
     program.rs        — Top-level program lowering (constants, functions)
     stmt.rs           — Statement lowering
-    expr.rs           — Expression lowering
-    control.rs        — Control flow lowering (if, match, loops)
+    expr.rs           — Expression lowering (guarded expressions, binary/unary ops)
+    control.rs        — Control flow lowering (if, match, loops, type guards)
     pattern.rs        — Pattern destructuring lowering
     constant.rs       — Constant expression lowering
     const_eval.rs     — Compile-time constant evaluation (intrinsic + extern)
-    opt/
-      mod.rs          — Optimizer pass runner
-      const_fold.rs   — Constant folding pass
-      ref_elision.rs  — Ref elision (MakeRef → Copy/Index, chain shortening)
-      type_refinement.rs — Type set refinement
-      coercion.rs     — Coercion insertion (checked Convert for mixed types, Undefined for incompatible)
-      guard_elim.rs   — Guard elimination + CFG simplification
-      definedness.rs  — Definedness analysis
-      cast_elision.rs — Identity Convert → Copy
-      copy_prop.rs    — Copy propagation (replace uses, remove dead Copies)
-      dce.rs          — Dead code elimination (remove unused instructions)
-      algebra.rs      — Algebraic simplification (identity, annihilation, strength reduction)
+  opt/
+    mod.rs            — Optimizer pass runner
+    const_fold.rs     — Constant folding pass
+    cse.rs            — Common subexpression elimination
+    copy_prop.rs      — Copy propagation (replace uses, remove dead Copies)
+    guard_elim.rs     — CFG simplification (unreachable block removal, jump threading)
+    coercion.rs       — Coercion insertion (checked Convert for mixed types, Undefined for incompatible)
+    cast_elision.rs   — Identity Convert → Copy
+    dce.rs            — Dead code elimination (remove unused instructions)
+    type_refinement.rs — Type set refinement
+    ref_elision.rs    — Ref elision (MakeRef → Copy/Index, chain shortening)
+    algebra.rs        — Algebraic simplification (identity, annihilation, strength reduction)
+  ssa/
+    mod.rs            — SSA module entry
+    promote.rs        — Braun et al. (2013) mem2reg pass
 
 docs/
   DESIGN.md           — Comprehensive design document

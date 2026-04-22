@@ -858,13 +858,12 @@ fn if_expr<'a>(expr: BoxedParser<'a, Expression>) -> BoxedParser<'a, Expression>
     recursive(|if_e| {
         let body = block_body(expr.clone());
 
-        // else if chain returns the If expression directly
+        // else if chain returns the If expression directly as the else_expr
         // else block returns (statements, final_expr)
         let else_branch = kw("else").ignore_then(
-            if_e.map_with(|e, extra| {
-                // else if: wrap in a spanned statement, no final expr
-                let stmt = Spanned::new(Statement::Expression(e), extra.span());
-                (vec![stmt], None)
+            if_e.map(|e| {
+                // else if: the inner if IS the else expression (its value flows through)
+                (vec![], Some(e))
             })
             .or(block_body(expr.clone())),
         );
