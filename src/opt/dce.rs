@@ -141,6 +141,11 @@ fn collect_terminator_reads(term: &Terminator, used: &mut HashSet<VarId>) {
         Terminator::Exit { value } => {
             used.insert(*value);
         }
+        Terminator::TailCall { args, .. } => {
+            for v in args {
+                used.insert(*v);
+            }
+        }
         Terminator::Jump { .. } | Terminator::Return { value: None } | Terminator::Unreachable => {}
     }
 }

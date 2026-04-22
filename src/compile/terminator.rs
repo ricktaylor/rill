@@ -5,6 +5,7 @@ pub(super) fn compile_terminator(
     block_map: &HashMap<BlockId, usize>,
     types: &TypeAnalysis,
     _block_id: BlockId,
+    frame_size: usize,
 ) -> Result<Step, ExecError> {
     Ok(match term {
         Terminator::Jump { target } => {
@@ -72,6 +73,30 @@ pub(super) fn compile_terminator(
         }
 
         Terminator::Unreachable => Box::new(|_vm, _prog| Ok(Action::Return(Value::Undefined))),
+
+        Terminator::TailCall { args, .. } => {
+            let arg_slots: Vec<usize> = args.iter().map(|v| slot(*v)).collect();
+            let param_count = arg_slots.len();
+            let entry_idx = block_map[&crate::ir::BlockId(0)];
+
+            Box::new(move |vm: &mut VM, _prog| {
+                // Read all arg values before overwriting (handles param swap cases)
+                let values: Vec<Value> = arg_slots.iter().map(|&s| vm.local(s).clone()).collect();
+
+                // Overwrite param slots (1-indexed)
+                for (i, val) in values.into_iter().enumerate() {
+                    vm.set_local(i + 1, val);
+                }
+
+                // Reset non-param locals to Undefined (match fresh frame semantics)
+                for i in (param_count + 1)..frame_size {
+                    vm.set_local(i, Value::Undefined);
+                }
+
+                // Jump to entry block — reuse current frame, no stack growth
+                Ok(Action::NextBlock(entry_idx))
+            })
+        }
     })
 }
 

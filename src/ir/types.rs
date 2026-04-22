@@ -558,6 +558,13 @@ pub enum Terminator {
 
     /// Unreachable code (placeholder after merging)
     Unreachable,
+
+    /// Self-recursive tail call: overwrite params and jump to entry.
+    /// Introduced by the TCO pass; has no successors (replaces Call + Return chain).
+    TailCall {
+        function: FunctionRef,
+        args: Vec<VarId>,
+    },
 }
 
 impl Terminator {
@@ -575,7 +582,10 @@ impl Terminator {
                 succs.push(*default);
                 succs
             }
-            Terminator::Return { .. } | Terminator::Exit { .. } | Terminator::Unreachable => {
+            Terminator::Return { .. }
+            | Terminator::Exit { .. }
+            | Terminator::Unreachable
+            | Terminator::TailCall { .. } => {
                 vec![]
             }
         }

@@ -7,25 +7,28 @@ Architecture: Source → Parser (chumsky) → AST → Lower (operators → Intri
 
 ## What's Done
 
-The full compilation and execution pipeline is working end-to-end with 260+ tests passing.
+The full compilation and execution pipeline is working end-to-end with 270+ tests passing.
 
 - **Parser** — chumsky-based, implicit return support (`src/ast/parser.rs`)
-- **AST** — type definitions, `TypeSet` as `u16` bitfield (`src/ast.rs`, `src/types.rs`)
-- **IR lowering** — AST → SSA IR with loop-carried phis (`src/ir/`)
+- **AST** — type definitions (`src/ast/`), `TypeSet` as `u16` bitfield (`src/types.rs`)
+- **IR lowering** — AST → pre-SSA IR (`src/ir/`), then mem2reg → SSA (`src/ssa/`)
   - Statement, expression, control flow, pattern destructuring lowering
+  - Emit helpers (emit_const, emit_copy, emit_index, emit_call, emit_phi, etc.)
+  - Slot-based binding (Assign/Read) — SSA promotion handled by mem2reg pass
   - `with` reference bindings (MakeRef/WriteRef), ref origin tracking
   - Constant expression lowering and compile-time evaluation
   - IntrinsicOp for all operators, `len`, collection construction
   - Compile-time properties in op variants: `Convert(NumericType, ConvertMode)`, `MakeSeq`, `ArraySeq(SliceMode)`
   - Range guard: `start < end` If check before MakeSeq/ArraySeq (reversed → undefined)
   - Inclusive ranges normalized to exclusive via `end + 1` checked Add in lowerer
+  - Expression-level type guards (`lower_guarded_expression`, `emit_type_guard`)
   - Extern param type guards (Match guards inserted before constrained calls)
-- **Optimizer** — passes in two-phase pipeline (`src/ir/opt/`)
-  - Phase 1 (fixpoint): const fold → CSE → copy prop → CFG simplify → coercion elision → DCE
-  - Phase 2 (type-informed): type refinement → coercion insertion (Convert/Undefined) → algebraic simplification → cast elision → ref elision → dead match arm elimination → re-run Phase 1
+- **Optimizer** — passes in two-phase pipeline (`src/opt/`)
+  - Phase 1 (fixpoint): const fold → CSE → copy prop → DCE → ref elision → coercion elision → CFG simplify
+  - Phase 2 (type-informed): type analysis → coercion insertion → cast elision → algebraic simplification → non-bool condition folding → dead match arm elimination → re-run Phase 1
   - Interprocedural return type inference + argument type propagation
   - Function monomorphization (up to 4 variants per function)
-  - Type mismatch warnings (W009), definedness diagnostics (E201) via TypeSet
+  - Type mismatch warnings (W009), definedness warnings (W201) via TypeSet
   - Unified type/definedness: Undefined is a type, no separate definedness pass
 - **Compiler** — closure-threaded with type specialization (`src/compile/`)
   - Type-specialized closures (direct `u64::checked_add` etc. when types provably known)
@@ -39,7 +42,7 @@ The full compilation and execution pipeline is working end-to-end with 260+ test
 - **Public API** — `compile()`, `Program::call()`, `FunctionHandle` for hot-path (`src/lib.rs`)
 - **Externs** — registry with purity tracking, monomorphic variants (`src/externs.rs`)
 - **Diagnostics** — source spans, line:column formatting, error codes (`src/diagnostics.rs`)
-- **Docs** — ABNF grammar, design document, stdlib spec, examples
+- **Docs** — ABNF grammar, design document, stdlib spec, examples, benchmarks
 
 All 28 code review issues (CR-1 through CR-27) resolved — see git history.
 
@@ -153,8 +156,11 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
 
 ### P2 — Optimization
 
-- [ ] **Tail-Call Optimization (TCO)** — rewrite tail calls to parameter overwrite
-      + jump to entry. The flat pc-based executor supports this naturally.
+- [x] **Tail-Call Optimization (TCO)** — self-recursive tail calls detected via
+      backward phi-chain tracing from Return, rewritten to `Terminator::TailCall`.
+      Compiled as param overwrite + `NextBlock(entry)` — no new frame, no stack growth.
+      Enables unbounded recursion depth for tail-recursive functions (100K+ tested).
+      Scope: self-recursive, by-value args only. See `src/opt/tail_call.rs`.
 - [ ] **Function Inlining** — clone callee IR into call site for small pure
       functions. Works best after monomorphization: the inlined clone is
       already type-specialized, so the inlined body folds further via
@@ -196,6 +202,11 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
 - [x] **Type guards for intrinsic args** — `emit_type_guard` checks args
       match `param_type()` via Match. Fallibility in `result_type()`.
       `is_fallible()` removed — folded into `result_type()` per-arm.
+
+### P2 — Parser
+- [ ] **Optional braces in match arms** — allow `pattern => expr,` in addition to
+      `pattern => { stmts; expr }`. The `=>` token disambiguates; trailing `,` or `}`
+      delimits the bare expression. Currently `block_body()` always requires braces.
 
 ### P2 — Diagnostics
 
@@ -249,7 +260,7 @@ enum StepKind {
     // terminators
     BranchIf { cond: usize, then_pc: usize, else_pc: usize },
     Jump { pc: usize },
-    Guard { value: usize, defined_pc: usize, undefined_pc: usize },
+    MatchType { value: usize, arms: Vec<(BaseType, usize)>, default_pc: usize },
     Return { value: Option<usize> },
 }
 ```
@@ -300,15 +311,14 @@ the current closure-per-instruction approach.
 Optimizer pipeline:
 ```
 Phase 1 (fixpoint):
-  Const Fold → CSE → Copy Prop → CFG Simplify → Coercion Elision → DCE
+  Const Fold → CSE → Copy Prop → DCE → Ref Elision → Coercion Elision → CFG Simplify
 
 Phase 2 (type-informed — on simplified CFG):
-  Type Refinement → Coercion Insertion (Convert for mixed types)
-    → Dead Match Arm Elimination → Algebraic Simplification
-      → Cast Elision → Ref Elision → Re-run Phase 1
+  Type Analysis → Coercion Insertion → Cast Elision → Algebraic Simplification
+    → Non-Bool Condition Folding → Dead Match Arm Elimination → Re-run Phase 1
 
 Phase 3 (post-optimisation):
-  E201 definedness warnings (TypeSet-based)
+  W201 definedness warnings (TypeSet-based)
 ```
 
 Undefined is a type (`BaseType::Undefined`). No separate definedness pass.
@@ -321,48 +331,54 @@ See `docs/unified_definedness_plan.md` and `docs/runtime_checks.md`.
 ```
 src/
   lib.rs              — Public API: compile(), Program::call(), re-exports
-  compile/
-    mod.rs            — Types, public API (compile_program, execute), link phase, compile_function/block/instruction
-    terminator.rs     — compile_terminator, compile_match, match predicate compilation
-    specialize.rs     — try_specialize_binary/convert, compile_intrinsic_dispatch, type-specialized closures
-    exec.rs           — Per-op functions (exec_add etc.), index_value
-    tests.rs          — Unit + end-to-end tests
-  ast/
-    types.rs          — AST node types, Span, Spanned
-    parser.rs         — Chumsky-based parser -> AST
-  types.rs            — BaseType, NumericType, ConvertMode, SliceMode, TypeSet
-  externs.rs         — ExternRegistry, Lua-style extern API: fn(&mut VM, usize)
-  diagnostics.rs      — Error/warning accumulator with codes
+  types.rs            — BaseType, NumericType, ConvertMode, SliceMode, TypeSet (u16 bitfield)
+  diagnostics.rs      — Error/warning accumulator with codes (E1xx, W0xx, W2xx)
+  externs.rs          — ExternRegistry, Lua-style extern API: fn(&mut VM, usize)
   exec.rs             — VM, Heap, HeapVal, Value, Slot, Float
+  ast/
+    mod.rs            — Re-exports
+    types.rs          — AST node types, Span, Spanned
+    parser.rs         — Chumsky-based parser → AST
   ir/
-    mod.rs            — Lowerer state, scope management, emit helpers, public lower() API
+    mod.rs            — Lowerer state, scope/slot management, emit helpers, public lower() API
     types.rs          — IR types: VarId, BlockId, Instruction, IntrinsicOp, Terminator, etc.
     program.rs        — Top-level program lowering (constants, functions)
     stmt.rs           — Statement lowering
     expr.rs           — Expression lowering (guarded expressions, binary/unary ops)
-    control.rs        — Control flow lowering (if, match, loops, type guards)
+    control.rs        — Control flow lowering (if, match, loops, emit_guard/emit_match/emit_narrowing)
     pattern.rs        — Pattern destructuring lowering
     constant.rs       — Constant expression lowering
     const_eval.rs     — Compile-time constant evaluation (intrinsic + extern)
-  opt/
-    mod.rs            — Optimizer pass runner
-    const_fold.rs     — Constant folding pass
-    cse.rs            — Common subexpression elimination
-    copy_prop.rs      — Copy propagation (replace uses, remove dead Copies)
-    guard_elim.rs     — CFG simplification (unreachable block removal, jump threading)
-    coercion.rs       — Coercion insertion (checked Convert for mixed types, Undefined for incompatible)
-    cast_elision.rs   — Identity Convert → Copy
-    dce.rs            — Dead code elimination (remove unused instructions)
-    type_refinement.rs — Type set refinement
-    ref_elision.rs    — Ref elision (MakeRef → Copy/Index, chain shortening)
-    algebra.rs        — Algebraic simplification (identity, annihilation, strength reduction)
   ssa/
     mod.rs            — SSA module entry
-    promote.rs        — Braun et al. (2013) mem2reg pass
+    promote.rs        — Braun et al. (2013) mem2reg pass (Assign/Read → Phi/VarId)
+  opt/
+    mod.rs            — Optimizer pass runner (Phase 1 fixpoint + Phase 2 type-informed)
+    const_fold.rs     — Constant folding
+    cse.rs            — Common subexpression elimination
+    copy_prop.rs      — Copy propagation (skips narrowing copies)
+    dce.rs            — Dead code elimination
+    ref_elision.rs    — Ref elision (MakeRef → Copy/Index, chain shortening)
+    coercion.rs       — Coercion insertion + elision (checked Convert for mixed types)
+    guard_elim.rs     — CFG simplification (unreachable block removal, jump threading)
+    type_refinement.rs — Type analysis (per-VarId TypeSet, Match refinement)
+    cast_elision.rs   — Identity Convert → Copy
+    algebra.rs        — Algebraic simplification (identity, annihilation, strength reduction)
+    tail_call.rs      — Tail-call optimization (self-recursive detection + rewrite)
+  compile/
+    mod.rs            — Compiler: link phase, phi elimination, flat PC executor
+    terminator.rs     — compile_terminator, compile_match, match predicate compilation
+    specialize.rs     — Type-specialized closures, compile_intrinsic_dispatch
+    exec.rs           — Per-op functions (exec_add, exec_eq, etc.), index_value
+    tests.rs          — Unit + end-to-end tests (260+)
 
 docs/
   DESIGN.md           — Comprehensive design document
-  STDLIB.md           — Standard library documentation
+  STDLIB.md           — Standard library specification
   grammar.abnf        — Formal ABNF grammar
   example.txt         — Syntax examples
+  benchmarks.rill     — Benchmark functions (fib, ack, tak, primes, binary_trees)
+  bytecode_format.md  — Bytecode serialization design (planned)
+  runtime_checks.md   — Expression-level guard design
+  unified_definedness_plan.md — Unified type/definedness (completed)
 ```

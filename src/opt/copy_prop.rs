@@ -242,6 +242,14 @@ fn replace_vars_in_terminator(term: &mut Terminator, map: &HashMap<VarId, VarId>
                 count += 1;
             }
         }
+        Terminator::TailCall { args, .. } => {
+            for v in args.iter_mut() {
+                if let Some(&new) = map.get(v) {
+                    *v = new;
+                    count += 1;
+                }
+            }
+        }
         Terminator::Jump { .. } | Terminator::Return { value: None } | Terminator::Unreachable => {}
     }
 

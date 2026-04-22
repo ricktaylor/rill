@@ -334,7 +334,7 @@ fn compile_function(func: &Function, link_map: &LinkMap) -> Result<CompiledFunct
         }
 
         blocks.push(compile_block(
-            ir_block, &block_map, link_map, &ref_map, &types,
+            ir_block, &block_map, link_map, &ref_map, &types, frame_size,
         )?);
     }
 
@@ -386,6 +386,7 @@ fn compile_block(
     link_map: &LinkMap,
     ref_map: &HashMap<VarId, RefMeta>,
     types: &TypeAnalysis,
+    frame_size: usize,
 ) -> Result<Vec<Step>, ExecError> {
     let mut steps: Vec<Step> = Vec::new();
 
@@ -410,6 +411,7 @@ fn compile_block(
         block_map,
         types,
         block.id,
+        frame_size,
     )?);
 
     Ok(steps)

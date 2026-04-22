@@ -1800,8 +1800,8 @@ fn test_ack_one_level() {
 
 #[test]
 fn bench_ackermann() {
-    let val = run_with_args(BENCHMARK_SOURCE, "ack", &[Value::UInt(1), Value::UInt(5)]);
-    assert_eq!(val, Value::UInt(7));
+    let val = run_with_args(BENCHMARK_SOURCE, "ack", &[Value::UInt(3), Value::UInt(5)]);
+    assert_eq!(val, Value::UInt(253));
 }
 
 #[test]
@@ -1963,4 +1963,131 @@ fn bench_bitwise() {
     // popcount(4)=1, popcount(5)=2, popcount(6)=2, popcount(7)=3 → total=12
     let val = run_with_args(BENCHMARK_SOURCE, "bitwise_benchmark", &[Value::UInt(8)]);
     assert_eq!(val, Value::UInt(12));
+}
+
+// ========================================================================
+// Tail-Call Optimization Tests
+// ========================================================================
+
+#[test]
+fn tco_tail_recursive_factorial() {
+    // 20! = 2432902008176640000 (fits in u64)
+    let val = run_with_args(
+        r#"
+        fn factorial(n, acc) {
+            if n <= 1 { acc }
+            else { factorial(n - 1, n * acc) }
+        }
+        "#,
+        "factorial",
+        &[Value::UInt(20), Value::UInt(1)],
+    );
+    assert_eq!(val, Value::UInt(2432902008176640000));
+}
+
+#[test]
+fn tco_deep_tail_recursive_sum() {
+    // Sum 1..=100000 via tail recursion — 100K frames without TCO would overflow
+    let val = run_with_args(
+        r#"
+        fn sum(n, acc) {
+            if n == 0 { acc }
+            else { sum(n - 1, acc + n) }
+        }
+        "#,
+        "sum",
+        &[Value::UInt(100_000), Value::UInt(0)],
+    );
+    assert_eq!(val, Value::UInt(5_000_050_000));
+}
+
+#[test]
+fn tco_deep_recursion() {
+    // 100,000 recursive calls — exceeds MAX_STACK_SIZE (65536) without TCO
+    let val = run_with_args(
+        r#"
+        fn count_down(n) {
+            if n == 0 { 0 }
+            else { count_down(n - 1) }
+        }
+        "#,
+        "count_down",
+        &[Value::UInt(100_000)],
+    );
+    assert_eq!(val, Value::UInt(0));
+}
+
+#[test]
+fn tco_ackermann_deeper() {
+    // ack(3,7) = 1021 — exercises deep recursion with partial TCO
+    // (2 of 3 branches are tail calls, inner ack(m, n-1) is not)
+    let val = run_with_args(
+        r#"
+        fn ack(m, n) {
+            if m == 0 {
+                n + 1
+            } else if n == 0 {
+                ack(m - 1, 1)
+            } else {
+                ack(m - 1, ack(m, n - 1))
+            }
+        }
+        "#,
+        "ack",
+        &[Value::UInt(3), Value::UInt(7)],
+    );
+    assert_eq!(val, Value::UInt(1021));
+}
+
+#[test]
+fn tco_param_swap() {
+    // Tests that arg values are read before being overwritten
+    let val = run_with_args(
+        r#"
+        fn swap_recurse(a, b) {
+            if a == 0 { b }
+            else { swap_recurse(b, a - 1) }
+        }
+        "#,
+        "swap_recurse",
+        &[Value::UInt(5), Value::UInt(100)],
+    );
+    // a=5,b=100 → swap(100,4) → swap(4,99) → swap(99,3) → swap(3,98)
+    // → swap(98,2) → swap(2,97) → swap(97,1) → swap(1,96) → swap(96,0)
+    // → swap(0,95) → returns 95
+    assert_eq!(val, Value::UInt(95));
+}
+
+#[test]
+fn tco_non_tail_not_rewritten() {
+    // fib(n-1) + fib(n-2) — neither call is in tail position
+    // Should still work correctly (not rewritten to tail calls)
+    let val = run_with_args(
+        r#"
+        fn fib(n) {
+            if n < 2 { n }
+            else { fib(n - 1) + fib(n - 2) }
+        }
+        "#,
+        "fib",
+        &[Value::UInt(10)],
+    );
+    assert_eq!(val, Value::UInt(55));
+}
+
+#[test]
+fn tco_tail_call_in_match() {
+    let val = run_with_args(
+        r#"
+        fn process(x) {
+            match x {
+                0 => { 42 },
+                _ => { process(x - 1) },
+            }
+        }
+        "#,
+        "process",
+        &[Value::UInt(10)],
+    );
+    assert_eq!(val, Value::UInt(42));
 }

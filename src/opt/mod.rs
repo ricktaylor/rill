@@ -17,11 +17,9 @@ mod const_fold;
 mod copy_prop;
 mod cse;
 mod dce;
-// Definedness analysis removed — definedness is now tracked via BaseType::Undefined
-// in the TypeSet. Guard elimination handled by eliminate_dead_match_arms.
-// TODO: Re-add E200/E201 diagnostics via type-based checks.
 mod guard_elim;
 mod ref_elision;
+mod tail_call;
 mod type_refinement;
 
 pub use algebra::simplify_algebra;
@@ -33,6 +31,7 @@ pub use cse::eliminate_common_subexpressions;
 pub use dce::eliminate_dead_code;
 pub use guard_elim::simplify_cfg;
 pub use ref_elision::elide_refs;
+pub use tail_call::optimize_tail_calls;
 pub use type_refinement::{
     ParamTypes, ReturnTypes, TypeAnalysis, analyze_types, infer_return_type,
 };
@@ -151,6 +150,18 @@ pub fn optimize(program: &mut IrProgram, externs: &ExternRegistry, diagnostics: 
                     }
                 }
             }
+        }
+    }
+
+    // Phase T: Tail-call optimization
+    //
+    // Detect self-recursive tail calls and rewrite Call + Return chain to TailCall
+    // terminators. Runs after all optimization to benefit from simplified CFGs.
+    // CFG simplify after to remove now-unreachable join/phi blocks.
+    for function in &mut program.functions {
+        let tco_count = optimize_tail_calls(function);
+        if tco_count > 0 {
+            simplify_cfg(function);
         }
     }
 }
