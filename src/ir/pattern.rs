@@ -41,9 +41,7 @@ impl<'a> Lowerer<'a> {
 
             ast::Pattern::Variable(name) => match mode {
                 BindingMode::Value => {
-                    let dest = self.new_var(name.clone(), TypeSet::any());
-                    self.emit(Instruction::Copy { dest, src: value });
-                    self.bind(name, dest);
+                    self.bind(name, value);
                 }
                 BindingMode::Reference => {
                     self.bind(name, value);
@@ -61,11 +59,7 @@ impl<'a> Lowerer<'a> {
 
             ast::Pattern::Array(patterns) => {
                 for (i, pat) in patterns.iter().enumerate() {
-                    let idx = self.new_temp(TypeSet::single(types::BaseType::UInt));
-                    self.emit(Instruction::Const {
-                        dest: idx,
-                        value: Literal::UInt(i as u64),
-                    });
+                    let idx = self.emit_const(Literal::UInt(i as u64));
 
                     let (elem, elem_origin) = if matches!(mode, BindingMode::Reference) {
                         let dest = self.new_temp(TypeSet::any());
@@ -77,13 +71,7 @@ impl<'a> Lowerer<'a> {
                         let origin = RefOrigin { ref_var: dest };
                         (dest, Some(origin))
                     } else {
-                        let dest = self.new_temp(TypeSet::any());
-                        self.emit(Instruction::Index {
-                            dest,
-                            base: value,
-                            key: idx,
-                        });
-                        (dest, None)
+                        (self.emit_index(value, idx), None)
                     };
 
                     self.lower_pattern_binding_ref(&pat.node, elem, mode, elem_origin);
@@ -97,11 +85,7 @@ impl<'a> Lowerer<'a> {
             } => {
                 // Bind before elements (from start)
                 for (i, pat) in before.iter().enumerate() {
-                    let idx = self.new_temp(TypeSet::single(types::BaseType::UInt));
-                    self.emit(Instruction::Const {
-                        dest: idx,
-                        value: Literal::UInt(i as u64),
-                    });
+                    let idx = self.emit_const(Literal::UInt(i as u64));
 
                     let (elem, elem_origin) = if matches!(mode, BindingMode::Reference) {
                         let dest = self.new_temp(TypeSet::any());
@@ -113,13 +97,7 @@ impl<'a> Lowerer<'a> {
                         let origin = RefOrigin { ref_var: dest };
                         (dest, Some(origin))
                     } else {
-                        let dest = self.new_temp(TypeSet::any());
-                        self.emit(Instruction::Index {
-                            dest,
-                            base: value,
-                            key: idx,
-                        });
-                        (dest, None)
+                        (self.emit_index(value, idx), None)
                     };
 
                     self.lower_pattern_binding_ref(&pat.node, elem, mode, elem_origin);
@@ -137,17 +115,9 @@ impl<'a> Lowerer<'a> {
                 //                             so mutations write back to arr
                 // A start < end guard produces undefined for empty slices.
                 if let Some(rest_name) = rest {
-                    let start = self.new_temp(TypeSet::single(types::BaseType::UInt));
-                    self.emit(Instruction::Const {
-                        dest: start,
-                        value: Literal::UInt(before.len() as u64),
-                    });
+                    let start = self.emit_const(Literal::UInt(before.len() as u64));
 
-                    let after_len = self.new_temp(TypeSet::single(types::BaseType::UInt));
-                    self.emit(Instruction::Const {
-                        dest: after_len,
-                        value: Literal::UInt(after.len() as u64),
-                    });
+                    let after_len = self.emit_const(Literal::UInt(after.len() as u64));
                     let end = self.emit_binary_intrinsic(IntrinsicOp::Sub, length, after_len);
 
                     let slice_mode = if matches!(mode, BindingMode::Reference) {
@@ -161,8 +131,6 @@ impl<'a> Lowerer<'a> {
                     let seq_bb = self.fresh_block();
                     let undef_bb = self.fresh_block();
                     let join_bb = self.fresh_block();
-                    let rest_val = self.new_temp(TypeSet::single(types::BaseType::Sequence));
-
                     self.finish_block(Terminator::If {
                         condition: valid,
                         then_target: seq_bb,
@@ -184,48 +152,25 @@ impl<'a> Lowerer<'a> {
                     // Else: undefined
                     self.current_block = undef_bb;
                     self.current_instructions = Vec::new();
-                    let undef_val = self.new_temp(TypeSet::single(types::BaseType::Sequence));
-                    self.emit(Instruction::Const {
-                        dest: undef_val,
-                        value: Literal::Undefined,
-                    });
+                    let undef_val = self.emit_undefined();
                     self.finish_block(Terminator::Jump { target: join_bb });
 
                     // Join: phi
                     self.current_block = join_bb;
                     self.current_instructions = Vec::new();
-                    self.emit(Instruction::Phi {
-                        dest: rest_val,
-                        sources: vec![(seq_bb, seq_val), (undef_bb, undef_val)],
-                    });
+                    let rest_val = self.emit_phi(vec![(seq_bb, seq_val), (undef_bb, undef_val)]);
 
-                    let rest_var = self.new_var(
-                        rest_name.clone(),
-                        TypeSet::single(types::BaseType::Sequence),
-                    );
-                    self.emit(Instruction::Copy {
-                        dest: rest_var,
-                        src: rest_val,
-                    });
-                    self.bind(rest_name, rest_var);
+                    self.bind(rest_name, rest_val);
                 }
 
                 // Bind after elements (from end, using len - after.len() + i)
                 if !after.is_empty() {
-                    let after_len = self.new_temp(TypeSet::single(types::BaseType::UInt));
-                    self.emit(Instruction::Const {
-                        dest: after_len,
-                        value: Literal::UInt(after.len() as u64),
-                    });
+                    let after_len = self.emit_const(Literal::UInt(after.len() as u64));
                     let after_start =
                         self.emit_binary_intrinsic(IntrinsicOp::Sub, length, after_len);
 
                     for (i, pat) in after.iter().enumerate() {
-                        let offset = self.new_temp(TypeSet::single(types::BaseType::UInt));
-                        self.emit(Instruction::Const {
-                            dest: offset,
-                            value: Literal::UInt(i as u64),
-                        });
+                        let offset = self.emit_const(Literal::UInt(i as u64));
                         let idx = self.emit_binary_intrinsic(IntrinsicOp::Add, after_start, offset);
 
                         let (elem, elem_origin) = if matches!(mode, BindingMode::Reference) {
@@ -238,13 +183,7 @@ impl<'a> Lowerer<'a> {
                             let origin = RefOrigin { ref_var: dest };
                             (dest, Some(origin))
                         } else {
-                            let dest = self.new_temp(TypeSet::any());
-                            self.emit(Instruction::Index {
-                                dest,
-                                base: value,
-                                key: idx,
-                            });
-                            (dest, None)
+                            (self.emit_index(value, idx), None)
                         };
 
                         self.lower_pattern_binding_ref(&pat.node, elem, mode, elem_origin);
@@ -261,12 +200,7 @@ impl<'a> Lowerer<'a> {
                         ast::Pattern::Literal(lit) => self.lower_literal(lit),
                         ast::Pattern::Variable(name) => {
                             // Variable key: use the variable name as a text key
-                            let key = self.new_temp(TypeSet::single(types::BaseType::Text));
-                            self.emit(Instruction::Const {
-                                dest: key,
-                                value: Literal::Text(name.to_string()),
-                            });
-                            key
+                            self.emit_const(Literal::Text(name.to_string()))
                         }
                         _ => {
                             self.diagnostics.error(
@@ -288,13 +222,7 @@ impl<'a> Lowerer<'a> {
                         let origin = RefOrigin { ref_var: dest };
                         (dest, Some(origin))
                     } else {
-                        let dest = self.new_temp(TypeSet::any());
-                        self.emit(Instruction::Index {
-                            dest,
-                            base: value,
-                            key: key_var,
-                        });
-                        (dest, None)
+                        (self.emit_index(value, key_var), None)
                     };
 
                     self.lower_pattern_binding_ref(&val_pat.node, val, mode, val_origin);

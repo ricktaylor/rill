@@ -4,7 +4,7 @@ pub(super) fn compile_terminator(
     term: &Terminator,
     block_map: &HashMap<BlockId, usize>,
     types: &TypeAnalysis,
-    block_id: BlockId,
+    _block_id: BlockId,
 ) -> Result<Step, ExecError> {
     Ok(match term {
         Terminator::Jump { target } => {
@@ -23,7 +23,7 @@ pub(super) fn compile_terminator(
             let else_idx = block_map[else_target];
 
             let cond_type = types
-                .get_at_exit(block_id, *condition)
+                .get(*condition)
                 .copied()
                 .unwrap_or(crate::types::TypeSet::any());
 
@@ -33,7 +33,7 @@ pub(super) fn compile_terminator(
             debug_assert!(
                 cond_type.contains(BaseType::Bool)
                     || cond_type.may_be_undefined()
-                    || cond_type.is_dead(),
+                    || cond_type.is_empty(),
                 "If condition with non-Bool type {:?} should have been folded by optimizer",
                 cond_type
             );

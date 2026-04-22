@@ -239,9 +239,9 @@ fn uint_power_of_2(var: VarId, constants: &HashMap<VarId, ConstVal>) -> Option<u
     }
 }
 
-fn is_uint(var: VarId, types: &TypeAnalysis, block_id: super::BlockId) -> bool {
+fn is_uint(var: VarId, types: &TypeAnalysis, _block_id: super::BlockId) -> bool {
     types
-        .get_at_exit(block_id, var)
+        .get(var)
         .is_some_and(|t| t.is_single() && t.contains(BaseType::UInt))
 }
 
@@ -250,9 +250,9 @@ fn zero_const(
     dest: VarId,
     ref_var: VarId,
     types: &TypeAnalysis,
-    block_id: super::BlockId,
+    _block_id: super::BlockId,
 ) -> Instruction {
-    let type_set = types.get_at_exit(block_id, ref_var);
+    let type_set = types.get(ref_var);
     let value = if type_set.is_some_and(|t| t.contains(BaseType::Int)) {
         Literal::Int(0)
     } else if type_set.is_some_and(|t| t.contains(BaseType::Float)) {

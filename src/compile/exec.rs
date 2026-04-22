@@ -186,6 +186,10 @@ pub(super) fn exec_neg(a: &Value) -> Value {
 }
 
 pub(super) fn exec_eq(a: &Value, b: &Value) -> Value {
+    // Undefined poisons: any comparison with Undefined produces Undefined
+    if a.is_undefined() || b.is_undefined() {
+        return Value::Undefined;
+    }
     Value::Bool(a == b)
 }
 
@@ -305,9 +309,11 @@ pub(super) fn exec_make_array(arg_slots: &[usize], vm: &mut VM) -> Result<Value,
 }
 
 pub(super) fn exec_make_map(arg_slots: &[usize], vm: &mut VM) -> Result<Value, ExecError> {
-    if !arg_slots.len().is_multiple_of(2) {
-        return Ok(Value::Undefined);
-    }
+    debug_assert!(
+        arg_slots.len().is_multiple_of(2),
+        "MakeMap: odd arg count {} is a compiler bug",
+        arg_slots.len()
+    );
     let map: IndexMap<Value, Value> = arg_slots
         .chunks(2)
         .filter_map(|pair| {

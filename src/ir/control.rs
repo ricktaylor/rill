@@ -69,12 +69,7 @@ impl<'a> Lowerer<'a> {
         let then_value = if let Some(expr) = then_expr {
             self.lower_expression(expr)
         } else {
-            let dest = self.new_temp(TypeSet::undefined());
-            self.emit(Instruction::Const {
-                dest,
-                value: Literal::Undefined,
-            });
-            dest
+            self.emit_undefined()
         };
         let then_exit_block = self.current_block;
         self.pop_scope(); // End condition bindings scope
@@ -93,12 +88,7 @@ impl<'a> Lowerer<'a> {
         let else_value = if let Some(expr) = else_expr {
             self.lower_expression(expr)
         } else {
-            let dest = self.new_temp(TypeSet::undefined());
-            self.emit(Instruction::Const {
-                dest,
-                value: Literal::Undefined,
-            });
-            dest
+            self.emit_undefined()
         };
         let else_exit_block = self.current_block;
         self.pop_scope();
@@ -108,15 +98,11 @@ impl<'a> Lowerer<'a> {
         self.current_block = join_bb;
         self.current_instructions = Vec::new();
 
-        let result = self.new_temp(TypeSet::any());
-        self.emit(Instruction::Phi {
-            dest: result,
-            sources: vec![(then_exit_block, then_value), (else_exit_block, else_value)],
-        });
-
         // Variable phis are handled by mem2reg — no manual merge needed.
-
-        result
+        self.emit_phi(vec![
+            (then_exit_block, then_value),
+            (else_exit_block, else_value),
+        ])
     }
 
     /// Lower a pattern match for if-let/if-with conditions
@@ -147,17 +133,15 @@ impl<'a> Lowerer<'a> {
             ast::Pattern::Variable(name) => {
                 // Only presence check needed - no type constraint
                 // Guard checks defined vs undefined
-                self.emit_guard(value, else_bb);
+                let narrowed = self.emit_guard(value, else_bb);
 
-                // Bind the variable
+                // Bind the variable (using narrowed value — Undefined excluded)
                 match mode {
                     BindingMode::Value => {
-                        let dest = self.new_var(name.clone(), TypeSet::any());
-                        self.emit(Instruction::Copy { dest, src: value });
-                        self.bind(name, dest);
+                        self.bind(name, narrowed);
                     }
                     BindingMode::Reference => {
-                        self.bind(name, value);
+                        self.bind(name, narrowed);
                         if let Some(origin) = ref_origin {
                             self.bind_ref(name, origin);
                         }
@@ -167,15 +151,11 @@ impl<'a> Lowerer<'a> {
 
             ast::Pattern::Array(patterns) => {
                 // Match checks type AND rejects undefined (no Guard needed)
-                self.emit_match(value, MatchPattern::Array(patterns.len()), else_bb);
+                let value = self.emit_match(value, MatchPattern::Array(patterns.len()), else_bb);
 
                 // Bind each element
                 for (i, elem_pat) in patterns.iter().enumerate() {
-                    let idx = self.new_temp(TypeSet::single(types::BaseType::UInt));
-                    self.emit(Instruction::Const {
-                        dest: idx,
-                        value: Literal::UInt(i as u64),
-                    });
+                    let idx = self.emit_const(Literal::UInt(i as u64));
 
                     let (elem, elem_origin) = if matches!(mode, BindingMode::Reference) {
                         let dest = self.new_temp(TypeSet::any());
@@ -187,12 +167,7 @@ impl<'a> Lowerer<'a> {
                         let origin = RefOrigin { ref_var: dest };
                         (dest, Some(origin))
                     } else {
-                        let dest = self.new_temp(TypeSet::any());
-                        self.emit(Instruction::Index {
-                            dest,
-                            base: value,
-                            key: idx,
-                        });
+                        let dest = self.emit_index(value, idx);
                         (dest, None)
                     };
 
@@ -208,8 +183,8 @@ impl<'a> Lowerer<'a> {
 
             ast::Pattern::Type { type_name, binding } => {
                 // Match checks type AND rejects undefined (no Guard needed)
-                if let Some(base_type) = self.type_name_to_base_type(type_name) {
-                    self.emit_match(value, MatchPattern::Type(base_type), else_bb);
+                let narrowed = if let Some(base_type) = self.type_name_to_base_type(type_name) {
+                    self.emit_match(value, MatchPattern::Type(base_type), else_bb)
                 } else {
                     // Unknown type - always fail to else
                     self.finish_block(Terminator::Jump { target: else_bb });
@@ -217,11 +192,11 @@ impl<'a> Lowerer<'a> {
                     self.current_block = unreachable_bb;
                     self.current_instructions = Vec::new();
                     return;
-                }
+                };
 
-                // If there's a nested binding, process it (pass ref_origin through)
+                // If there's a nested binding, process it with narrowed value
                 if let Some(inner_pat) = binding {
-                    self.lower_if_pattern(inner_pat.as_ref(), value, mode, else_bb, ref_origin);
+                    self.lower_if_pattern(inner_pat.as_ref(), narrowed, mode, else_bb, ref_origin);
                 }
             }
 
@@ -232,15 +207,11 @@ impl<'a> Lowerer<'a> {
             } => {
                 // Match checks min length AND rejects undefined (no Guard needed)
                 let min_len = before.len() + after.len();
-                self.emit_match(value, MatchPattern::ArrayMin(min_len), else_bb);
+                let value = self.emit_match(value, MatchPattern::ArrayMin(min_len), else_bb);
 
                 // Bind before elements
                 for (i, pat) in before.iter().enumerate() {
-                    let idx = self.new_temp(TypeSet::single(types::BaseType::UInt));
-                    self.emit(Instruction::Const {
-                        dest: idx,
-                        value: Literal::UInt(i as u64),
-                    });
+                    let idx = self.emit_const(Literal::UInt(i as u64));
 
                     let (elem, elem_origin) = if matches!(mode, BindingMode::Reference) {
                         let dest = self.new_temp(TypeSet::any());
@@ -252,12 +223,7 @@ impl<'a> Lowerer<'a> {
                         let origin = RefOrigin { ref_var: dest };
                         (dest, Some(origin))
                     } else {
-                        let dest = self.new_temp(TypeSet::any());
-                        self.emit(Instruction::Index {
-                            dest,
-                            base: value,
-                            key: idx,
-                        });
+                        let dest = self.emit_index(value, idx);
                         (dest, None)
                     };
 
@@ -273,17 +239,9 @@ impl<'a> Lowerer<'a> {
                 // let = ReadOnly (by-value iteration only).
                 // A start < end guard produces undefined for empty slices.
                 if let Some(rest_name) = rest {
-                    let start = self.new_temp(TypeSet::single(types::BaseType::UInt));
-                    self.emit(Instruction::Const {
-                        dest: start,
-                        value: Literal::UInt(before.len() as u64),
-                    });
+                    let start = self.emit_const(Literal::UInt(before.len() as u64));
 
-                    let after_len_val = self.new_temp(TypeSet::single(types::BaseType::UInt));
-                    self.emit(Instruction::Const {
-                        dest: after_len_val,
-                        value: Literal::UInt(after.len() as u64),
-                    });
+                    let after_len_val = self.emit_const(Literal::UInt(after.len() as u64));
                     let end = self.emit_binary_intrinsic(IntrinsicOp::Sub, length, after_len_val);
 
                     let slice_mode = if matches!(mode, BindingMode::Reference) {
@@ -297,8 +255,6 @@ impl<'a> Lowerer<'a> {
                     let seq_bb = self.fresh_block();
                     let undef_bb = self.fresh_block();
                     let join_bb = self.fresh_block();
-                    let rest_val = self.new_temp(TypeSet::single(types::BaseType::Sequence));
-
                     self.finish_block(Terminator::If {
                         condition: valid,
                         then_target: seq_bb,
@@ -309,7 +265,7 @@ impl<'a> Lowerer<'a> {
                     // Then: create the slice sequence
                     self.current_block = seq_bb;
                     self.current_instructions = Vec::new();
-                    let seq_val = self.new_temp(TypeSet::single(types::BaseType::Sequence));
+                    let seq_val = self.new_temp(TypeSet::sequence());
                     self.emit(Instruction::Intrinsic {
                         dest: seq_val,
                         op: IntrinsicOp::ArraySeq(slice_mode),
@@ -320,48 +276,25 @@ impl<'a> Lowerer<'a> {
                     // Else: undefined
                     self.current_block = undef_bb;
                     self.current_instructions = Vec::new();
-                    let undef_val = self.new_temp(TypeSet::single(types::BaseType::Sequence));
-                    self.emit(Instruction::Const {
-                        dest: undef_val,
-                        value: Literal::Undefined,
-                    });
+                    let undef_val = self.emit_undefined();
                     self.finish_block(Terminator::Jump { target: join_bb });
 
                     // Join: phi
                     self.current_block = join_bb;
                     self.current_instructions = Vec::new();
-                    self.emit(Instruction::Phi {
-                        dest: rest_val,
-                        sources: vec![(seq_bb, seq_val), (undef_bb, undef_val)],
-                    });
+                    let rest_val = self.emit_phi(vec![(seq_bb, seq_val), (undef_bb, undef_val)]);
 
-                    let rest_var = self.new_var(
-                        rest_name.clone(),
-                        TypeSet::single(types::BaseType::Sequence),
-                    );
-                    self.emit(Instruction::Copy {
-                        dest: rest_var,
-                        src: rest_val,
-                    });
-                    self.bind(rest_name, rest_var);
+                    self.bind(rest_name, rest_val);
                 }
 
                 // Bind after elements (from end, using len - after.len() + i)
                 if !after.is_empty() {
-                    let after_len_val = self.new_temp(TypeSet::single(types::BaseType::UInt));
-                    self.emit(Instruction::Const {
-                        dest: after_len_val,
-                        value: Literal::UInt(after.len() as u64),
-                    });
+                    let after_len_val = self.emit_const(Literal::UInt(after.len() as u64));
                     let after_start =
                         self.emit_binary_intrinsic(IntrinsicOp::Sub, length, after_len_val);
 
                     for (i, pat) in after.iter().enumerate() {
-                        let offset = self.new_temp(TypeSet::single(types::BaseType::UInt));
-                        self.emit(Instruction::Const {
-                            dest: offset,
-                            value: Literal::UInt(i as u64),
-                        });
+                        let offset = self.emit_const(Literal::UInt(i as u64));
                         let idx = self.emit_binary_intrinsic(IntrinsicOp::Add, after_start, offset);
 
                         let (elem, elem_origin) = if matches!(mode, BindingMode::Reference) {
@@ -374,12 +307,7 @@ impl<'a> Lowerer<'a> {
                             let origin = RefOrigin { ref_var: dest };
                             (dest, Some(origin))
                         } else {
-                            let dest = self.new_temp(TypeSet::any());
-                            self.emit(Instruction::Index {
-                                dest,
-                                base: value,
-                                key: idx,
-                            });
+                            let dest = self.emit_index(value, idx);
                             (dest, None)
                         };
 
@@ -390,27 +318,18 @@ impl<'a> Lowerer<'a> {
 
             ast::Pattern::Map(entries) => {
                 // Check it's a map, then destructure entries by key
-                self.emit_match(value, MatchPattern::Type(types::BaseType::Map), else_bb);
+                let value =
+                    self.emit_match(value, MatchPattern::Type(types::BaseType::Map), else_bb);
 
                 for (key_pat, val_pat) in entries {
                     let key_var = match &key_pat.node {
                         ast::Pattern::Literal(lit) => {
                             let lit_pattern = self.ast_literal_to_ir_literal(lit);
-                            let k = self.new_temp(TypeSet::any());
-                            self.emit(Instruction::Const {
-                                dest: k,
-                                value: lit_pattern,
-                            });
-                            k
+                            self.emit_const(lit_pattern)
                         }
                         ast::Pattern::Variable(name) => {
                             // Variable key: treat name as text key
-                            let k = self.new_temp(TypeSet::single(types::BaseType::Text));
-                            self.emit(Instruction::Const {
-                                dest: k,
-                                value: Literal::Text(name.to_string()),
-                            });
-                            k
+                            self.emit_const(Literal::Text(name.to_string()))
                         }
                         _ => {
                             self.diagnostics.error(
@@ -432,18 +351,13 @@ impl<'a> Lowerer<'a> {
                         let origin = RefOrigin { ref_var: dest };
                         (dest, Some(origin))
                     } else {
-                        let dest = self.new_temp(TypeSet::any());
-                        self.emit(Instruction::Index {
-                            dest,
-                            base: value,
-                            key: key_var,
-                        });
+                        let dest = self.emit_index(value, key_var);
                         (dest, None)
                     };
 
                     // Value must be present for the pattern to match
-                    self.emit_guard(val, else_bb);
-                    self.lower_if_pattern(val_pat, val, mode, else_bb, val_origin);
+                    let narrowed_val = self.emit_guard(val, else_bb);
+                    self.lower_if_pattern(val_pat, narrowed_val, mode, else_bb, val_origin);
                 }
             }
         }
@@ -452,7 +366,14 @@ impl<'a> Lowerer<'a> {
     /// Emit Guard terminator: check value is defined
     /// On defined: continues in new block
     /// On undefined: jumps to fail_bb
-    fn emit_guard(&mut self, value: VarId, fail_bb: BlockId) {
+    /// Emit a definedness guard (Match with Undefined arm).
+    ///
+    /// On defined: continues in new block with a narrowed VarId (Undefined excluded)
+    /// On undefined: jumps to fail_bb
+    ///
+    /// Returns the narrowed VarId for use in the match arm. The narrowed var
+    /// has the same type as the original but with Undefined excluded.
+    pub fn emit_guard(&mut self, value: VarId, fail_bb: BlockId) -> VarId {
         let ok_bb = self.fresh_block();
         self.finish_block(Terminator::Match {
             value,
@@ -462,13 +383,30 @@ impl<'a> Lowerer<'a> {
         });
         self.current_block = ok_bb;
         self.current_instructions = Vec::new();
+
+        // Narrowing copy: value is provably defined on this path
+        self.emit_narrowing(
+            value,
+            self.var_type(value).difference(&TypeSet::undefined()),
+        )
     }
 
-    /// Emit Match terminator: check value matches pattern
-    /// Match implicitly rejects undefined (won't match any pattern)
-    /// On match: continues in new block
+    /// Emit Match terminator: check value matches pattern.
+    ///
+    /// On match: continues in new block with a narrowed VarId
     /// On no match: jumps to fail_bb
-    fn emit_match(&mut self, value: VarId, pattern: MatchPattern, fail_bb: BlockId) {
+    ///
+    /// Returns the narrowed VarId for use in the match arm. The narrowed var
+    /// has the type implied by the pattern.
+    fn emit_match(&mut self, value: VarId, pattern: MatchPattern, fail_bb: BlockId) -> VarId {
+        let narrowed_type = match &pattern {
+            MatchPattern::Type(ty) => TypeSet::single(*ty),
+            MatchPattern::Literal(lit) => TypeSet::single(lit.base_type()),
+            MatchPattern::Array(_) | MatchPattern::ArrayMin(_) => {
+                TypeSet::single(types::BaseType::Array)
+            }
+        };
+
         let ok_bb = self.fresh_block();
         self.finish_block(Terminator::Match {
             value,
@@ -478,6 +416,20 @@ impl<'a> Lowerer<'a> {
         });
         self.current_block = ok_bb;
         self.current_instructions = Vec::new();
+
+        // Narrowing copy: value's type is narrowed to the pattern's type
+        self.emit_narrowing(value, self.var_type(value).intersection(&narrowed_type))
+    }
+
+    /// Emit a narrowing copy if the type actually narrows.
+    /// Returns the narrowed VarId, or the original if no narrowing needed.
+    pub fn emit_narrowing(&mut self, src: VarId, narrowed: TypeSet) -> VarId {
+        let src_type = self.var_type(src);
+        if narrowed != src_type && !narrowed.is_empty() {
+            self.emit_copy(src, narrowed)
+        } else {
+            src
+        }
     }
 
     /// Convert AST literal to IR literal for pattern matching
@@ -572,23 +524,11 @@ impl<'a> Lowerer<'a> {
         self.current_block = exit_bb;
         self.current_instructions = Vec::new();
 
-        let result = self.new_temp(if break_values.is_empty() {
-            TypeSet::undefined()
-        } else {
-            TypeSet::any()
-        });
         if break_values.is_empty() {
-            self.emit(Instruction::Const {
-                dest: result,
-                value: Literal::Undefined,
-            });
+            self.emit_undefined()
         } else {
-            self.emit(Instruction::Phi {
-                dest: result,
-                sources: break_values,
-            });
+            self.emit_phi(break_values)
         }
-        result
     }
 
     /// Lower an infinite loop
@@ -631,19 +571,11 @@ impl<'a> Lowerer<'a> {
         self.current_block = exit_bb;
         self.current_instructions = Vec::new();
 
-        let result = self.new_temp(TypeSet::any());
         if break_values.is_empty() {
-            self.emit(Instruction::Const {
-                dest: result,
-                value: Literal::Undefined,
-            });
+            self.emit_undefined()
         } else {
-            self.emit(Instruction::Phi {
-                dest: result,
-                sources: break_values,
-            });
+            self.emit_phi(break_values)
         }
-        result
     }
 
     /// Lower a for loop with type dispatch.
@@ -693,12 +625,7 @@ impl<'a> Lowerer<'a> {
         self.current_block = join_bb;
         self.current_instructions = Vec::new();
 
-        let result = self.new_temp(TypeSet::undefined());
-        self.emit(Instruction::Const {
-            dest: result,
-            value: Literal::Undefined,
-        });
-        result
+        self.emit_undefined()
     }
 
     /// Lower the index-based iteration path (for Array, Map, Bytes, Text).
@@ -725,11 +652,7 @@ impl<'a> Lowerer<'a> {
         let length = self.emit_unary_intrinsic(IntrinsicOp::Len, iter_var);
 
         // i = 0
-        let i_init = self.new_temp(TypeSet::single(types::BaseType::UInt));
-        self.emit(Instruction::Const {
-            dest: i_init,
-            value: Literal::UInt(0),
-        });
+        let i_init = self.emit_const(Literal::UInt(0));
 
         let header_bb = self.fresh_block();
         let body_bb = self.fresh_block();
@@ -743,7 +666,7 @@ impl<'a> Lowerer<'a> {
         self.current_block = header_bb;
         self.current_instructions = Vec::new();
 
-        let i_var = self.new_temp(TypeSet::single(types::BaseType::UInt));
+        let i_var = self.new_temp(TypeSet::uint());
         let i_phi_idx = self.current_instructions.len();
         self.emit(Instruction::Phi {
             dest: i_var,
@@ -779,24 +702,14 @@ impl<'a> Lowerer<'a> {
             let origin = RefOrigin { ref_var: dest };
             (dest, Some(origin))
         } else {
-            let dest = self.new_temp(TypeSet::any());
-            self.emit(Instruction::Index {
-                dest,
-                base: iter_var,
-                key: i_var,
-            });
+            let dest = self.emit_index(iter_var, i_var);
             (dest, None)
         };
 
         match binding {
             ast::ForBinding::Single(name) => match mode {
                 BindingMode::Value => {
-                    let var = self.new_var(name.clone(), TypeSet::any());
-                    self.emit(Instruction::Copy {
-                        dest: var,
-                        src: elem,
-                    });
-                    self.bind(name, var);
+                    self.bind(name, elem);
                 }
                 BindingMode::Reference => {
                     self.bind(name, elem);
@@ -806,21 +719,11 @@ impl<'a> Lowerer<'a> {
                 }
             },
             ast::ForBinding::Pair(key_name, val_name) => {
-                let key_var = self.new_var(key_name.clone(), TypeSet::any());
-                self.emit(Instruction::Copy {
-                    dest: key_var,
-                    src: i_var,
-                });
-                self.bind(key_name, key_var);
+                self.bind(key_name, i_var);
 
                 match mode {
                     BindingMode::Value => {
-                        let var = self.new_var(val_name.clone(), TypeSet::any());
-                        self.emit(Instruction::Copy {
-                            dest: var,
-                            src: elem,
-                        });
-                        self.bind(val_name, var);
+                        self.bind(val_name, elem);
                     }
                     BindingMode::Reference => {
                         self.bind(val_name, elem);
@@ -854,11 +757,7 @@ impl<'a> Lowerer<'a> {
         self.current_block = latch_bb;
         self.current_instructions = Vec::new();
 
-        let one = self.new_temp(TypeSet::single(types::BaseType::UInt));
-        self.emit(Instruction::Const {
-            dest: one,
-            value: Literal::UInt(1),
-        });
+        let one = self.emit_const(Literal::UInt(1));
         let i_next = self.emit_binary_intrinsic(IntrinsicOp::Add, i_var, one);
 
         let latch_exit_bb = self.current_block;
@@ -914,12 +813,7 @@ impl<'a> Lowerer<'a> {
         self.current_block = header_bb;
         self.current_instructions = Vec::new();
 
-        let elem = self.new_temp(TypeSet::any());
-        self.emit(Instruction::Intrinsic {
-            dest: elem,
-            op: IntrinsicOp::SeqNext,
-            args: vec![seq_var],
-        });
+        let elem = self.emit_unary_intrinsic(IntrinsicOp::SeqNext, seq_var);
 
         self.finish_block(Terminator::Match {
             value: elem,
@@ -936,32 +830,13 @@ impl<'a> Lowerer<'a> {
         // Sequences are always by-value (no backing collection to write back to).
         match binding {
             ast::ForBinding::Single(name) => {
-                let var = self.new_var(name.clone(), TypeSet::any());
-                self.emit(Instruction::Copy {
-                    dest: var,
-                    src: elem,
-                });
-                self.bind(name, var);
+                self.bind(name, elem);
             }
             ast::ForBinding::Pair(key_name, val_name) => {
-                let var = self.new_var(val_name.clone(), TypeSet::any());
-                self.emit(Instruction::Copy {
-                    dest: var,
-                    src: elem,
-                });
-                self.bind(val_name, var);
+                self.bind(val_name, elem);
                 // Key is undefined for sequences (no natural index)
-                let undef = self.new_temp(TypeSet::undefined());
-                self.emit(Instruction::Const {
-                    dest: undef,
-                    value: Literal::Undefined,
-                });
-                let key_var = self.new_var(key_name.clone(), TypeSet::any());
-                self.emit(Instruction::Copy {
-                    dest: key_var,
-                    src: undef,
-                });
-                self.bind(key_name, key_var);
+                let undef = self.emit_undefined();
+                self.bind(key_name, undef);
             }
         }
 
@@ -1037,12 +912,7 @@ impl<'a> Lowerer<'a> {
             let arm_value = if let Some(ref expr) = arm.body_expr {
                 self.lower_expression(expr)
             } else {
-                let dest = self.new_temp(TypeSet::undefined());
-                self.emit(Instruction::Const {
-                    dest,
-                    value: Literal::Undefined,
-                });
-                dest
+                self.emit_undefined()
             };
 
             let exit_block = self.current_block;
@@ -1056,11 +926,7 @@ impl<'a> Lowerer<'a> {
         }
 
         // Final fallthrough (unreachable if patterns are exhaustive)
-        let fallback = self.new_temp(TypeSet::undefined());
-        self.emit(Instruction::Const {
-            dest: fallback,
-            value: Literal::Undefined,
-        });
+        let fallback = self.emit_undefined();
         let fallback_block = self.current_block;
         arm_results.push((fallback_block, fallback));
         self.finish_block(Terminator::Jump { target: exit_bb });
@@ -1069,13 +935,7 @@ impl<'a> Lowerer<'a> {
         self.current_block = exit_bb;
         self.current_instructions = Vec::new();
 
-        let result = self.new_temp(TypeSet::any());
-        self.emit(Instruction::Phi {
-            dest: result,
-            sources: arm_results,
-        });
-
-        result
+        self.emit_phi(arm_results)
     }
 
     /// Lower a `..` / `..=` expression as a MakeSeq intrinsic.
@@ -1099,11 +959,7 @@ impl<'a> Lowerer<'a> {
 
         // For inclusive ranges, emit end_excl = end + 1 (checked)
         let end_excl = if inclusive {
-            let one = self.new_temp(TypeSet::uint());
-            self.emit(Instruction::Const {
-                dest: one,
-                value: Literal::UInt(1),
-            });
+            let one = self.emit_const(Literal::UInt(1));
             self.emit_binary_intrinsic(IntrinsicOp::Add, end_var, one)
         } else {
             end_var
@@ -1116,8 +972,6 @@ impl<'a> Lowerer<'a> {
         let undef_bb = self.fresh_block();
         let join_bb = self.fresh_block();
 
-        let result = self.new_temp(TypeSet::single(types::BaseType::Sequence));
-
         self.finish_block(Terminator::If {
             condition: valid,
             then_target: seq_bb,
@@ -1128,32 +982,18 @@ impl<'a> Lowerer<'a> {
         // Then: create the sequence
         self.current_block = seq_bb;
         self.current_instructions = Vec::new();
-        let seq_val = self.new_temp(TypeSet::single(types::BaseType::Sequence));
-        self.emit(Instruction::Intrinsic {
-            dest: seq_val,
-            op: IntrinsicOp::MakeSeq,
-            args: vec![start_var, end_excl],
-        });
+        let seq_val = self.emit_binary_intrinsic(IntrinsicOp::MakeSeq, start_var, end_excl);
         self.finish_block(Terminator::Jump { target: join_bb });
 
         // Else: undefined
         self.current_block = undef_bb;
         self.current_instructions = Vec::new();
-        let undef_val = self.new_temp(TypeSet::single(types::BaseType::Sequence));
-        self.emit(Instruction::Const {
-            dest: undef_val,
-            value: Literal::Undefined,
-        });
+        let undef_val = self.emit_undefined();
         self.finish_block(Terminator::Jump { target: join_bb });
 
         // Join: phi
         self.current_block = join_bb;
         self.current_instructions = Vec::new();
-        self.emit(Instruction::Phi {
-            dest: result,
-            sources: vec![(seq_bb, seq_val), (undef_bb, undef_val)],
-        });
-
-        result
+        self.emit_phi(vec![(seq_bb, seq_val), (undef_bb, undef_val)])
     }
 }

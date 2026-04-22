@@ -15,7 +15,7 @@ pub(super) fn try_specialize_binary(
     dest_slot: usize,
     args: &[VarId],
     types: &TypeAnalysis,
-    block_id: BlockId,
+    _block_id: BlockId,
 ) -> Option<Step> {
     // Only specialize binary arithmetic and comparison
     if args.len() != 2 {
@@ -34,8 +34,8 @@ pub(super) fn try_specialize_binary(
         return None;
     }
 
-    let a_type = types.get_at_exit(block_id, args[0])?;
-    let b_type = types.get_at_exit(block_id, args[1])?;
+    let a_type = types.get(args[0])?;
+    let b_type = types.get(args[1])?;
 
     // Both must be single and the same type
     if !a_type.is_single() || !b_type.is_single() || a_type != b_type {
@@ -70,7 +70,7 @@ pub(super) fn try_specialize_convert(
     dest_slot: usize,
     args: &[VarId],
     types: &TypeAnalysis,
-    block_id: BlockId,
+    _block_id: BlockId,
 ) -> Option<Step> {
     let (target, mode) = match op {
         IntrinsicOp::Convert(t, m) => (t, m),
@@ -83,7 +83,7 @@ pub(super) fn try_specialize_convert(
 
     // Check if source type is known
     let src_nt = types
-        .get_at_exit(block_id, args[0])
+        .get(args[0])
         .filter(|t| t.is_single())
         .and_then(|t| t.as_single())
         .filter(|bt| bt.is_numeric())

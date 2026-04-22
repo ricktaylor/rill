@@ -346,7 +346,7 @@ impl TypeSet {
 
     /// Check if type set is bottom (unreachable/dead code — no possible type).
     /// Not the same as undefined: `{Undefined}` is a valid single-type set.
-    pub const fn is_dead(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.bits == 0
     }
 

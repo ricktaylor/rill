@@ -21,7 +21,7 @@ pub fn elide_identity_casts(
     let mut changes = 0;
 
     for block_idx in 0..function.blocks.len() {
-        let block_id = function.blocks[block_idx].id;
+        let _block_id = function.blocks[block_idx].id;
 
         for inst_idx in 0..function.blocks[block_idx].instructions.len() {
             let inst = &function.blocks[block_idx].instructions[inst_idx].node;
@@ -36,7 +36,7 @@ pub fn elide_identity_casts(
             };
 
             // Get source type from analysis
-            let src_type = match types.get_at_exit(block_id, src) {
+            let src_type = match types.get(src) {
                 Some(t) if t.is_single() => t,
                 _ => continue,
             };

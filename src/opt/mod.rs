@@ -265,7 +265,7 @@ fn monomorphize(program: &mut IrProgram, externs: &ExternRegistry) {
                         .iter()
                         .map(|a| {
                             types
-                                .get_at_exit(block.id, a.value)
+                                .get(a.value)
                                 .copied()
                                 .unwrap_or(crate::types::TypeSet::any())
                         })
@@ -429,7 +429,7 @@ fn collect_param_info(program: &IrProgram, externs: Option<&ExternRegistry>) -> 
                     for (i, arg) in args.iter().enumerate() {
                         if i < param_count {
                             let arg_type = types
-                                .get_at_exit(block.id, arg.value)
+                                .get(arg.value)
                                 .copied()
                                 .unwrap_or_else(type_refinement::all_types);
                             type_entry[i] = type_entry[i].union(&arg_type);
@@ -555,11 +555,11 @@ fn check_intrinsic_types(
             for (i, arg) in args.iter().enumerate() {
                 let required = op.param_type(i);
                 let actual = types
-                    .get_at_exit(block.id, *arg)
+                    .get(*arg)
                     .copied()
                     .unwrap_or(crate::types::TypeSet::any());
 
-                if actual.intersection(&required).is_dead() && !actual.is_dead() {
+                if actual.intersection(&required).is_empty() && !actual.is_empty() {
                     diagnostics.warning(
                         crate::diagnostics::DiagnosticCode::W009_TypeMismatch,
                         inst.span,
@@ -594,11 +594,11 @@ fn fold_non_bool_conditions(
                 ..
             } => {
                 let cond_type = types
-                    .get_at_exit(block.id, *condition)
+                    .get(*condition)
                     .copied()
                     .unwrap_or(crate::types::TypeSet::any());
 
-                if !cond_type.contains(crate::types::BaseType::Bool) && !cond_type.is_dead() {
+                if !cond_type.contains(crate::types::BaseType::Bool) && !cond_type.is_empty() {
                     (*else_target, *span)
                 } else {
                     continue;
@@ -640,8 +640,8 @@ fn eliminate_dead_match_arms(
             _ => continue,
         };
 
-        let scrutinee_type = match types.get_at_exit(block.id, value) {
-            Some(ts) if !ts.is_dead() => *ts,
+        let scrutinee_type = match types.get(value) {
+            Some(ts) if !ts.is_empty() => *ts,
             _ => continue, // unknown type — can't prune
         };
 
@@ -738,11 +738,11 @@ fn check_condition_types(
         };
 
         let actual = types
-            .get_at_exit(block.id, cond_var)
+            .get(cond_var)
             .copied()
             .unwrap_or(crate::types::TypeSet::any());
 
-        if !actual.contains(crate::types::BaseType::Bool) && !actual.is_dead() {
+        if !actual.contains(crate::types::BaseType::Bool) && !actual.is_empty() {
             diagnostics.warning(
                 crate::diagnostics::DiagnosticCode::W009_TypeMismatch,
                 span,
@@ -791,7 +791,7 @@ fn check_definedness_warnings(
 
             for (i, arg) in args.iter().enumerate() {
                 let arg_type = types
-                    .get_at_exit(block.id, *arg)
+                    .get(*arg)
                     .copied()
                     .unwrap_or(crate::types::TypeSet::any());
 

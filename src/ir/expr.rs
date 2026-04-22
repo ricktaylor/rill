@@ -7,10 +7,12 @@ impl<'a> Lowerer<'a> {
     // Expression Lowering
     // ========================================================================
 
-    /// Lower an expression, returning the VarId holding the result
+    /// Lower an expression, returning the VarId holding the result.
     ///
-    /// Always returns a VarId. On error, emits a diagnostic and returns
-    /// a placeholder (undefined) value.
+    /// If `expr_guard_fail` is set on the lowerer, intrinsic emit helpers
+    /// will guard their args against Undefined, jumping to the shared
+    /// fail block. The caller that set `expr_guard_fail` is responsible
+    /// for emitting the fail path and join Phi.
     pub fn lower_expression(&mut self, expr: &ast::Expression) -> VarId {
         match expr {
             ast::Expression::Literal(lit) => self.lower_literal(lit),
@@ -30,9 +32,7 @@ impl<'a> Lowerer<'a> {
                         _ => None, // Array/Map constants can't be inlined as literals
                     };
                     if let Some(lit) = lit {
-                        let dest = self.new_temp(TypeSet::any());
-                        self.emit(Instruction::Const { dest, value: lit });
-                        dest
+                        self.emit_const(lit)
                     } else {
                         self.error_placeholder()
                     }
@@ -68,17 +68,13 @@ impl<'a> Lowerer<'a> {
             ast::Expression::ArrayAccess { array, index } => {
                 let base = self.lower_expression(array);
                 let key = self.lower_expression(index);
-                let dest = self.new_temp(TypeSet::any());
-                self.emit(Instruction::Index { dest, base, key });
-                dest
+                self.emit_index(base, key)
             }
 
             ast::Expression::MemberAccess { object, member } => {
                 let base = self.lower_expression(object);
                 let key = self.lower_expression(member);
-                let dest = self.new_temp(TypeSet::any());
-                self.emit(Instruction::Index { dest, base, key });
-                dest
+                self.emit_index(base, key)
             }
 
             ast::Expression::Block {
@@ -92,12 +88,7 @@ impl<'a> Lowerer<'a> {
                 let result = if let Some(expr) = final_expr {
                     self.lower_expression(expr)
                 } else {
-                    let dest = self.new_temp(TypeSet::undefined());
-                    self.emit(Instruction::Const {
-                        dest,
-                        value: Literal::Undefined,
-                    });
-                    dest
+                    self.emit_undefined()
                 };
                 self.pop_scope();
                 result
@@ -162,12 +153,7 @@ impl<'a> Lowerer<'a> {
                     ),
                 );
                 // Return undefined — error already emitted
-                let dest = self.new_temp(TypeSet::undefined());
-                self.emit(Instruction::Const {
-                    dest,
-                    value: Literal::Undefined,
-                });
-                return dest;
+                return self.emit_undefined();
             }
         };
 
@@ -179,83 +165,21 @@ impl<'a> Lowerer<'a> {
 
     /// Lower a literal value
     pub fn lower_literal(&mut self, lit: &ast::Literal) -> VarId {
-        let (dest, instruction) = match lit {
-            ast::Literal::Bool(b) => {
-                let dest = self.new_temp(TypeSet::single(types::BaseType::Bool));
-                (
-                    dest,
-                    Instruction::Const {
-                        dest,
-                        value: Literal::Bool(*b),
-                    },
-                )
-            }
-            ast::Literal::UInt(n) => {
-                let dest = self.new_temp(TypeSet::single(types::BaseType::UInt));
-                (
-                    dest,
-                    Instruction::Const {
-                        dest,
-                        value: Literal::UInt(*n),
-                    },
-                )
-            }
-            ast::Literal::Int(n) => {
-                let dest = self.new_temp(TypeSet::single(types::BaseType::Int));
-                (
-                    dest,
-                    Instruction::Const {
-                        dest,
-                        value: Literal::Int(*n),
-                    },
-                )
-            }
-            ast::Literal::Float(f) => {
-                let dest = self.new_temp(TypeSet::single(types::BaseType::Float));
-                (
-                    dest,
-                    Instruction::Const {
-                        dest,
-                        value: Literal::Float(*f),
-                    },
-                )
-            }
-            ast::Literal::Text(s) => {
-                let dest = self.new_temp(TypeSet::single(types::BaseType::Text));
-                (
-                    dest,
-                    Instruction::Const {
-                        dest,
-                        value: Literal::Text(s.clone()),
-                    },
-                )
-            }
-            ast::Literal::Bytes(b) => {
-                let dest = self.new_temp(TypeSet::single(types::BaseType::Bytes));
-                (
-                    dest,
-                    Instruction::Const {
-                        dest,
-                        value: Literal::Bytes(b.clone()),
-                    },
-                )
-            }
-            ast::Literal::Array(elements) => {
-                return self.lower_array_literal(elements);
-            }
-            ast::Literal::Map(entries) => {
-                return self.lower_map_literal(entries);
-            }
-        };
-
-        self.emit(instruction);
-        dest
+        match lit {
+            ast::Literal::Bool(b) => self.emit_const(Literal::Bool(*b)),
+            ast::Literal::UInt(n) => self.emit_const(Literal::UInt(*n)),
+            ast::Literal::Int(n) => self.emit_const(Literal::Int(*n)),
+            ast::Literal::Float(f) => self.emit_const(Literal::Float(*f)),
+            ast::Literal::Text(s) => self.emit_const(Literal::Text(s.clone())),
+            ast::Literal::Bytes(b) => self.emit_const(Literal::Bytes(b.clone())),
+            ast::Literal::Array(elements) => self.lower_array_literal(elements),
+            ast::Literal::Map(entries) => self.lower_map_literal(entries),
+        }
     }
 
     fn lower_array_literal(&mut self, elements: &[ast::Expression]) -> VarId {
         let args: Vec<VarId> = elements.iter().map(|e| self.lower_expression(e)).collect();
-
-        let dest = self.new_temp(TypeSet::single(types::BaseType::Array));
+        let dest = self.new_temp(TypeSet::array());
         self.emit(Instruction::Intrinsic {
             dest,
             op: IntrinsicOp::MakeArray,
@@ -265,20 +189,62 @@ impl<'a> Lowerer<'a> {
     }
 
     fn lower_map_literal(&mut self, entries: &[(ast::Expression, ast::Expression)]) -> VarId {
-        let entry_vars: Vec<(VarId, VarId)> = entries
+        let args: Vec<VarId> = entries
             .iter()
-            .map(|(k, v)| (self.lower_expression(k), self.lower_expression(v)))
+            .flat_map(|(k, v)| [self.lower_expression(k), self.lower_expression(v)])
             .collect();
-
-        let args: Vec<VarId> = entry_vars.into_iter().flat_map(|(k, v)| [k, v]).collect();
-
-        let dest = self.new_temp(TypeSet::single(types::BaseType::Map));
+        let dest = self.new_temp(TypeSet::map());
         self.emit(Instruction::Intrinsic {
             dest,
             op: IntrinsicOp::MakeMap,
             args,
         });
         dest
+    }
+
+    /// Set up an expression-level guard and evaluate an expression.
+    /// If any intrinsic within the expression encounters an Undefined arg,
+    /// all guards jump to a shared fail block. One Phi at the end merges
+    /// the result with Undefined.
+    ///
+    /// If a guard is already active (nested expression), reuses it.
+    fn lower_guarded_expression(&mut self, f: impl FnOnce(&mut Self) -> VarId) -> VarId {
+        if self.expr_guard_fail.is_some() {
+            // Already inside a guarded expression — just evaluate
+            return f(self);
+        }
+
+        let fail_bb = self.fresh_block();
+        self.expr_guard_fail = Some(fail_bb);
+
+        let result = f(self);
+
+        self.expr_guard_fail = None;
+
+        // Check if any guard actually references fail_bb
+        let fail_used = self
+            .blocks
+            .iter()
+            .any(|b| b.terminator.successors().contains(&fail_bb));
+
+        if !fail_used {
+            // No guards were triggered — no Phi needed
+            return result;
+        }
+
+        // Emit fail path and join
+        let ok_exit = self.current_block;
+        let join_bb = self.fresh_block();
+        self.finish_block(Terminator::Jump { target: join_bb });
+
+        self.current_block = fail_bb;
+        self.current_instructions = Vec::new();
+        let undef_val = self.emit_undefined();
+        self.finish_block(Terminator::Jump { target: join_bb });
+
+        self.current_block = join_bb;
+        self.current_instructions = Vec::new();
+        self.emit_phi(vec![(ok_exit, result), (fail_bb, undef_val)])
     }
 
     fn lower_binary_op(
@@ -294,62 +260,35 @@ impl<'a> Lowerer<'a> {
             _ => {}
         }
 
-        let lhs = self.lower_expression(left);
-        let rhs = self.lower_expression(right);
+        self.lower_guarded_expression(|s| {
+            let lhs = s.lower_expression(left);
+            let rhs = s.lower_expression(right);
 
-        // Reflexive comparison operators expand to combinations of Eq/Lt/Not
-        // This reduces the number of intrinsics and enables optimization
-        match op {
-            // a != b  →  Not(Eq(a, b))
-            ast::BinaryOperator::NotEqual => {
-                let eq_result = self.emit_binary_intrinsic(IntrinsicOp::Eq, lhs, rhs);
-                return self.emit_unary_intrinsic(IntrinsicOp::Not, eq_result);
+            match op {
+                ast::BinaryOperator::NotEqual => {
+                    let eq_result = s.emit_binary_intrinsic(IntrinsicOp::Eq, lhs, rhs);
+                    s.emit_unary_intrinsic(IntrinsicOp::Not, eq_result)
+                }
+                ast::BinaryOperator::Greater => s.emit_binary_intrinsic(IntrinsicOp::Lt, rhs, lhs),
+                ast::BinaryOperator::LessEqual => {
+                    let lt_result = s.emit_binary_intrinsic(IntrinsicOp::Lt, rhs, lhs);
+                    s.emit_unary_intrinsic(IntrinsicOp::Not, lt_result)
+                }
+                ast::BinaryOperator::GreaterEqual => {
+                    let lt_result = s.emit_binary_intrinsic(IntrinsicOp::Lt, lhs, rhs);
+                    s.emit_unary_intrinsic(IntrinsicOp::Not, lt_result)
+                }
+                _ => {
+                    let intrinsic = op
+                        .intrinsic_op()
+                        .expect("reflexive/short-circuit ops handled above");
+                    s.emit_binary_intrinsic(intrinsic, lhs, rhs)
+                }
             }
-            // a > b  →  Lt(b, a)  (swap operands)
-            ast::BinaryOperator::Greater => {
-                return self.emit_binary_intrinsic(IntrinsicOp::Lt, rhs, lhs);
-            }
-            // a <= b  →  Not(Lt(b, a))
-            ast::BinaryOperator::LessEqual => {
-                let lt_result = self.emit_binary_intrinsic(IntrinsicOp::Lt, rhs, lhs);
-                return self.emit_unary_intrinsic(IntrinsicOp::Not, lt_result);
-            }
-            // a >= b  →  Not(Lt(a, b))
-            ast::BinaryOperator::GreaterEqual => {
-                let lt_result = self.emit_binary_intrinsic(IntrinsicOp::Lt, lhs, rhs);
-                return self.emit_unary_intrinsic(IntrinsicOp::Not, lt_result);
-            }
-            _ => {}
-        }
-
-        // Direct intrinsic mapping for remaining operators
-        let intrinsic = op
-            .intrinsic_op()
-            .expect("reflexive/short-circuit ops handled above");
-        self.emit_binary_intrinsic(intrinsic, lhs, rhs)
+        })
     }
 
-    /// Emit a binary intrinsic operation.
-    pub fn emit_binary_intrinsic(&mut self, op: IntrinsicOp, lhs: VarId, rhs: VarId) -> VarId {
-        let dest = self.new_temp(op.result_type());
-        self.emit(Instruction::Intrinsic {
-            dest,
-            op,
-            args: vec![lhs, rhs],
-        });
-        dest
-    }
-
-    /// Emit a unary intrinsic operation.
-    pub fn emit_unary_intrinsic(&mut self, op: IntrinsicOp, arg: VarId) -> VarId {
-        let dest = self.new_temp(op.result_type());
-        self.emit(Instruction::Intrinsic {
-            dest,
-            op,
-            args: vec![arg],
-        });
-        dest
-    }
+    // emit_binary_intrinsic and emit_unary_intrinsic are defined in mod.rs
 
     fn lower_short_circuit_and(
         &mut self,
@@ -378,13 +317,9 @@ impl<'a> Lowerer<'a> {
         self.current_block = join_block;
         self.current_instructions = Vec::new();
 
-        let false_var = self.new_temp(TypeSet::single(types::BaseType::Bool));
-        self.emit(Instruction::Const {
-            dest: false_var,
-            value: Literal::Bool(false),
-        });
+        let false_var = self.emit_const(Literal::Bool(false));
 
-        let result = self.new_temp(TypeSet::single(types::BaseType::Bool));
+        let result = self.new_temp(TypeSet::bool());
         self.emit(Instruction::Phi {
             dest: result,
             sources: vec![(from_left, false_var), (from_right, rhs)],
@@ -416,13 +351,9 @@ impl<'a> Lowerer<'a> {
         self.current_block = join_block;
         self.current_instructions = Vec::new();
 
-        let true_var = self.new_temp(TypeSet::single(types::BaseType::Bool));
-        self.emit(Instruction::Const {
-            dest: true_var,
-            value: Literal::Bool(true),
-        });
+        let true_var = self.emit_const(Literal::Bool(true));
 
-        let result = self.new_temp(TypeSet::single(types::BaseType::Bool));
+        let result = self.new_temp(TypeSet::bool());
         self.emit(Instruction::Phi {
             dest: result,
             sources: vec![(from_left, true_var), (from_right, rhs)],
@@ -432,8 +363,10 @@ impl<'a> Lowerer<'a> {
     }
 
     fn lower_unary_op(&mut self, op: &ast::UnaryOperator, operand: &ast::Expression) -> VarId {
-        let arg = self.lower_expression(operand);
-        self.emit_unary_intrinsic(op.intrinsic_op(), arg)
+        self.lower_guarded_expression(|s| {
+            let arg = s.lower_expression(operand);
+            s.emit_unary_intrinsic(op.intrinsic_op(), arg)
+        })
     }
 
     pub fn lower_function_call(
@@ -506,7 +439,7 @@ impl<'a> Lowerer<'a> {
         let has_type_guards = param_specs.is_some_and(|specs| {
             specs
                 .iter()
-                .any(|s| !s.type_sig.is_dead() && s.type_sig != TypeSet::any())
+                .any(|s| !s.type_sig.is_empty() && s.type_sig != TypeSet::any())
         });
 
         if has_type_guards {
@@ -521,7 +454,7 @@ impl<'a> Lowerer<'a> {
                     .map(|s| s.type_sig)
                     .unwrap_or(TypeSet::any());
 
-                if type_sig.is_dead() || type_sig == TypeSet::any() {
+                if type_sig.is_empty() || type_sig == TypeSet::any() {
                     continue; // no constraint
                 }
 
@@ -549,50 +482,36 @@ impl<'a> Lowerer<'a> {
             // Call block
             self.current_block = call_bb;
             self.current_instructions = Vec::new();
-            let call_dest = self.new_temp(TypeSet::any());
-            self.emit(Instruction::Call {
-                dest: call_dest,
-                function: FunctionRef {
+            let call_dest = self.emit_call(
+                FunctionRef {
                     namespace: namespace.cloned(),
                     name: name.clone(),
                 },
                 args,
-            });
+            );
             let call_exit = self.current_block;
             self.finish_block(Terminator::Jump { target: join_bb });
 
             // Skip block — type mismatch, result is undefined
             self.current_block = skip_bb;
             self.current_instructions = Vec::new();
-            let undef_dest = self.new_temp(TypeSet::undefined());
-            self.emit(Instruction::Const {
-                dest: undef_dest,
-                value: Literal::Undefined,
-            });
+            let undef_dest = self.emit_undefined();
             let skip_exit = self.current_block;
             self.finish_block(Terminator::Jump { target: join_bb });
 
             // Join with phi
             self.current_block = join_bb;
             self.current_instructions = Vec::new();
-            let result = self.new_temp(TypeSet::any());
-            self.emit(Instruction::Phi {
-                dest: result,
-                sources: vec![(call_exit, call_dest), (skip_exit, undef_dest)],
-            });
-            result
+            self.emit_phi(vec![(call_exit, call_dest), (skip_exit, undef_dest)])
         } else {
             // No type constraints — emit call directly
-            let dest = self.new_temp(TypeSet::any());
-            self.emit(Instruction::Call {
-                dest,
-                function: FunctionRef {
+            self.emit_call(
+                FunctionRef {
                     namespace: namespace.cloned(),
                     name: name.clone(),
                 },
                 args,
-            });
-            dest
+            )
         }
     }
 
@@ -611,7 +530,7 @@ impl<'a> Lowerer<'a> {
             "append" if arguments.len() == 2 => {
                 let arr = self.lower_expression(&arguments[0]);
                 let val = self.lower_expression(&arguments[1]);
-                let dest = self.new_temp(TypeSet::single(types::BaseType::Array));
+                let dest = self.new_temp(TypeSet::array());
                 self.emit(Instruction::Append {
                     dest,
                     arr,

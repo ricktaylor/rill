@@ -8,7 +8,7 @@ fn run(source: &str, func_name: &str) -> Result<Value, String> {
         crate::compile(source, &externs).map_err(|d| format!("compilation failed: {}", d))?;
 
     if diagnostics.has_warnings() {
-        eprintln!("warnings: {}", diagnostics);
+        eprintln!("{}", diagnostics);
     }
 
     let mut vm = VM::new();
@@ -1829,7 +1829,6 @@ fn bench_map_insert_loop() {
 }
 
 #[test]
-#[ignore] // Known bug: in-place mutation via SetIndex not visible after for-loop dispatch (see TODO.md)
 fn bench_map_operations() {
     // sum of i*i for i in 0..10 = 0+1+4+9+16+25+36+49+64+81 = 285
     let val = run_with_args(BENCHMARK_SOURCE, "map_benchmark", &[Value::UInt(10)]);

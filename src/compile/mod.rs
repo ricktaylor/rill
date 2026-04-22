@@ -505,10 +505,7 @@ fn compile_instruction(
         Instruction::Copy { dest, src } => {
             let d = slot(*dest);
             let s = slot(*src);
-            if types
-                .get_at_exit(block_id, *src)
-                .is_some_and(|t| t.is_defined())
-            {
+            if types.get(*src).is_some_and(|t| t.is_defined()) {
                 Box::new(move |vm: &mut VM, _prog| {
                     let val = vm.local(s).clone();
                     vm.set_local(d, val);
@@ -528,7 +525,7 @@ fn compile_instruction(
             let k = slot(*key);
 
             // Specialize based on known base type
-            let base_type = types.get_at_exit(block_id, *base).filter(|t| t.is_single());
+            let base_type = types.get(*base).filter(|t| t.is_single());
 
             if base_type.is_some_and(|t| t.contains(BaseType::Array)) {
                 Box::new(move |vm: &mut VM, _prog| {
@@ -606,7 +603,7 @@ fn compile_instruction(
             let v = slot(*value);
 
             // Specialize based on known base type
-            let base_type = types.get_at_exit(block_id, *base).filter(|t| t.is_single());
+            let base_type = types.get(*base).filter(|t| t.is_single());
 
             if base_type.is_some_and(|t| t.contains(BaseType::Array)) {
                 // Array: key is UInt index
@@ -660,19 +657,14 @@ fn compile_instruction(
                     let f = if !variants.is_empty() {
                         let arg_types: Vec<TypeSet> = args
                             .iter()
-                            .map(|a| {
-                                types
-                                    .get_at_exit(block_id, a.value)
-                                    .copied()
-                                    .unwrap_or(TypeSet::any())
-                            })
+                            .map(|a| types.get(a.value).copied().unwrap_or(TypeSet::any()))
                             .collect();
                         variants
                             .iter()
                             .find(|(param_types, _, _)| {
                                 param_types.len() == arg_types.len()
                                     && param_types.iter().zip(&arg_types).all(|(spec, actual)| {
-                                        !actual.is_dead() && actual.difference(spec).is_dead()
+                                        !actual.is_empty() && actual.difference(spec).is_empty()
                                     })
                             })
                             .map(|(_, _, vf)| *vf)
@@ -791,7 +783,7 @@ fn compile_instruction(
                     // Element reference: read base[key] into dest
                     // Specialize based on known base type (same as Index)
                     let k_slot = slot(*k);
-                    let base_type = types.get_at_exit(block_id, *base).filter(|t| t.is_single());
+                    let base_type = types.get(*base).filter(|t| t.is_single());
 
                     if base_type.is_some_and(|t| t.contains(BaseType::Array)) {
                         Box::new(move |vm: &mut VM, _prog| {
@@ -855,9 +847,7 @@ fn compile_instruction(
                 match meta.key_slot {
                     Some(key_slot) => {
                         // Element write-back: specialize based on known base type
-                        let base_type = types
-                            .get_at_exit(block_id, meta.base_var)
-                            .filter(|t| t.is_single());
+                        let base_type = types.get(meta.base_var).filter(|t| t.is_single());
 
                         if base_type.is_some_and(|t| t.contains(BaseType::Array)) {
                             // Array: key is UInt index

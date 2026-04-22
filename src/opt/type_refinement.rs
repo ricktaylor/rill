@@ -20,30 +20,20 @@ use std::collections::{HashMap, HashSet, VecDeque};
 // Analysis State
 // ============================================================================
 
-/// Map from (BlockId, VarId) to TypeSet at block entry
-pub type TypeMap = HashMap<(BlockId, VarId), TypeSet>;
-
-/// Analysis result for a function
+/// Analysis result for a function — one TypeSet per VarId.
+///
+/// In SSA form, each VarId is defined exactly once, so its type is
+/// determined at its definition site. Type narrowing after Match arms
+/// is handled by narrowing copies (pi-nodes) that create new VarIds.
 #[derive(Debug)]
 pub struct TypeAnalysis {
-    /// TypeSet of each variable at each block's entry point
-    #[allow(dead_code)]
-    pub at_entry: TypeMap,
-
-    /// TypeSet of each variable at each block's exit point
-    pub at_exit: TypeMap,
+    types: HashMap<VarId, TypeSet>,
 }
 
 impl TypeAnalysis {
-    /// Get the TypeSet of a variable at a block's entry
-    #[allow(dead_code)]
-    pub fn get_at_entry(&self, block: BlockId, var: VarId) -> Option<&TypeSet> {
-        self.at_entry.get(&(block, var))
-    }
-
-    /// Get the TypeSet of a variable at a block's exit
-    pub fn get_at_exit(&self, block: BlockId, var: VarId) -> Option<&TypeSet> {
-        self.at_exit.get(&(block, var))
+    /// Get the TypeSet of a variable.
+    pub fn get(&self, var: VarId) -> Option<&TypeSet> {
+        self.types.get(&var)
     }
 }
 
@@ -71,6 +61,7 @@ fn transfer_instruction(
     state: &mut HashMap<VarId, TypeSet>,
     externs: Option<&ExternRegistry>,
     return_types: &ReturnTypes,
+    declared_types: &HashMap<VarId, TypeSet>,
 ) {
     match instruction {
         // Undefined produces only undefined (no concrete types)
@@ -95,14 +86,13 @@ fn transfer_instruction(
             state.insert(*dest, TypeSet::single(ty));
         }
 
-        // Copy inherits the type of the source
+        // Copy inherits the source type, constrained by the dest's declared type.
+        // Narrowing copies (from emit_guard/emit_match) have a narrower declared
+        // type — the intersection gives the correct narrowed result.
         Instruction::Copy { dest, src } => {
-            if let Some(src_type) = state.get(src) {
-                state.insert(*dest, *src_type);
-            } else {
-                // Unknown source - use all types as optional
-                state.insert(*dest, all_types());
-            }
+            let src_type = state.get(src).copied().unwrap_or_else(all_types);
+            let declared = declared_types.get(dest).copied().unwrap_or_else(all_types);
+            state.insert(*dest, src_type.intersection(&declared));
         }
 
         // Index result: element type of base
@@ -135,7 +125,9 @@ fn transfer_instruction(
             state.insert(*dest, result.unwrap_or_else(all_types));
         }
 
-        // Intrinsic: refine result type based on operand types
+        // Intrinsic: refine result type based on operand types.
+        // Fallibility (Undefined from domain errors) is included in result_type().
+        // Expression-level guards prevent Undefined cascade at intrinsic inputs.
         Instruction::Intrinsic { dest, op, args } => {
             let arg_types: Vec<TypeSet> = args
                 .iter()
@@ -207,7 +199,7 @@ fn compute_call_type(
         // Not an extern — check inferred return types for user functions
         let name = function.qualified_name();
         if let Some(rt) = return_types.get(&name)
-            && !rt.is_dead()
+            && !rt.is_empty()
         {
             return *rt;
         }
@@ -232,7 +224,7 @@ fn compute_call_type(
 /// Convert an extern's TypeSet to analysis TypeSet
 /// (Now they're the same type, so just clone)
 fn type_sig_to_type_set(sig: &TypeSet) -> TypeSet {
-    if sig.is_dead() {
+    if sig.is_empty() {
         // Empty types means any type
         all_types()
     } else {
@@ -247,7 +239,7 @@ fn apply_match_refinement(
     terminator: &Terminator,
     state: &HashMap<VarId, TypeSet>,
 ) -> HashMap<BlockId, HashMap<VarId, TypeSet>> {
-    let mut refined = HashMap::new();
+    let mut refined: HashMap<BlockId, HashMap<VarId, TypeSet>> = HashMap::new();
 
     if let Terminator::Match {
         value,
@@ -281,7 +273,15 @@ fn apply_match_refinement(
                 }
             };
             arm_state.insert(*value, refined_type);
-            refined.insert(*target, arm_state);
+            // If multiple arms target the same block, union the refined types
+            if let Some(existing) = refined.get_mut(target) {
+                for (var, new_type) in &arm_state {
+                    let entry = existing.entry(*var).or_insert(TypeSet::none());
+                    *entry = entry.union(new_type);
+                }
+            } else {
+                refined.insert(*target, arm_state);
+            }
         }
 
         // For default arm, exclude the matched types
@@ -342,7 +342,7 @@ pub fn infer_return_type(
     let mut result = TypeSet::none();
     for block in &function.blocks {
         if let Terminator::Return { value: Some(v) } = &block.terminator
-            && let Some(ts) = types.get_at_exit(block.id, *v)
+            && let Some(ts) = types.get(*v)
         {
             result = result.union(ts);
         }
@@ -367,6 +367,10 @@ pub fn analyze_types_full(
 ) -> TypeAnalysis {
     let block_index = build_block_index_map(function);
 
+    // Declared types from locals — used to constrain narrowing copies
+    let declared_types: HashMap<VarId, TypeSet> =
+        function.locals.iter().map(|v| (v.id, v.type_set)).collect();
+
     // State at entry and exit of each block
     let mut entry_states: HashMap<BlockId, HashMap<VarId, TypeSet>> = HashMap::new();
     let mut exit_states: HashMap<BlockId, HashMap<VarId, TypeSet>> = HashMap::new();
@@ -378,7 +382,7 @@ pub fn analyze_types_full(
         // Use propagated type from call sites if available, else all types
         let ty = propagated
             .and_then(|pts| pts.get(i).copied())
-            .filter(|t| !t.is_dead())
+            .filter(|t| !t.is_empty())
             .unwrap_or_else(all_types);
         initial_state.insert(param.var, ty);
     }
@@ -409,7 +413,13 @@ pub fn analyze_types_full(
 
         // Apply transfer function for each instruction
         for spanned_inst in &block.instructions {
-            transfer_instruction(&spanned_inst.node, &mut state, externs, return_types);
+            transfer_instruction(
+                &spanned_inst.node,
+                &mut state,
+                externs,
+                return_types,
+                &declared_types,
+            );
         }
 
         // Check if exit state changed
@@ -454,23 +464,63 @@ pub fn analyze_types_full(
         }
     }
 
-    // Convert to the public format
-    let mut at_entry = TypeMap::new();
-    let mut at_exit = TypeMap::new();
+    // Build per-VarId types from the defining block's exit state.
+    //
+    // In SSA, each VarId is defined exactly once. The type is determined
+    // by the instruction that defines it, not by which block uses it.
+    // Match refinement may propagate narrowed types for a VarId into
+    // successor blocks' entry states, but those are refinements of the
+    // original — the definition-site type is the canonical one.
+    //
+    // We use the exit state of the entry block for params, and for each
+    // instruction's dest, we use the exit state of the block it's in.
+    let mut types: HashMap<VarId, TypeSet> = HashMap::new();
 
-    for (block_id, state) in entry_states {
-        for (var, type_set) in state {
-            at_entry.insert((block_id, var), type_set);
+    // Params: from entry block's exit state
+    if let Some(entry_exit) = exit_states.get(&function.entry_block) {
+        for param in &function.params {
+            if let Some(&ts) = entry_exit.get(&param.var) {
+                types.insert(param.var, ts);
+            }
+        }
+        if let Some(ref rest) = function.rest_param
+            && let Some(&ts) = entry_exit.get(&rest.var)
+        {
+            types.insert(rest.var, ts);
         }
     }
 
-    for (block_id, state) in exit_states {
-        for (var, type_set) in state {
-            at_exit.insert((block_id, var), type_set);
+    // Instructions: from their defining block's exit state
+    for block in &function.blocks {
+        if let Some(exit) = exit_states.get(&block.id) {
+            for inst in &block.instructions {
+                // Get the dest VarId if this instruction defines one
+                let dest = match &inst.node {
+                    Instruction::Const { dest, .. }
+                    | Instruction::Copy { dest, .. }
+                    | Instruction::Index { dest, .. }
+                    | Instruction::Intrinsic { dest, .. }
+                    | Instruction::Call { dest, .. }
+                    | Instruction::MakeRef { dest, .. }
+                    | Instruction::Append { dest, .. }
+                    | Instruction::Phi { dest, .. }
+                    | Instruction::Read { dest, .. } => Some(*dest),
+                    Instruction::SetIndex { .. }
+                    | Instruction::WriteRef { .. }
+                    | Instruction::Assign { .. }
+                    | Instruction::Drop { .. } => None,
+                };
+
+                if let Some(var) = dest
+                    && let Some(&ts) = exit.get(&var)
+                {
+                    types.insert(var, ts);
+                }
+            }
         }
     }
 
-    TypeAnalysis { at_entry, at_exit }
+    TypeAnalysis { types }
 }
 
 // ============================================================================
@@ -481,7 +531,7 @@ pub fn analyze_types_full(
 mod tests {
     use super::*;
     use crate::ast;
-    use crate::ir::{BasicBlock, Literal, MatchPattern, Param, SpannedInst};
+    use crate::ir::{BasicBlock, Literal, MatchPattern, Param, SpannedInst, Var};
 
     fn var(id: u32) -> VarId {
         VarId(id)
@@ -538,7 +588,7 @@ mod tests {
         let func = make_function(blocks);
         let analysis = analyze_types(&func, None);
 
-        let type_set = analysis.get_at_exit(block(0), var(0)).unwrap();
+        let type_set = analysis.get(var(0)).unwrap();
         assert!(type_set.contains(BaseType::UInt));
         assert!(type_set.is_single());
     }
@@ -559,7 +609,7 @@ mod tests {
         let func = make_function(blocks);
         let analysis = analyze_types(&func, None);
 
-        let type_set = analysis.get_at_exit(block(0), var(0)).unwrap();
+        let type_set = analysis.get(var(0)).unwrap();
         assert_eq!(*type_set, TypeSet::undefined()); // Exactly {Undefined}
         assert!(type_set.may_be_undefined());
         assert!(!type_set.is_defined());
@@ -587,7 +637,7 @@ mod tests {
         let func = make_function(blocks);
         let analysis = analyze_types(&func, None);
 
-        let type_set = analysis.get_at_exit(block(0), var(1)).unwrap();
+        let type_set = analysis.get(var(1)).unwrap();
         assert!(type_set.contains(BaseType::Bool));
         assert!(type_set.is_single());
     }
@@ -597,12 +647,15 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_match_refines_type() {
-        // match x {
-        //   uint: block1,
-        //   int: block2,
-        //   _: block3
-        // }
+    fn test_match_with_narrowing_copies() {
+        // SSA narrowing: Match on param var(0), each arm has a narrowing Copy
+        // var(1) = Copy(var(0)) with UInt type in block 1
+        // var(2) = Copy(var(0)) with Int type in block 2
+        let locals = vec![
+            Var::new(var(0), ast::Identifier("x".into()), TypeSet::any()),
+            Var::new(var(1), ast::Identifier("$narrow".into()), TypeSet::uint()),
+            Var::new(var(2), ast::Identifier("$narrow".into()), TypeSet::int()),
+        ];
         let blocks = vec![
             BasicBlock {
                 id: block(0),
@@ -619,16 +672,22 @@ mod tests {
             },
             BasicBlock {
                 id: block(1),
-                instructions: vec![],
+                instructions: vec![si(Instruction::Copy {
+                    dest: var(1),
+                    src: var(0),
+                })],
                 terminator: Terminator::Return {
-                    value: Some(var(0)),
+                    value: Some(var(1)),
                 },
             },
             BasicBlock {
                 id: block(2),
-                instructions: vec![],
+                instructions: vec![si(Instruction::Copy {
+                    dest: var(2),
+                    src: var(0),
+                })],
                 terminator: Terminator::Return {
-                    value: Some(var(0)),
+                    value: Some(var(2)),
                 },
             },
             BasicBlock {
@@ -640,30 +699,46 @@ mod tests {
             },
         ];
 
-        let func = make_function_with_param(var(0), blocks);
+        let func = Function {
+            name: ast::Identifier("test".into()),
+            params: vec![Param {
+                var: var(0),
+                by_ref: false,
+            }],
+            rest_param: None,
+            blocks,
+            locals,
+            entry_block: BlockId(0),
+        };
+        // mem2reg is not needed — IR is already in SSA form
         let analysis = analyze_types(&func, None);
 
-        // In block 1, var(0) should be UInt only
-        let type_1 = analysis.get_at_entry(block(1), var(0)).unwrap();
+        // var(1) should be UInt (narrowing copy in block 1)
+        let type_1 = analysis.get(var(1)).unwrap();
         assert!(type_1.contains(BaseType::UInt));
-        assert!(type_1.is_single());
 
-        // In block 2, var(0) should be Int only
-        let type_2 = analysis.get_at_entry(block(2), var(0)).unwrap();
+        // var(2) should be Int (narrowing copy in block 2)
+        let type_2 = analysis.get(var(2)).unwrap();
         assert!(type_2.contains(BaseType::Int));
-        assert!(type_2.is_single());
 
-        // In block 3 (default), var(0) should NOT include UInt or Int
-        let type_3 = analysis.get_at_entry(block(3), var(0)).unwrap();
-        assert!(!type_3.contains(BaseType::UInt));
-        assert!(!type_3.contains(BaseType::Int));
+        // var(0) is the param — type is any()
+        let type_0 = analysis.get(var(0)).unwrap();
+        assert!(type_0.may_be_undefined()); // any() includes Undefined
     }
 
     #[test]
-    fn test_guard_match_refines_types() {
-        // Match with Type(Undefined) arm refines types:
-        // - Undefined arm: var is Undefined
-        // - Default (defined) arm: var has all types except Undefined
+    fn test_guard_with_narrowing_copy() {
+        // SSA narrowing: Match on var(1) from Index, defined path has a
+        // narrowing Copy var(2) with Undefined excluded.
+        let locals = vec![
+            Var::new(var(0), ast::Identifier("x".into()), TypeSet::any()),
+            Var::new(var(1), ast::Identifier("idx_result".into()), TypeSet::any()),
+            Var::new(
+                var(2),
+                ast::Identifier("$narrow".into()),
+                TypeSet::defined(),
+            ),
+        ];
         let blocks = vec![
             BasicBlock {
                 id: block(0),
@@ -681,9 +756,13 @@ mod tests {
             },
             BasicBlock {
                 id: block(1),
-                instructions: vec![],
+                // Narrowing copy: var(2) = Copy(var(1)) with defined() type
+                instructions: vec![si(Instruction::Copy {
+                    dest: var(2),
+                    src: var(1),
+                })],
                 terminator: Terminator::Return {
-                    value: Some(var(1)),
+                    value: Some(var(2)),
                 },
             },
             BasicBlock {
@@ -693,18 +772,27 @@ mod tests {
             },
         ];
 
-        let func = make_function_with_param(var(0), blocks);
+        let func = Function {
+            name: ast::Identifier("test".into()),
+            params: vec![Param {
+                var: var(0),
+                by_ref: false,
+            }],
+            rest_param: None,
+            blocks,
+            locals,
+            entry_block: BlockId(0),
+        };
         let analysis = analyze_types(&func, None);
 
-        // In the default (defined) branch, Undefined is excluded
-        let type_1 = analysis.get_at_entry(block(1), var(1)).unwrap();
-        assert!(!type_1.is_dead());
-        assert!(!type_1.contains(BaseType::Undefined));
+        // var(2) is the narrowing copy — should be defined() (no Undefined)
+        let type_2 = analysis.get(var(2)).unwrap();
+        assert!(!type_2.is_empty());
+        assert!(!type_2.contains(BaseType::Undefined));
 
-        // In the Undefined arm, var is Undefined
-        let type_2 = analysis.get_at_entry(block(2), var(1)).unwrap();
-        assert!(type_2.contains(BaseType::Undefined));
-        assert!(type_2.is_single());
+        // var(1) is the Index result — could be anything including Undefined
+        let type_1 = analysis.get(var(1)).unwrap();
+        assert!(type_1.may_be_undefined());
     }
 
     #[test]
@@ -754,7 +842,7 @@ mod tests {
         let analysis = analyze_types(&func, None);
 
         // Phi result should be UInt | Text
-        let type_set = analysis.get_at_exit(block(3), var(3)).unwrap();
+        let type_set = analysis.get(var(3)).unwrap();
         assert!(type_set.contains(BaseType::UInt));
         assert!(type_set.contains(BaseType::Text));
         assert_eq!(type_set.len(), 2);
@@ -788,7 +876,7 @@ mod tests {
         let analysis = analyze_types(&func, None);
 
         // Rest param should be Array type
-        let type_set = analysis.get_at_entry(block(0), var(1)).unwrap();
+        let type_set = analysis.get(var(1)).unwrap();
         assert!(type_set.contains(BaseType::Array));
         assert!(type_set.is_single());
     }

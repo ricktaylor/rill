@@ -145,9 +145,9 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
     - [x] `write_variable` via `current_def` tracking
     - [x] Phi insertion at control flow merge points
     - [x] Trivial phi elimination
-  - Phase 3: Validate — **2 ignored tests remain**
+  - Phase 3: Validate — **1 ignored test remains**
     - [ ] `bench_ackermann` — recursive if-else chains produce None
-    - [ ] `bench_map_operations` — in-place mutation via SetIndex not visible after for-loop dispatch
+    - [x] `bench_map_operations` — fixed by LowerVar refactor (redundant Copy removal)
 
 ### P2 — Optimization
 
@@ -169,13 +169,16 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
       `Value::Undefined` at runtime, `Terminator::Guard` → Match,
       `Instruction::Undefined` → `Const { Literal::Undefined }`,
       definedness pass deleted. See `docs/unified_definedness_plan.md`.
-- [ ] **SSA type narrowing** — After Match narrows a type, insert a Copy
-      with the narrowed TypeSet on each arm. Makes type analysis one
-      TypeSet per VarId globally (no per-block tracking). Eliminates
-      `get_at_exit(block_id, var_id)` in favour of `get(var_id)`.
-- [ ] **Type guard insertion pass** — emit Match before intrinsics
-      based on `param_type()` constraints. Makes implicit runtime type dispatch
-      explicit in IR. Enables peephole fusion. See `docs/runtime_checks.md`.
+- [x] **Clean layer separation** — Lowerer uses emit helpers (emit_const,
+      emit_index, emit_call, etc.) for temps, bind/read_var/reassign for
+      named variables. emit_guard/emit_match return narrowed VarIds (pi-nodes).
+      TypeAnalysis simplified to one TypeSet per VarId (no per-block tracking).
+      Copy transfer uses declared type intersection for narrowing.
+- [x] **Expression-level undefined guards** — `lower_guarded_expression`
+      wraps binary/unary ops with a shared fail block. All guards within
+      the expression jump to the same fail_bb. One Phi at the end merges
+      result with Undefined. No cascade — inner guards reuse the outer
+      fail_bb. `fail_used` check skips Phi when no guards were triggered.
 - [ ] **Delete `definedness.rs`** — file exists as dead code. Remove once
       E200/E201 diagnostics are confirmed working via TypeSet checks.
 

@@ -562,7 +562,7 @@ impl ExternDef {
                 && v.param_types
                     .iter()
                     .zip(arg_types)
-                    .all(|(spec, actual)| !actual.is_dead() && actual.difference(spec).is_dead())
+                    .all(|(spec, actual)| !actual.is_empty() && actual.difference(spec).is_empty())
         })
     }
 }

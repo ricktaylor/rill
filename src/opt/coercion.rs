@@ -59,8 +59,8 @@ pub fn insert_coercions(function: &mut Function, types: &TypeAnalysis) -> usize 
                     // Incompatible: if either arg is provably non-numeric
                     // (known type with no numeric intersection), the op
                     // always produces undefined.
-                    let a_incompatible = a_numeric.is_dead() && !a_type.is_dead();
-                    let b_incompatible = b_numeric.is_dead() && !b_type.is_dead();
+                    let a_incompatible = a_numeric.is_empty() && !a_type.is_empty();
+                    let b_incompatible = b_numeric.is_empty() && !b_type.is_empty();
                     if a_incompatible || b_incompatible {
                         new_instructions.push(spanned(
                             Instruction::Const {
@@ -141,11 +141,8 @@ fn is_coercible_binary(op: IntrinsicOp) -> bool {
 }
 
 /// Look up a variable's type from the analysis, defaulting to all types.
-fn lookup_type(types: &TypeAnalysis, block: BlockId, var: VarId) -> TypeSet {
-    types
-        .get_at_exit(block, var)
-        .copied()
-        .unwrap_or(TypeSet::any())
+fn lookup_type(types: &TypeAnalysis, _block: BlockId, var: VarId) -> TypeSet {
+    types.get(var).copied().unwrap_or(TypeSet::any())
 }
 
 /// Extract the single numeric BaseType from a TypeSet, if it contains exactly one.

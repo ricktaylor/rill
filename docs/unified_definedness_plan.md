@@ -14,7 +14,9 @@ separate Definedness lattice and analysis pass. Guard becomes Match.
 - **Stage 4a**: `Literal::Undefined` added, `Instruction::Undefined` removed (replaced with `Const { Literal::Undefined }`)
 - **Stage 4b**: `Terminator::Guard` removed, replaced with `Match { arms: [(Type(Undefined), undef_bb)], default: defined_bb }`
 - **Critical fix**: `TypeSet::all()` aliased to `any()` (includes Undefined) so type analysis correctly models unknown variables as possibly-undefined. Without this, `eliminate_dead_match_arms` incorrectly killed all definedness guards.
-- **Stage 5**: Definedness pass disconnected from optimizer pipeline. `analyze_definedness`, `eliminate_guards`, `check_definedness`, `ParamDefinedness` all removed from the pipeline. Guard elimination handled by `eliminate_dead_match_arms` via TypeSet. Compiler uses `TypeSet::is_defined()` instead of `Definedness::Defined`. If terminator specialization simplified (no unreachable for Undefined conditions). `definedness.rs` file kept as dead code for reference.
+- **Stage 5**: Definedness pass deleted (`definedness.rs` removed). `analyze_definedness`, `eliminate_guards`, `check_definedness`, `ParamDefinedness` all removed. Guard elimination handled by `eliminate_dead_match_arms` via TypeSet. Compiler uses `TypeSet::is_defined()`. E201 diagnostics re-added as post-optimisation TypeSet check.
+- **Stage 6**: TypeSet API renamed — `empty()` → `none()`, `is_empty()` → `is_dead()`, `all()` removed (use `any()` or `defined()`). All migration aliases removed. `TypeSet::undefined()` for Const(Undefined) vars instead of empty().
+- **Remaining**: SSA type narrowing — clean layer separation (lowerer → SSA → optimizer). Narrowing copies after Match arms belong in SSA pass. Per-block type tracking to be replaced with per-VarId once layers are separated.
 
 ## Stage 1: Foundation Types
 

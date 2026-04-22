@@ -94,49 +94,18 @@ pub enum IntrinsicOp {
 }
 
 impl IntrinsicOp {
-    /// Whether this operation can fail (return undefined) for domain reasons.
-    /// Impure operations are always fallible; this covers the pure/const case.
-    pub fn is_fallible(self) -> bool {
-        match self {
-            // Arithmetic can overflow / divide-by-zero
-            Self::Add | Self::Sub | Self::Mul | Self::Div | Self::Mod | Self::Neg => true,
-            // Comparison: type mismatch → undefined
-            Self::Eq => false,
-            Self::Lt => true,
-            // Logical: always succeed on correct types
-            Self::Not => false,
-            // Bitwise: bit_test/bit_set can go out of bounds
-            Self::BitAnd | Self::BitOr | Self::BitXor | Self::BitNot | Self::Shl | Self::Shr => {
-                false
-            }
-            Self::BitTest | Self::BitSet => true,
-            // Collection
-            Self::Len => true, // wrong type → undefined
-            Self::MakeArray => false,
-            Self::MakeMap => true, // odd arg count
-            // Sequence
-            Self::MakeSeq | Self::ArraySeq(_) => false,
-            Self::SeqNext => true,  // exhausted → undefined
-            Self::Collect => false, // always succeeds (empty seq → empty array)
-            // Checked UInt→Int can overflow (u64::MAX > i64::MAX), all others are infallible
-            Self::Convert(NumericType::Int, ConvertMode::Checked) => true,
-            Self::Convert(..) => false,
-        }
-    }
-
     /// Required type for each argument position.
     ///
-    /// Returns the TypeSet of types that are valid for each argument. If the
-    /// actual operand type has no intersection with the required type, the
-    /// operation will always produce undefined — which is almost certainly a bug.
+    /// All intrinsics require defined inputs — Undefined poisons everything.
+    /// No param_type includes Undefined.
     pub fn param_type(self, index: usize) -> TypeSet {
         match self {
             // Arithmetic: both args must be numeric
             Self::Add | Self::Sub | Self::Mul | Self::Div | Self::Mod => TypeSet::numeric(),
             Self::Neg => TypeSet::numeric(),
 
-            // Comparison
-            Self::Eq => TypeSet::any(), // any two values can be compared
+            // Comparison: any defined value
+            Self::Eq => TypeSet::defined(),
             Self::Lt => TypeSet::numeric(),
 
             // Logical: Bool only
@@ -157,38 +126,55 @@ impl IntrinsicOp {
 
             // Collection
             Self::Len => TypeSet::collection(),
-            Self::MakeArray | Self::MakeMap => TypeSet::any(),
+            Self::MakeArray | Self::MakeMap => TypeSet::defined(),
 
             // Sequence
             Self::MakeSeq => TypeSet::uint(), // start, end
-            Self::ArraySeq(_) => TypeSet::any(),
-            Self::SeqNext => TypeSet::single(BaseType::Sequence), // arg must be Sequence
+            Self::ArraySeq(_) => TypeSet::defined(),
+            Self::SeqNext => TypeSet::single(BaseType::Sequence),
             Self::Collect => TypeSet::single(BaseType::Sequence),
             // Conversion: single arg (the value to convert)
             Self::Convert(..) => TypeSet::numeric(),
         }
     }
 
-    /// Static result type (worst case, ignoring operand types).
+    /// Static result type — the value types this operation can produce.
+    ///
+    /// Includes Undefined where the operation can fail (overflow, div-by-zero,
+    /// type mismatch, out-of-bounds, exhaustion). Expression-level guards
+    /// ensure inputs are defined, but the operation itself may still produce
+    /// Undefined from domain errors.
     pub fn result_type(self) -> TypeSet {
         match self {
+            // Arithmetic: can overflow / div-by-zero
             Self::Add | Self::Sub | Self::Mul | Self::Div | Self::Mod | Self::Neg => {
-                TypeSet::numeric()
+                TypeSet::numeric().union(&TypeSet::undefined())
             }
-            Self::Eq | Self::Lt | Self::Not | Self::BitTest => TypeSet::bool(),
-            Self::BitAnd
-            | Self::BitOr
-            | Self::BitXor
-            | Self::BitNot
-            | Self::Shl
-            | Self::Shr
-            | Self::BitSet
-            | Self::Len => TypeSet::uint(),
-            Self::MakeArray => TypeSet::single(BaseType::Array),
-            Self::MakeMap => TypeSet::single(BaseType::Map),
-            Self::MakeSeq | Self::ArraySeq(_) => TypeSet::single(BaseType::Sequence),
-            Self::SeqNext => TypeSet::any(), // element could be any type
-            Self::Collect => TypeSet::single(BaseType::Array),
+            // Eq: infallible (with defined inputs, always produces Bool)
+            Self::Eq | Self::Not => TypeSet::bool(),
+            // Lt: type mismatch → undefined
+            Self::Lt => TypeSet::bool().union(&TypeSet::undefined()),
+            // Bitwise: infallible on UInt inputs
+            Self::BitAnd | Self::BitOr | Self::BitXor | Self::BitNot | Self::Shl | Self::Shr => {
+                TypeSet::uint()
+            }
+            // BitTest/BitSet: out-of-bounds bit position → undefined
+            Self::BitTest => TypeSet::bool().union(&TypeSet::undefined()),
+            Self::BitSet => TypeSet::uint().union(&TypeSet::undefined()),
+            // Len: wrong type → undefined
+            Self::Len => TypeSet::uint().union(&TypeSet::undefined()),
+            // Collection construction: infallible (lowerer guarantees valid args)
+            Self::MakeArray => TypeSet::array(),
+            Self::MakeMap => TypeSet::map(),
+            // Sequence: MakeSeq/ArraySeq infallible, SeqNext exhaustion → undefined
+            Self::MakeSeq | Self::ArraySeq(_) => TypeSet::sequence(),
+            Self::SeqNext => TypeSet::any(),
+            // Collect: always succeeds (empty seq → empty array)
+            Self::Collect => TypeSet::array(),
+            // Convert: checked UInt→Int can overflow
+            Self::Convert(NumericType::Int, ConvertMode::Checked) => {
+                TypeSet::int().union(&TypeSet::undefined())
+            }
             Self::Convert(t, _) => TypeSet::single(BaseType::from(t)),
         }
     }
@@ -292,7 +278,7 @@ fn promote_union(a: TypeSet, b: TypeSet) -> TypeSet {
         result = result.union(&TypeSet::single(BaseType::Float));
     }
 
-    if result.is_dead() {
+    if result.is_empty() {
         TypeSet::numeric()
     } else {
         result
@@ -491,6 +477,21 @@ pub enum Literal {
     Undefined,
 }
 
+impl Literal {
+    /// The BaseType this literal belongs to.
+    pub fn base_type(&self) -> BaseType {
+        match self {
+            Literal::Bool(_) => BaseType::Bool,
+            Literal::UInt(_) => BaseType::UInt,
+            Literal::Int(_) => BaseType::Int,
+            Literal::Float(_) => BaseType::Float,
+            Literal::Text(_) => BaseType::Text,
+            Literal::Bytes(_) => BaseType::Bytes,
+            Literal::Undefined => BaseType::Undefined,
+        }
+    }
+}
+
 // ============================================================================
 // Control Flow
 // ============================================================================
@@ -594,6 +595,16 @@ pub struct Function {
     pub locals: Vec<Var>,
     pub blocks: Vec<BasicBlock>,
     pub entry_block: BlockId,
+}
+
+impl Function {
+    /// Get the TypeSet of a variable by VarId. O(1) direct indexing.
+    pub fn var_type(&self, var: VarId) -> TypeSet {
+        self.locals
+            .get(var.0 as usize)
+            .map(|v| v.type_set)
+            .unwrap_or(TypeSet::any())
+    }
 }
 
 impl Default for Function {

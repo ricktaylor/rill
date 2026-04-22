@@ -122,6 +122,12 @@ pub struct Lowerer<'a> {
     /// Extern functions merged into root scope via `require ns as _`.
     /// Maps function name → source namespace (for diagnostics).
     pub merged_externs: HashMap<ast::Identifier, ast::Identifier>,
+
+    /// Expression-level guard fail block. When set, `emit_binary_intrinsic`
+    /// and `emit_unary_intrinsic` guard their args against Undefined,
+    /// jumping to this block if any arg is Undefined. All guards within
+    /// an expression share the same fail block — no intermediate Phis.
+    pub expr_guard_fail: Option<BlockId>,
 }
 
 /// Context for a loop (for break/continue)
@@ -151,6 +157,7 @@ impl<'a> Lowerer<'a> {
             loop_stack: Vec::new(),
             require_aliases: HashMap::new(),
             merged_externs: HashMap::new(),
+            expr_guard_fail: None,
         }
     }
 
@@ -191,12 +198,7 @@ impl<'a> Lowerer<'a> {
 
     /// Create an undefined value as error recovery placeholder
     pub fn error_placeholder(&mut self) -> VarId {
-        let dest = self.new_temp(TypeSet::undefined());
-        self.emit(Instruction::Const {
-            dest,
-            value: Literal::Undefined,
-        });
-        dest
+        self.emit_undefined()
     }
 
     // ========================================================================
@@ -227,6 +229,15 @@ impl<'a> Lowerer<'a> {
 
     pub fn new_temp(&mut self, type_set: TypeSet) -> VarId {
         self.new_var(ast::Identifier("$tmp".to_string()), type_set)
+    }
+
+    /// Get the declared TypeSet for a VarId.
+    pub fn var_type(&self, var: VarId) -> TypeSet {
+        self.vars
+            .iter()
+            .find(|v| v.id == var)
+            .map(|v| v.type_set)
+            .unwrap_or(TypeSet::any())
     }
 
     // ========================================================================
@@ -359,6 +370,150 @@ impl<'a> Lowerer<'a> {
     pub fn emit(&mut self, instruction: Instruction) {
         self.current_instructions
             .push(ast::Spanned::new(instruction, self.current_span));
+    }
+
+    // ========================================================================
+    // Typed Emission Helpers
+    //
+    // All computation flows through these. Each creates a temp VarId,
+    // emits the instruction, and returns the VarId. The lowerer should
+    // use these instead of constructing Instruction variants directly.
+    // ========================================================================
+
+    /// Emit a constant value, returning the temp that holds it.
+    pub fn emit_const(&mut self, value: Literal) -> VarId {
+        let type_set = match &value {
+            Literal::Bool(_) => TypeSet::bool(),
+            Literal::UInt(_) => TypeSet::uint(),
+            Literal::Int(_) => TypeSet::int(),
+            Literal::Float(_) => TypeSet::float(),
+            Literal::Text(_) => TypeSet::text(),
+            Literal::Bytes(_) => TypeSet::bytes(),
+            Literal::Undefined => TypeSet::undefined(),
+        };
+        let dest = self.new_temp(type_set);
+        self.emit(Instruction::Const { dest, value });
+        dest
+    }
+
+    /// Emit a Copy, returning the new temp.
+    pub fn emit_copy(&mut self, src: VarId, type_set: TypeSet) -> VarId {
+        let dest = self.new_temp(type_set);
+        self.emit(Instruction::Copy { dest, src });
+        dest
+    }
+
+    /// Emit an Index operation: `dest = base[key]`.
+    pub fn emit_index(&mut self, base: VarId, key: VarId) -> VarId {
+        let dest = self.new_temp(TypeSet::any());
+        self.emit(Instruction::Index { dest, base, key });
+        dest
+    }
+
+    /// Emit a function call, returning the result temp.
+    /// Uses the extern's declared return type if known, otherwise `any()`.
+    pub fn emit_call(&mut self, function: FunctionRef, args: Vec<CallArg>) -> VarId {
+        let return_type = self
+            .externs
+            .lookup(&function)
+            .map(|def| *def.meta.returns.type_sig())
+            .unwrap_or(TypeSet::any());
+        let dest = self.new_temp(return_type);
+        self.emit(Instruction::Call {
+            dest,
+            function,
+            args,
+        });
+        dest
+    }
+
+    /// Emit an Undefined constant.
+    pub fn emit_undefined(&mut self) -> VarId {
+        self.emit_const(Literal::Undefined)
+    }
+
+    /// Emit a Phi node, computing the type as the union of source types.
+    pub fn emit_phi(&mut self, sources: Vec<(BlockId, VarId)>) -> VarId {
+        let type_set = sources.iter().fold(TypeSet::none(), |acc, &(_, var)| {
+            acc.union(&self.var_type(var))
+        });
+        let dest = self.new_temp(type_set);
+        self.emit(Instruction::Phi { dest, sources });
+        dest
+    }
+
+    /// Emit a binary intrinsic operation.
+    /// If `expr_guard_fail` is set, type-guards both args against param_type.
+    pub fn emit_binary_intrinsic(&mut self, op: IntrinsicOp, lhs: VarId, rhs: VarId) -> VarId {
+        let (lhs, rhs) = if let Some(fail_bb) = self.expr_guard_fail {
+            (
+                self.emit_type_guard(lhs, op.param_type(0), fail_bb),
+                self.emit_type_guard(rhs, op.param_type(1), fail_bb),
+            )
+        } else {
+            (lhs, rhs)
+        };
+        let dest = self.new_temp(op.result_type());
+        self.emit(Instruction::Intrinsic {
+            dest,
+            op,
+            args: vec![lhs, rhs],
+        });
+        dest
+    }
+
+    /// Emit a unary intrinsic operation.
+    /// If `expr_guard_fail` is set, type-guards the arg against param_type.
+    pub fn emit_unary_intrinsic(&mut self, op: IntrinsicOp, arg: VarId) -> VarId {
+        let arg = if let Some(fail_bb) = self.expr_guard_fail {
+            self.emit_type_guard(arg, op.param_type(0), fail_bb)
+        } else {
+            arg
+        };
+        let dest = self.new_temp(op.result_type());
+        self.emit(Instruction::Intrinsic {
+            dest,
+            op,
+            args: vec![arg],
+        });
+        dest
+    }
+
+    /// Emit a type guard: Match on the value's type against the required TypeSet.
+    /// If the value's type is in the required set, returns a narrowed VarId.
+    /// If not, jumps to fail_bb.
+    ///
+    /// For single-type requirements (e.g. Bool), emits a single-arm Match.
+    /// For multi-type requirements (e.g. numeric = UInt|Int|Float), emits
+    /// a multi-arm Match with one arm per accepted type.
+    pub fn emit_type_guard(&mut self, value: VarId, required: TypeSet, fail_bb: BlockId) -> VarId {
+        // If the value's declared type is already within the required set,
+        // no guard needed.
+        let src_type = self.var_type(value);
+        if !src_type.is_empty() && src_type.difference(&required).is_empty() {
+            return value;
+        }
+
+        let ok_bb = self.fresh_block();
+
+        // Build Match arms: one per accepted type
+        let arms: Vec<(MatchPattern, BlockId)> = required
+            .iter()
+            .map(|ty| (MatchPattern::Type(ty), ok_bb))
+            .collect();
+
+        self.finish_block(Terminator::Match {
+            value,
+            arms,
+            default: fail_bb,
+            span: self.current_span,
+        });
+
+        self.current_block = ok_bb;
+        self.current_instructions = Vec::new();
+
+        // Narrowing: value is now known to be within the required type set
+        self.emit_narrowing(value, src_type.intersection(&required))
     }
 
     /// Set the current span for subsequent instructions

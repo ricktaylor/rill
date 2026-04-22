@@ -438,6 +438,10 @@ impl PromoteCtx {
             .map(|m| m + 1)
             .unwrap_or(0);
         for id in existing_max..self.next_var_id {
+            // Phi vars and uninitialized reads get any() — type refinement narrows later.
+            // Uninitialized reads (entry block, no Assign) produce Undefined at runtime
+            // but we use any() here because phis at loop headers merge defined values
+            // and shouldn't be constrained to Undefined.
             function.locals.push(Var::new(
                 VarId(id),
                 ast::Identifier("_phi".to_string()),
