@@ -322,6 +322,22 @@ impl Var {
     pub fn new(id: VarId, name: ast::Identifier, type_set: TypeSet) -> Self {
         Var { id, name, type_set }
     }
+
+    /// Whether this is a user-defined variable (not a compiler temp).
+    pub fn is_user_var(&self) -> bool {
+        let n = self.name.as_ref();
+        !n.starts_with('$') && n != "_phi"
+    }
+
+    /// Human-readable name for diagnostics.
+    /// Returns the original variable name for user vars, or `_N` for temps.
+    pub fn display_name(&self) -> String {
+        if self.is_user_var() {
+            format!("`{}`", self.name)
+        } else {
+            format!("_{}", self.id.0)
+        }
+    }
 }
 
 // ============================================================================
@@ -604,6 +620,49 @@ impl Function {
             .get(var.0 as usize)
             .map(|v| v.type_set)
             .unwrap_or(TypeSet::any())
+    }
+
+    /// Human-readable variable name for diagnostics.
+    /// For user variables, returns the name. For temps, traces back through
+    /// SSA to describe the expression that produced the value.
+    pub fn var_display_name(&self, var: VarId) -> String {
+        if let Some(v) = self.locals.get(var.0 as usize) {
+            if v.is_user_var() {
+                return v.display_name();
+            }
+        }
+        // Temp — find the defining instruction and describe it
+        self.describe_var_origin(var)
+    }
+
+    /// Trace a VarId back through SSA to describe its origin.
+    fn describe_var_origin(&self, var: VarId) -> String {
+        for block in &self.blocks {
+            for inst in &block.instructions {
+                let (dest, desc) = match &inst.node {
+                    Instruction::Copy { dest, src } => {
+                        // Follow copies to find the real origin
+                        (*dest, self.var_display_name(*src))
+                    }
+                    Instruction::Index { dest, .. } => (*dest, "index result".to_string()),
+                    Instruction::Intrinsic { dest, op, .. } => {
+                        (*dest, format!("result of `{:?}`", op))
+                    }
+                    Instruction::Call { dest, function, .. } => {
+                        (*dest, format!("result of call to `{}`", function.qualified_name()))
+                    }
+                    Instruction::Phi { dest, .. } => (*dest, "merged value".to_string()),
+                    Instruction::MakeRef { dest, .. } => (*dest, "reference".to_string()),
+                    Instruction::Append { dest, .. } => (*dest, "append result".to_string()),
+                    Instruction::Const { dest, .. } => (*dest, "constant".to_string()),
+                    _ => continue,
+                };
+                if dest == var {
+                    return desc;
+                }
+            }
+        }
+        format!("_{}", var.0)
     }
 }
 

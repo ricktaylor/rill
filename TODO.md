@@ -20,13 +20,13 @@ The full compilation and execution pipeline is working end-to-end with 139+ test
   - Range guard: `start < end` If check before MakeSeq/ArraySeq (reversed → undefined)
   - Inclusive ranges normalized to exclusive via `end + 1` checked Add in lowerer
   - Extern param type guards (Match guards inserted before constrained calls)
-- **Optimizer** — 11 passes in two-phase pipeline (`src/ir/opt/`)
-  - Phase 1 (fixpoint): const fold → CSE → copy prop → definedness → guard elim → CFG simplify → coercion elision → DCE
-  - Phase 2 (type-informed): type refinement → coercion insertion (Convert/Undefined) → algebraic simplification → cast elision → ref elision → dead arm elimination → re-run Phase 1
-  - Interprocedural return type inference + argument type/definedness propagation
+- **Optimizer** — passes in two-phase pipeline (`src/ir/opt/`)
+  - Phase 1 (fixpoint): const fold → CSE → copy prop → CFG simplify → coercion elision → DCE
+  - Phase 2 (type-informed): type refinement → coercion insertion (Convert/Undefined) → algebraic simplification → cast elision → ref elision → dead match arm elimination → re-run Phase 1
+  - Interprocedural return type inference + argument type propagation
   - Function monomorphization (up to 4 variants per function)
-  - Type mismatch warnings (W009), definedness diagnostics (E200/E201) with provenance tracking
-  - Guarded index suppression (loop guards, length checks, match scrutinees)
+  - Type mismatch warnings (W009), definedness diagnostics (E201) via TypeSet
+  - Unified type/definedness: Undefined is a type, no separate definedness pass
 - **Compiler** — closure-threaded with type specialization (`src/compile/`)
   - Type-specialized closures (direct `u64::checked_add` etc. when types provably known)
   - Extern monomorphism (variant selection at compile time)
@@ -158,8 +158,19 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
       already type-specialized, so the inlined body folds further via
       const fold + coercion elision. Decision: inline if callee is pure,
       small (< ~10 instructions), and called with known-type args.
-- [ ] **Loop-Invariant Code Motion (LICM)** — lift pure computations with
-      loop-external operands to pre-header. Requires loop detection, dominator tree.
+- [ ] **Dominator tree + Cytron SSA** — when LICM or GVN is needed, build a
+      dominator tree and switch from Braun et al. to Cytron et al. for SSA
+      construction. The tree enables three things at once:
+      1. LICM (lift loop-invariant code to pre-header)
+      2. GVN (more powerful CSE across blocks)
+      3. Array bounds checking (recognise `i < len(arr)` guards dominating
+         `arr[i]` and mark Index results as defined)
+      Braun has no advantage once the tree exists. Single migration, three wins.
+      Note: for-loop element bindings currently use explicit narrowing copies
+      (`emit_copy(raw, TypeSet::defined())` in `lower_for_idx`, `emit_narrowing`
+      in `lower_for_seq`) because the lowerer knows `i < len` holds. With
+      dominator-based bounds checking, the type analysis would prove this
+      automatically and these manual annotations can be removed.
 - [ ] **Dead write-back elimination** — a WriteRef exists but the base value is never
       read after the write-back point. Requires liveness analysis.
 
@@ -179,8 +190,10 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
       the expression jump to the same fail_bb. One Phi at the end merges
       result with Undefined. No cascade — inner guards reuse the outer
       fail_bb. `fail_used` check skips Phi when no guards were triggered.
-- [ ] **Delete `definedness.rs`** — file exists as dead code. Remove once
-      E200/E201 diagnostics are confirmed working via TypeSet checks.
+- [x] **`definedness.rs` deleted** — definedness pass fully replaced by TypeSet.
+- [x] **Type guards for intrinsic args** — `emit_type_guard` checks args
+      match `param_type()` via Match. Fallibility in `result_type()`.
+      `is_fallible()` removed — folded into `result_type()` per-arm.
 
 ### P2 — Diagnostics
 
@@ -282,50 +295,24 @@ the current closure-per-instruction approach.
 
 ### Type-Specialized Compilation (completed)
 
-Two-phase definedness model:
+Optimizer pipeline:
 ```
-Phase 1 (coarse — before type info):
-  Const Fold → Definedness (coarse) → Diagnostics → Guard Elim → CFG Simplify
+Phase 1 (fixpoint):
+  Const Fold → CSE → Copy Prop → CFG Simplify → Coercion Elision → DCE
 
 Phase 2 (type-informed — on simplified CFG):
-  Type Refinement → Coercion Insertion (generates Match + Convert + Undefined)
-    → Definedness (fine — sees explicit Undefined from coercion)
-      → Guard Elim → CFG Simplify → Const Fold → CFG Simplify
-        → Type-aware closure compilation
+  Type Refinement → Coercion Insertion (Convert for mixed types)
+    → Dead Match Arm Elimination → Algebraic Simplification
+      → Cast Elision → Ref Elision → Re-run Phase 1
+
+Phase 3 (post-optimisation):
+  E201 definedness warnings (TypeSet-based)
 ```
 
-The coercion pass bridges type analysis and definedness: it transforms type
-mismatches into explicit `Undefined` instructions that the existing definedness
-analysis can reason about — no new analysis infrastructure needed.
-
-### Unified Type/Definedness (P2)
-
-Undefined is really just a type. The separate `Definedness` lattice
-(`Defined | MaybeUndefined | Undefined`) and its dedicated analysis pass
-can be replaced by adding `BaseType::Undefined` to the TypeSet:
-
-```
-Definedness::Defined        →  !type.contains(Undefined)
-Definedness::MaybeUndefined →  type.contains(Undefined) && type.len() > 1
-Definedness::Undefined      →  type == TypeSet::single(Undefined)
-Guard { defined, undefined } →  Match { arms: [(Undefined, undef_bb)], default: ok_bb }
-Instruction::Undefined      →  Instruction::Const { Literal::Undefined }
-all_defined (compiler)      →  !type.contains(Undefined)  (same query as type analysis)
-```
-
-TypeSet naming:
-- `TypeSet::any()` — true top, all types including Undefined
-- `TypeSet::defined()` — any value type, excludes Undefined (replaces current `all()`)
-- `TypeSet::numeric()` etc. — excludes Undefined (implies defined)
-
-Runtime: `Option<Value>` becomes `Value` with an `Undefined` variant.
-Slots are always populated. The `all_defined` optimization becomes
-"type analysis proved no Undefined in the set" — the same pass that
-already narrows types.
-
-This eliminates: the `Definedness` enum, the `DefinednessAnalysis` pass,
-the `Guard` terminator variant, and the `Instruction::Undefined` variant.
-Guard becomes Match. Undefined becomes Const. One analysis instead of two.
+Undefined is a type (`BaseType::Undefined`). No separate definedness pass.
+Type guards (`emit_type_guard`) check both type and definedness via Match.
+Expression-level guards (`lower_guarded_expression`) prevent Phi cascade.
+See `docs/unified_definedness_plan.md` and `docs/runtime_checks.md`.
 
 ## File Map
 

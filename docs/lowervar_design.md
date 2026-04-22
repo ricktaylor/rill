@@ -1,4 +1,4 @@
-# LowerVar Design
+# Lowerer Architecture
 
 ## Core Principle
 
@@ -14,30 +14,12 @@ Assign  = write a temp into a slot
 Read    = get a temp from a slot
 ```
 
-## The Type
-
-```rust
-/// A value in the lowerer. All values are temps — VarIds defined by
-/// exactly one instruction. Named variables are accessed via slots
-/// (Assign/Read), which produce temps.
-///
-/// LowerVar is a transparent wrapper over VarId that prevents the
-/// lowerer from accidentally constructing instructions with raw VarIds.
-/// All instruction emission goes through helper methods that accept
-/// LowerVar and call as_var() internally.
-struct LowerVar(VarId);
-```
-
-Wait — if everything is a temp, why do we need `LowerVar` at all?
-Because the lowerer needs to track **what a value represents** for
-binding and narrowing decisions. But the instruction operands are
-always VarIds (temps).
-
-The real abstraction the lowerer needs is not a variable type — it's
-a clean API where:
-- You can't emit an instruction without going through helpers
-- Named variable access always goes through read/write
-- Narrowing happens automatically at Match boundaries
+The abstraction is the **API** — emit helpers that return VarIds and
+prevent direct instruction construction:
+- All instruction emission goes through helpers (`emit_const`, `emit_binary_intrinsic`, etc.)
+- Named variable access goes through `bind`/`read_var`/`reassign`
+- Type narrowing happens automatically at Match boundaries via `emit_type_guard`
+- Expression-level guards wrap binary/unary ops via `lower_guarded_expression`
 
 ## Lowerer API
 

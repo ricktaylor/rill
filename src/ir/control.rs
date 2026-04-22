@@ -602,11 +602,13 @@ impl<'a> Lowerer<'a> {
         let idx_bb = self.fresh_block();
         let join_bb = self.fresh_block();
 
+        // Type dispatch is compiler-internal — use default span to suppress
+        // unreachable arm warnings (the user didn't write this match).
         self.finish_block(Terminator::Match {
             value: iter_var,
             arms: vec![(MatchPattern::Type(types::BaseType::Sequence), seq_bb)],
             default: idx_bb,
-            span: self.current_span,
+            span: ast::Span::default(),
         });
 
         // === Sequence path ===
@@ -692,8 +694,9 @@ impl<'a> Lowerer<'a> {
             BindingMode::Reference
         };
 
+        // Index is bounded by i < len(iter_var) — element is always defined.
         let (elem, elem_origin) = if matches!(mode, BindingMode::Reference) {
-            let dest = self.new_temp(TypeSet::any());
+            let dest = self.new_temp(TypeSet::defined());
             self.emit(Instruction::MakeRef {
                 dest,
                 base: iter_var,
@@ -702,7 +705,8 @@ impl<'a> Lowerer<'a> {
             let origin = RefOrigin { ref_var: dest };
             (dest, Some(origin))
         } else {
-            let dest = self.emit_index(iter_var, i_var);
+            let raw = self.emit_index(iter_var, i_var);
+            let dest = self.emit_copy(raw, TypeSet::defined());
             (dest, None)
         };
 
@@ -815,16 +819,19 @@ impl<'a> Lowerer<'a> {
 
         let elem = self.emit_unary_intrinsic(IntrinsicOp::SeqNext, seq_var);
 
+        // SeqNext exhaustion guard is compiler-internal — use default span
+        // to suppress spurious diagnostics.
         self.finish_block(Terminator::Match {
             value: elem,
             arms: vec![(MatchPattern::Type(types::BaseType::Undefined), exit_bb)],
             default: body_bb,
-            span: self.current_span,
+            span: ast::Span::default(),
         });
 
-        // Body
+        // Body — elem is provably defined (Undefined took exit_bb)
         self.current_block = body_bb;
         self.current_instructions = Vec::new();
+        let elem = self.emit_narrowing(elem, TypeSet::defined());
         self.push_scope();
 
         // Sequences are always by-value (no backing collection to write back to).

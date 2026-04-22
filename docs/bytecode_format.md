@@ -112,7 +112,119 @@ in the bytecode's function list and resolve without any external registry.
 
 Externs (embedder-provided functions, both global and namespaced) are the
 only truly late-bound symbols. They appear as symbolic `FunctionRef` names
-and are resolved against the host's `ExternRegistry` at load time.
+with encoded type signatures, and are resolved against the host's
+`ExternRegistry` at load time.
+
+### Extern signature encoding
+
+Each extern `FunctionRef` in bytecode includes the type signature that
+was in effect at compilation time. This enables the linker to detect
+signature drift — when the host's `ExternRegistry` has changed since
+the bytecode was compiled.
+
+The signature is encoded using the `TypeSet` bitfield, compactly
+represented as two base64 characters per type position.
+
+#### Binary representation (in CBOR)
+
+```
+FunctionRef {
+  namespace: Option<String>,  ; extern namespace (None = global)
+  name: String,               ; function name
+  param_sigs: [<u16>, ...],   ; TypeSet bits for each parameter
+  return_sig: <u16>,          ; TypeSet bits for return type
+  diverges: bool,             ; true if function exits (never returns)
+}
+```
+
+#### Human-readable mangled names
+
+For diagnostics, logging, and bytecode inspection, TypeSet values are
+encoded as two base64 characters. The 10-bit TypeSet splits into 4 high
+bits + 6 low bits, each mapped to a base64 character:
+
+```
+Base64 alphabet: A-Z (0-25), a-z (26-51), 0-9 (52-61), + (62), / (63)
+
+TypeSet bits (10):  HHHH LLLLLL
+                    ─┬── ──┬───
+                     │     └── second char: bits[5:0] → base64
+                     └──────── first char:  bits[9:6] → base64 (0-15 only)
+```
+
+The mangled extern reference is: `name$param1$param2$...$return`
+where each position is two base64 chars. Diverging functions use `!`
+for the return position.
+
+| TypeSet | Bits | Encoded | Meaning |
+|---------|------|---------|---------|
+| `bool()` | `0b0000000001` | `AB` | Bool only |
+| `uint()` | `0b0000000010` | `AC` | UInt only |
+| `int()` | `0b0000000100` | `AE` | Int only |
+| `float()` | `0b0000001000` | `AI` | Float only |
+| `numeric()` | `0b0000001110` | `AO` | UInt\|Int\|Float |
+| `text()` | `0b0000010000` | `AQ` | Text only |
+| `bytes()` | `0b0000100000` | `Ag` | Bytes only |
+| `array()` | `0b0001000000` | `BA` | Array only |
+| `map()` | `0b0010000000` | `CA` | Map only |
+| `sequence()` | `0b0100000000` | `EA` | Sequence only |
+| `defined()` | `0b0111111111` | `H/` | All value types |
+| `undefined()` | `0b1000000000` | `IA` | Undefined only |
+| `any()` | `0b1111111111` | `P/` | All including Undefined |
+
+**Examples:**
+```
+sqrt$AO$AO          ; sqrt(numeric) -> numeric
+decode$Ag$H/        ; decode(Bytes) -> defined()
+exit$AC$!           ; exit(UInt) -> diverges
+len$Bg$AC           ; len(collection) -> UInt  (collection = 0b0001110000)
+cbor::encode$H/$Ag  ; cbor::encode(defined) -> Bytes
+```
+
+The `TypeSet` bit layout:
+```
+Bit 0: Bool      Bit 5: Bytes
+Bit 1: UInt      Bit 6: Array
+Bit 2: Int       Bit 7: Map
+Bit 3: Float     Bit 8: Sequence
+Bit 4: Text      Bit 9: Undefined
+```
+
+**Link-time compatibility checks:**
+
+At load time, the linker compares bytecode signatures against the
+registry's current signatures using subset/superset rules:
+
+| Check | Rule | Rationale |
+|-------|------|-----------|
+| Param types | bytecode ⊆ registry | Bytecode passes narrower types; registry accepts wider — safe |
+| Return type | registry ⊆ bytecode | Registry returns narrower types; bytecode handles wider — safe |
+| Param count | bytecode ≤ registry (with optional params) | Extra optional params are safe |
+| Diverges | must match | Diverging vs returning is a control flow difference |
+
+If a check fails, the linker emits `E500_ExternSignatureMismatch` with
+the expected and actual signatures — a clear diagnostic pointing to the
+drift.
+
+**Example:**
+
+```
+; Compiled with: sqrt(x: numeric) -> numeric
+; Bytecode contains: param_sigs=[0x000E], return_sig=0x000E
+
+; Host registry has: sqrt(x: Float) -> Float
+; Registry param: 0x0008 (Float only)
+; Registry return: 0x0008 (Float only)
+
+; Check: bytecode param 0x000E ⊆ registry param 0x0008? NO
+;   Bytecode passes UInt|Int|Float but registry only accepts Float
+;   → E500: extern `sqrt` parameter 0 type mismatch
+;     bytecode expects {UInt, Int, Float}, host accepts {Float}
+```
+
+This catches real bugs: code compiled expecting `sqrt(42)` to work
+(UInt arg) would fail at runtime if the host's `sqrt` only accepts Float.
+The linker catches it at load time instead.
 
 ### Top-level structure
 

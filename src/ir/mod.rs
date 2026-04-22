@@ -502,11 +502,13 @@ impl<'a> Lowerer<'a> {
             .map(|ty| (MatchPattern::Type(ty), ok_bb))
             .collect();
 
+        // Type guard is compiler-internal — use default span to suppress
+        // spurious diagnostics about unreachable arms.
         self.finish_block(Terminator::Match {
             value,
             arms,
             default: fail_bb,
-            span: self.current_span,
+            span: ast::Span::default(),
         });
 
         self.current_block = ok_bb;

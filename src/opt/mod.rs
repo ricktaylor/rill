@@ -1,16 +1,14 @@
 //! IR Optimization Passes
 //!
 //! The optimization pipeline runs after lowering to improve the IR before
-//! execution. Passes are ordered to maximize effectiveness:
+//! execution. Two-phase pipeline:
 //!
-//! 1. Constant Folding (early) - fold obvious compile-time constants
-//! 2. Definedness Analysis - compute which values are provably defined
-//! 3. Diagnostics - emit warnings/errors based on definedness
-//! 4. Guard Elimination - remove Guards for provably-defined values
-//! 5. CFG Simplification - merge blocks, remove unreachable code
-//! 6. Type Refinement - narrow TypeSets based on control flow
-//! 7. Constant Folding (cleanup) - fold constants exposed by earlier passes
-//! 8. Dead Code Elimination - remove unused computations
+//! Phase 1 (fixpoint): Const Fold → CSE → Copy Prop → CFG Simplify → DCE
+//! Phase 2 (type-informed): Type Refinement → Coercion → Dead Arm Elimination
+//!
+//! Diagnostics are emitted post-optimization so that dead code elimination
+//! has a chance to remove synthetic instructions before we warn about them.
+//! Warnings are suppressed for synthetic spans (Span::default()).
 
 mod algebra;
 mod cast_elision;
@@ -559,7 +557,10 @@ fn check_intrinsic_types(
                     .copied()
                     .unwrap_or(crate::types::TypeSet::any());
 
-                if actual.intersection(&required).is_empty() && !actual.is_empty() {
+                if actual.intersection(&required).is_empty()
+                    && !actual.is_empty()
+                    && inst.span != crate::ast::Span::default()
+                {
                     diagnostics.warning(
                         crate::diagnostics::DiagnosticCode::W009_TypeMismatch,
                         inst.span,
@@ -742,7 +743,10 @@ fn check_condition_types(
             .copied()
             .unwrap_or(crate::types::TypeSet::any());
 
-        if !actual.contains(crate::types::BaseType::Bool) && !actual.is_empty() {
+        if !actual.contains(crate::types::BaseType::Bool)
+            && !actual.is_empty()
+            && span != crate::ast::Span::default()
+        {
             diagnostics.warning(
                 crate::diagnostics::DiagnosticCode::W009_TypeMismatch,
                 span,
@@ -789,6 +793,11 @@ fn check_definedness_warnings(
                 _ => continue,
             };
 
+            // Skip diagnostics for synthetic instructions (no source location)
+            if span == crate::ast::Span::default() {
+                continue;
+            }
+
             for (i, arg) in args.iter().enumerate() {
                 let arg_type = types
                     .get(*arg)
@@ -796,13 +805,14 @@ fn check_definedness_warnings(
                     .unwrap_or(crate::types::TypeSet::any());
 
                 if arg_type.may_be_undefined() {
+                    let display_name = function.var_display_name(*arg);
                     diagnostics.warning(
-                        crate::diagnostics::DiagnosticCode::E201_UseOfMaybeUndefined,
+                        crate::diagnostics::DiagnosticCode::W201_UseOfMaybeUndefined,
                         span,
                         format!(
-                            "use of possibly undefined value `_{:?}` as argument {} to \
+                            "use of possibly undefined value {} as argument {} to \
                              intrinsic `{}` in function `{}`; consider adding a guard",
-                            arg.0,
+                            display_name,
                             i + 1,
                             op_name,
                             function.name,

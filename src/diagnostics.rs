@@ -98,14 +98,14 @@ pub enum DiagnosticCode {
     E106_ConstEvalFailed,
 
     // ========================================================================
-    // Definedness Analysis Errors (E200-E299)
+    // Definedness Warnings (W200-W299)
     // ========================================================================
     /// Use of definitely undefined value
-    E200_UseOfUndefined,
+    W200_UseOfUndefined,
     /// Use of possibly undefined value without guard
-    E201_UseOfMaybeUndefined,
+    W201_UseOfMaybeUndefined,
     /// Assignment to undefined location
-    E202_AssignmentToUndefined,
+    W202_AssignmentToUndefined,
 
     // ========================================================================
     // Type Analysis Errors (E300-E399)
@@ -188,9 +188,9 @@ impl DiagnosticCode {
             DiagnosticCode::E106_ConstEvalFailed => "E106",
 
             // Definedness
-            DiagnosticCode::E200_UseOfUndefined => "E200",
-            DiagnosticCode::E201_UseOfMaybeUndefined => "E201",
-            DiagnosticCode::E202_AssignmentToUndefined => "E202",
+            DiagnosticCode::W200_UseOfUndefined => "W200",
+            DiagnosticCode::W201_UseOfMaybeUndefined => "W201",
+            DiagnosticCode::W202_AssignmentToUndefined => "W202",
 
             // Type
             DiagnosticCode::E300_TypeMismatch => "E300",

@@ -254,7 +254,7 @@ fn try_simplify_terminator(
                     }
                 };
 
-                if unreachable_count > 0 {
+                if unreachable_count > 0 && *span != crate::ast::Span::default() {
                     diagnostics.warning(
                         DiagnosticCode::W003_UnreachableCode,
                         *span,

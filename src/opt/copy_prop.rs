@@ -16,17 +16,30 @@ use std::collections::HashMap;
 
 /// Propagate copies: replace uses of `Copy(dest, src)` dest with src.
 ///
+/// Skips narrowing copies where the dest has a narrower declared type
+/// than the source — these carry type information from Match guards,
+/// for-loop bounds, etc. that would be lost if propagated.
+///
 /// Returns the number of Copy instructions removed.
 pub fn propagate_copies(function: &mut Function) -> usize {
-    // Phase 1: collect Copy mappings (dest → src)
+    // Phase 1: collect Copy mappings (dest → src), skipping narrowing copies
     let mut copy_map: HashMap<VarId, VarId> = HashMap::new();
     for block in &function.blocks {
         for inst in &block.instructions {
             if let Instruction::Copy { dest, src } = &inst.node {
-                // Only propagate if dest != src (self-copy is a no-op)
-                if dest != src {
-                    copy_map.insert(*dest, *src);
+                if dest == src {
+                    continue;
                 }
+                // Skip narrowing copies: dest type is a strict subset of src type
+                let dest_type = function.var_type(*dest);
+                let src_type = function.var_type(*src);
+                if dest_type != src_type
+                    && !dest_type.is_empty()
+                    && dest_type.difference(&src_type).is_empty()
+                {
+                    continue;
+                }
+                copy_map.insert(*dest, *src);
             }
         }
     }
