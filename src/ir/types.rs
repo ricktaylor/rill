@@ -311,7 +311,6 @@ pub struct VarId(pub u32);
 
 /// SSA variable metadata
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct Var {
     pub id: VarId,
     pub name: ast::Identifier,
@@ -553,10 +552,8 @@ pub enum Terminator {
 
     /// Self-recursive tail call: overwrite params and jump to entry.
     /// Introduced by the TCO pass; has no successors (replaces Call + Return chain).
-    TailCall {
-        function: FunctionRef,
-        args: Vec<VarId>,
-    },
+    /// Currently self-recursive only — the target is always the enclosing function.
+    TailCall { args: Vec<VarId> },
 }
 
 impl Terminator {
@@ -681,7 +678,6 @@ impl Default for Function {
 
 /// Function parameter with binding mode
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct Param {
     pub var: VarId,
     pub by_ref: bool,
@@ -696,7 +692,6 @@ pub struct IrProgram {
 
 /// A constant binding (result of const pattern matching)
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct ConstBinding {
     pub name: ast::Identifier,
     pub value: ConstValue,

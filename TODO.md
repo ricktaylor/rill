@@ -98,6 +98,11 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
       containing is_defined, is_uint, is_int, ..., default, etc.
       Embedder includes via `SourceLoader::preamble()`.
       Not a language feature — an embedder API convenience.
+- [ ] **By-ref parameter passing across function calls** — `Param::by_ref` and
+      `CallArg::by_ref` are set but never read for user function calls. The compiler
+      ignores `_by_ref` when copying args into the callee's frame (compile/mod.rs:686).
+      Need to: emit `Slot::Ref` for by-ref params, ensure write-back propagates to caller.
+      Within-function `with` bindings (MakeRef/WriteRef) work; cross-function does not.
 - [ ] **Host sequence support** (`SeqState::Host` variant, defer trait design to embedder API)
 - [ ] **Bytecode format** — CBOR serialization of optimized IR (see `docs/bytecode_format.md`)
   - Phase 1: Encoding infrastructure

@@ -11,7 +11,7 @@
 //! - All args by-value (no by_ref)
 //! - No rest params
 
-use crate::ir::{BlockId, Function, FunctionRef, Instruction, Terminator, VarId};
+use crate::ir::{BlockId, Function, Instruction, Terminator, VarId};
 use std::collections::{HashMap, HashSet};
 
 /// Detect and rewrite self-recursive tail calls in a function.
@@ -38,8 +38,6 @@ struct TailCallCandidate {
     call_block_id: BlockId,
     /// Index of the Call instruction within the block
     call_inst_index: usize,
-    /// The function being called (self)
-    function: FunctionRef,
     /// Argument VarIds
     args: Vec<VarId>,
 }
@@ -103,7 +101,6 @@ fn find_tail_call_candidates(function: &Function, self_name: &str) -> Vec<TailCa
                 candidates.push(TailCallCandidate {
                     call_block_id: block.id,
                     call_inst_index: inst_idx,
-                    function: func_ref.clone(),
                     args: args.iter().map(|a| a.value).collect(),
                 });
             }
@@ -240,7 +237,6 @@ fn apply_tail_calls(function: &mut Function, candidates: Vec<TailCallCandidate>)
 
             // Replace terminator with TailCall
             block.terminator = Terminator::TailCall {
-                function: candidate.function,
                 args: candidate.args,
             };
 

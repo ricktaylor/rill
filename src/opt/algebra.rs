@@ -26,14 +26,13 @@ use crate::opt::type_refinement::TypeAnalysis;
 use crate::types::BaseType;
 use std::collections::HashMap;
 
-/// Value of a constant operand (only numeric/bool needed for algebra).
+/// Value of a constant operand (numeric only — Bool constants don't
+/// participate in algebraic rewrites since And/Or are control flow).
 #[derive(Clone, Copy)]
 enum ConstVal {
     UInt(u64),
     Int(i64),
     Float(f64),
-    #[allow(dead_code)]
-    Bool(bool),
 }
 
 /// Run algebraic simplification on a function.
@@ -51,7 +50,6 @@ pub fn simplify_algebra(function: &mut Function, types: &TypeAnalysis) -> usize 
                         Literal::UInt(n) => Some(ConstVal::UInt(*n)),
                         Literal::Int(n) => Some(ConstVal::Int(*n)),
                         Literal::Float(f) => Some(ConstVal::Float(*f)),
-                        Literal::Bool(b) => Some(ConstVal::Bool(*b)),
                         _ => None,
                     };
                     if let Some(cv) = cv {
