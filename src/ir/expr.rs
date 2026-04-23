@@ -411,46 +411,83 @@ impl<'a> Lowerer<'a> {
             return result;
         }
 
-        // Resolve the extern function.
+        // Resolve the extern function and effective namespace.
+        //
+        // Resolution order for unqualified calls:
+        //   1. Intrinsics (handled above by try_lower_intrinsic)
+        //   2. Local user functions (same file)
+        //   3. Merged imports (import "x" as _)
+        //   4. Externs — global and merged (require ns as _)
+        //
+        // Locals and imports override externs — the original
+        // is always reachable via qualified `ns::func()` syntax.
         //
         // For qualified calls (ns::func): look up the alias in require_aliases
         // to find the extern namespace, then look up the function in that namespace.
         //
-        // For unqualified calls: check global externs first, then merged externs
-        // (from `require ns as _`), then fall through to user function resolution.
-        let extern_def = if let Some(ns) = namespace {
+        // `effective_ns` captures the resolved namespace for unqualified calls
+        // that match a merged import — the Call's FunctionRef needs it.
+        // Resolve the call target and extract param metadata.
+        // We extract owned data from the extern def to avoid holding a borrow
+        // on `self` across the mutable operations that follow.
+        let mut effective_ns = namespace.cloned();
+        let has_root_extern = self.lookup_root_extern(name).is_some();
+
+        let (param_by_ref, param_specs_owned): (
+            Option<Vec<bool>>,
+            Option<Vec<crate::externs::ParamSpec>>,
+        ) = if let Some(ns) = namespace {
             // Qualified call: ns::func()
             if let Some(extern_ns) = self.require_aliases.get(ns) {
-                self.externs.get_in(extern_ns, name)
+                let def = self.externs.get_in(extern_ns, name);
+                let specs = def.map(|d| d.meta.params.clone());
+                let by_ref = specs.as_ref().map(|s| s.iter().map(|p| p.by_ref).collect());
+                (by_ref, specs)
             } else {
-                // No matching require — will be checked against user functions later
-                None
+                (self.user_fn_params.get(name).cloned(), None)
             }
+        } else if self.user_fn_params.contains_key(name) {
+            // Local function — shadows any externs/imports
+            if has_root_extern {
+                self.diagnostics.warning(
+                    diagnostics::DiagnosticCode::W004_ShadowedVariable,
+                    self.current_span,
+                    format!("local function `{}` shadows extern function", name),
+                );
+            } else if self.merged_imports.contains_key(name) {
+                self.diagnostics.warning(
+                    diagnostics::DiagnosticCode::W004_ShadowedVariable,
+                    self.current_span,
+                    format!("local function `{}` shadows imported function", name),
+                );
+            }
+            (self.user_fn_params.get(name).cloned(), None)
+        } else if let Some(canonical_ns) = self.merged_imports.get(name).cloned() {
+            // Merged import — shadows externs
+            if has_root_extern {
+                self.diagnostics.warning(
+                    diagnostics::DiagnosticCode::W004_ShadowedVariable,
+                    self.current_span,
+                    format!("imported function `{}` shadows extern function", name),
+                );
+            }
+            effective_ns = Some(canonical_ns);
+            (self.user_fn_params.get(name).cloned(), None)
         } else {
-            // Unqualified call: check globals, then merged externs
-            self.externs.get(name).or_else(|| {
-                self.merged_externs
-                    .get(name)
-                    .and_then(|ns| self.externs.get_in(ns, name))
-            })
+            // Merged externs (require ns as _) — set namespace for linker resolution
+            if let Some(src_ns) = self.merged_externs.get(name).cloned() {
+                effective_ns = Some(src_ns);
+            }
+            let def = self.lookup_root_extern(name);
+            let specs = def.map(|d| d.meta.params.clone());
+            let by_ref = specs.as_ref().map(|s| s.iter().map(|p| p.by_ref).collect());
+            (
+                by_ref.or_else(|| self.user_fn_params.get(name).cloned()),
+                specs,
+            )
         };
 
-        // Build the lookup name for the link phase.
-        let _lookup_name = if let Some(ns) = namespace {
-            format!("{ns}::{name}")
-        } else {
-            name.to_string()
-        };
-
-        let param_specs = extern_def.map(|b| &b.meta.params);
-
-        // Collect by-ref modes BEFORE lowering args — needed to emit MakeRef
-        // for by-ref params at the call site (caller's responsibility).
-        let param_by_ref: Option<Vec<bool>> = if let Some(specs) = param_specs {
-            Some(specs.iter().map(|s| s.by_ref).collect())
-        } else {
-            self.user_fn_params.get(name).cloned()
-        };
+        let param_specs = param_specs_owned.as_deref();
 
         // Lower each arg, wrapping in MakeRef for by-ref callee params.
         // The caller emits the coercion: MakeRef for by-ref, plain value for by-val.
@@ -535,7 +572,7 @@ impl<'a> Lowerer<'a> {
             self.current_instructions = Vec::new();
             let call_dest = self.emit_call(
                 FunctionRef {
-                    namespace: namespace.cloned(),
+                    namespace: effective_ns.clone(),
                     name: name.clone(),
                 },
                 args.clone(),
@@ -560,7 +597,7 @@ impl<'a> Lowerer<'a> {
             // No type constraints — emit call directly
             let result = self.emit_call(
                 FunctionRef {
-                    namespace: namespace.cloned(),
+                    namespace: effective_ns.clone(),
                     name: name.clone(),
                 },
                 args.clone(),

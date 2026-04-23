@@ -1491,7 +1491,7 @@ fn test_extern_variant_selection() {
     let mut externs = ExternRegistry::new();
     externs
         .register(
-            ExternDef::new("classify", generic)
+            ExternDef::new("math", "classify", generic)
                 .param("x", TypeSet::numeric())
                 .returns(TypeSet::uint())
                 .pure_infallible()
@@ -1502,6 +1502,7 @@ fn test_extern_variant_selection() {
 
     // Compile with the custom registry
     let source = r#"
+            require math as _;
             fn test() {
                 let a = classify(42);
                 a
@@ -2110,7 +2111,7 @@ fn byref_dump_accessor() {
     "#;
     let externs = externs::standard_externs();
     let mut diags = crate::diagnostics::Diagnostics::new();
-    let ast = crate::ast::parser::parse(source, &mut diags).expect("parse failed");
+    let ast = crate::ast::parser::parse(source, "", &mut diags).expect("parse failed");
     let ir = crate::ir::lower(&ast, &externs, &mut diags).expect("lower failed");
     eprintln!("=== BEFORE OPTIMIZATION ===");
     for func in &ir.functions {
@@ -2257,4 +2258,352 @@ fn byref_no_writeback_without_with() {
         "test",
     );
     assert_eq!(val, Value::UInt(5));
+}
+
+// ========================================================================
+// Module System: Compiler Builder + MemoryLoader
+// ========================================================================
+
+#[test]
+fn test_compiler_single_file() {
+    // Single file via Compiler builder (no imports)
+    let mut loader = crate::loader::MemoryLoader::new();
+    loader.add_source("main.rill", "fn test() { 42 }");
+
+    let mut compiler = crate::Compiler::new(&loader);
+    compiler.add("main.rill");
+    let (program, _warnings) = compiler.build().expect("build should succeed");
+
+    let mut vm = VM::new();
+    let result = program
+        .call(&mut vm, "test", 0)
+        .expect("call should succeed");
+    assert_eq!(result, Value::UInt(42));
+}
+
+#[test]
+fn test_compiler_multi_file_import() {
+    // Two files: main imports utils
+    let mut loader = crate::loader::MemoryLoader::new();
+    loader.add_source("utils.rill", "fn helper() { 99 }");
+    loader.add_source(
+        "main.rill",
+        r#"
+        import "utils.rill";
+        fn test() { utils::helper() }
+        "#,
+    );
+
+    let mut compiler = crate::Compiler::new(&loader);
+    compiler.add("main.rill");
+    let (program, _warnings) = compiler.build().expect("build should succeed");
+
+    let mut vm = VM::new();
+    let result = program
+        .call(&mut vm, "test", 0)
+        .expect("call should succeed");
+    assert_eq!(result, Value::UInt(99));
+}
+
+#[test]
+fn test_compiler_import_with_alias() {
+    // Import with alias: `import "utils.rill" as helpers`
+    let mut loader = crate::loader::MemoryLoader::new();
+    loader.add_source("utils.rill", "fn helper() { 42 }");
+    loader.add_source(
+        "main.rill",
+        r#"
+        import "utils.rill" as helpers;
+        fn test() { helpers::helper() }
+        "#,
+    );
+
+    let mut compiler = crate::Compiler::new(&loader);
+    compiler.add("main.rill");
+    let (program, _warnings) = compiler.build().expect("build should succeed");
+
+    let mut vm = VM::new();
+    let result = program
+        .call(&mut vm, "test", 0)
+        .expect("call should succeed");
+    assert_eq!(result, Value::UInt(42));
+}
+
+#[test]
+fn test_compiler_transitive_imports() {
+    // Three files: main → utils → common
+    let mut loader = crate::loader::MemoryLoader::new();
+    loader.add_source("common.rill", "fn base_val() { 10 }");
+    loader.add_source(
+        "utils.rill",
+        r#"
+        import "common.rill";
+        fn helper() { common::base_val() + 1 }
+        "#,
+    );
+    loader.add_source(
+        "main.rill",
+        r#"
+        import "utils.rill";
+        fn test() { utils::helper() }
+        "#,
+    );
+
+    let mut compiler = crate::Compiler::new(&loader);
+    compiler.add("main.rill");
+    let (program, _warnings) = compiler.build().expect("build should succeed");
+
+    let mut vm = VM::new();
+    let result = program
+        .call(&mut vm, "test", 0)
+        .expect("call should succeed");
+    assert_eq!(result, Value::UInt(11));
+}
+
+#[test]
+fn test_compiler_diamond_imports() {
+    // Diamond: main imports A and B, both import common
+    // common should be loaded only once
+    let mut loader = crate::loader::MemoryLoader::new();
+    loader.add_source("common.rill", "fn shared() { 7 }");
+    loader.add_source(
+        "a.rill",
+        r#"
+        import "common.rill";
+        fn from_a() { common::shared() + 1 }
+        "#,
+    );
+    loader.add_source(
+        "b.rill",
+        r#"
+        import "common.rill";
+        fn from_b() { common::shared() + 2 }
+        "#,
+    );
+    loader.add_source(
+        "main.rill",
+        r#"
+        import "a.rill";
+        import "b.rill";
+        fn test() { a::from_a() + b::from_b() }
+        "#,
+    );
+
+    let mut compiler = crate::Compiler::new(&loader);
+    compiler.add("main.rill");
+    let (program, _warnings) = compiler.build().expect("build should succeed");
+
+    let mut vm = VM::new();
+    let result = program
+        .call(&mut vm, "test", 0)
+        .expect("call should succeed");
+    // from_a = 7+1 = 8, from_b = 7+2 = 9, total = 17
+    assert_eq!(result, Value::UInt(17));
+}
+
+#[test]
+fn test_compiler_import_not_found() {
+    let mut loader = crate::loader::MemoryLoader::new();
+    loader.add_source(
+        "main.rill",
+        r#"
+        import "nonexistent.rill";
+        fn test() { 1 }
+        "#,
+    );
+
+    let mut compiler = crate::Compiler::new(&loader);
+    compiler.add("main.rill");
+    let result = compiler.build();
+    // Should fail with an error about the missing import
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_compiler_duplicate_namespace() {
+    // Two imports with the same default namespace
+    let mut loader = crate::loader::MemoryLoader::new();
+    loader.add("a/utils.rill", "utils", "fn from_a() { 1 }");
+    loader.add("b/utils.rill", "utils", "fn from_b() { 2 }");
+    loader.add_source(
+        "main.rill",
+        r#"
+        import "a/utils.rill";
+        import "b/utils.rill";
+        fn test() { 1 }
+        "#,
+    );
+
+    let mut compiler = crate::Compiler::new(&loader);
+    compiler.add("main.rill");
+    let result = compiler.build();
+    // Should fail: duplicate namespace "utils"
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_compiler_add_source_direct() {
+    // Using add_source() for single-file compilation (no loader)
+    let loader = crate::loader::MemoryLoader::new();
+    let mut compiler = crate::Compiler::new(&loader);
+    compiler.add_source("fn test() { 123 }", "inline");
+    let (program, _warnings) = compiler.build().expect("build should succeed");
+
+    let mut vm = VM::new();
+    let result = program
+        .call(&mut vm, "test", 0)
+        .expect("call should succeed");
+    assert_eq!(result, Value::UInt(123));
+}
+
+#[test]
+fn test_compiler_import_as_underscore() {
+    // import "utils.rill" as _ — merge into root scope
+    let mut loader = crate::loader::MemoryLoader::new();
+    loader.add_source("utils.rill", "fn helper() { 77 }");
+    loader.add_source(
+        "main.rill",
+        r#"
+        import "utils.rill" as _;
+        fn test() { helper() }
+        "#,
+    );
+
+    let mut compiler = crate::Compiler::new(&loader);
+    compiler.add("main.rill");
+    let (program, _warnings) = compiler.build().expect("build should succeed");
+
+    let mut vm = VM::new();
+    let result = program
+        .call(&mut vm, "test", 0)
+        .expect("call should succeed");
+    assert_eq!(result, Value::UInt(77));
+}
+
+#[test]
+fn test_compiler_import_as_underscore_multiple_functions() {
+    // as _ with multiple functions from imported file
+    let mut loader = crate::loader::MemoryLoader::new();
+    loader.add_source(
+        "math.rill",
+        r#"
+        fn add_one(x) { x + 1 }
+        fn double(x) { x * 2 }
+        "#,
+    );
+    loader.add_source(
+        "main.rill",
+        r#"
+        import "math.rill" as _;
+        fn test() { double(add_one(5)) }
+        "#,
+    );
+
+    let mut compiler = crate::Compiler::new(&loader);
+    compiler.add("main.rill");
+    let (program, _warnings) = compiler.build().expect("build should succeed");
+
+    let mut vm = VM::new();
+    let result = program
+        .call(&mut vm, "test", 0)
+        .expect("call should succeed");
+    // add_one(5) = 6, double(6) = 12
+    assert_eq!(result, Value::UInt(12));
+}
+
+#[test]
+fn test_compiler_import_require_namespace_clash() {
+    // import and require both claim the same namespace — should error
+    let mut loader = crate::loader::MemoryLoader::new();
+    loader.add_source("math.rill", "fn add(x, y) { x + y }");
+    loader.add_source(
+        "main.rill",
+        r#"
+        require math;
+        import "math.rill";
+        fn test() { 1 }
+        "#,
+    );
+
+    let externs = crate::standard_externs();
+    let mut compiler = crate::Compiler::with_externs(externs, &loader);
+    // Register a "math" extern namespace so the require is valid
+    compiler
+        .add_extern(crate::ExternDef::new("math", "sin", |_vm, _argc| {
+            Ok(crate::externs::ExecResult::Return(Value::Float(
+                crate::exec::Float::new(0.0).unwrap(),
+            )))
+        }))
+        .unwrap();
+    compiler.add("main.rill");
+    let result = compiler.build();
+    assert!(
+        result.is_err(),
+        "should error on import/require namespace clash"
+    );
+}
+
+#[test]
+fn test_compiler_import_require_no_clash_with_alias() {
+    // import with alias avoids the clash
+    let mut loader = crate::loader::MemoryLoader::new();
+    loader.add_source("math.rill", "fn add(x, y) { x + y }");
+    loader.add_source(
+        "main.rill",
+        r#"
+        require math;
+        import "math.rill" as rill_math;
+        fn test() { rill_math::add(1, 2) }
+        "#,
+    );
+
+    let externs = crate::standard_externs();
+    let mut compiler = crate::Compiler::with_externs(externs, &loader);
+    compiler
+        .add_extern(crate::ExternDef::new("math", "sin", |_vm, _argc| {
+            Ok(crate::externs::ExecResult::Return(Value::Float(
+                crate::exec::Float::new(0.0).unwrap(),
+            )))
+        }))
+        .unwrap();
+    compiler.add("main.rill");
+    let (program, _warnings) = compiler.build().expect("should succeed with alias");
+
+    let mut vm = VM::new();
+    let result = program
+        .call(&mut vm, "test", 0)
+        .expect("call should succeed");
+    assert_eq!(result, Value::UInt(3));
+}
+
+#[test]
+fn test_pretty_error_rendering() {
+    // Verify that compilation errors include source context.
+    // Use a parse error (precise span) rather than a lowering error.
+    let source = "fn test( { }";
+    let externs = crate::standard_externs();
+    let err = match crate::compile(source, &externs) {
+        Err(e) => e,
+        Ok(_) => panic!("expected compilation error"),
+    };
+    let rendered = format!("{}", err);
+
+    // Should have file:line:col location
+    assert!(
+        rendered.contains("--> <input>:"),
+        "should show source file: {}",
+        rendered
+    );
+    // Should show the source line
+    assert!(
+        rendered.contains("fn test("),
+        "should show source line: {}",
+        rendered
+    );
+    // Should have caret underline
+    assert!(
+        rendered.contains("^"),
+        "should have caret underline: {}",
+        rendered
+    );
 }

@@ -168,7 +168,7 @@ fn is_removable(
         Instruction::Call { function, .. } => {
             // Check extern registry for purity metadata
             if let Some(registry) = externs
-                && let Some(def) = registry.get(&function.qualified_name())
+                && let Some(def) = registry.lookup(function)
             {
                 return def.meta.purity.is_pure();
             }

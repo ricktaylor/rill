@@ -23,7 +23,9 @@
 //! ```
 
 use crate::ast::Span;
+use std::collections::HashMap;
 use std::fmt;
+use std::rc::Rc;
 
 // ============================================================================
 // Severity
@@ -257,6 +259,8 @@ impl fmt::Display for DiagnosticCode {
 /// A related note attached to a diagnostic
 #[derive(Debug, Clone)]
 pub struct Note {
+    /// Source file identity (when note spans a different file than the diagnostic)
+    pub source_id: Option<Rc<str>>,
     /// Optional span for the note (may be None for general notes)
     pub span: Option<Span>,
     /// The note message
@@ -267,6 +271,7 @@ impl Note {
     /// Create a note with a span
     pub fn at(span: Span, message: impl Into<String>) -> Self {
         Note {
+            source_id: None,
             span: Some(span),
             message: message.into(),
         }
@@ -275,6 +280,7 @@ impl Note {
     /// Create a note without a span
     pub fn text(message: impl Into<String>) -> Self {
         Note {
+            source_id: None,
             span: None,
             message: message.into(),
         }
@@ -292,6 +298,8 @@ pub struct Diagnostic {
     pub severity: Severity,
     /// Diagnostic code
     pub code: DiagnosticCode,
+    /// Source file identity (canonical_id from SourceLoader)
+    pub source_id: Option<Rc<str>>,
     /// Primary span (where the error occurred)
     pub span: Option<Span>,
     /// Primary message
@@ -306,6 +314,7 @@ impl Diagnostic {
         Diagnostic {
             severity: code.severity(),
             code,
+            source_id: None,
             span: None,
             message: message.into(),
             notes: Vec::new(),
@@ -317,10 +326,17 @@ impl Diagnostic {
         Diagnostic {
             severity: code.severity(),
             code,
+            source_id: None,
             span: Some(span),
             message: message.into(),
             notes: Vec::new(),
         }
+    }
+
+    /// Set the source file identity for this diagnostic
+    pub fn in_source(&mut self, source_id: Rc<str>) -> &mut Self {
+        self.source_id = Some(source_id);
+        self
     }
 
     /// Add a note with a span
@@ -356,12 +372,20 @@ impl fmt::Display for Diagnostic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} [{}]: {}", self.severity, self.code, self.message)?;
         if let Some(span) = &self.span {
-            write!(f, " (at {}..{})", span.start, span.end)?;
+            if let Some(source_id) = &self.source_id {
+                write!(f, " (at {}:{}..{})", source_id, span.start, span.end)?;
+            } else {
+                write!(f, " (at {}..{})", span.start, span.end)?;
+            }
         }
         for note in &self.notes {
             write!(f, "\n  note: {}", note.message)?;
             if let Some(span) = &note.span {
-                write!(f, " (at {}..{})", span.start, span.end)?;
+                if let Some(source_id) = &note.source_id {
+                    write!(f, " (at {}:{}..{})", source_id, span.start, span.end)?;
+                } else {
+                    write!(f, " (at {}..{})", span.start, span.end)?;
+                }
             }
         }
         Ok(())
@@ -372,6 +396,28 @@ impl fmt::Display for Diagnostic {
 // Diagnostics Accumulator
 // ============================================================================
 
+/// Map from source file identity to source text.
+///
+/// Used by diagnostic rendering to convert byte offsets to line:column
+/// positions and display source snippets. Populated during compilation
+/// as each source file is loaded.
+#[derive(Debug, Default, Clone)]
+pub struct SourceMap {
+    sources: HashMap<Rc<str>, String>,
+}
+
+impl SourceMap {
+    /// Register a source file's text for diagnostic rendering.
+    pub fn add(&mut self, source_id: Rc<str>, source: String) {
+        self.sources.insert(source_id, source);
+    }
+
+    /// Look up the source text for a file.
+    pub fn get(&self, source_id: &str) -> Option<&str> {
+        self.sources.get(source_id).map(|s| s.as_str())
+    }
+}
+
 /// Accumulator for diagnostics throughout compilation
 ///
 /// Collects errors, warnings, and info messages without aborting on the first error.
@@ -379,16 +425,38 @@ impl fmt::Display for Diagnostic {
 #[derive(Debug, Default)]
 pub struct Diagnostics {
     items: Vec<Diagnostic>,
+    /// Source text for each file, used for line:col rendering
+    pub source_map: SourceMap,
+    /// Current source file — automatically applied to new diagnostics
+    current_source: Option<Rc<str>>,
 }
 
 impl Diagnostics {
     /// Create a new empty diagnostics accumulator
     pub fn new() -> Self {
-        Diagnostics { items: Vec::new() }
+        Diagnostics {
+            items: Vec::new(),
+            source_map: SourceMap::default(),
+            current_source: None,
+        }
     }
 
-    /// Add a diagnostic
-    pub fn emit(&mut self, diagnostic: Diagnostic) {
+    /// Set the current source file. All subsequent diagnostics will be
+    /// tagged with this source_id until changed or cleared.
+    pub fn set_source(&mut self, source_id: Rc<str>) {
+        self.current_source = Some(source_id);
+    }
+
+    /// Clear the current source file.
+    pub fn clear_source(&mut self) {
+        self.current_source = None;
+    }
+
+    /// Add a diagnostic (tagged with current source if set)
+    pub fn emit(&mut self, mut diagnostic: Diagnostic) {
+        if diagnostic.source_id.is_none() {
+            diagnostic.source_id = self.current_source.clone();
+        }
         self.items.push(diagnostic);
     }
 
@@ -399,7 +467,9 @@ impl Diagnostics {
         span: Span,
         message: impl Into<String>,
     ) -> &mut Diagnostic {
-        self.items.push(Diagnostic::at(code, span, message));
+        let mut diag = Diagnostic::at(code, span, message);
+        diag.source_id = self.current_source.clone();
+        self.items.push(diag);
         self.items.last_mut().unwrap()
     }
 
@@ -409,7 +479,9 @@ impl Diagnostics {
         code: DiagnosticCode,
         message: impl Into<String>,
     ) -> &mut Diagnostic {
-        self.items.push(Diagnostic::new(code, message));
+        let mut diag = Diagnostic::new(code, message);
+        diag.source_id = self.current_source.clone();
+        self.items.push(diag);
         self.items.last_mut().unwrap()
     }
 
@@ -422,6 +494,7 @@ impl Diagnostics {
     ) -> &mut Diagnostic {
         let mut diag = Diagnostic::at(code, span, message);
         diag.severity = Severity::Warning;
+        diag.source_id = self.current_source.clone();
         self.items.push(diag);
         self.items.last_mut().unwrap()
     }
@@ -434,6 +507,7 @@ impl Diagnostics {
     ) -> &mut Diagnostic {
         let mut diag = Diagnostic::new(code, message);
         diag.severity = Severity::Warning;
+        diag.source_id = self.current_source.clone();
         self.items.push(diag);
         self.items.last_mut().unwrap()
     }
@@ -447,6 +521,7 @@ impl Diagnostics {
     ) -> &mut Diagnostic {
         let mut diag = Diagnostic::at(code, span, message);
         diag.severity = Severity::Info;
+        diag.source_id = self.current_source.clone();
         self.items.push(diag);
         self.items.last_mut().unwrap()
     }
@@ -522,6 +597,9 @@ impl Diagnostics {
     /// Merge diagnostics from another accumulator
     pub fn merge(&mut self, other: Diagnostics) {
         self.items.extend(other.items);
+        for (id, text) in other.source_map.sources {
+            self.source_map.sources.entry(id).or_insert(text);
+        }
     }
 
     /// Convert to a Result, preserving warnings on success.
@@ -543,6 +621,159 @@ impl Diagnostics {
             let b_start = b.span.map(|s| s.start).unwrap_or(0);
             a_start.cmp(&b_start)
         });
+    }
+
+    /// Format a diagnostic's location as `file:line:col` or `line:col`.
+    ///
+    /// Uses the source map to convert byte offsets to line:column positions.
+    /// Falls back to byte offsets if the source text is not in the map.
+    pub fn format_location(&self, diag: &Diagnostic) -> Option<String> {
+        let span = diag.span?;
+        match &diag.source_id {
+            Some(source_id) => {
+                if let Some(source) = self.source_map.get(source_id) {
+                    let lc = offset_to_line_col(source, span.start);
+                    Some(format!("{}:{}:{}", source_id, lc.line, lc.col))
+                } else {
+                    Some(format!("{}:{}..{}", source_id, span.start, span.end))
+                }
+            }
+            None => {
+                // Single-file mode: no source_id, try the default source
+                Some(format!("{}..{}", span.start, span.end))
+            }
+        }
+    }
+
+    /// Render a single diagnostic with source context.
+    ///
+    /// Produces rustc-style output:
+    /// ```text
+    /// error[E100]: undefined variable `foo`
+    ///  --> utils.rill:12:5
+    ///    |
+    /// 12 |     foo + 1
+    ///    |     ^^^ not found in this scope
+    /// ```
+    ///
+    /// Falls back to a simple one-line format when source text is unavailable.
+    pub fn render(&self, diag: &Diagnostic, out: &mut String) {
+        use fmt::Write;
+
+        // Header: severity[code]: message
+        let _ = writeln!(out, "{}[{}]: {}", diag.severity, diag.code, diag.message);
+
+        // Location + source context
+        if let Some(span) = diag.span {
+            let source_text = diag
+                .source_id
+                .as_ref()
+                .and_then(|id| self.source_map.get(id));
+
+            if let Some(source) = source_text {
+                let start_lc = offset_to_line_col(source, span.start);
+                let end_lc = offset_to_line_col(source, span.end);
+
+                // --> file:line:col
+                let file = diag
+                    .source_id
+                    .as_ref()
+                    .map(|s| s.as_ref())
+                    .unwrap_or("<input>");
+                let _ = writeln!(out, " --> {}:{}:{}", file, start_lc.line, start_lc.col);
+
+                // Source line with caret
+                let (line_text, line_start) = source_line_at(source, span.start);
+                let line_num = format!("{}", start_lc.line);
+                let gutter = line_num.len();
+
+                // Separator
+                let _ = writeln!(out, "{:>gutter$} |", "");
+
+                // Source line
+                let _ = writeln!(out, "{} | {}", line_num, line_text);
+
+                // Caret line — underline the span
+                let col_start = span.start.saturating_sub(line_start);
+                let col_end = if start_lc.line == end_lc.line {
+                    span.end.saturating_sub(line_start)
+                } else {
+                    line_text.len() // span crosses lines — underline to end
+                };
+                let underline_len = col_end.saturating_sub(col_start).max(1);
+
+                let _ = writeln!(
+                    out,
+                    "{:>gutter$} | {:>padding$}{}",
+                    "",
+                    "",
+                    "^".repeat(underline_len),
+                    padding = col_start,
+                );
+            } else {
+                // No source text — show byte offsets
+                if let Some(source_id) = &diag.source_id {
+                    let _ = writeln!(out, " --> {}:{}..{}", source_id, span.start, span.end);
+                } else {
+                    let _ = writeln!(out, " --> {}..{}", span.start, span.end);
+                }
+            }
+        }
+
+        // Notes
+        for note in &diag.notes {
+            if let Some(span) = note.span {
+                let source_text = note
+                    .source_id
+                    .as_ref()
+                    .or(diag.source_id.as_ref())
+                    .and_then(|id| self.source_map.get(id));
+
+                if let Some(source) = source_text {
+                    let lc = offset_to_line_col(source, span.start);
+                    let file = note
+                        .source_id
+                        .as_ref()
+                        .or(diag.source_id.as_ref())
+                        .map(|s| s.as_ref())
+                        .unwrap_or("<input>");
+                    let _ = writeln!(
+                        out,
+                        " = note: {} ({}:{}:{})",
+                        note.message, file, lc.line, lc.col
+                    );
+                } else {
+                    let _ = writeln!(
+                        out,
+                        " = note: {} (at {}..{})",
+                        note.message, span.start, span.end
+                    );
+                }
+            } else {
+                let _ = writeln!(out, " = help: {}", note.message);
+            }
+        }
+    }
+
+    /// Render all diagnostics with source context.
+    pub fn render_all(&self) -> String {
+        let mut out = String::new();
+        for (i, diag) in self.items.iter().enumerate() {
+            if i > 0 {
+                out.push('\n');
+            }
+            self.render(diag, &mut out);
+        }
+        if self.has_errors() {
+            use fmt::Write;
+            let _ = writeln!(
+                &mut out,
+                "compilation failed: {} error(s), {} warning(s)",
+                self.error_count(),
+                self.warning_count()
+            );
+        }
+        out
     }
 }
 
@@ -566,22 +797,7 @@ impl<'a> IntoIterator for &'a Diagnostics {
 
 impl fmt::Display for Diagnostics {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (i, diag) in self.items.iter().enumerate() {
-            if i > 0 {
-                writeln!(f)?;
-            }
-            write!(f, "{}", diag)?;
-        }
-        if self.has_errors() {
-            writeln!(f)?;
-            write!(
-                f,
-                "compilation failed: {} error(s), {} warning(s)",
-                self.error_count(),
-                self.warning_count()
-            )?;
-        }
-        Ok(())
+        write!(f, "{}", self.render_all())
     }
 }
 
@@ -633,6 +849,17 @@ pub fn span_to_line_col(source: &str, span: Span) -> (LineCol, LineCol) {
         offset_to_line_col(source, span.start),
         offset_to_line_col(source, span.end),
     )
+}
+
+/// Get the source line containing a byte offset, and the byte offset of the line start.
+fn source_line_at(source: &str, offset: usize) -> (&str, usize) {
+    let offset = offset.min(source.len());
+    let line_start = source[..offset].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let line_end = source[offset..]
+        .find('\n')
+        .map(|i| offset + i)
+        .unwrap_or(source.len());
+    (&source[line_start..line_end], line_start)
 }
 
 // ============================================================================
@@ -836,5 +1063,90 @@ mod tests {
     fn test_line_col_display() {
         let lc = LineCol { line: 3, col: 12 };
         assert_eq!(lc.to_string(), "3:12");
+    }
+
+    // ========================================================================
+    // Pretty Rendering Tests
+    // ========================================================================
+
+    #[test]
+    fn test_render_with_source_context() {
+        let source = "fn test() {\n    foo + 1;\n}";
+        let mut diags = Diagnostics::new();
+        diags
+            .source_map
+            .add(Rc::from("test.rill"), source.to_string());
+
+        let mut d = Diagnostic::at(
+            DiagnosticCode::E100_UndefinedVariable,
+            test_span(16, 19), // "foo" on line 2
+            "undefined variable `foo`",
+        );
+        d.in_source(Rc::from("test.rill"));
+        diags.emit(d);
+
+        let rendered = diags.render_all();
+        assert!(rendered.contains("error[E100]: undefined variable `foo`"));
+        assert!(rendered.contains("--> test.rill:2:5"));
+        assert!(rendered.contains("    foo + 1;"));
+        assert!(rendered.contains("^^^"));
+    }
+
+    #[test]
+    fn test_render_with_note() {
+        let source = "fn test() {\n    let x = 1;\n    let x = 2;\n}";
+        let mut diags = Diagnostics::new();
+        diags
+            .source_map
+            .add(Rc::from("test.rill"), source.to_string());
+
+        let mut d = Diagnostic::at(
+            DiagnosticCode::E400_DuplicateDefinition,
+            test_span(31, 32), // second "x" on line 3
+            "duplicate variable `x`",
+        );
+        d.in_source(Rc::from("test.rill"));
+        d.note(test_span(16, 17), "previously defined here");
+        diags.emit(d);
+
+        let rendered = diags.render_all();
+        assert!(rendered.contains("error[E400]"));
+        assert!(rendered.contains("--> test.rill:3:"));
+        assert!(rendered.contains("note: previously defined here"));
+    }
+
+    #[test]
+    fn test_render_without_source() {
+        let mut diags = Diagnostics::new();
+        diags.error_no_span(
+            DiagnosticCode::E500_UndefinedExternal,
+            "failed to load 'missing.rill'",
+        );
+
+        let rendered = diags.render_all();
+        assert!(rendered.contains("error[E500]: failed to load"));
+        // No source context — just the message
+        assert!(!rendered.contains("-->"));
+    }
+
+    #[test]
+    fn test_render_single_char_span() {
+        let source = "x";
+        let mut diags = Diagnostics::new();
+        diags
+            .source_map
+            .add(Rc::from("test.rill"), source.to_string());
+
+        let mut d = Diagnostic::at(
+            DiagnosticCode::E100_UndefinedVariable,
+            test_span(0, 1),
+            "undefined variable `x`",
+        );
+        d.in_source(Rc::from("test.rill"));
+        diags.emit(d);
+
+        let rendered = diags.render_all();
+        assert!(rendered.contains("--> test.rill:1:1"));
+        assert!(rendered.contains("^"));
     }
 }

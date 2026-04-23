@@ -11,6 +11,7 @@ use super::Spanned;
 use super::*;
 use crate::diagnostics::{Diagnostic, DiagnosticCode, Diagnostics};
 use chumsky::prelude::*;
+use std::rc::Rc;
 
 // ============================================================================
 // Type Aliases
@@ -1405,7 +1406,7 @@ enum TopLevel {
     Function(Spanned<Function>),
 }
 
-fn program<'a>() -> BoxedParser<'a, AstProgram> {
+fn program<'a>(source_id: Rc<str>) -> BoxedParser<'a, AstProgram> {
     let top_level = choice((
         import().map(TopLevel::Import),
         require().map(TopLevel::Require),
@@ -1417,7 +1418,7 @@ fn program<'a>() -> BoxedParser<'a, AstProgram> {
     whitespace()
         .ignore_then(top_level.repeated().collect::<Vec<_>>())
         .then_ignore(end())
-        .map(|items| {
+        .map(move |items| {
             let mut imports: Vec<Spanned<Import>> = Vec::new();
             let mut requires: Vec<Spanned<Require>> = Vec::new();
             let mut constants: Vec<Spanned<Constant>> = Vec::new();
@@ -1433,6 +1434,7 @@ fn program<'a>() -> BoxedParser<'a, AstProgram> {
             }
 
             AstProgram {
+                source_id: source_id.clone(),
                 imports,
                 requires,
                 constants,
@@ -1526,12 +1528,17 @@ fn convert_parse_errors(errors: Vec<Rich<'_, char, Span>>, diags: &mut Diagnosti
 // Public API
 // ============================================================================
 
-/// Parse a Rill source file, emitting diagnostics on error
+/// Parse a Rill source file, emitting diagnostics on error.
+///
+/// `source_id` identifies this source file (e.g., "main.rill" or an absolute path).
+/// It is stored in the returned `AstProgram` and used for multi-file diagnostics.
+/// Pass an empty string for single-file compilation.
 ///
 /// Returns `Some(AstProgram)` if parsing succeeded, `None` if there were errors.
 /// Errors are emitted to the provided diagnostics accumulator.
-pub fn parse(input: &str, diags: &mut Diagnostics) -> Option<AstProgram> {
-    match program().parse(input).into_result() {
+pub fn parse(input: &str, source_id: &str, diags: &mut Diagnostics) -> Option<AstProgram> {
+    let source_id: Rc<str> = Rc::from(source_id);
+    match program(source_id).parse(input).into_result() {
         Ok(program) => Some(program),
         Err(errors) => {
             convert_parse_errors(errors, diags);
@@ -1571,7 +1578,7 @@ mod tests {
     // Test helper: parse program and return Result for easy assertion
     fn try_parse(input: &str) -> Result<AstProgram, ()> {
         let mut diags = Diagnostics::new();
-        parse(input, &mut diags).ok_or(())
+        parse(input, "", &mut diags).ok_or(())
     }
 
     #[test]
@@ -2201,13 +2208,13 @@ mod tests {
         let mut diags = Diagnostics::new();
 
         // Valid input should succeed
-        let result = parse("fn test() { }", &mut diags);
+        let result = parse("fn test() { }", "", &mut diags);
         assert!(result.is_some());
         assert!(!diags.has_errors());
 
         // Invalid input should fail and emit diagnostics
         let mut diags = Diagnostics::new();
-        let result = parse("fn { }", &mut diags);
+        let result = parse("fn { }", "", &mut diags);
         assert!(result.is_none());
         assert!(diags.has_errors());
         assert!(diags.error_count() >= 1);

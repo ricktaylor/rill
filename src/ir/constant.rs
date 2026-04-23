@@ -244,27 +244,13 @@ impl<'a> Lowerer<'a> {
         }
 
         // Fall through to registry lookup for host-provided externs
-        let lookup_name = match namespace {
-            Some(ns) => format!("{}::{}", ns, name),
-            None => name.to_string(),
+        let def = if let Some(ns) = namespace {
+            self.externs.get_in(ns, name)
+        } else {
+            self.lookup_root_extern(name)
         };
-
-        self.call_const_extern(&lookup_name, &args)
-    }
-
-    /// Evaluate an intrinsic at compile time
-    fn eval_intrinsic(&self, op: IntrinsicOp, args: &[ConstValue]) -> ConstResult<ConstValue> {
-        const_eval::eval_intrinsic_const(op, args)
-            .ok_or_else(|| format!("constant evaluation of {:?} failed", op))
-    }
-
-    /// Call an extern's const evaluator
-    fn call_const_extern(&self, name: &str, args: &[ConstValue]) -> ConstResult<ConstValue> {
-        // Look up the extern
-        let def = self
-            .externs
-            .get(name)
-            .ok_or_else(|| format!("unknown function '{}' in constant expression", name))?;
+        let def =
+            def.ok_or_else(|| format!("unknown function '{}' in constant expression", name))?;
 
         // Check if it's a const function
         let const_eval =
@@ -273,7 +259,13 @@ impl<'a> Lowerer<'a> {
             })?;
 
         // Call the const evaluator
-        const_eval(args).ok_or_else(|| format!("constant evaluation of '{}' failed", name))
+        const_eval(&args).ok_or_else(|| format!("constant evaluation of '{}' failed", name))
+    }
+
+    /// Evaluate an intrinsic at compile time
+    fn eval_intrinsic(&self, op: IntrinsicOp, args: &[ConstValue]) -> ConstResult<ConstValue> {
+        const_eval::eval_intrinsic_const(op, args)
+            .ok_or_else(|| format!("constant evaluation of {:?} failed", op))
     }
 
     /// Index into a const array or map

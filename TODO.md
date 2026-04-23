@@ -54,11 +54,10 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
 
 - [ ] **Module system** — `import` for source files, `require` for extern namespaces
   - Phase 1: ExternRegistry namespaces + `require` — **done**
-    - [x] `ExternRegistry` restructured: `globals` + `namespaces` maps
-    - [x] `register_in(namespace, def)` for namespaced externs
-    - [x] `register()` / `register_in()` return `Result<(), RegistryError>`
-    - [x] `RegistryError` enum (thiserror): `IntrinsicClash`, `DuplicateGlobal`, `DuplicateInNamespace`
-    - [x] `has_namespace()`, `get_in()`, `namespace_iter()`, `globals_iter()`
+    - [x] `ExternRegistry` — namespaces only (no globals), `register(def)` takes self-describing `ExternDef`
+    - [x] `ExternDef` carries `namespace` + `name` — `ExternDef::new("math", "sqrt", impl)`
+    - [x] `register()` returns `Result<(), RegistryError>`, `RegistryError::DuplicateInNamespace`
+    - [x] `has_namespace()`, `get_in()`, `namespace_iter()`, `lookup()`
     - [x] Parser: `require` keyword, `require ident [as (ident / "_")] ;`
     - [x] Parser: `import` takes only quoted string path (removed `ImportPath::Stdlib`)
     - [x] Parser: `import` and `require` support `as _` (merge into root scope)
@@ -70,17 +69,24 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
     - [x] Lowerer: resolve `ns::CONST` against required extern namespaces
     - [x] Lowerer: `as _` merges extern functions into root scope (`merged_externs`)
     - [x] Removed IR `Import` type and `IrProgram.imports` (no longer needed)
-  - Phase 2: Source file imports
-    - [ ] `SourceLoader` trait — `load()` for imports, `preamble()` for standard prelude
-    - [ ] `compile()` signature: add `Option<&dyn SourceLoader>` parameter
-    - [ ] Import resolution: derive namespace from filename stem
-    - [ ] Import resolution: `as name` explicit alias, `as _` merge into root scope
-    - [ ] Parse imported source files (recursive — imported files can import)
-    - [ ] Cycle detection: error on circular imports
-    - [ ] Lower imported functions/constants into namespaced scope
-    - [ ] Private imports: each file's imports are invisible to its importers
-    - [ ] Diagnostic: "source file not found" (via SourceLoader::load error)
-    - [ ] Diagnostic: duplicate namespace alias (import vs import, import vs require)
+  - Phase 2a: Source file imports — **done**
+    - [x] `SourceLoader` trait: `load(identifier, from) -> SourceResult { source, namespace, canonical_id }`
+    - [x] `FileLoader` (filesystem) and `MemoryLoader` (in-memory) implementations
+    - [x] `Compiler` builder: `new(&loader)`, `add_extern()`, `add()`, `add_source()`, `build()`
+    - [x] Single loader per Compiler — canonical_id consistency guaranteed
+    - [x] BFS import queue with canonical_id deduplication (no cycles possible)
+    - [x] Import resolution: derive namespace from loader's `SourceResult.namespace`
+    - [x] Import resolution: `as name` explicit alias, call-site rewriting
+    - [x] Imported functions prefixed with canonical namespace in merged IR
+    - [x] Diagnostic: "source file not found" (via SourceLoader::load error)
+    - [x] Diagnostic: duplicate namespace alias (import vs import)
+    - [x] Source tracking: `source_id` on `Diagnostic`, `SourceMap` on `Diagnostics`
+    - [x] `parse()` accepts `source_id` parameter, stored in `AstProgram`
+  - Phase 2b: Remaining module features
+    - [x] `import "x" as _` (root merge) — two-pass parse/lower, `merged_imports` in lowerer
+    - [x] Multi-file diagnostic rendering with `file:line:col`, source line, caret underline
+    - [ ] Linker builder (bytecode + prelude template pattern)
+    - [x] Import vs require namespace clash detection — error with `as` hint
   - Phase 3: Name clash enforcement — **done**
     - [x] Duplicate function name in same file → error (with note pointing to first definition)
     - [x] Function/constant name vs intrinsic (`len`, `collect`) → error
@@ -94,6 +100,11 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
     - [ ] DCE: imported functions not referenced from root → eliminate
     - [ ] Root file functions always kept (potential embedder entry points)
     - [ ] Unused import warning
+- [ ] **Expression spans** — Wrap `Expression` in `Spanned<Expression>` so expression-level
+      errors (undefined variable, type mismatch, invalid cast) point at the exact expression,
+      not the enclosing statement. Currently `lower_expression` uses `self.current_span` which
+      is the statement span. Requires parser changes (`.map_with()` on expression combinators)
+      and lowerer changes (`lower_expression` takes/sets span).
 - [ ] **Standard prelude** — `STANDARD_PRELUDE` const string of Rill source
       containing is_defined, is_uint, is_int, ..., default, etc.
       Embedder includes via `SourceLoader::preamble()`.
@@ -200,6 +211,11 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
       automatically and these manual annotations can be removed.
 - [ ] **Dead write-back elimination** — a WriteRef exists but the base value is never
       read after the write-back point. Requires liveness analysis.
+- [ ] **Slot allocator** — map VarIds to physical slot offsets via liveness analysis.
+      Currently `slot(VarId) = var.0` (identity mapping, one slot per VarId).
+      Non-overlapping VarIds can share slots, reducing frame_size. Accessor pairs
+      allocated as two adjacent physical slots. Linear scan or graph colouring.
+      Prerequisite: liveness intervals from the SSA graph.
 
 ### P2 — Architecture
 

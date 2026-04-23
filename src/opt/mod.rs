@@ -201,7 +201,7 @@ fn collect_pure_functions(
                     } => {
                         let callee = func_ref.qualified_name();
                         if let Some(registry) = externs
-                            && let Some(def) = registry.get(&callee)
+                            && let Some(def) = registry.lookup(func_ref)
                         {
                             return def.meta.purity.is_pure();
                         }

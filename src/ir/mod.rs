@@ -145,6 +145,12 @@ pub struct Lowerer<'a> {
     /// Maps param name → param VarId. Used to forward the Ref chain
     /// when passing a by-ref param to another by-ref callee param.
     pub byref_param_vars: HashMap<ast::Identifier, VarId>,
+
+    /// Functions merged into root scope via `import "file" as _`.
+    /// Maps unqualified function name → canonical namespace.
+    /// Checked in `lower_function_call` for unqualified calls after
+    /// externs and `merged_externs`.
+    pub merged_imports: HashMap<ast::Identifier, ast::Identifier>,
 }
 
 /// Context for a loop (for break/continue)
@@ -177,6 +183,7 @@ impl<'a> Lowerer<'a> {
             expr_guard_fail: None,
             user_fn_params: HashMap::new(),
             byref_param_vars: HashMap::new(),
+            merged_imports: HashMap::new(),
         }
     }
 
@@ -218,6 +225,13 @@ impl<'a> Lowerer<'a> {
     /// Create an undefined value as error recovery placeholder
     pub fn error_placeholder(&mut self) -> VarId {
         self.emit_undefined()
+    }
+
+    /// Look up an unqualified extern in root scope (from `require ns as _`).
+    pub fn lookup_root_extern(&self, name: &ast::Identifier) -> Option<&externs::ExternDef> {
+        self.merged_externs
+            .get(name)
+            .and_then(|ns| self.externs.get_in(ns, name))
     }
 
     // ========================================================================
@@ -572,8 +586,28 @@ pub fn lower(
     externs: &externs::ExternRegistry,
     diagnostics: &mut Diagnostics,
 ) -> Option<IrProgram> {
+    lower_with_imports(program, externs, diagnostics, HashMap::new())
+}
+
+/// Lower an AST program to IR, with merged import names.
+///
+/// `merged_imports` maps unqualified function names to their canonical namespace
+/// (from `import "file" as _`). These names are resolved as user function calls
+/// with the canonical namespace added to the FunctionRef.
+pub fn lower_with_imports(
+    program: &ast::AstProgram,
+    externs: &externs::ExternRegistry,
+    diagnostics: &mut Diagnostics,
+    merged_imports: HashMap<ast::Identifier, ast::Identifier>,
+) -> Option<IrProgram> {
+    if !program.source_id.is_empty() {
+        diagnostics.set_source(program.source_id.clone());
+    }
     let mut lowerer = Lowerer::new(externs, diagnostics);
-    lowerer.lower_program(program)
+    lowerer.merged_imports = merged_imports;
+    let result = lowerer.lower_program(program);
+    lowerer.diagnostics.clear_source();
+    result
 }
 
 #[cfg(test)]
@@ -587,7 +621,7 @@ mod tests {
 
     fn try_parse(source: &str) -> ast::AstProgram {
         let mut diags = Diagnostics::new();
-        crate::ast::parser::parse(source, &mut diags).expect("parse failed")
+        crate::ast::parser::parse(source, "", &mut diags).expect("parse failed")
     }
 
     fn try_lower(ast: &ast::AstProgram, registry: &externs::ExternRegistry) -> IrProgram {

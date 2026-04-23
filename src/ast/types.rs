@@ -1,4 +1,5 @@
 use chumsky::span::SimpleSpan;
+use std::rc::Rc;
 
 // ============================================================================
 // Span Types
@@ -95,6 +96,8 @@ pub type Pat = Spanned<Pattern>;
 // ============================================================================
 
 pub struct AstProgram {
+    /// Source file identity (canonical_id from SourceLoader, or empty for single-file)
+    pub source_id: Rc<str>,
     pub imports: Vec<Spanned<Import>>,
     pub requires: Vec<Spanned<Require>>,
     pub constants: Vec<Spanned<Constant>>,
@@ -110,10 +113,10 @@ pub struct Constant {
 /// Source file import: `import "path/to/file.rill" [as alias];`
 ///
 /// Loads a .rill source file. Namespace defaults to filename stem.
-/// `as _` merges functions into the root scope (no namespace).
+/// `as _` merges functions into the root scope (not yet supported).
 ///
-/// Note: source file loading is not yet implemented (Phase 2 of module system).
-/// The parser accepts the syntax but the lowerer does not process imports.
+/// Import resolution is handled by the Compiler builder, which loads and
+/// parses imported files via the SourceLoader, then merges their IR.
 #[derive(Debug, Clone)]
 pub struct Import {
     pub path: String,              // Quoted file path

@@ -73,7 +73,7 @@ pub fn eliminate_common_subexpressions_with_purity(
                     let name = func_ref.qualified_name();
                     let is_pure = if let Some(registry) = externs {
                         registry
-                            .get(&name)
+                            .lookup(func_ref)
                             .is_some_and(|def| def.meta.purity.is_pure())
                     } else {
                         false

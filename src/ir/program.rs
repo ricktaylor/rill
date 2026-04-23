@@ -26,9 +26,13 @@ impl<'a> Lowerer<'a> {
         // Build the namespace alias table from require declarations
         self.build_require_aliases(&program.requires);
 
-        // Note: imports (source files) are not yet implemented — they are
-        // collected but not loaded. Phase 2 of the module system will add
-        // SourceLoader support.
+        // Import resolution is handled by the Compiler builder (BFS queue
+        // in process_source). The lowerer processes each file independently;
+        // cross-file calls are resolved by the linker after IR merging.
+
+        // Note: import vs require namespace clash detection is handled by
+        // the Compiler builder (parse_source_tree), which has the loader's
+        // namespace for each imported file.
 
         // Validate function and constant names for clashes
         let function_names = self.check_function_names(&program.functions);
@@ -175,7 +179,7 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// Check a name against intrinsics, global externs, and merged externs.
+    /// Check a name against intrinsics and merged externs (`require ns as _`).
     ///
     /// Returns `Some(message)` if there's a clash, `None` if clean.
     fn check_name_clash(&self, name: &ast::Identifier, kind: &str) -> Option<String> {
@@ -184,9 +188,6 @@ impl<'a> Lowerer<'a> {
                 "{} `{}` clashes with built-in intrinsic",
                 kind, name
             ));
-        }
-        if self.externs.contains(name) {
-            return Some(format!("{} `{}` clashes with global extern", kind, name));
         }
         if let Some(ns) = self.merged_externs.get(name) {
             return Some(format!(
@@ -248,6 +249,8 @@ impl<'a> Lowerer<'a> {
     fn require_merge_to_root(&mut self, namespace: &ast::Identifier, span: ast::Span) {
         for (name, _) in self.externs.namespace_iter(namespace) {
             let name = ast::Identifier(name.clone());
+
+            // Check against other merged externs
             use std::collections::hash_map::Entry;
             match self.merged_externs.entry(name) {
                 Entry::Occupied(e) => {
@@ -255,8 +258,11 @@ impl<'a> Lowerer<'a> {
                         DiagnosticCode::E400_DuplicateDefinition,
                         span,
                         format!(
-                            "extern function `{}` (from namespace `{}`) clashes with another definition",
-                            e.key(), namespace
+                            "extern function `{}` (from namespace `{}`) \
+                             clashes with extern from namespace `{}`",
+                            e.key(),
+                            namespace,
+                            e.get()
                         ),
                     );
                 }

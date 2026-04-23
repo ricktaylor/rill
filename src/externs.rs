@@ -22,20 +22,24 @@
 //! ```ignore
 //! let mut registry = ExternRegistry::new();
 //!
-//! // Global extern — available without `require`
 //! registry.register(
-//!     ExternDef::new("exit", my_exit_impl)
+//!     ExternDef::new("runtime", "exit", my_exit_impl)
 //!         .param_optional("code", TypeSet::uint())
 //!         .exits(TypeSet::uint())
 //! )?;
 //!
-//! // Namespaced extern — requires `require cbor;` in script
-//! registry.register_in("cbor",
-//!     ExternDef::new("decode", my_decode_impl)
+//! registry.register(
+//!     ExternDef::new("cbor", "decode", my_decode_impl)
 //!         .param("data", TypeSet::bytes())
 //!         .returns(TypeSet::any())
 //!         .pure()
-//! );
+//! )?;
+//! ```
+//!
+//! Scripts access these via `require`:
+//! ```rill
+//! require runtime as _;  // exit() available unqualified
+//! require cbor;           // cbor::decode() available qualified
 //! ```
 
 use super::*;
@@ -391,6 +395,8 @@ impl core::fmt::Debug for ExternVariant {
 
 /// Complete definition of an extern function
 pub struct ExternDef {
+    /// Namespace (e.g., "math", "cbor")
+    pub namespace: String,
     /// Function name
     pub name: String,
     /// Compiler metadata
@@ -404,6 +410,7 @@ pub struct ExternDef {
 impl core::fmt::Debug for ExternDef {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("ExternDef")
+            .field("namespace", &self.namespace)
             .field("name", &self.name)
             .field("meta", &self.meta)
             .field("implementation", &self.implementation)
@@ -413,10 +420,15 @@ impl core::fmt::Debug for ExternDef {
 }
 
 impl ExternDef {
-    /// Create a new extern definition with a native function
-    /// Default: returns any type, pure but fallible
-    pub fn new(name: impl Into<String>, f: ExternFn) -> Self {
+    /// Create a new extern definition with a native function.
+    ///
+    /// `namespace` groups the function — scripts use `require namespace;`
+    /// to access it as `namespace::name()`.
+    ///
+    /// Default: returns any type, pure but fallible.
+    pub fn new(namespace: impl Into<String>, name: impl Into<String>, f: ExternFn) -> Self {
         ExternDef {
+            namespace: namespace.into(),
             name: name.into(),
             meta: ExternMeta::returning(TypeSet::any()),
             implementation: ExternImpl::Native(f),
@@ -424,13 +436,15 @@ impl ExternDef {
         }
     }
 
-    /// Create a new extern definition with a closure
-    /// Default: returns any type, pure but fallible
-    pub fn with_closure<F>(name: impl Into<String>, f: F) -> Self
+    /// Create a new extern definition with a closure.
+    ///
+    /// Default: returns any type, pure but fallible.
+    pub fn with_closure<F>(namespace: impl Into<String>, name: impl Into<String>, f: F) -> Self
     where
         F: Fn(&mut VM, usize) -> Result<ExecResult, ExecError> + Send + Sync + 'static,
     {
         ExternDef {
+            namespace: namespace.into(),
             name: name.into(),
             meta: ExternMeta::returning(TypeSet::any()),
             implementation: ExternImpl::Closure(Box::new(f)),
@@ -524,7 +538,7 @@ impl ExternDef {
     /// time, this variant is selected instead of the generic implementation.
     ///
     /// ```ignore
-    /// ExternDef::new("sqrt", sqrt_generic)
+    /// ExternDef::new("math", "sqrt", sqrt_generic)
     ///     .param("x", TypeSet::numeric())
     ///     .returns(TypeSet::numeric())
     ///     .variant(&[TypeSet::uint()], TypeSet::uint(), sqrt_uint)
@@ -575,32 +589,22 @@ impl ExternDef {
 /// Error returned when extern registration fails.
 #[derive(Debug, thiserror::Error)]
 pub enum RegistryError {
-    /// Global extern name clashes with a built-in intrinsic.
-    #[error("cannot register global extern `{name}`: clashes with built-in intrinsic")]
-    IntrinsicClash { name: String },
-
-    /// Global extern name was already registered.
-    #[error("global extern `{name}` is already registered")]
-    DuplicateGlobal { name: String },
-
     /// Function name was already registered in this namespace.
-    #[error("extern `{name}` is already registered in namespace `{namespace}`")]
+    #[error("extern `{namespace}::{name}` is already registered")]
     DuplicateInNamespace { namespace: String, name: String },
 }
 
 /// Registry of extern functions
 ///
 /// Contains embedder-provided functions that Rill scripts can call.
-/// Functions are either **global** (available without `require`) or
-/// **namespaced** (grouped under a namespace, require a `require`
-/// declaration in the script).
+/// All externs are namespaced — scripts use `require namespace;` to
+/// access them as `namespace::func()`, or `require namespace as _;`
+/// to merge into root scope.
 ///
 /// Language-defined operators are handled as `IntrinsicOp` (core
 /// intrinsics) and do not appear here.
 #[derive(Debug, Default)]
 pub struct ExternRegistry {
-    /// Global externs — available unqualified without `require`
-    globals: HashMap<String, ExternDef>,
     /// Namespaced externs — namespace → (function name → def)
     namespaces: HashMap<String, HashMap<String, ExternDef>>,
 }
@@ -609,62 +613,30 @@ impl ExternRegistry {
     /// Create an empty registry
     pub fn new() -> Self {
         ExternRegistry {
-            globals: HashMap::new(),
             namespaces: HashMap::new(),
         }
     }
 
-    /// Names reserved by the compiler — cannot be used for global externs.
-    const RESERVED_NAMES: &[&str] = &["len", "collect", "append"];
-
-    /// Register a global extern function (available without `require`).
+    /// Register an extern function.
     ///
-    /// Global externs are callable unqualified: `exit(0)`, `print("hello")`.
-    ///
-    /// Returns an error if the name clashes with a built-in intrinsic
-    /// or is already registered.
-    pub fn register(&mut self, def: ExternDef) -> Result<(), RegistryError> {
-        if Self::RESERVED_NAMES.contains(&def.name.as_str()) {
-            return Err(RegistryError::IntrinsicClash {
-                name: def.name.clone(),
-            });
-        }
-        if self.globals.contains_key(&def.name) {
-            return Err(RegistryError::DuplicateGlobal {
-                name: def.name.clone(),
-            });
-        }
-        self.globals.insert(def.name.clone(), def);
-        Ok(())
-    }
-
-    /// Register an extern function in a namespace.
-    ///
-    /// Namespaced externs require `require namespace;` in the script and
-    /// are called qualified: `cbor::decode(bytes)`.
-    ///
-    /// Returns an error if the function name is already registered in
-    /// this namespace.
+    /// The namespace and name come from the `ExternDef`.
+    /// Scripts use `require namespace;` to access as `namespace::func()`,
+    /// or `require namespace as _;` to merge into root scope.
     ///
     /// ```ignore
-    /// registry.register_in("cbor", ExternDef::new("decode", decode_fn))?;
-    /// registry.register_in("cbor", ExternDef::new("encode", encode_fn))?;
+    /// registry.register(ExternDef::new("cbor", "decode", decode_fn))?;
+    /// registry.register(ExternDef::new("cbor", "encode", encode_fn))?;
     /// ```
-    pub fn register_in(&mut self, namespace: &str, def: ExternDef) -> Result<(), RegistryError> {
-        let ns = self.namespaces.entry(namespace.to_string()).or_default();
+    pub fn register(&mut self, def: ExternDef) -> Result<(), RegistryError> {
+        let ns = self.namespaces.entry(def.namespace.clone()).or_default();
         if ns.contains_key(&def.name) {
             return Err(RegistryError::DuplicateInNamespace {
-                namespace: namespace.to_string(),
+                namespace: def.namespace.clone(),
                 name: def.name.clone(),
             });
         }
         ns.insert(def.name.clone(), def);
         Ok(())
-    }
-
-    /// Look up a global extern by name.
-    pub fn get(&self, name: &str) -> Option<&ExternDef> {
-        self.globals.get(name)
     }
 
     /// Look up a namespaced extern by namespace and function name.
@@ -674,18 +646,10 @@ impl ExternRegistry {
 
     /// Look up an extern by function reference.
     ///
-    /// Checks namespaced externs first (if qualified), then globals.
+    /// Only resolves qualified (namespaced) references.
     pub fn lookup(&self, func: &FunctionRef) -> Option<&ExternDef> {
-        if let Some(ns) = &func.namespace {
-            self.get_in(ns, &func.name)
-        } else {
-            self.get(func.name.as_ref())
-        }
-    }
-
-    /// Check if a global extern with this name exists.
-    pub fn contains(&self, name: &str) -> bool {
-        self.globals.contains_key(name)
+        let ns = func.namespace.as_ref()?;
+        self.get_in(ns, &func.name)
     }
 
     /// Check if a namespace has been registered.
@@ -706,33 +670,25 @@ impl ExternRegistry {
             .flat_map(|ns| ns.iter())
     }
 
-    /// Iterate over all global externs.
-    pub fn globals_iter(&self) -> impl Iterator<Item = (&String, &ExternDef)> {
-        self.globals.iter()
-    }
-
-    /// Iterate over all registered externs (globals + all namespaces).
+    /// Iterate over all registered externs.
     ///
-    /// Yields `(qualified_name, def)` where qualified_name is `"func"` for
-    /// globals and `"ns::func"` for namespaced externs.
+    /// Yields `(qualified_name, def)` where qualified_name is `"ns::func"`.
     pub fn iter(&self) -> impl Iterator<Item = (String, &ExternDef)> {
-        let globals = self.globals.iter().map(|(k, v)| (k.clone(), v));
-        let namespaced = self.namespaces.iter().flat_map(|(ns, funcs)| {
+        self.namespaces.iter().flat_map(|(ns, funcs)| {
             funcs
                 .iter()
                 .map(move |(name, def)| (format!("{ns}::{name}"), def))
-        });
-        globals.chain(namespaced)
+        })
     }
 
     /// Get the total number of registered externs.
     pub fn len(&self) -> usize {
-        self.globals.len() + self.namespaces.values().map(|ns| ns.len()).sum::<usize>()
+        self.namespaces.values().map(|ns| ns.len()).sum::<usize>()
     }
 
     /// Check if the registry is empty.
     pub fn is_empty(&self) -> bool {
-        self.globals.is_empty() && self.namespaces.is_empty()
+        self.namespaces.is_empty()
     }
 }
 
@@ -842,7 +798,7 @@ mod tests {
             Ok(ExecResult::Return(Value::Undefined))
         }
 
-        let def = ExternDef::new("test", dummy)
+        let def = ExternDef::new("ns", "test", dummy)
             .param("x", TypeSet::uint())
             .param_optional("y", TypeSet::int())
             .returns(TypeSet::bool())
@@ -865,43 +821,30 @@ mod tests {
         let mut registry = ExternRegistry::new();
         assert!(registry.is_empty());
 
-        registry.register(ExternDef::new("foo", dummy)).unwrap();
+        registry
+            .register(ExternDef::new("test", "foo", dummy))
+            .unwrap();
         assert_eq!(registry.len(), 1);
-        assert!(registry.contains("foo"));
-        assert!(!registry.contains("bar"));
+        assert!(registry.has_namespace("test"));
 
-        let def = registry.get("foo").unwrap();
+        let def = registry.get_in("test", "foo").unwrap();
         assert_eq!(def.name, "foo");
     }
 
     #[test]
-    fn test_register_intrinsic_clash() {
+    fn test_register_no_intrinsic_clash_when_namespaced() {
         fn dummy(_vm: &mut VM, _argc: usize) -> Result<ExecResult, ExecError> {
             Ok(ExecResult::Return(Value::Undefined))
         }
 
+        // Intrinsic names are fine in namespaces — clash only happens at `require ns as _`
         let mut registry = ExternRegistry::new();
-        let result = registry.register(ExternDef::new("len", dummy));
-        assert!(matches!(result, Err(RegistryError::IntrinsicClash { .. })));
-
-        let result = registry.register(ExternDef::new("collect", dummy));
-        assert!(matches!(result, Err(RegistryError::IntrinsicClash { .. })));
-
-        // Non-reserved name succeeds
-        registry.register(ExternDef::new("exit", dummy)).unwrap();
-    }
-
-    #[test]
-    fn test_register_duplicate_global() {
-        fn dummy(_vm: &mut VM, _argc: usize) -> Result<ExecResult, ExecError> {
-            Ok(ExecResult::Return(Value::Undefined))
-        }
-
-        let mut registry = ExternRegistry::new();
-        registry.register(ExternDef::new("exit", dummy)).unwrap();
-
-        let result = registry.register(ExternDef::new("exit", dummy));
-        assert!(matches!(result, Err(RegistryError::DuplicateGlobal { .. })));
+        registry
+            .register(ExternDef::new("core", "len", dummy))
+            .unwrap();
+        registry
+            .register(ExternDef::new("core", "collect", dummy))
+            .unwrap();
     }
 
     #[test]
@@ -912,10 +855,10 @@ mod tests {
 
         let mut registry = ExternRegistry::new();
         registry
-            .register_in("cbor", ExternDef::new("decode", dummy))
+            .register(ExternDef::new("cbor", "decode", dummy))
             .unwrap();
 
-        let result = registry.register_in("cbor", ExternDef::new("decode", dummy));
+        let result = registry.register(ExternDef::new("cbor", "decode", dummy));
         assert!(matches!(
             result,
             Err(RegistryError::DuplicateInNamespace { .. })
@@ -923,7 +866,7 @@ mod tests {
 
         // Same name in different namespace is fine
         registry
-            .register_in("json", ExternDef::new("decode", dummy))
+            .register(ExternDef::new("json", "decode", dummy))
             .unwrap();
     }
 
@@ -935,10 +878,10 @@ mod tests {
 
         let mut registry = ExternRegistry::new();
         registry
-            .register_in("cbor", ExternDef::new("decode", dummy))
+            .register(ExternDef::new("cbor", "decode", dummy))
             .unwrap();
         registry
-            .register_in("cbor", ExternDef::new("encode", dummy))
+            .register(ExternDef::new("cbor", "encode", dummy))
             .unwrap();
 
         assert!(registry.has_namespace("cbor"));
@@ -964,7 +907,7 @@ mod tests {
             Ok(ExecResult::Return(Value::UInt(2)))
         }
 
-        let def = ExternDef::new("sqrt", generic)
+        let def = ExternDef::new("math", "sqrt", generic)
             .param("x", TypeSet::numeric())
             .returns(TypeSet::numeric())
             .variant(&[TypeSet::uint()], TypeSet::uint(), uint_variant)
