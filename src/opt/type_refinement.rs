@@ -128,7 +128,10 @@ fn transfer_instruction(
             let mut result_elem: Option<TypeSet> = None;
             let mut all_have_elems = true;
             for (_, var) in sources {
-                let var_type = state.get(var).cloned().unwrap_or(TypeSet::any());
+                // Use none() (bottom) for unknown sources — standard dataflow.
+                // any() would poison the Phi on the first iteration before
+                // back-edge sources are processed, preventing convergence.
+                let var_type = state.get(var).cloned().unwrap_or(TypeSet::none());
                 result_type = Some(match result_type {
                     None => var_type,
                     Some(prev) => prev.union(&var_type),
@@ -931,5 +934,175 @@ mod tests {
         let type_set = analysis.get(var(1)).unwrap();
         assert!(type_set.contains(BaseType::Array));
         assert!(type_set.is_single());
+    }
+
+    // ========================================================================
+    // Phi Convergence Tests
+    // ========================================================================
+
+    #[test]
+    fn test_phi_converges_with_reload_loop() {
+        // Simulates a loop-carried map mutation:
+        //
+        //   B0 (entry): v0 = MakeMap(), v1 = cond  →  Jump B1
+        //   B1 (header): v2 = Phi(B0: v0, B2: v3)  →  If v1 → B2, B3
+        //   B2 (body): v3 = Reload(v2)  →  Jump B1
+        //   B3 (exit): Return v2
+        //
+        // The Phi merges v0 (Map) with v3 (Reload of v2).
+        // v2's type depends on v3, which depends on v2 — circular.
+        //
+        // With bottom-start (none() for unknown sources), the worklist
+        // converges on Map: v2 = Map ∪ none() = Map → v3 = Map → stable.
+        //
+        // With top-start (any() for unknown sources), it would widen to
+        // any(): v2 = Map ∪ any() = any() → stuck.
+        let blocks = vec![
+            BasicBlock {
+                id: block(0),
+                instructions: vec![
+                    si(Instruction::Intrinsic {
+                        dest: var(0),
+                        op: crate::ir::IntrinsicOp::MakeMap,
+                        args: vec![],
+                    }),
+                    si(Instruction::Const {
+                        dest: var(1),
+                        value: Literal::Bool(true),
+                    }),
+                ],
+                terminator: Terminator::Jump { target: block(1) },
+            },
+            BasicBlock {
+                id: block(1),
+                instructions: vec![si(Instruction::Phi {
+                    dest: var(2),
+                    sources: vec![(block(0), var(0)), (block(2), var(3))],
+                })],
+                terminator: Terminator::If {
+                    condition: var(1),
+                    then_target: block(2),
+                    else_target: block(3),
+                    span: ast::Span::default(),
+                },
+            },
+            BasicBlock {
+                id: block(2),
+                instructions: vec![si(Instruction::Reload {
+                    dest: var(3),
+                    src: var(2),
+                })],
+                terminator: Terminator::Jump { target: block(1) },
+            },
+            BasicBlock {
+                id: block(3),
+                instructions: vec![],
+                terminator: Terminator::Return {
+                    value: Some(var(2)),
+                },
+            },
+        ];
+
+        let func = make_function(blocks);
+        let analysis = analyze_types(&func, None);
+
+        // v0 = MakeMap → Map
+        let v0_type = analysis.get(var(0)).unwrap();
+        assert!(v0_type.contains(BaseType::Map));
+        assert!(v0_type.is_single());
+
+        // v2 = Phi → should converge on Map (not any())
+        let v2_type = analysis.get(var(2)).unwrap();
+        assert!(
+            v2_type.contains(BaseType::Map),
+            "Phi should contain Map, got {:?}",
+            v2_type
+        );
+        assert!(
+            v2_type.is_single(),
+            "Phi should converge on just Map, got {:?}",
+            v2_type
+        );
+
+        // v3 = Reload(v2) → should inherit Map
+        let v3_type = analysis.get(var(3)).unwrap();
+        assert!(v3_type.contains(BaseType::Map));
+        assert!(v3_type.is_single());
+    }
+
+    #[test]
+    fn test_phi_converges_array_with_append() {
+        // Loop building an array via Append:
+        //
+        //   B0: v0 = MakeArray(), v1 = cond  →  Jump B1
+        //   B1: v2 = Phi(B0: v0, B2: v3)  →  If v1 → B2, B3
+        //   B2: v3 = Append(v2, v4)  →  Jump B1
+        //   B3: Return v2
+        //
+        // v2 should converge on Array.
+        let blocks = vec![
+            BasicBlock {
+                id: block(0),
+                instructions: vec![
+                    si(Instruction::Intrinsic {
+                        dest: var(0),
+                        op: crate::ir::IntrinsicOp::MakeArray,
+                        args: vec![],
+                    }),
+                    si(Instruction::Const {
+                        dest: var(1),
+                        value: Literal::Bool(true),
+                    }),
+                ],
+                terminator: Terminator::Jump { target: block(1) },
+            },
+            BasicBlock {
+                id: block(1),
+                instructions: vec![si(Instruction::Phi {
+                    dest: var(2),
+                    sources: vec![(block(0), var(0)), (block(2), var(3))],
+                })],
+                terminator: Terminator::If {
+                    condition: var(1),
+                    then_target: block(2),
+                    else_target: block(3),
+                    span: ast::Span::default(),
+                },
+            },
+            BasicBlock {
+                id: block(2),
+                instructions: vec![
+                    si(Instruction::Const {
+                        dest: var(4),
+                        value: Literal::UInt(42),
+                    }),
+                    si(Instruction::Append {
+                        dest: var(3),
+                        arr: var(2),
+                        value: var(4),
+                    }),
+                ],
+                terminator: Terminator::Jump { target: block(1) },
+            },
+            BasicBlock {
+                id: block(3),
+                instructions: vec![],
+                terminator: Terminator::Return {
+                    value: Some(var(2)),
+                },
+            },
+        ];
+
+        let func = make_function(blocks);
+        let analysis = analyze_types(&func, None);
+
+        // v2 should converge on Array (not any())
+        let v2_type = analysis.get(var(2)).unwrap();
+        assert!(v2_type.contains(BaseType::Array));
+        assert!(
+            v2_type.is_single(),
+            "Phi should converge on just Array, got {:?}",
+            v2_type
+        );
     }
 }

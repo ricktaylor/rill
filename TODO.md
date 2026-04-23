@@ -258,13 +258,12 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
       - `with` without write-back optimises to same IR as `let`
       - WriteAccessor bases tracked in written_bases (prevents incorrect Ref demotion)
 
-### P2 — Known Issues
+### P2 — Known Issues (resolved)
 
-- [ ] **Type analysis Phi convergence** — Reload in a loop produces `any()` on the
-      first worklist iteration (source type not yet known). The Phi unions Map ∪ any()
-      = any(), and the worklist may not re-iterate to converge on Map. This causes the
-      compiler to emit generic dispatch closures instead of type-specialized ones for
-      loop-carried collections. Functionally correct but suboptimal.
+- [x] **Type analysis Phi convergence** — Fixed: Phi sources default to `none()` (bottom)
+      instead of `any()` (top). Standard dataflow bottom-start. The worklist converges
+      correctly: `Map ∪ none() = Map` instead of `Map ∪ any() = any()`.
+      Loop-carried collections now get type-specialized dispatch.
 
 ### P2 — Parser
 - [ ] **Optional braces in match arms** — allow `pattern => expr,` in addition to
