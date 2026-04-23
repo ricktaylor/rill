@@ -6,6 +6,9 @@ use crate::ast;
 use crate::ir::*;
 use std::collections::HashMap;
 
+/// Phi insertion map: block → [(dest_var, [(pred_block, pred_var)])]
+type PhiMap = HashMap<BlockId, Vec<(VarId, Vec<(BlockId, VarId)>)>>;
+
 /// Promote all `Assign`/`Read` instructions in a function to SSA form.
 ///
 /// After this pass:
@@ -87,7 +90,7 @@ struct PromoteCtx {
 
     /// Phi nodes to insert at the start of blocks.
     /// `block_id → [(dest_var, [(pred_block, pred_var)])]`
-    inserted_phis: HashMap<BlockId, Vec<(VarId, Vec<(BlockId, VarId)>)>>,
+    inserted_phis: PhiMap,
 
     /// Replacement map: for each `Read` instruction's dest VarId,
     /// the resolved SSA VarId to use instead.
