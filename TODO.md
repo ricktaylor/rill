@@ -246,6 +246,11 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
       The peephole layer (future StepKind) can fuse back to a single closure.
 - [x] **build_ref_map/RefMeta removed** — WriteAccessor carries base+key directly.
       WriteRef uses vm.set_local which resolves through Slot types. No tracing.
+- [x] **Frame stack separated** — `FrameInfo` moved from `Slot::Frame` to a
+      separate `Vec<FrameInfo>`. Removes `Frame` from Slot enum (one fewer variant
+      in hot path), eliminates `Box` allocation per call, removes `rotate_right(1)`
+      in `call_with_args`. Slot offsets are now 0-based (`slot(VarId) = var.0`).
+      Stack size configurable via `VM::with_limits(heap, stack)`.
 - [x] **ref_elision updated** for Accessor/Ref split:
       - Ref(Accessor) → Accessor: flattens double indirection
       - Read-only Accessor → Index: removes Slot::Accessor overhead

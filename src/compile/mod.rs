@@ -100,7 +100,7 @@ pub(crate) enum Action {
 /// Maps VarIds to stack slot offsets.
 /// Slot 0 = Frame info. VarId(n) → slot n + 1.
 pub(crate) fn slot(var: VarId) -> usize {
-    var.0 as usize + 1
+    var.0 as usize // Frame info is on a separate stack — slot 0 is available
 }
 
 /// Maps BlockId to index in the compiled blocks array.
@@ -263,7 +263,7 @@ fn link_functions(
 
 fn compile_function(func: &Function, link_map: &LinkMap) -> Result<CompiledFunction, ExecError> {
     let block_map = build_block_map(&func.blocks);
-    let frame_size = 1 + func.locals.len(); // slot 0 = Frame, then locals
+    let frame_size = func.locals.len(); // frame info on separate stack
 
     // Type analysis for specialization — when both operands of an arithmetic
     // op are provably the same type, the compiler emits a direct closure
@@ -597,13 +597,13 @@ fn compile_instruction(
                     let argc = arg_slots.len();
                     Box::new(move |vm: &mut VM, _prog| {
                         let caller_bp = vm.bp();
-                        let frame_size = 1 + argc;
+                        let frame_size = argc; // frame info on separate stack
                         vm.call(frame_size, None)?;
 
                         // Uniform shallow copy — Refs stay Refs, Vals stay Vals.
                         // The lowerer already emitted MakeRef for by-ref args.
                         for (i, &s) in arg_slots.iter().enumerate() {
-                            vm.copy_slot_from(i + 1, caller_bp + s);
+                            vm.copy_slot_from(i, caller_bp + s);
                         }
 
                         let result = f(vm, argc);
@@ -627,7 +627,7 @@ fn compile_instruction(
                         // already emitted MakeRef for by-ref args.
                         for (i, &s) in arg_slots.iter().enumerate() {
                             if i < func.param_count {
-                                vm.copy_slot_from(i + 1, caller_bp + s);
+                                vm.copy_slot_from(i, caller_bp + s);
                             }
                         }
 

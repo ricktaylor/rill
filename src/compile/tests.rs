@@ -2003,7 +2003,7 @@ fn tco_deep_tail_recursive_sum() {
 
 #[test]
 fn tco_deep_recursion() {
-    // 100,000 recursive calls — exceeds MAX_STACK_SIZE (65536) without TCO
+    // 100,000 recursive calls — exceeds DEFAULT_STACK_SIZE (65536) without TCO
     let val = run_with_args(
         r#"
         fn count_down(n) {

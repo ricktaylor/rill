@@ -83,7 +83,7 @@ pub(super) fn compile_terminator(
                 // Undefined. set_local writes through Refs (by-ref contract) and
                 // directly for Vals. Simulates pop + re-create of the frame.
                 for (i, val) in values.into_iter().enumerate() {
-                    vm.set_local(i + 1, val);
+                    vm.set_local(i, val);
                 }
                 // Reset non-param locals — clears Val/Ref/Accessor unconditionally.
                 // Must NOT use set_local (would write through Accessors).

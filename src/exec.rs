@@ -14,7 +14,7 @@ use types::BaseType;
 // ============================================================================
 
 /// Maximum stack size (catches both value overflow and recursion)
-pub const MAX_STACK_SIZE: usize = 65536;
+pub const DEFAULT_STACK_SIZE: usize = 65536;
 
 /// Default heap limit (bytes, approximate)
 pub const DEFAULT_HEAP_LIMIT: usize = 16 * 1024 * 1024; // 16 MB
@@ -252,8 +252,7 @@ impl Eq for Float {}
 // Stack Slots
 // ============================================================================
 
-/// Frame info stored in slot 0 of each call frame.
-/// Boxed to keep Slot size small (24 bytes instead of 32).
+/// Frame info stored in a separate frame stack (not in the slot stack).
 #[derive(Debug, Clone)]
 pub struct FrameInfo {
     pub bp: usize,
@@ -271,8 +270,6 @@ pub enum Slot {
     /// Reading resolves to base_collection[key_value].
     /// Writing mutates the collection element at base[key].
     Accessor { base: usize, key: usize },
-    /// Saved frame info (slot 0 of each frame)
-    Frame(Box<FrameInfo>),
 }
 
 impl Slot {
@@ -492,15 +489,15 @@ impl Hash for Value {
 ///
 /// Frame layout:
 /// ```text
-/// ┌─────────────────┬────────┬────────┬─────┐
-/// │ Frame(bp,ret)   │ param0 │ local0 │ ... │
-/// └─────────────────┴────────┴────────┴─────┘
-///   bp+0              bp+1     bp+2
+/// ┌────────┬────────┬─────┐
+/// │ param0 │ local0 │ ... │
+/// └────────┴────────┴─────┘
+///   bp+0     bp+1
 /// ```
 ///
-/// - Slot 0: Frame info (saved BP + return slot for direct writes)
-/// - IR local offsets start at 1 (params first, then locals)
-/// - frame_size includes the Frame slot
+/// - Frame info (saved BP + return slot) stored on separate frame_stack
+/// - IR local offsets start at 0 (params first, then locals)
+/// - frame_size = params + locals (no Frame slot overhead)
 ///
 /// Heap tracking:
 /// - Collections use HeapVal which tracks allocations via shared Heap
@@ -508,20 +505,28 @@ impl Hash for Value {
 /// - CoW cloning checks heap limit before allocating
 pub struct VM {
     stack: Vec<Slot>,
+    frame_stack: Vec<FrameInfo>,
     bp: usize,
     heap: HeapRef,
+    max_stack_size: usize,
 }
 
 impl VM {
     pub fn new() -> Self {
-        Self::with_heap_limit(DEFAULT_HEAP_LIMIT)
+        Self::with_limits(DEFAULT_HEAP_LIMIT, DEFAULT_STACK_SIZE)
     }
 
     pub fn with_heap_limit(heap_limit: usize) -> Self {
+        Self::with_limits(heap_limit, DEFAULT_STACK_SIZE)
+    }
+
+    pub fn with_limits(heap_limit: usize, max_stack_size: usize) -> Self {
         VM {
             stack: Vec::new(),
+            frame_stack: Vec::new(),
             bp: 0,
             heap: Rc::new(Heap::new(heap_limit)),
+            max_stack_size,
         }
     }
 
@@ -560,33 +565,28 @@ impl VM {
 
     /// Call a function: reserve frame, save BP and return slot in slot 0
     ///
-    /// - `frame_size`: includes the Frame slot, so minimum is 1
+    /// - `frame_size`: number of slots for params + locals
     /// - `return_slot`: absolute index where callee should write return value (None if no return)
     ///
-    /// IR local offsets are 1-based (slot 0 is Frame info).
+    /// IR local offsets are 0-based (frame info on separate stack).
     pub fn call(&mut self, frame_size: usize, return_slot: Option<usize>) -> Result<(), ExecError> {
-        // frame_size must include at least the Frame slot
-        if frame_size < 1 {
-            return Err(ExecError::StackOverflow);
-        }
-
         // Stack overflow check
-        if self.stack.len() + frame_size > MAX_STACK_SIZE {
+        if self.stack.len() + frame_size > self.max_stack_size {
             return Err(ExecError::StackOverflow);
         }
 
         let old_bp = self.bp;
         self.bp = self.stack.len();
 
-        // Reserve entire frame at once
-        self.stack
-            .resize(self.bp + frame_size, Slot::Val(Value::Undefined));
-
-        // Slot 0 is frame info (saved BP + return destination)
-        self.stack[self.bp] = Slot::Frame(Box::new(FrameInfo {
+        // Save frame info on the frame stack (not in the slot stack)
+        self.frame_stack.push(FrameInfo {
             bp: old_bp,
             return_slot,
-        }));
+        });
+
+        // Reserve entire frame at once — all slots start as Undefined
+        self.stack
+            .resize(self.bp + frame_size, Slot::Val(Value::Undefined));
 
         Ok(())
     }
@@ -598,51 +598,44 @@ impl VM {
     /// vm.push(Value::UInt(42))?;
     /// vm.push(Value::Text("hello".into()))?;
     /// vm.call_with_args(frame_size, 2)?;
-    /// // Args are now in slots 1..=2 of the new frame
+    /// // Args are now in slots 0..argc of the new frame
     /// ```
     ///
     /// Internally, the pushed values are shifted right by one slot to make
     /// room for the Frame info at slot 0. On `ret()`, the entire frame
     /// (including adopted args) is cleaned up.
     pub fn call_with_args(&mut self, frame_size: usize, argc: usize) -> Result<(), ExecError> {
-        if frame_size < 1 + argc {
+        if frame_size < argc {
             return Err(ExecError::StackOverflow);
         }
 
         let args_base = self.stack.len() - argc;
 
         // Stack overflow check
-        if args_base + frame_size > MAX_STACK_SIZE {
+        if args_base + frame_size > self.max_stack_size {
             return Err(ExecError::StackOverflow);
         }
 
         let old_bp = self.bp;
         self.bp = args_base;
 
-        // Extend to full frame size
-        self.stack
-            .resize(self.bp + frame_size, Slot::Val(Value::Undefined));
-
-        // Shift args right by 1 to make room for Frame slot at bp.
-        // rotate_right(1) on [bp..bp+argc+1] moves args from [bp..bp+argc]
-        // to [bp+1..bp+argc+1] in a single bulk operation (compiles to memmove).
-        self.stack[self.bp..self.bp + argc + 1].rotate_right(1);
-
-        // Slot 0 is frame info (overwrites the Uninit rotated into position)
-        self.stack[self.bp] = Slot::Frame(Box::new(FrameInfo {
+        // Save frame info on the frame stack
+        self.frame_stack.push(FrameInfo {
             bp: old_bp,
             return_slot: None,
-        }));
+        });
+
+        // Extend to full frame size — args are already in place at bp,
+        // no rotate needed (Frame slot no longer occupies slot 0).
+        self.stack
+            .resize(self.bp + frame_size, Slot::Val(Value::Undefined));
 
         Ok(())
     }
 
-    /// Return from function without a value: restore BP, truncate stack
+    /// Return from function: restore BP, truncate stack
     pub fn ret(&mut self) {
-        let saved_bp = match self.stack.get(self.bp) {
-            Some(Slot::Frame(info)) => info.bp,
-            _ => 0, // Corrupted or at top level
-        };
+        let saved_bp = self.frame_stack.pop().map(|info| info.bp).unwrap_or(0);
 
         self.stack.truncate(self.bp);
         self.bp = saved_bp;
@@ -652,20 +645,20 @@ impl VM {
     ///
     /// Writes directly to the return_slot specified in call(), avoiding copies.
     pub fn ret_val(&mut self, value: Value) {
-        let (saved_bp, return_slot) = match self.stack.get(self.bp) {
-            Some(Slot::Frame(info)) => (info.bp, info.return_slot),
-            _ => (0, None),
-        };
+        let info = self.frame_stack.pop().unwrap_or(FrameInfo {
+            bp: 0,
+            return_slot: None,
+        });
 
         // Write return value directly to caller's slot (must happen before truncate)
-        if let Some(slot) = return_slot
+        if let Some(slot) = info.return_slot
             && let Some(s) = self.stack.get_mut(slot)
         {
             *s = Slot::Val(value);
         }
 
         self.stack.truncate(self.bp);
-        self.bp = saved_bp;
+        self.bp = info.bp;
     }
 
     /// Bind a parameter after call() setup
@@ -723,7 +716,6 @@ impl VM {
                     _ => None,
                 }
             }
-            Slot::Frame(_) => None,
         }
     }
 
@@ -749,7 +741,6 @@ impl VM {
                 return self.set(t, value);
             }
             Slot::Accessor { base, key } => (*base, *key),
-            Slot::Frame(_) => return,
         };
         // Write through Accessor: mutate the collection element
         let key_val = self.get(key).cloned().unwrap_or(Value::Undefined);
@@ -814,7 +805,7 @@ impl VM {
     /// }
     /// ```
     pub fn arg(&self, index: usize) -> &Value {
-        self.local(index + 1) // slot 0 = Frame, slot 1 = arg 0
+        self.local(index) // args start at slot 0 (no Frame slot)
     }
 
     /// Set a slot to be a reference to another slot
@@ -911,7 +902,7 @@ impl VM {
 
     /// Push a value, return its absolute index
     pub fn push(&mut self, value: Value) -> Result<usize, ExecError> {
-        if self.stack.len() >= MAX_STACK_SIZE {
+        if self.stack.len() >= self.max_stack_size {
             return Err(ExecError::StackOverflow);
         }
         let idx = self.stack.len();
@@ -1018,7 +1009,7 @@ impl Default for VM {
 #[derive(Debug, thiserror::Error)]
 pub enum ExecError {
     /// Stack overflow (value or recursion)
-    #[error("stack overflow (limit: {MAX_STACK_SIZE} slots)")]
+    #[error("stack overflow")]
     StackOverflow,
     /// Heap allocation limit exceeded
     #[error("heap allocation limit exceeded")]
