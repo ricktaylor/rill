@@ -49,8 +49,8 @@ impl<'a> Lowerer<'a> {
     // ========================================================================
 
     /// Evaluate an expression at compile time, returning a ConstValue
-    fn const_eval_expr(&self, expr: &ast::Expression) -> ConstResult<ConstValue> {
-        match expr {
+    fn const_eval_expr(&self, expr: &ast::Expr) -> ConstResult<ConstValue> {
+        match &expr.node {
             ast::Expression::Literal(lit) => self.const_eval_literal(lit),
 
             ast::Expression::Variable(name) => {
@@ -158,9 +158,9 @@ impl<'a> Lowerer<'a> {
     /// Evaluate a binary operation at compile time
     fn const_eval_binary_op(
         &self,
-        left: &ast::Expression,
+        left: &ast::Expr,
         op: &ast::BinaryOperator,
-        right: &ast::Expression,
+        right: &ast::Expr,
     ) -> ConstResult<ConstValue> {
         // Short-circuit evaluation for && and ||
         match op {
@@ -219,7 +219,7 @@ impl<'a> Lowerer<'a> {
     fn const_eval_unary_op(
         &self,
         op: &ast::UnaryOperator,
-        operand: &ast::Expression,
+        operand: &ast::Expr,
     ) -> ConstResult<ConstValue> {
         let arg = self.const_eval_expr(operand)?;
         self.eval_intrinsic(op.intrinsic_op(), &[arg])
@@ -230,7 +230,7 @@ impl<'a> Lowerer<'a> {
         &self,
         namespace: Option<&ast::Identifier>,
         name: &ast::Identifier,
-        arguments: &[ast::Expression],
+        arguments: &[ast::Expr],
     ) -> ConstResult<ConstValue> {
         // Evaluate all arguments first
         let args: ConstResult<Vec<_>> = arguments.iter().map(|e| self.const_eval_expr(e)).collect();

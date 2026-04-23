@@ -87,11 +87,11 @@ impl<'a> Lowerer<'a> {
     /// Returns the VarId containing the assigned value (or undefined if lvalue invalid)
     pub fn lower_assignment(
         &mut self,
-        target: &ast::Expression,
+        target: &ast::Expr,
         op: &ast::AssignmentOp,
-        value: &ast::Expression,
+        value: &ast::Expr,
     ) -> VarId {
-        match target {
+        match &target.node {
             ast::Expression::Variable(name) => {
                 let rhs = self.lower_expression(value);
 
@@ -136,7 +136,7 @@ impl<'a> Lowerer<'a> {
             }
 
             ast::Expression::ArrayAccess { array, index } => {
-                let base_name = if let ast::Expression::Variable(name) = array.as_ref() {
+                let base_name = if let ast::Expression::Variable(name) = &array.node {
                     Some(name.clone())
                 } else {
                     None
@@ -147,7 +147,7 @@ impl<'a> Lowerer<'a> {
             }
 
             ast::Expression::MemberAccess { object, member } => {
-                let base_name = if let ast::Expression::Variable(name) = object.as_ref() {
+                let base_name = if let ast::Expression::Variable(name) = &object.node {
                     Some(name.clone())
                 } else {
                     None
@@ -251,7 +251,7 @@ impl<'a> Lowerer<'a> {
         base: VarId,
         key: VarId,
         op: &ast::AssignmentOp,
-        value: &ast::Expression,
+        value: &ast::Expr,
         base_name: Option<ast::Identifier>,
     ) -> VarId {
         if matches!(op, ast::AssignmentOp::Assign) {

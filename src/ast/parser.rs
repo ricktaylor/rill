@@ -287,10 +287,10 @@ fn assign_op<'a>() -> BoxedParser<'a, AssignmentOp> {
 // Expressions
 // ============================================================================
 
-fn expression<'a>() -> BoxedParser<'a, Expression> {
+fn expression<'a>() -> BoxedParser<'a, Expr> {
     recursive(|expr| {
         // Build parsers using the recursive handle
-        let expr_boxed: BoxedParser<'a, Expression> = expr.clone().boxed();
+        let expr_boxed: BoxedParser<'a, Expr> = expr.clone().boxed();
 
         // Primary expressions
         let primary = primary_expr(expr_boxed.clone());
@@ -316,7 +316,7 @@ fn expression<'a>() -> BoxedParser<'a, Expression> {
     .boxed()
 }
 
-fn primary_expr<'a>(expr: BoxedParser<'a, Expression>) -> BoxedParser<'a, Expression> {
+fn primary_expr<'a>(expr: BoxedParser<'a, Expr>) -> BoxedParser<'a, Expr> {
     // Array literal
     let array_lit = expr
         .clone()
@@ -328,7 +328,9 @@ fn primary_expr<'a>(expr: BoxedParser<'a, Expression>) -> BoxedParser<'a, Expres
             just('[').padded_by(whitespace()),
             just(']').padded_by(whitespace()),
         )
-        .map(|exprs| Expression::Literal(Literal::Array(exprs)));
+        .map_with(|exprs, extra| {
+            Spanned::new(Expression::Literal(Literal::Array(exprs)), extra.span())
+        });
 
     // Map literal
     let map_entry = expr
@@ -345,7 +347,9 @@ fn primary_expr<'a>(expr: BoxedParser<'a, Expression>) -> BoxedParser<'a, Expres
             just('{').padded_by(whitespace()),
             just('}').padded_by(whitespace()),
         )
-        .map(|entries| Expression::Literal(Literal::Map(entries)));
+        .map_with(|entries, extra| {
+            Spanned::new(Expression::Literal(Literal::Map(entries)), extra.span())
+        });
 
     // Simple literals
     let literal = choice((
@@ -358,7 +362,7 @@ fn primary_expr<'a>(expr: BoxedParser<'a, Expression>) -> BoxedParser<'a, Expres
         text_literal(),
     ))
     .padded_by(whitespace())
-    .map(Expression::Literal);
+    .map_with(|lit, extra| Spanned::new(Expression::Literal(lit), extra.span()));
 
     // Function call arguments parser
     let call_args = expr
@@ -377,19 +381,22 @@ fn primary_expr<'a>(expr: BoxedParser<'a, Expression>) -> BoxedParser<'a, Expres
     let callable_or_variable =
         qualified_name()
             .then(call_args.or_not())
-            .map(|((namespace, name), args)| match args {
-                Some(arguments) => Expression::FunctionCall {
-                    namespace,
-                    name,
-                    arguments,
-                },
-                None => match namespace {
-                    Some(ns) => Expression::QualifiedName {
-                        namespace: ns,
+            .map_with(|((namespace, name), args), extra| {
+                let node = match args {
+                    Some(arguments) => Expression::FunctionCall {
+                        namespace,
                         name,
+                        arguments,
                     },
-                    None => Expression::Variable(name),
-                },
+                    None => match namespace {
+                        Some(ns) => Expression::QualifiedName {
+                            namespace: ns,
+                            name,
+                        },
+                        None => Expression::Variable(name),
+                    },
+                };
+                Spanned::new(node, extra.span())
             });
 
     let paren = expr.clone().padded_by(whitespace()).delimited_by(
@@ -425,28 +432,33 @@ fn primary_expr<'a>(expr: BoxedParser<'a, Expression>) -> BoxedParser<'a, Expres
 
 /// Postfix operations: member access and indexing only
 /// Function calls are parsed in primary_expr, not as postfix
+/// Carries (PostfixOp, span_of_entire_postfix_suffix) for span computation
 #[derive(Clone, Debug)]
 enum PostfixOp {
-    Member(Expression),
-    Index(Expression),
+    Member(Expr),
+    Index(Expr),
 }
 
 fn postfix_expr<'a>(
-    expr: BoxedParser<'a, Expression>,
-    primary: BoxedParser<'a, Expression>,
-) -> BoxedParser<'a, Expression> {
+    expr: BoxedParser<'a, Expr>,
+    primary: BoxedParser<'a, Expr>,
+) -> BoxedParser<'a, Expr> {
     // Member access: obj.field or obj.(expr)
+    // Wrap with map_with to capture the full postfix span (. through end)
     let member_ident = just('.')
         .padded_by(whitespace())
         .ignore_then(ident())
-        .map(|id| PostfixOp::Member(Expression::Literal(Literal::Text(id.0))));
+        .map_with(|id, extra| {
+            let key = Spanned::new(Expression::Literal(Literal::Text(id.0)), extra.span());
+            (PostfixOp::Member(key), extra.span())
+        });
 
     let member_dyn = just('.')
         .ignore_then(expr.clone().padded_by(whitespace()).delimited_by(
             just('(').padded_by(whitespace()),
             just(')').padded_by(whitespace()),
         ))
-        .map(PostfixOp::Member);
+        .map_with(|e, extra| (PostfixOp::Member(e), extra.span()));
 
     // Array/map indexing: arr[i]
     let index = expr
@@ -455,27 +467,32 @@ fn postfix_expr<'a>(
             just('[').padded_by(whitespace()),
             just(']').padded_by(whitespace()),
         )
-        .map(PostfixOp::Index);
+        .map_with(|e, extra| (PostfixOp::Index(e), extra.span()));
 
     // No Call here - function calls are only valid after identifiers,
     // and are parsed in primary_expr via callable_or_variable
     let postfix_op = choice((member_ident, member_dyn, index)).boxed();
 
     primary
-        .foldl(postfix_op.repeated(), |lhs, op| match op {
-            PostfixOp::Member(key) => Expression::MemberAccess {
-                object: Box::new(lhs),
-                member: Box::new(key),
-            },
-            PostfixOp::Index(idx) => Expression::ArrayAccess {
-                array: Box::new(lhs),
-                index: Box::new(idx),
-            },
+        .foldl(postfix_op.repeated(), |lhs, (op, op_span)| {
+            let start = lhs.span.start;
+            let node = match op {
+                PostfixOp::Member(key) => Expression::MemberAccess {
+                    object: Box::new(lhs),
+                    member: Box::new(key),
+                },
+                PostfixOp::Index(idx) => Expression::ArrayAccess {
+                    array: Box::new(lhs),
+                    index: Box::new(idx),
+                },
+            };
+            let span = chumsky::span::Span::new((), start..op_span.end);
+            Spanned::new(node, span)
         })
         .boxed()
 }
 
-fn bittest_expr<'a>(postfix: BoxedParser<'a, Expression>) -> BoxedParser<'a, Expression> {
+fn bittest_expr<'a>(postfix: BoxedParser<'a, Expr>) -> BoxedParser<'a, Expr> {
     // Bit test operator: X @ B - returns true if bit B is set in X
     let bittest_op = just('@')
         .to(BinaryOperator::BitTest)
@@ -485,52 +502,81 @@ fn bittest_expr<'a>(postfix: BoxedParser<'a, Expression>) -> BoxedParser<'a, Exp
     postfix
         .clone()
         .foldl(bittest_op.then(postfix).repeated(), |l, (op, r)| {
-            Expression::BinaryOp {
-                left: Box::new(l),
-                op,
-                right: Box::new(r),
-            }
+            let span = chumsky::span::Span::new((), l.span.start..r.span.end);
+            Spanned::new(
+                Expression::BinaryOp {
+                    left: Box::new(l),
+                    op,
+                    right: Box::new(r),
+                },
+                span,
+            )
         })
         .boxed()
 }
 
-fn unary_expr<'a>(bittest: BoxedParser<'a, Expression>) -> BoxedParser<'a, Expression> {
+fn unary_expr<'a>(bittest: BoxedParser<'a, Expr>) -> BoxedParser<'a, Expr> {
     let unary_op = choice((
         just('!').to(UnaryOperator::Not),
         just('-').to(UnaryOperator::Negate),
         just('~').to(UnaryOperator::BitwiseNot),
     ))
     .padded_by(whitespace())
+    .map_with(|op, extra| (op, extra.span()))
     .boxed();
 
     unary_op
         .repeated()
-        .foldr(bittest, |op, rhs| Expression::UnaryOp {
-            op,
-            operand: Box::new(rhs),
+        .foldr(bittest, |(op, op_span), rhs| {
+            let span = chumsky::span::Span::new((), op_span.start..rhs.span.end);
+            Spanned::new(
+                Expression::UnaryOp {
+                    op,
+                    operand: Box::new(rhs),
+                },
+                span,
+            )
         })
         .boxed()
 }
 
-fn cast_expr<'a>(unary: BoxedParser<'a, Expression>) -> BoxedParser<'a, Expression> {
+fn cast_expr<'a>(unary: BoxedParser<'a, Expr>) -> BoxedParser<'a, Expr> {
     // Type cast: expr as Type
     // Uses text::keyword to match "as" followed by a word boundary,
     // then parses a type name identifier.
     let cast_target = text::keyword("as")
         .padded_by(whitespace())
-        .ignore_then(ident());
+        .ignore_then(ident())
+        .map_with(|id, extra| (id, extra.span()));
 
     unary
-        .foldl(cast_target.repeated(), |lhs, target_type| {
-            Expression::Cast {
-                value: Box::new(lhs),
-                target_type,
-            }
+        .foldl(cast_target.repeated(), |lhs, (target_type, cast_span)| {
+            let span = chumsky::span::Span::new((), lhs.span.start..cast_span.end);
+            Spanned::new(
+                Expression::Cast {
+                    value: Box::new(lhs),
+                    target_type,
+                },
+                span,
+            )
         })
         .boxed()
 }
 
-fn binary_expr<'a>(atom: BoxedParser<'a, Expression>) -> BoxedParser<'a, Expression> {
+fn binary_expr<'a>(atom: BoxedParser<'a, Expr>) -> BoxedParser<'a, Expr> {
+    // Helper: create a spanned binary op from two Expr operands
+    fn make_binop(l: Expr, op: BinaryOperator, r: Expr) -> Expr {
+        let span = chumsky::span::Span::new((), l.span.start..r.span.end);
+        Spanned::new(
+            Expression::BinaryOp {
+                left: Box::new(l),
+                op,
+                right: Box::new(r),
+            },
+            span,
+        )
+    }
+
     // Multiplicative
     let mult_op = choice((
         just('*').to(BinaryOperator::Multiply),
@@ -543,11 +589,7 @@ fn binary_expr<'a>(atom: BoxedParser<'a, Expression>) -> BoxedParser<'a, Express
     let multiplicative = atom
         .clone()
         .foldl(mult_op.then(atom).repeated(), |l, (op, r)| {
-            Expression::BinaryOp {
-                left: Box::new(l),
-                op,
-                right: Box::new(r),
-            }
+            make_binop(l, op, r)
         })
         .boxed();
 
@@ -562,11 +604,7 @@ fn binary_expr<'a>(atom: BoxedParser<'a, Expression>) -> BoxedParser<'a, Express
     let additive = multiplicative
         .clone()
         .foldl(add_op.then(multiplicative).repeated(), |l, (op, r)| {
-            Expression::BinaryOp {
-                left: Box::new(l),
-                op,
-                right: Box::new(r),
-            }
+            make_binop(l, op, r)
         })
         .boxed();
 
@@ -581,11 +619,7 @@ fn binary_expr<'a>(atom: BoxedParser<'a, Expression>) -> BoxedParser<'a, Express
     let shift = additive
         .clone()
         .foldl(shift_op.then(additive).repeated(), |l, (op, r)| {
-            Expression::BinaryOp {
-                left: Box::new(l),
-                op,
-                right: Box::new(r),
-            }
+            make_binop(l, op, r)
         })
         .boxed();
 
@@ -599,11 +633,7 @@ fn binary_expr<'a>(atom: BoxedParser<'a, Expression>) -> BoxedParser<'a, Express
     let bitand = shift
         .clone()
         .foldl(bitand_op.then(shift).repeated(), |l, (op, r)| {
-            Expression::BinaryOp {
-                left: Box::new(l),
-                op,
-                right: Box::new(r),
-            }
+            make_binop(l, op, r)
         })
         .boxed();
 
@@ -616,11 +646,7 @@ fn binary_expr<'a>(atom: BoxedParser<'a, Expression>) -> BoxedParser<'a, Express
     let bitxor = bitand
         .clone()
         .foldl(bitxor_op.then(bitand).repeated(), |l, (op, r)| {
-            Expression::BinaryOp {
-                left: Box::new(l),
-                op,
-                right: Box::new(r),
-            }
+            make_binop(l, op, r)
         })
         .boxed();
 
@@ -634,11 +660,7 @@ fn binary_expr<'a>(atom: BoxedParser<'a, Expression>) -> BoxedParser<'a, Express
     let bitor = bitxor
         .clone()
         .foldl(bitor_op.then(bitxor).repeated(), |l, (op, r)| {
-            Expression::BinaryOp {
-                left: Box::new(l),
-                op,
-                right: Box::new(r),
-            }
+            make_binop(l, op, r)
         })
         .boxed();
 
@@ -655,11 +677,7 @@ fn binary_expr<'a>(atom: BoxedParser<'a, Expression>) -> BoxedParser<'a, Express
     let comparison = bitor
         .clone()
         .foldl(cmp_op.then(bitor).repeated(), |l, (op, r)| {
-            Expression::BinaryOp {
-                left: Box::new(l),
-                op,
-                right: Box::new(r),
-            }
+            make_binop(l, op, r)
         })
         .boxed();
 
@@ -674,11 +692,7 @@ fn binary_expr<'a>(atom: BoxedParser<'a, Expression>) -> BoxedParser<'a, Express
     let equality = comparison
         .clone()
         .foldl(eq_op.then(comparison).repeated(), |l, (op, r)| {
-            Expression::BinaryOp {
-                left: Box::new(l),
-                op,
-                right: Box::new(r),
-            }
+            make_binop(l, op, r)
         })
         .boxed();
 
@@ -691,11 +705,7 @@ fn binary_expr<'a>(atom: BoxedParser<'a, Expression>) -> BoxedParser<'a, Express
     let logical_and = equality
         .clone()
         .foldl(and_op.then(equality).repeated(), |l, (op, r)| {
-            Expression::BinaryOp {
-                left: Box::new(l),
-                op,
-                right: Box::new(r),
-            }
+            make_binop(l, op, r)
         })
         .boxed();
 
@@ -708,11 +718,7 @@ fn binary_expr<'a>(atom: BoxedParser<'a, Expression>) -> BoxedParser<'a, Express
     let logical_or = logical_and
         .clone()
         .foldl(or_op.then(logical_and).repeated(), |l, (op, r)| {
-            Expression::BinaryOp {
-                left: Box::new(l),
-                op,
-                right: Box::new(r),
-            }
+            make_binop(l, op, r)
         })
         .boxed();
 
@@ -728,11 +734,17 @@ fn binary_expr<'a>(atom: BoxedParser<'a, Expression>) -> BoxedParser<'a, Express
         .clone()
         .then(range_op.then(logical_or).or_not())
         .map(|(start, rest)| match rest {
-            Some(((_, inclusive), end)) => Expression::Range {
-                start: Box::new(start),
-                end: Box::new(end),
-                inclusive: inclusive.is_some(),
-            },
+            Some(((_, inclusive), end)) => {
+                let span = chumsky::span::Span::new((), start.span.start..end.span.end);
+                Spanned::new(
+                    Expression::Range {
+                        start: Box::new(start),
+                        end: Box::new(end),
+                        inclusive: inclusive.is_some(),
+                    },
+                    span,
+                )
+            }
             None => start,
         })
         .boxed()
@@ -742,9 +754,9 @@ fn binary_expr<'a>(atom: BoxedParser<'a, Expression>) -> BoxedParser<'a, Express
 /// Assignment has lowest precedence and is right-associative
 /// a = b = c parses as a = (b = c)
 fn assign_expr<'a>(
-    binary: BoxedParser<'a, Expression>,
-    expr: BoxedParser<'a, Expression>,
-) -> BoxedParser<'a, Expression> {
+    binary: BoxedParser<'a, Expr>,
+    expr: BoxedParser<'a, Expr>,
+) -> BoxedParser<'a, Expr> {
     // Right-associative: use foldr pattern
     // First, parse the left operand (binary expression)
     // Then optionally parse assign-op followed by another assign-expr
@@ -752,11 +764,17 @@ fn assign_expr<'a>(
         .clone()
         .then(assign_op().then(expr).or_not())
         .map(|(target, rest)| match rest {
-            Some((op, value)) => Expression::Assignment {
-                target: Box::new(target),
-                op,
-                value: Box::new(value),
-            },
+            Some((op, value)) => {
+                let span = chumsky::span::Span::new((), target.span.start..value.span.end);
+                Spanned::new(
+                    Expression::Assignment {
+                        target: Box::new(target),
+                        op,
+                        value: Box::new(value),
+                    },
+                    span,
+                )
+            }
             None => target,
         })
         .boxed()
@@ -770,7 +788,7 @@ fn assign_expr<'a>(
 /// Used internally by `block_body` to resolve the statement-vs-final-expression ambiguity.
 enum BlockItem {
     Statement(Stmt),
-    TrailingExpr(Expression),
+    TrailingExpr(Expr),
 }
 
 /// Parse a block body: { items* }
@@ -780,9 +798,7 @@ enum BlockItem {
 /// The LAST trailing expression becomes the block's return value.
 /// Earlier trailing expressions become void statements (e.g., `if cond { }` mid-block).
 /// Non-block expressions without `;` at the end are also final expressions (`42`).
-fn block_body<'a>(
-    expr: BoxedParser<'a, Expression>,
-) -> BoxedParser<'a, (Vec<Stmt>, Option<Expression>)> {
+fn block_body<'a>(expr: BoxedParser<'a, Expr>) -> BoxedParser<'a, (Vec<Stmt>, Option<Expr>)> {
     // A statement (requires `;` for non-keyword forms)
     let stmt_item = statement(expr.clone()).map(BlockItem::Statement).boxed();
 
@@ -810,7 +826,7 @@ fn block_body<'a>(
                             final_expr = Some(expr);
                         } else {
                             // Mid-block expression without ; → void statement
-                            let span = chumsky::span::Span::new((), 0..0);
+                            let span = expr.span;
                             statements.push(Spanned::new(Statement::Expression(expr), span));
                         }
                     }
@@ -826,16 +842,21 @@ fn block_body<'a>(
         .boxed()
 }
 
-fn block_expr<'a>(expr: BoxedParser<'a, Expression>) -> BoxedParser<'a, Expression> {
+fn block_expr<'a>(expr: BoxedParser<'a, Expr>) -> BoxedParser<'a, Expr> {
     block_body(expr)
-        .map(|(statements, final_expr)| Expression::Block {
-            statements,
-            final_expr: final_expr.map(Box::new),
+        .map_with(|(statements, final_expr), extra| {
+            Spanned::new(
+                Expression::Block {
+                    statements,
+                    final_expr: final_expr.map(Box::new),
+                },
+                extra.span(),
+            )
         })
         .boxed()
 }
 
-fn if_condition<'a>(expr: BoxedParser<'a, Expression>) -> BoxedParser<'a, IfCondition> {
+fn if_condition<'a>(expr: BoxedParser<'a, Expr>) -> BoxedParser<'a, IfCondition> {
     // if let pattern = expr - by-value binding, body runs if pattern matches
     let let_binding = kw("let")
         .ignore_then(pattern())
@@ -855,14 +876,14 @@ fn if_condition<'a>(expr: BoxedParser<'a, Expression>) -> BoxedParser<'a, IfCond
     choice((let_binding, with_binding, bool_cond)).boxed()
 }
 
-fn if_expr<'a>(expr: BoxedParser<'a, Expression>) -> BoxedParser<'a, Expression> {
+fn if_expr<'a>(expr: BoxedParser<'a, Expr>) -> BoxedParser<'a, Expr> {
     recursive(|if_e| {
         let body = block_body(expr.clone());
 
         // else if chain returns the If expression directly as the else_expr
         // else block returns (statements, final_expr)
         let else_branch = kw("else").ignore_then(
-            if_e.map(|e| {
+            if_e.map(|e: Expr| {
                 // else if: the inner if IS the else expression (its value flows through)
                 (vec![], Some(e))
             })
@@ -878,46 +899,61 @@ fn if_expr<'a>(expr: BoxedParser<'a, Expression>) -> BoxedParser<'a, Expression>
             )
             .then(body)
             .then(else_branch.or_not())
-            .map(|((conditions, (then_block, then_expr)), else_branch)| {
-                let (else_block, else_expr) = match else_branch {
-                    Some((stmts, expr)) => (Some(stmts), expr),
-                    None => (None, None),
-                };
-                Expression::If {
-                    conditions,
-                    then_block,
-                    then_expr: then_expr.map(Box::new),
-                    else_block,
-                    else_expr: else_expr.map(Box::new),
-                }
-            })
+            .map_with(
+                |((conditions, (then_block, then_expr)), else_branch), extra| {
+                    let (else_block, else_expr) = match else_branch {
+                        Some((stmts, expr)) => (Some(stmts), expr),
+                        None => (None, None),
+                    };
+                    Spanned::new(
+                        Expression::If {
+                            conditions,
+                            then_block,
+                            then_expr: then_expr.map(Box::new),
+                            else_block,
+                            else_expr: else_expr.map(Box::new),
+                        },
+                        extra.span(),
+                    )
+                },
+            )
     })
     .boxed()
 }
 
-fn while_expr<'a>(expr: BoxedParser<'a, Expression>) -> BoxedParser<'a, Expression> {
+fn while_expr<'a>(expr: BoxedParser<'a, Expr>) -> BoxedParser<'a, Expr> {
     kw("while")
         .ignore_then(expr.clone().padded_by(whitespace()))
         .then(block_body(expr))
-        .map(|(condition, (body, body_expr))| Expression::While {
-            condition: Box::new(condition),
-            body,
-            body_expr: body_expr.map(Box::new),
+        .map_with(|(condition, (body, body_expr)), extra| {
+            Spanned::new(
+                Expression::While {
+                    condition: Box::new(condition),
+                    body,
+                    body_expr: body_expr.map(Box::new),
+                },
+                extra.span(),
+            )
         })
         .boxed()
 }
 
-fn loop_expr<'a>(expr: BoxedParser<'a, Expression>) -> BoxedParser<'a, Expression> {
+fn loop_expr<'a>(expr: BoxedParser<'a, Expr>) -> BoxedParser<'a, Expr> {
     kw("loop")
         .ignore_then(block_body(expr))
-        .map(|(body, body_expr)| Expression::Loop {
-            body,
-            body_expr: body_expr.map(Box::new),
+        .map_with(|(body, body_expr), extra| {
+            Spanned::new(
+                Expression::Loop {
+                    body,
+                    body_expr: body_expr.map(Box::new),
+                },
+                extra.span(),
+            )
         })
         .boxed()
 }
 
-fn for_expr<'a>(expr: BoxedParser<'a, Expression>) -> BoxedParser<'a, Expression> {
+fn for_expr<'a>(expr: BoxedParser<'a, Expr>) -> BoxedParser<'a, Expr> {
     // Optional `let` or `with` keyword for binding mode
     // `let` = by-value (copy), `with` or default = by-reference
     let binding_is_value = choice((
@@ -949,13 +985,18 @@ fn for_expr<'a>(expr: BoxedParser<'a, Expression>) -> BoxedParser<'a, Expression
         .then_ignore(kw("in"))
         .then(expr.clone().padded_by(whitespace()))
         .then(block_body(expr))
-        .map(
-            |(((binding_is_value, binding), iterable), (body, body_expr))| Expression::For {
-                binding_is_value,
-                binding,
-                iterable: Box::new(iterable),
-                body,
-                body_expr: body_expr.map(Box::new),
+        .map_with(
+            |(((binding_is_value, binding), iterable), (body, body_expr)), extra| {
+                Spanned::new(
+                    Expression::For {
+                        binding_is_value,
+                        binding,
+                        iterable: Box::new(iterable),
+                        body,
+                        body_expr: body_expr.map(Box::new),
+                    },
+                    extra.span(),
+                )
             },
         )
         .boxed()
@@ -1149,7 +1190,7 @@ fn pattern_inner<'a>() -> BoxedParser<'a, Pat> {
     .boxed()
 }
 
-fn match_arm<'a>(expr: BoxedParser<'a, Expression>) -> BoxedParser<'a, MatchArm> {
+fn match_arm<'a>(expr: BoxedParser<'a, Expr>) -> BoxedParser<'a, MatchArm> {
     // Optional `let` or `with` prefix for binding mode
     // `let` = by-value (copy), `with` or default = by-reference
     let binding_is_value = choice((
@@ -1184,16 +1225,21 @@ fn match_arm<'a>(expr: BoxedParser<'a, Expression>) -> BoxedParser<'a, MatchArm>
         .boxed()
 }
 
-fn match_expr<'a>(expr: BoxedParser<'a, Expression>) -> BoxedParser<'a, Expression> {
+fn match_expr<'a>(expr: BoxedParser<'a, Expr>) -> BoxedParser<'a, Expr> {
     kw("match")
         .ignore_then(expr.clone().padded_by(whitespace()))
         .then(match_arm(expr).repeated().collect::<Vec<_>>().delimited_by(
             just('{').padded_by(whitespace()),
             just('}').padded_by(whitespace()),
         ))
-        .map(|(value, arms)| Expression::Match {
-            value: Box::new(value),
-            arms,
+        .map_with(|(value, arms), extra| {
+            Spanned::new(
+                Expression::Match {
+                    value: Box::new(value),
+                    arms,
+                },
+                extra.span(),
+            )
         })
         .boxed()
 }
@@ -1202,7 +1248,7 @@ fn match_expr<'a>(expr: BoxedParser<'a, Expression>) -> BoxedParser<'a, Expressi
 // Statements
 // ============================================================================
 
-fn statement<'a>(expr: BoxedParser<'a, Expression>) -> BoxedParser<'a, Stmt> {
+fn statement<'a>(expr: BoxedParser<'a, Expr>) -> BoxedParser<'a, Stmt> {
     // Variable declaration with pattern: let x = expr; or let [a, b] = expr;
     let var_decl = kw("let")
         .ignore_then(pattern())
@@ -1222,7 +1268,7 @@ fn statement<'a>(expr: BoxedParser<'a, Expression>) -> BoxedParser<'a, Stmt> {
         .boxed()
 }
 
-fn with_statement<'a>(expr: BoxedParser<'a, Expression>) -> BoxedParser<'a, Statement> {
+fn with_statement<'a>(expr: BoxedParser<'a, Expr>) -> BoxedParser<'a, Statement> {
     // Simple statement form: with pattern = expr;
     // Creates by-reference bindings (variables may be missing if pattern doesn't match)
     kw("with")
@@ -1234,7 +1280,7 @@ fn with_statement<'a>(expr: BoxedParser<'a, Expression>) -> BoxedParser<'a, Stat
         .boxed()
 }
 
-fn statement_inner<'a>(expr: BoxedParser<'a, Expression>) -> BoxedParser<'a, Statement> {
+fn statement_inner<'a>(expr: BoxedParser<'a, Expr>) -> BoxedParser<'a, Statement> {
     let return_stmt = kw("return")
         .ignore_then(expr.clone().padded_by(whitespace()).or_not())
         .then_ignore(just(';').padded_by(whitespace()))
@@ -1561,7 +1607,7 @@ mod tests {
             .into_result();
 
         match result {
-            Ok(expr) => Some(expr),
+            Ok(expr) => Some(expr.node),
             Err(errors) => {
                 convert_parse_errors(errors, diags);
                 None
@@ -1661,7 +1707,7 @@ mod tests {
         let result = try_parse_expr("x as Int").unwrap();
         match result {
             Expression::Cast { value, target_type } => {
-                assert!(matches!(*value, Expression::Variable(_)));
+                assert!(matches!(value.node, Expression::Variable(_)));
                 assert_eq!(target_type, Identifier("Int".to_string()));
             }
             _ => panic!("Expected Cast expression"),
@@ -1671,9 +1717,9 @@ mod tests {
         let result = try_parse_expr("x + y as Float").unwrap();
         match result {
             Expression::BinaryOp { left, op, right } => {
-                assert!(matches!(*left, Expression::Variable(_)));
+                assert!(matches!(left.node, Expression::Variable(_)));
                 assert!(matches!(op, BinaryOperator::Add));
-                assert!(matches!(*right, Expression::Cast { .. }));
+                assert!(matches!(right.node, Expression::Cast { .. }));
             }
             _ => panic!("Expected BinaryOp with Cast on right"),
         }
@@ -1682,7 +1728,7 @@ mod tests {
         let result = try_parse_expr("-x as UInt").unwrap();
         match result {
             Expression::Cast { value, target_type } => {
-                assert!(matches!(*value, Expression::UnaryOp { .. }));
+                assert!(matches!(value.node, Expression::UnaryOp { .. }));
                 assert_eq!(target_type, Identifier("UInt".to_string()));
             }
             _ => panic!("Expected Cast wrapping UnaryOp"),

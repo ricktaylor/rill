@@ -14,9 +14,9 @@ impl<'a> Lowerer<'a> {
         &mut self,
         conditions: &[ast::IfCondition],
         then_block: &[ast::Stmt],
-        then_expr: &Option<Box<ast::Expression>>,
+        then_expr: &Option<Box<ast::Expr>>,
         else_block: &Option<Vec<ast::Stmt>>,
-        else_expr: &Option<Box<ast::Expression>>,
+        else_expr: &Option<Box<ast::Expr>>,
     ) -> VarId {
         let else_bb = self.fresh_block();
         let join_bb = self.fresh_block();
@@ -494,9 +494,9 @@ impl<'a> Lowerer<'a> {
     /// Lower a while loop
     pub fn lower_while(
         &mut self,
-        condition: &ast::Expression,
+        condition: &ast::Expr,
         body: &[ast::Stmt],
-        body_expr: &Option<Box<ast::Expression>>,
+        body_expr: &Option<Box<ast::Expr>>,
     ) -> VarId {
         let header_bb = self.fresh_block();
         let body_bb = self.fresh_block();
@@ -552,11 +552,7 @@ impl<'a> Lowerer<'a> {
     }
 
     /// Lower an infinite loop
-    pub fn lower_loop(
-        &mut self,
-        body: &[ast::Stmt],
-        body_expr: &Option<Box<ast::Expression>>,
-    ) -> VarId {
+    pub fn lower_loop(&mut self, body: &[ast::Stmt], body_expr: &Option<Box<ast::Expr>>) -> VarId {
         let body_bb = self.fresh_block();
         let exit_bb = self.fresh_block();
 
@@ -612,9 +608,9 @@ impl<'a> Lowerer<'a> {
         &mut self,
         binding_is_value: bool,
         binding: &ast::ForBinding,
-        iterable: &ast::Expression,
+        iterable: &ast::Expr,
         body: &[ast::Stmt],
-        body_expr: &Option<Box<ast::Expression>>,
+        body_expr: &Option<Box<ast::Expr>>,
     ) -> VarId {
         let iter_var = self.lower_expression(iterable);
 
@@ -668,7 +664,7 @@ impl<'a> Lowerer<'a> {
         binding_is_value: bool,
         binding: &ast::ForBinding,
         body: &[ast::Stmt],
-        body_expr: &Option<Box<ast::Expression>>,
+        body_expr: &Option<Box<ast::Expr>>,
     ) {
         // length = Len(iter)
         let length = self.emit_unary_intrinsic(IntrinsicOp::Len, iter_var);
@@ -830,7 +826,7 @@ impl<'a> Lowerer<'a> {
         _binding_is_value: bool,
         binding: &ast::ForBinding,
         body: &[ast::Stmt],
-        body_expr: &Option<Box<ast::Expression>>,
+        body_expr: &Option<Box<ast::Expr>>,
     ) {
         let header_bb = self.fresh_block();
         let body_bb = self.fresh_block();
@@ -900,7 +896,7 @@ impl<'a> Lowerer<'a> {
     /// Uses a linear chain of pattern checks. Each arm tries its pattern
     /// against the scrutinee; on mismatch, control falls through to the next arm.
     /// This reuses `lower_if_pattern` which already handles all pattern types.
-    pub fn lower_match(&mut self, value: &ast::Expression, arms: &[ast::MatchArm]) -> VarId {
+    pub fn lower_match(&mut self, value: &ast::Expr, arms: &[ast::MatchArm]) -> VarId {
         let scrutinee = self.lower_expression(value);
         let exit_bb = self.fresh_block();
 
@@ -980,12 +976,7 @@ impl<'a> Lowerer<'a> {
     /// A `start < end` guard is emitted so that reversed ranges produce
     /// undefined, and the optimizer can prove the range is non-empty when
     /// execution reaches the loop body.
-    pub fn lower_range(
-        &mut self,
-        start: &ast::Expression,
-        end: &ast::Expression,
-        inclusive: bool,
-    ) -> VarId {
+    pub fn lower_range(&mut self, start: &ast::Expr, end: &ast::Expr, inclusive: bool) -> VarId {
         let start_var = self.lower_expression(start);
         let end_var = self.lower_expression(end);
 

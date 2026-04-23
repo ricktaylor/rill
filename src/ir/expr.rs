@@ -13,8 +13,9 @@ impl<'a> Lowerer<'a> {
     /// will guard their args against Undefined, jumping to the shared
     /// fail block. The caller that set `expr_guard_fail` is responsible
     /// for emitting the fail path and join Phi.
-    pub fn lower_expression(&mut self, expr: &ast::Expression) -> VarId {
-        match expr {
+    pub fn lower_expression(&mut self, expr: &ast::Expr) -> VarId {
+        self.set_span(expr.span);
+        match &expr.node {
             ast::Expression::Literal(lit) => self.lower_literal(lit),
 
             ast::Expression::Variable(name) => {
@@ -163,7 +164,7 @@ impl<'a> Lowerer<'a> {
     }
 
     /// Lower a type cast expression (`value as Type`)
-    fn lower_cast(&mut self, value: &ast::Expression, target_type: &ast::Identifier) -> VarId {
+    fn lower_cast(&mut self, value: &ast::Expr, target_type: &ast::Identifier) -> VarId {
         let val = self.lower_expression(value);
 
         // Validate target is a castable numeric type
@@ -205,7 +206,7 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    fn lower_array_literal(&mut self, elements: &[ast::Expression]) -> VarId {
+    fn lower_array_literal(&mut self, elements: &[ast::Expr]) -> VarId {
         let args: Vec<VarId> = elements.iter().map(|e| self.lower_expression(e)).collect();
         let dest = self.new_temp(TypeSet::array());
         self.emit(Instruction::Intrinsic {
@@ -216,7 +217,7 @@ impl<'a> Lowerer<'a> {
         dest
     }
 
-    fn lower_map_literal(&mut self, entries: &[(ast::Expression, ast::Expression)]) -> VarId {
+    fn lower_map_literal(&mut self, entries: &[(ast::Expr, ast::Expr)]) -> VarId {
         let args: Vec<VarId> = entries
             .iter()
             .flat_map(|(k, v)| [self.lower_expression(k), self.lower_expression(v)])
@@ -277,9 +278,9 @@ impl<'a> Lowerer<'a> {
 
     fn lower_binary_op(
         &mut self,
-        left: &ast::Expression,
+        left: &ast::Expr,
         op: &ast::BinaryOperator,
-        right: &ast::Expression,
+        right: &ast::Expr,
     ) -> VarId {
         // Short-circuit operators need special control flow
         match op {
@@ -318,11 +319,7 @@ impl<'a> Lowerer<'a> {
 
     // emit_binary_intrinsic and emit_unary_intrinsic are defined in mod.rs
 
-    fn lower_short_circuit_and(
-        &mut self,
-        left: &ast::Expression,
-        right: &ast::Expression,
-    ) -> VarId {
+    fn lower_short_circuit_and(&mut self, left: &ast::Expr, right: &ast::Expr) -> VarId {
         let lhs = self.lower_expression(left);
 
         let right_block = self.fresh_block();
@@ -356,7 +353,7 @@ impl<'a> Lowerer<'a> {
         result
     }
 
-    fn lower_short_circuit_or(&mut self, left: &ast::Expression, right: &ast::Expression) -> VarId {
+    fn lower_short_circuit_or(&mut self, left: &ast::Expr, right: &ast::Expr) -> VarId {
         let lhs = self.lower_expression(left);
 
         let right_block = self.fresh_block();
@@ -390,7 +387,7 @@ impl<'a> Lowerer<'a> {
         result
     }
 
-    fn lower_unary_op(&mut self, op: &ast::UnaryOperator, operand: &ast::Expression) -> VarId {
+    fn lower_unary_op(&mut self, op: &ast::UnaryOperator, operand: &ast::Expr) -> VarId {
         self.lower_guarded_expression(|s| {
             let arg = s.lower_expression(operand);
             s.emit_unary_intrinsic(op.intrinsic_op(), arg)
@@ -401,7 +398,7 @@ impl<'a> Lowerer<'a> {
         &mut self,
         namespace: Option<&ast::Identifier>,
         name: &ast::Identifier,
-        arguments: &[ast::Expression],
+        arguments: &[ast::Expr],
     ) -> VarId {
         // Check for compiler intrinsics first (e.g. len).
         // These lower to Instruction::Intrinsic, not function calls.
@@ -506,7 +503,7 @@ impl<'a> Lowerer<'a> {
                     // If the arg is a by-ref param variable, use the PARAM's
                     // VarId as the base (its slot has the Ref chain to the
                     // original caller). Otherwise use the lowered value.
-                    let base = if let ast::Expression::Variable(name) = arg {
+                    let base = if let ast::Expression::Variable(name) = &arg.node {
                         self.byref_param_vars.get(name).copied().unwrap_or(arg_var)
                     } else {
                         arg_var
@@ -610,7 +607,7 @@ impl<'a> Lowerer<'a> {
 
     /// Try to lower a call as a compiler intrinsic.
     /// Returns Some(result) if recognized, None to fall through to normal call resolution.
-    fn try_lower_intrinsic(&mut self, name: &str, arguments: &[ast::Expression]) -> Option<VarId> {
+    fn try_lower_intrinsic(&mut self, name: &str, arguments: &[ast::Expr]) -> Option<VarId> {
         match name {
             "len" if arguments.len() == 1 => {
                 let arg = self.lower_expression(&arguments[0]);
@@ -631,7 +628,7 @@ impl<'a> Lowerer<'a> {
                 });
                 // Reassign the array slot — append mutates via CoW, so the
                 // slot must be updated to the post-mutation value.
-                if let ast::Expression::Variable(name) = &arguments[0] {
+                if let ast::Expression::Variable(name) = &arguments[0].node {
                     self.reassign(name, dest);
                 }
                 Some(dest)
@@ -647,10 +644,10 @@ impl<'a> Lowerer<'a> {
     /// - For `arr[i]` / `obj.field`: emits MakeRef, returns `Some(RefOrigin)`
     /// - For plain variables: emits MakeRef (whole-value), returns `Some(RefOrigin)`
     /// - For other expressions: returns `(value, None)` — no ref tracking
-    pub fn lower_ref_expression(&mut self, expr: &ast::Expression) -> (VarId, Option<RefOrigin>) {
-        match expr {
+    pub fn lower_ref_expression(&mut self, expr: &ast::Expr) -> (VarId, Option<RefOrigin>) {
+        match &expr.node {
             ast::Expression::ArrayAccess { array, index } => {
-                let base_name = if let ast::Expression::Variable(name) = array.as_ref() {
+                let base_name = if let ast::Expression::Variable(name) = &array.node {
                     Some(name.clone())
                 } else {
                     None
@@ -669,7 +666,7 @@ impl<'a> Lowerer<'a> {
             }
 
             ast::Expression::MemberAccess { object, member } => {
-                let base_name = if let ast::Expression::Variable(name) = object.as_ref() {
+                let base_name = if let ast::Expression::Variable(name) = &object.node {
                     Some(name.clone())
                 } else {
                     None
@@ -720,7 +717,7 @@ impl<'a> Lowerer<'a> {
     /// the value in-place through the Slot::Ref).
     fn emit_byref_reloads(
         &mut self,
-        ast_args: &[ast::Expression],
+        ast_args: &[ast::Expr],
         ir_args: &[VarId],
         param_by_ref: &Option<Vec<bool>>,
     ) {
@@ -734,7 +731,7 @@ impl<'a> Lowerer<'a> {
             }
             // Only reload named variables — computed expressions have no
             // slot to reassign to.
-            if let ast::Expression::Variable(name) = ast_arg
+            if let ast::Expression::Variable(name) = &ast_arg.node
                 && let Some(&arg_var) = ir_args.get(i)
             {
                 let reloaded = self.emit_reload(arg_var);

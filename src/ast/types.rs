@@ -88,6 +88,9 @@ impl PartialEq<&str> for Identifier {
 /// Statement with source span
 pub type Stmt = Spanned<Statement>;
 
+/// Expression with source span
+pub type Expr = Spanned<Expression>;
+
 /// Pattern with source span
 pub type Pat = Spanned<Pattern>;
 
@@ -106,8 +109,8 @@ pub struct AstProgram {
 
 #[derive(Debug, Clone)]
 pub struct Constant {
-    pub pattern: Pat,      // Pattern to bind (match failure = compile error)
-    pub value: Expression, // Compiler verifies const-evaluability
+    pub pattern: Pat, // Pattern to bind (match failure = compile error)
+    pub value: Expr,  // Compiler verifies const-evaluability
 }
 
 /// Source file import: `import "path/to/file.rill" [as alias];`
@@ -160,7 +163,7 @@ pub struct Function {
     /// Function body
     pub statements: Vec<Stmt>,
     /// Final expression (if block ends without semicolon)
-    pub final_expr: Option<Box<Expression>>,
+    pub final_expr: Option<Box<Expr>>,
 }
 
 #[derive(Debug, Clone)]
@@ -171,10 +174,7 @@ pub enum Statement {
     //   - Single variable: let x = expr;
     //   - Array destructure: let [a, b, c] = arr;
     //   - With rest: let [first, ..rest] = arr;
-    VarDecl {
-        pattern: Pat,
-        initializer: Expression,
-    },
+    VarDecl { pattern: Pat, initializer: Expr },
 
     // Reference binding with pattern: with x = expr; or with [a, b] = arr;
     // Creates references to matched locations (reference semantics)
@@ -186,24 +186,17 @@ pub enum Statement {
     //   - Array destructure: with [a, b] = arr;
     //   - Rest patterns: with [first, ..rest] = arr;
     // All bindings are by-reference (use `let` for by-value copies)
-    With {
-        pattern: Pat,
-        value: Expression,
-    },
+    With { pattern: Pat, value: Expr },
 
     // Return statement: return; or return value;
     // Returns a value to the caller
-    Return {
-        value: Option<Expression>,
-    },
+    Return { value: Option<Expr> },
 
     // Expression as statement (function calls, etc.)
-    Expression(Expression),
+    Expression(Expr),
 
     // Loop control (can break with a value to return from loop expression)
-    Break {
-        value: Option<Expression>,
-    },
+    Break { value: Option<Expr> },
     Continue,
 }
 
@@ -218,9 +211,9 @@ pub enum Expression {
         name: Identifier,
     },
     BinaryOp {
-        left: Box<Expression>,
+        left: Box<Expr>,
         op: BinaryOperator,
-        right: Box<Expression>,
+        right: Box<Expr>,
     },
 
     // Assignment expression: target = value or target op= value
@@ -228,38 +221,38 @@ pub enum Expression {
     // Right-associative: a = b = c parses as a = (b = c)
     // Valid lvalues: Variable, ArrayAccess, MemberAccess, BinaryOp(BitTest)
     Assignment {
-        target: Box<Expression>,
+        target: Box<Expr>,
         op: AssignmentOp,
-        value: Box<Expression>,
+        value: Box<Expr>,
     },
 
     UnaryOp {
         op: UnaryOperator,
-        operand: Box<Expression>,
+        operand: Box<Expr>,
     },
     FunctionCall {
         namespace: Option<Identifier>, // e.g., "bpsec" in bpsec::validate()
         name: Identifier,
-        arguments: Vec<Expression>,
+        arguments: Vec<Expr>,
     },
     // Array/Map access: arr[i]
     // Returns missing if array/index is missing or out of bounds
     ArrayAccess {
-        array: Box<Expression>,
-        index: Box<Expression>,
+        array: Box<Expr>,
+        index: Box<Expr>,
     },
 
     // Member access (map key): obj.foo => obj[Text("foo")]
     // Returns missing if object or key is missing
     MemberAccess {
-        object: Box<Expression>,
-        member: Box<Expression>, // map key (any value type)
+        object: Box<Expr>,
+        member: Box<Expr>, // map key (any value type)
     },
 
     // Block expression: { statements; final_expr }
     Block {
         statements: Vec<Stmt>,
-        final_expr: Option<Box<Expression>>, // Last expr without semicolon
+        final_expr: Option<Box<Expr>>, // Last expr without semicolon
     },
 
     // If expression with optional let bindings
@@ -276,22 +269,22 @@ pub enum Expression {
     If {
         conditions: Vec<IfCondition>, // All must be true (short-circuit AND)
         then_block: Vec<Stmt>,
-        then_expr: Option<Box<Expression>>, // Final expr without semicolon
+        then_expr: Option<Box<Expr>>, // Final expr without semicolon
         else_block: Option<Vec<Stmt>>,
-        else_expr: Option<Box<Expression>>, // Final expr without semicolon
+        else_expr: Option<Box<Expr>>, // Final expr without semicolon
     },
 
     // While loop expression: while condition { }
     While {
-        condition: Box<Expression>,
+        condition: Box<Expr>,
         body: Vec<Stmt>,
-        body_expr: Option<Box<Expression>>, // Final expr without semicolon
+        body_expr: Option<Box<Expr>>, // Final expr without semicolon
     },
 
     // Infinite loop expression: loop { }
     Loop {
         body: Vec<Stmt>,
-        body_expr: Option<Box<Expression>>, // Final expr without semicolon
+        body_expr: Option<Box<Expr>>, // Final expr without semicolon
     },
 
     // Iterator-based for loop expression
@@ -302,14 +295,14 @@ pub enum Expression {
     For {
         binding_is_value: bool, // true if `let` keyword present (controls value binding)
         binding: ForBinding,    // Single variable or destructuring pattern
-        iterable: Box<Expression>, // Array, Map, or Range expression
+        iterable: Box<Expr>,    // Array, Map, or Range expression
         body: Vec<Stmt>,
-        body_expr: Option<Box<Expression>>, // Final expr without semicolon
+        body_expr: Option<Box<Expr>>, // Final expr without semicolon
     },
 
     // Pattern matching: match value { pattern => body, ... }
     Match {
-        value: Box<Expression>,
+        value: Box<Expr>,
         arms: Vec<MatchArm>,
     },
 
@@ -317,8 +310,8 @@ pub enum Expression {
     // Produces a lazy Sequence value, O(1) memory
     // Can be used anywhere an expression is expected
     Range {
-        start: Box<Expression>,
-        end: Box<Expression>,
+        start: Box<Expr>,
+        end: Box<Expr>,
         inclusive: bool, // true for ..=, false for ..
     },
 
@@ -326,7 +319,7 @@ pub enum Expression {
     // Infallible numeric reinterpretation or widening
     // Valid: UInt↔Int (bit reinterpret), UInt/Int→Float (widen)
     Cast {
-        value: Box<Expression>,
+        value: Box<Expr>,
         target_type: Identifier,
     },
 }
@@ -335,19 +328,19 @@ pub enum Expression {
 #[derive(Debug, Clone)]
 pub enum IfCondition {
     // Boolean expression: if x > 5, if is_some(x)
-    Bool(Expression),
+    Bool(Expr),
 
     // Let binding: if let pattern = expr
     // Pattern matching with by-value binding (copies)
     // Body runs only if pattern matches (all variables present)
     // Variables in scope for later conditions and the then-block
-    Let { pattern: Pat, value: Expression },
+    Let { pattern: Pat, value: Expr },
 
     // With binding: if with pattern = expr
     // Pattern matching with by-reference binding (mutations affect original)
     // Body runs only if pattern matches (all variables present)
     // Variables in scope for later conditions and the then-block
-    With { pattern: Pat, value: Expression },
+    With { pattern: Pat, value: Expr },
 }
 
 // Binding in for loops - single variable or key/value pair
@@ -368,9 +361,9 @@ pub enum ForBinding {
 pub struct MatchArm {
     pub binding_is_value: bool, // true if `let` prefix (by-value), false for by-reference
     pub pattern: Pat,
-    pub guard: Option<Expression>, // Optional if condition
+    pub guard: Option<Expr>, // Optional if condition
     pub body: Vec<Stmt>,
-    pub body_expr: Option<Box<Expression>>, // Final expr without semicolon
+    pub body_expr: Option<Box<Expr>>, // Final expr without semicolon
 }
 
 #[derive(Debug, Clone)]
@@ -425,8 +418,8 @@ pub enum Literal {
     Float(f64),
     Bytes(Vec<u8>),
     Text(String),
-    Array(Vec<Expression>),             // Array literal
-    Map(Vec<(Expression, Expression)>), // Map literal
+    Array(Vec<Expr>),       // Array literal
+    Map(Vec<(Expr, Expr)>), // Map literal
 }
 
 #[derive(Debug, Clone)]
