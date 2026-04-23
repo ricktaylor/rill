@@ -159,16 +159,16 @@ impl<'a> Lowerer<'a> {
 
                     let (elem, elem_origin) = if matches!(mode, BindingMode::Reference) {
                         let dest = self.new_temp(TypeSet::any());
-                        self.emit(Instruction::MakeRef {
+                        self.emit(Instruction::MakeAccessor {
                             dest,
                             base: value,
-                            key: Some(idx),
+                            key: idx,
                         });
                         let origin = RefOrigin {
                             ref_var: dest,
                             base_var: value,
+                            key_var: Some(idx),
                             base_name: None,
-                            whole_value: false,
                         };
                         (dest, Some(origin))
                     } else {
@@ -220,16 +220,16 @@ impl<'a> Lowerer<'a> {
 
                     let (elem, elem_origin) = if matches!(mode, BindingMode::Reference) {
                         let dest = self.new_temp(TypeSet::any());
-                        self.emit(Instruction::MakeRef {
+                        self.emit(Instruction::MakeAccessor {
                             dest,
                             base: value,
-                            key: Some(idx),
+                            key: idx,
                         });
                         let origin = RefOrigin {
                             ref_var: dest,
                             base_var: value,
+                            key_var: Some(idx),
                             base_name: None,
-                            whole_value: false,
                         };
                         (dest, Some(origin))
                     } else {
@@ -309,16 +309,16 @@ impl<'a> Lowerer<'a> {
 
                         let (elem, elem_origin) = if matches!(mode, BindingMode::Reference) {
                             let dest = self.new_temp(TypeSet::any());
-                            self.emit(Instruction::MakeRef {
+                            self.emit(Instruction::MakeAccessor {
                                 dest,
                                 base: value,
-                                key: Some(idx),
+                                key: idx,
                             });
                             let origin = RefOrigin {
                                 ref_var: dest,
                                 base_var: value,
+                                key_var: Some(idx),
                                 base_name: None,
-                                whole_value: false,
                             };
                             (dest, Some(origin))
                         } else {
@@ -358,16 +358,16 @@ impl<'a> Lowerer<'a> {
 
                     let (val, val_origin) = if matches!(mode, BindingMode::Reference) {
                         let dest = self.new_temp(TypeSet::any());
-                        self.emit(Instruction::MakeRef {
+                        self.emit(Instruction::MakeAccessor {
                             dest,
                             base: value,
-                            key: Some(key_var),
+                            key: key_var,
                         });
                         let origin = RefOrigin {
                             ref_var: dest,
                             base_var: value,
+                            key_var: Some(key_var),
                             base_name: None,
-                            whole_value: false,
                         };
                         (dest, Some(origin))
                     } else {
@@ -717,16 +717,16 @@ impl<'a> Lowerer<'a> {
         // Index is bounded by i < len(iter_var) — element is always defined.
         let (elem, elem_origin) = if matches!(mode, BindingMode::Reference) {
             let dest = self.new_temp(TypeSet::defined());
-            self.emit(Instruction::MakeRef {
+            self.emit(Instruction::MakeAccessor {
                 dest,
                 base: iter_var,
-                key: Some(i_var),
+                key: i_var,
             });
             let origin = RefOrigin {
                 ref_var: dest,
                 base_var: iter_var,
+                key_var: Some(i_var),
                 base_name: None,
-                whole_value: false,
             };
             (dest, Some(origin))
         } else {

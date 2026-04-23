@@ -85,8 +85,10 @@ pub(super) fn compile_terminator(
                 for (i, val) in values.into_iter().enumerate() {
                     vm.set_local(i + 1, val);
                 }
+                // Reset non-param locals — clears Val/Ref/Accessor unconditionally.
+                // Must NOT use set_local (would write through Accessors).
                 for i in (param_count + 1)..frame_size {
-                    vm.set_local(i, Value::Undefined);
+                    vm.reset_local(i);
                 }
 
                 // Jump to entry block — reuse current frame, no stack growth

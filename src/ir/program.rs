@@ -284,6 +284,7 @@ impl<'a> Lowerer<'a> {
         self.next_block_id = 0;
         self.next_slot_id = 0;
         self.loop_stack.clear();
+        self.byref_param_vars.clear();
 
         // Start with a fresh scope for parameters
         self.push_scope();
@@ -296,6 +297,20 @@ impl<'a> Lowerer<'a> {
         for param in &func.params {
             let var = self.new_var(param.name.clone(), TypeSet::any());
             self.bind(&param.name, var);
+            // By-ref params are ref-backed: assignments emit WriteRef
+            // (the caller created a MakeRef at the call site, so the
+            // param's compiled slot is a Slot::Ref). The WriteRef is
+            // side-effecting and survives mem2reg/DCE.
+            if !param.is_value {
+                let ref_origin = RefOrigin {
+                    ref_var: var,
+                    base_var: var,
+                    key_var: None,
+                    base_name: Some(param.name.clone()),
+                };
+                self.bind_ref(&param.name, ref_origin);
+                self.byref_param_vars.insert(param.name.clone(), var);
+            }
             params.push(var);
         }
 

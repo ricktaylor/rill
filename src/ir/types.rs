@@ -364,13 +364,6 @@ pub enum Instruction {
         key: VarId,
     },
 
-    /// Set a value in a collection: base[key] = value
-    SetIndex {
-        base: VarId,
-        key: VarId,
-        value: VarId,
-    },
-
     /// Intrinsic operation (pure, can be optimized)
     Intrinsic {
         dest: VarId,
@@ -385,34 +378,49 @@ pub enum Instruction {
         args: Vec<VarId>,
     },
 
-    /// Create a reference binding for `with` statements.
+    /// Create an Accessor to a collection element (`with x = arr[i]`).
     ///
-    /// Reads the value at `base[key]` (element ref) or `base` (whole-value ref)
-    /// into `dest`, and records that `dest` is a reference to that location.
-    /// The optimizer uses this provenance to reason about write-back semantics.
-    ///
-    /// - `key: Some(k)` — element reference: `with x = arr[i]`
-    /// - `key: None` — whole-value reference: `with x = y`
-    MakeRef {
+    /// At runtime, creates `Slot::Accessor { base, key }` in the dest slot.
+    /// Reading through the Accessor indexes into the collection.
+    /// Writing through the Accessor mutates the collection element.
+    MakeAccessor {
         dest: VarId,
         base: VarId,
-        key: Option<VarId>,
+        key: VarId,
     },
 
-    /// Write through a reference created by MakeRef.
+    /// Create a Ref to another slot (`with x = y`, or by-ref function params).
     ///
-    /// Semantically: writes `value` back to the location that `ref_var` references.
-    /// The compiler resolves `ref_var` to its MakeRef to find (base, key) and
-    /// emits the appropriate SetIndex or slot write.
+    /// At runtime, creates `Slot::Ref(target)` with path compression.
+    /// Reading follows the Ref. Writing follows the Ref (and through any
+    /// Accessor at the target, enabling Ref→Accessor chaining).
+    MakeRef { dest: VarId, base: VarId },
+
+    /// Write a value to a collection element: base[key] = value.
     ///
-    /// This instruction has no `dest` — it is a side effect (mutating a collection
-    /// or variable through a reference). The optimizer can see these explicitly
-    /// and reason about dead write-backs, forwarding, etc.
+    /// Direct collection mutation — compiles to a type-specialized
+    /// write closure (Array or Map). No Slot::Accessor dispatch.
+    /// Used for direct indexed assignment (`arr[i] = val`).
+    ///
+    /// This instruction has no `dest` — it is a side effect.
+    WriteAccessor {
+        base: VarId,
+        key: VarId,
+        value: VarId,
+    },
+
+    /// Write through a Ref or Accessor binding.
+    ///
+    /// At runtime: `vm.set_local(slot(ref_var), value)` which resolves
+    /// through Ref chains and Accessors automatically.
+    /// Used for writes to `with`-bound variables and by-ref params.
+    ///
+    /// This instruction has no `dest` — it is a side effect.
     WriteRef { ref_var: VarId, value: VarId },
 
     /// Append a value to an array in place: `append(arr, val)`.
     ///
-    /// Mutates `arr` via CoW. Like `SetIndex`, this is a side-effecting
+    /// Mutates `arr` via CoW. This is a side-effecting
     /// instruction — not a pure intrinsic. `dest` receives the array
     /// after mutation (for result capture), or undefined if `arr` is not
     /// an Array.
@@ -441,7 +449,7 @@ pub enum Instruction {
     ///
     /// Opaque to mem2reg — creates an SSA barrier so that subsequent reads
     /// of the variable get a new VarId after a mutation site (WriteRef,
-    /// SetIndex, Append, or by-ref function call). At runtime, this is
+    /// Append, or by-ref function call). At runtime, this is
     /// a slot copy (reads the current value of src's slot).
     Reload { dest: VarId, src: VarId },
 }
@@ -673,6 +681,156 @@ impl Default for Function {
             locals: Vec::new(),
             blocks: Vec::new(),
             entry_block: BlockId(0),
+        }
+    }
+}
+
+// ============================================================================
+// IR Dump (Debug)
+// ============================================================================
+
+impl Function {
+    /// Dump the function's IR to a string for debugging.
+    pub fn dump(&self) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+
+        let params: Vec<String> = self.params.iter().map(|v| format!("v{}", v.0)).collect();
+        let _ = writeln!(out, "fn {}({}):", self.name, params.join(", "));
+
+        for block in &self.blocks {
+            let _ = writeln!(out, "  B{}:", block.id.0);
+            for inst in &block.instructions {
+                let _ = writeln!(out, "    {}", fmt_instruction(&inst.node));
+            }
+            let _ = writeln!(out, "    → {}", fmt_terminator(&block.terminator));
+        }
+        out
+    }
+}
+
+fn fmt_var(v: VarId) -> String {
+    format!("v{}", v.0)
+}
+
+fn fmt_instruction(inst: &Instruction) -> String {
+    match inst {
+        Instruction::Phi { dest, sources } => {
+            let srcs: Vec<String> = sources
+                .iter()
+                .map(|(b, v)| format!("B{}:{}", b.0, fmt_var(*v)))
+                .collect();
+            format!("{} = Phi({})", fmt_var(*dest), srcs.join(", "))
+        }
+        Instruction::Copy { dest, src } => {
+            format!("{} = Copy({})", fmt_var(*dest), fmt_var(*src))
+        }
+        Instruction::Const { dest, value } => {
+            format!("{} = Const({:?})", fmt_var(*dest), value)
+        }
+        Instruction::Index { dest, base, key } => {
+            format!("{} = {}[{}]", fmt_var(*dest), fmt_var(*base), fmt_var(*key))
+        }
+        Instruction::Intrinsic { dest, op, args } => {
+            let arg_strs: Vec<String> = args.iter().map(|a| fmt_var(*a)).collect();
+            format!("{} = {:?}({})", fmt_var(*dest), op, arg_strs.join(", "))
+        }
+        Instruction::Call {
+            dest,
+            function,
+            args,
+        } => {
+            let arg_strs: Vec<String> = args.iter().map(|a| fmt_var(*a)).collect();
+            format!(
+                "{} = Call {}({})",
+                fmt_var(*dest),
+                function.qualified_name(),
+                arg_strs.join(", ")
+            )
+        }
+        Instruction::MakeAccessor { dest, base, key } => {
+            format!(
+                "{} = MakeAccessor({}[{}])",
+                fmt_var(*dest),
+                fmt_var(*base),
+                fmt_var(*key)
+            )
+        }
+        Instruction::MakeRef { dest, base } => {
+            format!("{} = MakeRef({})", fmt_var(*dest), fmt_var(*base))
+        }
+        Instruction::WriteRef { ref_var, value } => {
+            format!("WriteRef({}, {})", fmt_var(*ref_var), fmt_var(*value))
+        }
+        Instruction::WriteAccessor { base, key, value } => {
+            format!(
+                "{}[{}] = {}",
+                fmt_var(*base),
+                fmt_var(*key),
+                fmt_var(*value)
+            )
+        }
+        Instruction::Append { dest, arr, value } => {
+            format!(
+                "{} = Append({}, {})",
+                fmt_var(*dest),
+                fmt_var(*arr),
+                fmt_var(*value)
+            )
+        }
+        Instruction::Reload { dest, src } => {
+            format!("{} = Reload({})", fmt_var(*dest), fmt_var(*src))
+        }
+        Instruction::Assign { slot, value } => {
+            format!("Assign(slot_{}, {})", slot, fmt_var(*value))
+        }
+        Instruction::Read { slot, dest } => {
+            format!("{} = Read(slot_{})", fmt_var(*dest), slot)
+        }
+    }
+}
+
+fn fmt_terminator(term: &Terminator) -> String {
+    match term {
+        Terminator::Jump { target } => format!("Jump B{}", target.0),
+        Terminator::If {
+            condition,
+            then_target,
+            else_target,
+            ..
+        } => {
+            format!(
+                "If {} → B{}, B{}",
+                fmt_var(*condition),
+                then_target.0,
+                else_target.0
+            )
+        }
+        Terminator::Match {
+            value,
+            arms,
+            default,
+            ..
+        } => {
+            let arm_strs: Vec<String> = arms
+                .iter()
+                .map(|(pat, target)| format!("{:?}→B{}", pat, target.0))
+                .collect();
+            format!(
+                "Match {} [{}] default→B{}",
+                fmt_var(*value),
+                arm_strs.join(", "),
+                default.0
+            )
+        }
+        Terminator::Return { value } => match value {
+            Some(v) => format!("Return {}", fmt_var(*v)),
+            None => "Return".to_string(),
+        },
+        Terminator::Unreachable => "Unreachable".to_string(),
+        Terminator::TailCall { args } => {
+            let arg_strs: Vec<String> = args.iter().map(|a| fmt_var(*a)).collect();
+            format!("TailCall({})", arg_strs.join(", "))
         }
     }
 }

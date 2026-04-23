@@ -2092,3 +2092,169 @@ fn tco_tail_call_in_match() {
     );
     assert_eq!(val, Value::UInt(42));
 }
+
+// ========================================================================
+// By-Ref Write-Back Tests
+// ========================================================================
+
+#[test]
+fn byref_dump_accessor() {
+    let source = r#"
+        fn build_map(size) {
+            let m = {};
+            for i in 0..size {
+                m[i] = i * i;
+            }
+            m
+        }
+    "#;
+    let externs = externs::standard_externs();
+    let mut diags = crate::diagnostics::Diagnostics::new();
+    let ast = crate::ast::parser::parse(source, &mut diags).expect("parse failed");
+    let ir = crate::ir::lower(&ast, &externs, &mut diags).expect("lower failed");
+    eprintln!("=== BEFORE OPTIMIZATION ===");
+    for func in &ir.functions {
+        eprintln!("{}", func.dump());
+    }
+    let mut ir = ir;
+    crate::opt::optimize(&mut ir, &externs, &mut diags);
+    eprintln!("=== AFTER OPTIMIZATION ===");
+    for func in &ir.functions {
+        eprintln!("{}", func.dump());
+    }
+}
+
+#[test]
+fn byref_with_binding_writeback() {
+    // with x = arr[0]; x = 42 → arr[0] should be 42
+    let val = run_expect(
+        r#"
+        fn test() {
+            let arr = [1, 2, 3];
+            with x = arr[0];
+            x = 42;
+            arr[0]
+        }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(42));
+}
+
+#[test]
+fn byref_let_binding_no_writeback() {
+    // let x = arr[0]; x = 42 → arr[0] unchanged
+    let val = run_expect(
+        r#"
+        fn test() {
+            let arr = [1, 2, 3];
+            let x = arr[0];
+            x = 42;
+            arr[0]
+        }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(1));
+}
+
+#[test]
+fn byref_default_param_is_byval() {
+    // Default params are by-value — callee can't modify caller's variable
+    let val = run_expect(
+        r#"
+        fn modify(x) {
+            x = 99;
+        }
+        fn test() {
+            let a = 5;
+            modify(a);
+            a
+        }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(5));
+}
+
+#[test]
+fn byref_with_param_writeback() {
+    // with-param: callee mutation visible to caller
+    let val = run_expect(
+        r#"
+        fn set_to_zero(with x) {
+            x = 0;
+        }
+        fn test() {
+            let a = 42;
+            set_to_zero(a);
+            a
+        }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(0));
+}
+
+#[test]
+fn byref_array_mutation_through_param() {
+    // with-param: callee mutates array element, caller sees it
+    let val = run_expect(
+        r#"
+        fn set_first(with arr) {
+            arr[0] = 99;
+        }
+        fn test() {
+            let a = [1, 2, 3];
+            set_first(a);
+            a[0]
+        }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(99));
+}
+
+#[test]
+fn byref_recursive_countdown() {
+    // Recursive by-ref: count_down(with c) decrements through Ref chain
+    let val = run_expect(
+        r#"
+        fn count_down(with c) {
+            if c > 0 {
+                c = c - 1;
+                count_down(c);
+            }
+        }
+        fn test() {
+            let x = 5;
+            count_down(x);
+            x
+        }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(0));
+}
+
+#[test]
+fn byref_no_writeback_without_with() {
+    // Same function without `with` — by-value, no write-back
+    let val = run_expect(
+        r#"
+        fn count_down(c) {
+            if c > 0 {
+                c = c - 1;
+                count_down(c);
+            }
+        }
+        fn test() {
+            let x = 5;
+            count_down(x);
+            x
+        }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(5));
+}

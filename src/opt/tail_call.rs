@@ -132,17 +132,12 @@ fn instruction_reads(inst: &Instruction) -> Vec<VarId> {
         Instruction::Copy { src, .. } => vec![*src],
         Instruction::Const { .. } => vec![],
         Instruction::Index { base, key, .. } => vec![*base, *key],
-        Instruction::SetIndex { base, key, value } => vec![*base, *key, *value],
         Instruction::Intrinsic { args, .. } => args.clone(),
         Instruction::Call { args, .. } => args.clone(),
-        Instruction::MakeRef { base, key, .. } => {
-            let mut reads = vec![*base];
-            if let Some(k) = key {
-                reads.push(*k);
-            }
-            reads
-        }
+        Instruction::MakeAccessor { base, key, .. } => vec![*base, *key],
+        Instruction::MakeRef { base, .. } => vec![*base],
         Instruction::WriteRef { ref_var, value } => vec![*ref_var, *value],
+        Instruction::WriteAccessor { base, key, value } => vec![*base, *key, *value],
         Instruction::Append { arr, value, .. } => vec![*arr, *value],
         Instruction::Reload { src, .. } => vec![*src],
         Instruction::Assign { value, .. } => vec![*value],

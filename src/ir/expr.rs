@@ -465,12 +465,19 @@ impl<'a> Lowerer<'a> {
                     .copied()
                     .unwrap_or(false);
                 if is_ref {
-                    // Wrap in MakeRef — creates Slot::Ref at runtime
+                    // Wrap in MakeRef — creates Slot::Ref at runtime.
+                    // If the arg is a by-ref param variable, use the PARAM's
+                    // VarId as the base (its slot has the Ref chain to the
+                    // original caller). Otherwise use the lowered value.
+                    let base = if let ast::Expression::Variable(name) = arg {
+                        self.byref_param_vars.get(name).copied().unwrap_or(arg_var)
+                    } else {
+                        arg_var
+                    };
                     let ref_dest = self.new_temp(TypeSet::any());
                     self.emit(Instruction::MakeRef {
                         dest: ref_dest,
-                        base: arg_var,
-                        key: None,
+                        base,
                     });
                     ref_dest
                 } else {
@@ -614,16 +621,12 @@ impl<'a> Lowerer<'a> {
                 let base = self.lower_expression(array);
                 let key = self.lower_expression(index);
                 let dest = self.new_temp(TypeSet::any());
-                self.emit(Instruction::MakeRef {
-                    dest,
-                    base,
-                    key: Some(key),
-                });
+                self.emit(Instruction::MakeAccessor { dest, base, key });
                 let origin = RefOrigin {
                     ref_var: dest,
                     base_var: base,
+                    key_var: Some(key),
                     base_name,
-                    whole_value: false,
                 };
                 (dest, Some(origin))
             }
@@ -637,16 +640,12 @@ impl<'a> Lowerer<'a> {
                 let base = self.lower_expression(object);
                 let key = self.lower_expression(member);
                 let dest = self.new_temp(TypeSet::any());
-                self.emit(Instruction::MakeRef {
-                    dest,
-                    base,
-                    key: Some(key),
-                });
+                self.emit(Instruction::MakeAccessor { dest, base, key });
                 let origin = RefOrigin {
                     ref_var: dest,
                     base_var: base,
+                    key_var: Some(key),
                     base_name,
-                    whole_value: false,
                 };
                 (dest, Some(origin))
             }
@@ -654,16 +653,12 @@ impl<'a> Lowerer<'a> {
             ast::Expression::Variable(name) => {
                 if let Some(var) = self.read_var(name) {
                     let dest = self.new_temp(TypeSet::any());
-                    self.emit(Instruction::MakeRef {
-                        dest,
-                        base: var,
-                        key: None,
-                    });
+                    self.emit(Instruction::MakeRef { dest, base: var });
                     let origin = RefOrigin {
                         ref_var: dest,
                         base_var: var,
+                        key_var: None,
                         base_name: Some(name.clone()),
-                        whole_value: true,
                     };
                     (dest, Some(origin))
                 } else {

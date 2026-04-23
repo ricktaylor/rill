@@ -346,19 +346,20 @@ intrinsics are appended at the end; existing values never change.
 Each instruction is a CBOR array. The first element is an integer opcode.
 Remaining elements are the instruction's operands.
 
-| Opcode | Instruction   | Encoding                                      |
-|--------|---------------|-----------------------------------------------|
-| 0      | `Phi`         | `[0, dest, [[block, var], ...]]`              |
-| 1      | `Copy`        | `[1, dest, src]`                              |
-| 2      | `Const`       | `[2, dest, <Literal>]`                        |
-| 3      | `Index`       | `[3, dest, base, key]`                        |
-| 4      | `SetIndex`    | `[4, base, key, value]`                       |
-| 5      | `Intrinsic`   | `[5, dest, op, [args...]]`                    |
-| 6      | `Call`        | `[6, dest, <FunctionRef>, [var, ...]]`        |
-| 7      | `MakeRef`     | `[7, dest, base, key_or_null]`                |
-| 8      | `WriteRef`    | `[8, ref_var, value]`                         |
-| 9      | `Append`      | `[9, dest, arr, value]`                       |
-| 10     | `Reload`      | `[10, dest, src]`                             |
+| Opcode | Instruction      | Encoding                                      |
+|--------|------------------|-----------------------------------------------|
+| 0      | `Phi`            | `[0, dest, [[block, var], ...]]`              |
+| 1      | `Copy`           | `[1, dest, src]`                              |
+| 2      | `Const`          | `[2, dest, <Literal>]`                        |
+| 3      | `Index`          | `[3, dest, base, key]`                        |
+| 4      | `Intrinsic`      | `[4, dest, op, [args...]]`                    |
+| 5      | `Call`           | `[5, dest, <FunctionRef>, [var, ...]]`        |
+| 6      | `MakeAccessor`   | `[6, dest, base, key]`                        |
+| 7      | `MakeRef`        | `[7, dest, base]`                             |
+| 8      | `WriteAccessor`  | `[8, base, key, value]`                       |
+| 9      | `WriteRef`       | `[9, ref_var, value]`                         |
+| 10     | `Append`         | `[10, dest, arr, value]`                      |
+| 11     | `Reload`         | `[11, dest, src]`                             |
 
 ### FunctionRef
 

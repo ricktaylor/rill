@@ -5,7 +5,7 @@
 //! Copy of the first computation's result.
 //!
 //! Safe for pure operations in SSA form: same VarId operands guarantee
-//! same values. SetIndex/WriteRef create new VarIds, so intervening
+//! same values. WriteRef creates new VarIds via Reload, so intervening
 //! mutations don't invalidate earlier Index results.
 //!
 //! Runs in the Phase 1 fixpoint loop. Copy propagation + DCE clean up

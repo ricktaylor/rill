@@ -122,18 +122,6 @@ fn transfer_instruction(
             state.insert(*dest, element_types.union(&TypeSet::undefined()));
         }
 
-        // SetIndex doesn't produce a value, but updates element type of base.
-        // Strip Undefined — collection elements are always defined values.
-        Instruction::SetIndex { base, value, .. } => {
-            let val_type = state
-                .get(value)
-                .copied()
-                .unwrap_or(TypeSet::defined())
-                .difference(&TypeSet::undefined());
-            let existing = element_state.get(base).copied().unwrap_or(TypeSet::none());
-            element_state.insert(*base, existing.union(&val_type));
-        }
-
         // Phi: union of all incoming types (and element types for collections)
         Instruction::Phi { dest, sources } => {
             let mut result_type: Option<TypeSet> = None;
@@ -209,34 +197,44 @@ fn transfer_instruction(
             state.insert(*dest, type_set);
         }
 
-        // MakeRef: element ref reads base[key], same type rules as Index.
-        // Whole-value ref has the same type as its base.
-        Instruction::MakeRef { dest, base, key } => {
-            if key.is_some() {
-                // Element ref: same pattern as Index
-                let element_types = if let Some(base_type) = state.get(base)
-                    && base_type.is_single()
-                    && (base_type.contains(BaseType::Text) || base_type.contains(BaseType::Bytes))
-                {
-                    &TypeSet::uint()
-                } else if let Some(elem_type) = element_state.get(base) {
-                    elem_type
-                } else {
-                    &TypeSet::defined()
-                };
-                state.insert(*dest, element_types.union(&TypeSet::undefined()));
+        // MakeAccessor: element ref reads base[key], same type rules as Index.
+        Instruction::MakeAccessor { dest, base, .. } => {
+            let element_types = if let Some(base_type) = state.get(base)
+                && base_type.is_single()
+                && (base_type.contains(BaseType::Text) || base_type.contains(BaseType::Bytes))
+            {
+                &TypeSet::uint()
+            } else if let Some(elem_type) = element_state.get(base) {
+                elem_type
             } else {
-                // Whole-value ref: same type as base
-                if let Some(base_type) = state.get(base) {
-                    state.insert(*dest, *base_type);
-                } else {
-                    state.insert(*dest, TypeSet::any());
-                }
+                &TypeSet::defined()
+            };
+            state.insert(*dest, element_types.union(&TypeSet::undefined()));
+        }
+
+        // MakeRef: whole-value ref has the same type as its base.
+        Instruction::MakeRef { dest, base } => {
+            if let Some(base_type) = state.get(base) {
+                state.insert(*dest, *base_type);
+            } else {
+                state.insert(*dest, TypeSet::any());
             }
         }
 
         // WriteRef: side effect only (writes through a reference), no dest
         Instruction::WriteRef { .. } => {}
+
+        // WriteAccessor: side effect (base[key] = value), no dest.
+        // Track element type: the written value widens the base's element type.
+        Instruction::WriteAccessor { base, value, .. } => {
+            let val_type = state
+                .get(value)
+                .copied()
+                .unwrap_or(TypeSet::any())
+                .difference(&TypeSet::undefined());
+            let existing = element_state.get(base).copied().unwrap_or(TypeSet::none());
+            element_state.insert(*base, existing.union(&val_type));
+        }
 
         // Append: mutates array, result is Array type.
         // Element type = union of arr's element type + appended value's type.
@@ -579,13 +577,14 @@ pub fn analyze_types_full(
                     | Instruction::Index { dest, .. }
                     | Instruction::Intrinsic { dest, .. }
                     | Instruction::Call { dest, .. }
+                    | Instruction::MakeAccessor { dest, .. }
                     | Instruction::MakeRef { dest, .. }
                     | Instruction::Append { dest, .. }
                     | Instruction::Phi { dest, .. }
                     | Instruction::Read { dest, .. }
                     | Instruction::Reload { dest, .. } => Some(*dest),
-                    Instruction::SetIndex { .. }
-                    | Instruction::WriteRef { .. }
+                    Instruction::WriteRef { .. }
+                    | Instruction::WriteAccessor { .. }
                     | Instruction::Assign { .. } => None,
                 };
 

@@ -56,23 +56,21 @@ pub enum BindingMode {
 
 /// Origin of a reference binding: tracks what a `with`-bound variable refers to.
 ///
-/// Used by the lowerer to emit `WriteRef` instructions when a ref-backed
-/// variable is assigned. The `ref_var` is the dest of the MakeRef instruction;
-/// the compiler resolves it to (base, key) via `build_ref_map` at compile time.
-/// `base_name` is the named variable being mutated (for SSA Reload after WriteRef).
+/// For Accessor origins (from MakeAccessor): holds base + key VarIds.
+/// Write-back emits WriteAccessor { base, key, value }.
+///
+/// For Ref origins (from MakeRef or by-ref params): holds ref_var.
+/// Write-back emits WriteRef { ref_var, value }.
 #[derive(Clone)]
 pub struct RefOrigin {
-    /// The MakeRef dest VarId (the reference variable)
+    /// The MakeRef/MakeAccessor dest VarId (the reference variable)
     pub ref_var: VarId,
-    /// The MakeRef base VarId (the collection being referenced)
+    /// The base VarId (collection or variable being referenced)
     pub base_var: VarId,
-    /// The named variable holding the base (for Reload after WriteRef)
+    /// The key VarId (for Accessor origins only)
+    pub key_var: Option<VarId>,
+    /// The named variable holding the base (for Reload after write-back)
     pub base_name: Option<ast::Identifier>,
-    /// True if this is a whole-value ref (MakeRef key: None).
-    /// Whole-value refs can change the base's type entirely on write,
-    /// so WriteRef needs Reload. Element refs (key: Some) only mutate
-    /// collection contents — container type is unchanged.
-    pub whole_value: bool,
 }
 
 // ============================================================================
@@ -142,6 +140,11 @@ pub struct Lowerer<'a> {
     /// User function parameter by-ref modes, collected from AST before lowering.
     /// Used to emit Reload after calls for by-ref args from named variables.
     pub user_fn_params: HashMap<ast::Identifier, Vec<bool>>,
+
+    /// By-ref param VarIds for the current function being lowered.
+    /// Maps param name → param VarId. Used to forward the Ref chain
+    /// when passing a by-ref param to another by-ref callee param.
+    pub byref_param_vars: HashMap<ast::Identifier, VarId>,
 }
 
 /// Context for a loop (for break/continue)
@@ -173,6 +176,7 @@ impl<'a> Lowerer<'a> {
             merged_externs: HashMap::new(),
             expr_guard_fail: None,
             user_fn_params: HashMap::new(),
+            byref_param_vars: HashMap::new(),
         }
     }
 

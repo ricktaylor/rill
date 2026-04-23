@@ -173,7 +173,7 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
 - [x] **Element type tracking (Layer 1)** — `element_state` in type analysis tracks
       union of all element types per collection VarId. Flows into Index/MakeRef result
       types automatically (e.g., `[1,2,3][i]` → `UInt | Undefined` not `any()`).
-      Sources: MakeArray, MakeMap, Append, SetIndex, Phi (all-sources union), Copy, Reload.
+      Sources: MakeArray, MakeMap, Append, WriteAccessor, Phi (all-sources union), Copy, Reload.
       Elements never include Undefined; Index adds it for OOB/missing key.
 - [ ] **Per-key type tracking (Layer 2)** — `HashMap<Value, TypeSet>` per collection
       VarId for constant keys. Structural typing for maps: `config.timeout` → UInt,
@@ -228,10 +228,32 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
       new SSA def after in-place mutation, opaque to mem2reg. Copy propagation does not
       propagate through Reload (barrier). Type analysis uses source type.
   - [x] `Instruction::Reload` added to IR, compiler, all optimizer passes
+  - [x] Lowerer emits Reload + Assign after all mutations (WriteAccessor, WriteRef)
   - [x] Lowerer emits Reload + Assign after calls for by-ref (`with`) args
-  - [x] Lowerer emits Reload + Assign after whole-value WriteRef (type can change)
-  - In-place mutations (SetIndex, element WriteRef, Append) work at runtime without
-    Reload — the value stays in the same compiled slot.
+
+### P1 — Accessor/Ref Model (done)
+
+- [x] **Slot::Accessor** — far pointer into collection elements (`base + key` slot indices).
+      `vm.get()` reads through Accessors. `vm.set()` writes through Accessors (SetIndex).
+      Composes with Slot::Ref: `Ref → Accessor` chains resolve automatically.
+- [x] **Four reference instructions** — clean separation of concerns:
+      - `MakeAccessor { dest, base, key }` → creates `Slot::Accessor`
+      - `MakeRef { dest, base }` → creates `Slot::Ref` (with path compression)
+      - `WriteAccessor { base, key, value }` → direct element write (type-specialized)
+      - `WriteRef { ref_var, value }` → write through binding (VM resolves Ref/Accessor)
+- [x] **SetIndex removed** — was premature peephole optimisation in the lowerer.
+      All collection mutations now go through MakeAccessor + WriteAccessor + Reload.
+      The peephole layer (future StepKind) can fuse back to a single closure.
+- [x] **build_ref_map/RefMeta removed** — WriteAccessor carries base+key directly.
+      WriteRef uses vm.set_local which resolves through Slot types. No tracing.
+
+### P2 — Known Issues
+
+- [ ] **Type analysis Phi convergence** — Reload in a loop produces `any()` on the
+      first worklist iteration (source type not yet known). The Phi unions Map ∪ any()
+      = any(), and the worklist may not re-iterate to converge on Map. This causes the
+      compiler to emit generic dispatch closures instead of type-specialized ones for
+      loop-carried collections. Functionally correct but suboptimal.
 
 ### P2 — Parser
 - [ ] **Optional braces in match arms** — allow `pattern => expr,` in addition to
@@ -286,7 +308,7 @@ enum StepKind {
     // ... typed variants for Sub, Mul, Div, Mod, Lt, Eq
     Generic { dest: usize, op: IntrinsicOp, args: Vec<usize> },
     Index { dest: usize, base: usize, key: usize },
-    SetIndex { base: usize, key: usize, value: usize },
+    WriteAccessor { base: usize, key: usize, value: usize },
     // terminators
     BranchIf { cond: usize, then_pc: usize, else_pc: usize },
     Jump { pc: usize },

@@ -1,17 +1,17 @@
 //! Reference Elision Optimization
 //!
-//! Simplifies MakeRef instructions when the full reference indirection is unnecessary.
-//! Three rewrites, in order of application:
+//! Simplifies MakeRef and MakeAccessor instructions when the full reference
+//! indirection is unnecessary. Three rewrites, in order of application:
 //!
-//! 1. **Ref chain shortening** — `MakeRef(dest, base, None)` where `base` is itself
-//!    from `MakeRef(_, original, None)`: rewrite to `MakeRef(dest, original, None)`.
+//! 1. **Ref chain shortening** — `MakeRef(dest, base)` where `base` is itself
+//!    from `MakeRef(_, original)`: rewrite to `MakeRef(dest, original)`.
 //!    Eliminates multi-hop `Slot::Ref` chains at runtime.
 //!
-//! 2. **Read-only element ref demotion** — `MakeRef(dest, base, Some(k))` where no
+//! 2. **Read-only element ref demotion** — `MakeAccessor(dest, base, k)` where no
 //!    `WriteRef` targets `dest`: demote to `Index(dest, base, k)`. The ref metadata
 //!    was only needed for write-back; without it, a plain read suffices.
 //!
-//! 3. **Read-only whole-value ref demotion** — `MakeRef(dest, base, None)` where no
+//! 3. **Read-only whole-value ref demotion** — `MakeRef(dest, base)` where no
 //!    `WriteRef` in the function modifies `base` (directly or transitively): demote
 //!    to `Copy(dest, base)`. Eliminates the `Slot::Ref` indirection entirely.
 //!
@@ -52,21 +52,38 @@ pub fn elide_refs(function: &mut Function) -> usize {
 
     let mut make_refs: HashMap<VarId, RefInfo> = HashMap::new();
     let mut write_ref_targets: HashSet<VarId> = HashSet::new();
+    let mut call_arg_refs: HashSet<VarId> = HashSet::new();
 
     for block in &function.blocks {
         for inst in &block.instructions {
             match &inst.node {
-                Instruction::MakeRef { dest, base, key } => {
+                Instruction::MakeAccessor { dest, base, key } => {
                     make_refs.insert(
                         *dest,
                         RefInfo {
                             base: *base,
-                            key: *key,
+                            key: Some(*key),
+                        },
+                    );
+                }
+                Instruction::MakeRef { dest, base } => {
+                    make_refs.insert(
+                        *dest,
+                        RefInfo {
+                            base: *base,
+                            key: None,
                         },
                     );
                 }
                 Instruction::WriteRef { ref_var, .. } => {
                     write_ref_targets.insert(*ref_var);
+                }
+                // MakeRef dests passed as Call args must not be demoted —
+                // the callee may write through the Slot::Ref.
+                Instruction::Call { args, .. } => {
+                    for arg in args {
+                        call_arg_refs.insert(*arg);
+                    }
                 }
                 _ => {}
             }
@@ -99,20 +116,23 @@ pub fn elide_refs(function: &mut Function) -> usize {
 
     for block in &mut function.blocks {
         for inst in &mut block.instructions {
-            let Instruction::MakeRef { dest, base, key } = &inst.node else {
-                continue;
+            // Extract dest, base, key from MakeAccessor or MakeRef
+            let (dest, base, key) = match &inst.node {
+                Instruction::MakeAccessor { dest, base, key } => (*dest, *base, Some(*key)),
+                Instruction::MakeRef { dest, base } => (*dest, *base, None),
+                _ => continue,
             };
-            let dest = *dest;
-            let base = *base;
-            let key = *key;
 
             match key {
                 None => {
                     let resolved = resolve_base(base, &make_refs);
 
-                    if !write_ref_targets.contains(&dest) && !written_bases.contains(&resolved) {
-                        // No writes through this ref, and no writes to its
-                        // base from any ref → Slot::Ref is unnecessary.
+                    if !write_ref_targets.contains(&dest)
+                        && !written_bases.contains(&resolved)
+                        && !call_arg_refs.contains(&dest)
+                    {
+                        // No writes through this ref, no writes to its base,
+                        // and not passed as a call arg → Slot::Ref is unnecessary.
                         // Demote to Copy (uses the resolved base to also
                         // eliminate any chain in a single step).
                         inst.node = Instruction::Copy {
@@ -126,7 +146,6 @@ pub fn elide_refs(function: &mut Function) -> usize {
                         inst.node = Instruction::MakeRef {
                             dest,
                             base: resolved,
-                            key: None,
                         };
                         rewrites += 1;
                     }
@@ -178,7 +197,7 @@ mod tests {
 
     #[test]
     fn test_read_only_element_ref_demoted_to_index() {
-        // MakeRef(v2, v0, Some(v1)) with no WriteRef → becomes Index
+        // MakeAccessor(v2, v0, v1) with no WriteRef → becomes Index
         let blocks = vec![BasicBlock {
             id: block(0),
             instructions: vec![
@@ -190,10 +209,10 @@ mod tests {
                     dest: var(1),
                     value: Literal::UInt(1),
                 }),
-                si(Instruction::MakeRef {
+                si(Instruction::MakeAccessor {
                     dest: var(2),
                     base: var(0),
-                    key: Some(var(1)),
+                    key: var(1),
                 }),
             ],
             terminator: Terminator::Return {
@@ -214,7 +233,7 @@ mod tests {
 
     #[test]
     fn test_element_ref_with_writeback_kept() {
-        // MakeRef(v2, v0, Some(v1)) WITH WriteRef(v2, v3) → stays MakeRef
+        // MakeAccessor(v2, v0, v1) WITH WriteRef(v2, v3) → stays MakeAccessor
         let blocks = vec![BasicBlock {
             id: block(0),
             instructions: vec![
@@ -226,10 +245,10 @@ mod tests {
                     dest: var(1),
                     value: Literal::UInt(1),
                 }),
-                si(Instruction::MakeRef {
+                si(Instruction::MakeAccessor {
                     dest: var(2),
                     base: var(0),
-                    key: Some(var(1)),
+                    key: var(1),
                 }),
                 si(Instruction::Const {
                     dest: var(3),
@@ -251,7 +270,7 @@ mod tests {
         assert_eq!(rewrites, 0);
         assert!(matches!(
             &func.blocks[0].instructions[2].node,
-            Instruction::MakeRef { .. }
+            Instruction::MakeAccessor { .. }
         ));
     }
 
@@ -268,7 +287,6 @@ mod tests {
                 si(Instruction::MakeRef {
                     dest: var(1),
                     base: var(0),
-                    key: None,
                 }),
             ],
             terminator: Terminator::Return {
@@ -289,7 +307,7 @@ mod tests {
 
     #[test]
     fn test_whole_ref_with_writeback_kept() {
-        // MakeRef(v1, v0, None) WITH WriteRef(v1, v2) → stays MakeRef
+        // MakeRef(v1, v0) WITH WriteRef(v1, v2) → stays MakeRef
         let blocks = vec![BasicBlock {
             id: block(0),
             instructions: vec![
@@ -300,7 +318,6 @@ mod tests {
                 si(Instruction::MakeRef {
                     dest: var(1),
                     base: var(0),
-                    key: None,
                 }),
                 si(Instruction::Const {
                     dest: var(2),
@@ -324,8 +341,8 @@ mod tests {
 
     #[test]
     fn test_whole_ref_kept_when_sibling_writes_base() {
-        // v1 = MakeRef(v0, None)  — no WriteRef for v1
-        // v2 = MakeRef(v0, None)  — has WriteRef(v2, _)
+        // v1 = MakeRef(v0)  — no WriteRef for v1
+        // v2 = MakeRef(v0)  — has WriteRef(v2, _)
         // v1 must stay MakeRef because v0 is mutated through v2
         let blocks = vec![BasicBlock {
             id: block(0),
@@ -337,12 +354,10 @@ mod tests {
                 si(Instruction::MakeRef {
                     dest: var(1),
                     base: var(0),
-                    key: None,
                 }),
                 si(Instruction::MakeRef {
                     dest: var(2),
                     base: var(0),
-                    key: None,
                 }),
                 si(Instruction::Const {
                     dest: var(3),
@@ -365,17 +380,17 @@ mod tests {
         assert_eq!(rewrites, 0);
         assert!(matches!(
             &func.blocks[0].instructions[1].node,
-            Instruction::MakeRef { dest, base, key: None }
+            Instruction::MakeRef { dest, base }
                 if *dest == var(1) && *base == var(0)
         ));
     }
 
     #[test]
     fn test_chain_shortening() {
-        // v1 = MakeRef(v0, None)
-        // v2 = MakeRef(v1, None)
+        // v1 = MakeRef(v0)
+        // v2 = MakeRef(v1)
         // WriteRef(v2, _) — so v0 is a written base
-        // v2 should be shortened to MakeRef(v0, None) but NOT demoted
+        // v2 should be shortened to MakeRef(v0) but NOT demoted
         // v1 should also stay (v0 is written)
         let blocks = vec![BasicBlock {
             id: block(0),
@@ -387,12 +402,10 @@ mod tests {
                 si(Instruction::MakeRef {
                     dest: var(1),
                     base: var(0),
-                    key: None,
                 }),
                 si(Instruction::MakeRef {
                     dest: var(2),
                     base: var(1),
-                    key: None,
                 }),
                 si(Instruction::Const {
                     dest: var(3),
@@ -411,19 +424,19 @@ mod tests {
         let mut func = make_function(blocks);
         let rewrites = elide_refs(&mut func);
 
-        // v2 chain-shortened from MakeRef(v1, None) → MakeRef(v0, None)
+        // v2 chain-shortened from MakeRef(v1) → MakeRef(v0)
         assert_eq!(rewrites, 1);
         assert!(matches!(
             &func.blocks[0].instructions[2].node,
-            Instruction::MakeRef { dest, base, key: None }
+            Instruction::MakeRef { dest, base }
                 if *dest == var(2) && *base == var(0)
         ));
     }
 
     #[test]
     fn test_chain_demoted_when_no_writes() {
-        // v1 = MakeRef(v0, None)
-        // v2 = MakeRef(v1, None)
+        // v1 = MakeRef(v0)
+        // v2 = MakeRef(v1)
         // No WriteRef anywhere → both demoted to Copy
         let blocks = vec![BasicBlock {
             id: block(0),
@@ -435,12 +448,10 @@ mod tests {
                 si(Instruction::MakeRef {
                     dest: var(1),
                     base: var(0),
-                    key: None,
                 }),
                 si(Instruction::MakeRef {
                     dest: var(2),
                     base: var(1),
-                    key: None,
                 }),
             ],
             terminator: Terminator::Return {
@@ -467,9 +478,9 @@ mod tests {
 
     #[test]
     fn test_element_ref_kept_when_base_written_by_sibling() {
-        // v1 = MakeRef(v0, Some(v_idx))  — read-only element ref
-        // v2 = MakeRef(v0, Some(v_idx2)) — has WriteRef
-        // v1 can still be demoted to Index because element MakeRef reads
+        // v1 = MakeAccessor(v0, v_idx)  — read-only element ref
+        // v2 = MakeAccessor(v0, v_idx2) — has WriteRef
+        // v1 can still be demoted to Index because element MakeAccessor reads
         // a copy of the element value, not a Slot::Ref.
         let blocks = vec![BasicBlock {
             id: block(0),
@@ -482,15 +493,15 @@ mod tests {
                     dest: var(11),
                     value: Literal::UInt(1),
                 }),
-                si(Instruction::MakeRef {
+                si(Instruction::MakeAccessor {
                     dest: var(1),
                     base: var(0),
-                    key: Some(var(10)),
+                    key: var(10),
                 }),
-                si(Instruction::MakeRef {
+                si(Instruction::MakeAccessor {
                     dest: var(2),
                     base: var(0),
-                    key: Some(var(11)),
+                    key: var(11),
                 }),
                 si(Instruction::Const {
                     dest: var(3),
@@ -519,7 +530,7 @@ mod tests {
         ));
         assert!(matches!(
             &func.blocks[0].instructions[3].node,
-            Instruction::MakeRef { .. }
+            Instruction::MakeAccessor { .. }
         ));
     }
 }

@@ -310,105 +310,130 @@ pub struct FrameInfo {
 }
 
 pub enum Slot {
-    Val(Value),           // Actual value (16 bytes)
-    Ref(usize),           // Reference to another slot (used by MakeRef with key: None)
-    Frame(Box<FrameInfo>), // Frame info (boxed to keep Slot small)
-    Uninit,               // Reserved but unassigned
+    Val(Value),                        // Actual value (16 bytes)
+    Ref(usize),                        // Near pointer: another stack slot
+    Accessor { base: usize, key: usize }, // Far pointer: collection[key]
+    Frame(Box<FrameInfo>),             // Frame info (boxed to keep Slot small)
 }
-// Slot is 16 bytes total (Value is largest at 16 bytes)
+// Slot is 16 bytes total (Value is largest; Accessor fits in 2×usize = 16 bytes)
 ```
+
+Two kinds of slot indirection (analogous to x86 near/far pointers):
+- **Slot::Ref(target)** — near pointer: follows to another slot
+- **Slot::Accessor { base, key }** — far pointer: base slot + key slot → element in collection
+
+Collections (Array, Map) hold Values, not Slots. There is no shared heap —
+elements are accessed through an Accessor, which is a (base, key) pair that
+knows how to get/set a value in a collection. Reading through an Accessor
+does `base_collection[key]`. Writing through an Accessor mutates the element.
+
+Refs and Accessors compose: `Slot::Ref` pointing to a `Slot::Accessor` follows
+the full chain on read and write. `vm.set_local` resolves through Ref→Accessor
+automatically, enabling `with y = x; y = 10` where x is an Accessor.
 
 ### Call Convention
 
 ```rust
-// Caller: evaluate args, get absolute indices
-let args = [arg0_idx, arg1_idx];
-let return_slot = vm.bp() + dest_offset;
+// Caller: evaluate args, create refs/accessors as needed
+// For by-val params: pass value directly
+// For by-ref params: emit MakeRef (creates Slot::Ref to caller's slot)
 
 // Set up callee frame
-vm.call(frame_size, Some(return_slot))?;
+vm.call(frame_size, None)?;
 
-// Bind parameters
-vm.bind_param(1, args[0], true);   // by ref
-vm.bind_param(2, args[1], false);  // by val
+// Copy args via copy_slot_from (shallow: Ref stays Ref, Val stays Val)
+for (i, &s) in arg_slots.iter().enumerate() {
+    vm.copy_slot_from(i + 1, caller_bp + s);
+}
 
 // ... execute callee ...
 
-// Callee returns - writes directly to caller's slot
-vm.ret_val(result);
-
-// Caller reads from local(dest_offset)
+// Callee returns value
+vm.ret();
 ```
 
 ### Reference Binding (`with`)
 
 Reference bindings create tracked aliases so that mutations flow back to the
-source. The IR makes this explicit with two instructions: `MakeRef` creates the
-reference and `WriteRef` performs write-back. The optimizer can see both and
-reason about dead write-backs, forwarding, and alias relationships.
+source. Two IR instructions create bindings; the VM handles write-back
+automatically through Slot resolution.
 
-**Element references** (`with x = arr[i]`):
+**Accessors** (`with x = arr[i]`):
 
 ```
 // IR:
-v0 = MakeRef { base: arr, key: Some(i) }   // reads arr[i], records provenance
+v0 = MakeAccessor { base: arr, key: i }     // creates Slot::Accessor
 // bind "x" → v0
 
-// x = 10  →  assignment to ref-backed variable
+// x = 10  →  assignment to accessor-backed variable
 v1 = Const(10)
-WriteRef { ref_var: v0, value: v1 }          // write-back: arr[i] = 10
-// rebind "x" → v1 (for subsequent SSA reads)
+WriteAccessor { base: arr, key: i, value: v1 }  // direct element write
+Reload(arr)                                      // SSA visibility
 ```
 
-At runtime, `MakeRef` with a key reads the element (like `Index`). `WriteRef`
-resolves the ref_var back to its MakeRef to find (base, key) and emits a
-`SetIndex` on the collection.
+At runtime, `MakeAccessor` creates `Slot::Accessor { base, key }` in the dest
+slot. Reading `x` indexes into the collection. `WriteAccessor` writes directly
+to the collection element (type-specialized at compile time). `Reload` creates
+a fresh SSA def so the optimizer knows the collection was mutated.
+`set_array_elem` or `set_map_entry` based on the collection type.
 
-**Whole-value references** (`with x = y`):
+**Refs** (`with x = y`, or by-ref function params):
 
 ```
 // IR:
-v0 = MakeRef { base: y, key: None }         // whole-value ref
+v0 = MakeRef { base: y }                    // creates Slot::Ref
 // bind "x" → v0
 
 // x = 10
 v1 = Const(10)
-WriteRef { ref_var: v0, value: v1 }          // write-back to y's slot
-// rebind "x" → v1
+WriteRef { ref_var: v0, value: v1 }          // vm.set_local resolves Ref
+// → writes to y's slot directly
 ```
 
-At runtime, `MakeRef` without a key creates a `Slot::Ref` pointing to the
-base's stack slot. `WriteRef` writes directly to the base slot, so the source
-variable sees the new value.
+At runtime, `MakeRef` creates `Slot::Ref` pointing to the base's slot (with
+path compression — resolves existing Ref chains). Writing through a Ref
+follows the chain to the target slot.
 
-**For-loop references** (`for x in arr { x += 1 }`):
+**Chaining** (`with x = arr[i]; with y = x; y = 10`):
+- x = Slot::Accessor(arr, i)
+- y = Slot::Ref(x's slot)
+- `y = 10`: set_local follows Ref → finds Accessor → writes to arr[i]
+
+The full chain resolves automatically through vm.set_local's Slot dispatch.
+
+**For-loop accessors** (`for with x in arr { x += 1 }`):
 
 ```
 // IR (body block):
-v_ref = MakeRef { base: iter, key: Some(i_phi) }   // refs iter[i]
-// bind "x" → v_ref
+v_acc = MakeAccessor { base: iter, key: i_phi }  // accessor to iter[i]
+// bind "x" → v_acc
 
 // x += 1  →  compound assignment
-v_old = v_ref                            // current value
+v_old = v_acc                                     // reads through Accessor
 v_new = Intrinsic(Add, [v_old, 1])
-WriteRef { ref_var: v_ref, value: v_new }   // write-back: iter[i] = v_new
+WriteAccessor { base: iter, key: i_phi, value: v_new }  // direct element write
+Reload(iter)                                             // SSA visibility
 // rebind "x" → v_new
 ```
 
 The write-back is emitted at the point of assignment — correct even with
-`break` and `continue` (no deferred write-back needed).
+`break` and `continue` (no deferred write-back needed). Note: for-loop
+default is now by-value; `with` keyword opts into by-ref/accessor iteration.
 
 **Ref origin tracking:** The lowerer maintains a scoped `ref_origins` map
 (`Identifier → RefOrigin { ref_var, base, key }`) alongside the normal scope
 stack. When a ref-backed variable is assigned, the lowerer looks up its
 `RefOrigin` and emits `WriteRef`.
 
-**Compiler resolution:** At compile time, `build_ref_map()` collects all
-`MakeRef` instructions into a `VarId → RefMeta { base_slot, key_slot }` map.
-When compiling `WriteRef`, the compiler looks up the ref_var to find the
-base and key slots and emits the appropriate closure:
-- Element ref (key_slot is Some): SetIndex on the collection
-- Whole-value ref (key_slot is None): set_local on the base slot
+**Four IR instructions for references:**
+- `MakeAccessor { dest, base, key }` → creates `Slot::Accessor` (far pointer into collection)
+- `MakeRef { dest, base }` → creates `Slot::Ref` (near pointer to another slot)
+- `WriteAccessor { base, key, value }` → direct element write, type-specialized at compile time
+- `WriteRef { ref_var, value }` → write through a Ref/Accessor binding (VM resolves)
+
+No `build_ref_map` tracing needed — each instruction is self-describing.
+The compiler specializes WriteAccessor based on type analysis (Array vs Map).
+WriteRef uses `vm.set_local` which resolves through Slot::Ref and Slot::Accessor.
 
 ### Resource Limits
 
@@ -537,7 +562,7 @@ closures, eliminating runtime dispatches when static information is sufficient:
 | Binary arithmetic | Both args same single type | Direct typed operation (e.g. `u64::checked_add`) |
 | Cast/Widen target | Target always a constant | Target resolved at compile time, source-only dispatch |
 | Index/MakeRef | Base type known | Type-specific indexing (no 5-way dispatch) |
-| SetIndex/WriteRef | Base type known | Direct `set_array_elem` or `set_map_entry` |
+| WriteAccessor | Base type known | Direct `set_array_elem` or `set_map_entry` |
 | Match (single-arm) | From `if let` patterns | Inlined type/literal/length test |
 | Match (multi-arm) | From `match` expressions | Pre-compiled predicate closures |
 | Copy | Source provably Defined | Direct `.unwrap()` (no None check) |
@@ -1387,20 +1412,19 @@ demotes them to cheaper instructions.
 
 | Rewrite | Condition | Before → After |
 |---------|-----------|----------------|
-| Chain shortening | `base` from `MakeRef(_, orig, None)` | `MakeRef(d, base, None)` → `MakeRef(d, orig, None)` |
-| Element demotion | No `WriteRef` targets `dest` | `MakeRef(d, b, Some(k))` → `Index(d, b, k)` |
-| Whole-value demotion | No `WriteRef` targets `dest` AND base not in `written_bases` | `MakeRef(d, b, None)` → `Copy(d, b)` |
+| Ref chain shortening | `base` from `MakeRef(_, orig)` | `MakeRef(d, base)` → `MakeRef(d, orig)` |
+| Accessor demotion | No `WriteRef`/`WriteAccessor` targets `dest` | `MakeAccessor(d, b, k)` → `Index(d, b, k)` |
+| Ref demotion | No `WriteRef` targets `dest` AND base not in `written_bases` | `MakeRef(d, b)` → `Copy(d, b)` |
 
-**Written bases:** A base is "written" if any `WriteRef` in the function
-modifies it — either through a whole-value write (`key: None`) or an element
-write (`key: Some`, which mutates the collection). The pass follows `MakeRef`
-chains to find the resolved base. If a sibling ref to the same base has a
-`WriteRef`, the `Slot::Ref` alias must stay live so reads see the mutation.
+**Written bases:** A base is "written" if any `WriteAccessor` or `WriteRef`
+in the function modifies it. The pass follows `MakeRef` chains to find the
+resolved base. If a sibling ref to the same base has a write-back, the
+`Slot::Ref` alias must stay live so reads see the mutation.
 
-**Example:** `with x = arr; with y = arr[0]; y = 10` — the `WriteRef` for `y`
-writes to `arr`, so `arr` is in `written_bases`. If another ref aliases `arr`
-via `MakeRef(_, arr, None)`, it cannot be demoted to `Copy` because it must
-see the mutation to `arr[0]`.
+**Example:** `with x = arr; with y = arr[0]; y = 10` — the `WriteAccessor`
+for `arr[0]` writes to `arr`, so `arr` is in `written_bases`. If another ref
+aliases `arr` via `MakeRef(_, arr)`, it cannot be demoted to `Copy` because
+it must see the mutation.
 
 **Interaction with fixpoint:** Runs after constant folding. As other passes
 remove dead code (unreachable blocks, eliminated guards), `WriteRef`
@@ -1629,7 +1653,7 @@ may emerge. This pass runs the same constant folding logic as Pass 1 to clean up
 
 1. Mark as "live":
    - Variables used in `Return`, `Exit` terminators
-   - Variables used in `SetIndex` or `WriteRef` (side effects)
+   - Variables used in `WriteAccessor` or `WriteRef` (side effects)
    - Variables used in impure `Call` arguments
    - Variables used in terminator conditions (`If`, `Guard`, `Match`)
 
@@ -1815,16 +1839,18 @@ visible to the optimizer (no hidden aliasing):
 
 | Instruction | Emitted When | Runtime Effect |
 |-------------|-------------|----------------|
-| `MakeRef { dest, base, key: Some(k) }` | `with x = arr[i]`, for-loop by-ref | Reads `base[key]` into `dest` (like Index) |
-| `MakeRef { dest, base, key: None }` | `with x = y` | Creates `Slot::Ref` pointing to base's slot |
-| `WriteRef { ref_var, value }` | Assignment to ref-backed variable | Element: `SetIndex(base, key, value)`. Whole-value: slot write |
+| `MakeAccessor { dest, base, key }` | `with x = arr[i]`, for-loop by-ref | Creates `Slot::Accessor { base, key }` (far pointer) |
+| `MakeRef { dest, base }` | `with x = y`, by-ref function params | Creates `Slot::Ref(target)` (near pointer) |
+| `WriteAccessor { base, key, value }` | Direct `arr[i] = val` | Type-specialized `set_array_elem` or `set_map_entry` |
+| `WriteRef { ref_var, value }` | Assignment to `with`-bound variable | `vm.set_local` resolves through Slot::Ref / Slot::Accessor |
 
 The lowerer tracks ref origins in a scoped `HashMap<Identifier, RefOrigin>`
 (managed alongside the scope stack). When a ref-backed variable is assigned
 (`x = 10`), the lowerer:
-1. Looks up `x` in `ref_origins` → finds `RefOrigin { ref_var, base, key }`
-2. Emits `WriteRef { ref_var, value: v_new }`
-3. Creates a new SSA VarId and rebinds `x` (normal SSA behaviour)
+1. Looks up `x` in `ref_origins` → finds `RefOrigin { ref_var, base_var, key_var }`
+2. If `key_var` is Some: emits `WriteAccessor { base, key, value }` (element write)
+3. If `key_var` is None: emits `WriteRef { ref_var, value }` (whole-value write)
+4. Emits `Reload(base_var)` + reassigns the base variable (SSA visibility)
 
 The optimizer can then:
 - See `MakeRef` and know which variables are references and to what
@@ -2275,7 +2301,7 @@ to `Instruction::Intrinsic { op: IntrinsicOp, args }`. Some expand to control fl
 | `x && y` | `If(x, evaluate_y, false)` + Phi | Control flow (short-circuit) |
 | `x \|\| y` | `If(x, true, evaluate_y)` + Phi | Control flow (short-circuit) |
 | `if cond { a } else { b }` | `If` terminator + blocks + Phi | Control flow |
-| `arr[i] = v` (lvalue) | `Index` + `Guard` + `SetIndex` + Phi | Control flow |
+| `arr[i] = v` (lvalue) | `MakeAccessor` + `WriteAccessor` + `Reload` | SSA-visible mutation |
 | `with x = arr[i]` | `MakeRef(arr, Some(i))` | Reference binding |
 | `with x = y` | `MakeRef(y, None)` | Reference binding |
 | `x = v` (ref-backed) | `WriteRef(ref_var, v)` + Copy + rebind | Write-back through reference |

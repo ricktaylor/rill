@@ -128,21 +128,6 @@ fn replace_vars_in_instruction(inst: &mut Instruction, map: &HashMap<VarId, VarI
             }
         }
 
-        Instruction::SetIndex { base, key, value } => {
-            if let Some(&new) = map.get(base) {
-                *base = new;
-                count += 1;
-            }
-            if let Some(&new) = map.get(key) {
-                *key = new;
-                count += 1;
-            }
-            if let Some(&new) = map.get(value) {
-                *value = new;
-                count += 1;
-            }
-        }
-
         Instruction::Call { args, .. } => {
             for v in args.iter_mut() {
                 if let Some(&new) = map.get(v) {
@@ -161,15 +146,20 @@ fn replace_vars_in_instruction(inst: &mut Instruction, map: &HashMap<VarId, VarI
             }
         }
 
-        Instruction::MakeRef { base, key, .. } => {
+        Instruction::MakeAccessor { base, key, .. } => {
             if let Some(&new) = map.get(base) {
                 *base = new;
                 count += 1;
             }
-            if let Some(k) = key
-                && let Some(&new) = map.get(k)
-            {
-                *k = new;
+            if let Some(&new) = map.get(key) {
+                *key = new;
+                count += 1;
+            }
+        }
+
+        Instruction::MakeRef { base, .. } => {
+            if let Some(&new) = map.get(base) {
+                *base = new;
                 count += 1;
             }
         }
@@ -177,6 +167,21 @@ fn replace_vars_in_instruction(inst: &mut Instruction, map: &HashMap<VarId, VarI
         Instruction::WriteRef { ref_var, value } => {
             if let Some(&new) = map.get(ref_var) {
                 *ref_var = new;
+                count += 1;
+            }
+            if let Some(&new) = map.get(value) {
+                *value = new;
+                count += 1;
+            }
+        }
+
+        Instruction::WriteAccessor { base, key, value } => {
+            if let Some(&new) = map.get(base) {
+                *base = new;
+                count += 1;
+            }
+            if let Some(&new) = map.get(key) {
+                *key = new;
                 count += 1;
             }
             if let Some(&new) = map.get(value) {

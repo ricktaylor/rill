@@ -8,9 +8,9 @@
 //! - Impure `Call` is always kept (side effects)
 //! - Pure `Call` (extern with `is_pure()`, or user function proven pure)
 //!   can be removed if result is unused
-//! - `SetIndex`, `WriteRef`, `Append` are side-effecting — always kept
-//! - Everything else (Const, Copy, Index, Intrinsic, Phi, MakeRef, Reload)
-//!   is removed if its dest is unused
+//! - `WriteRef`, `Append` are side-effecting — always kept
+//! - Everything else (Const, Copy, Index, Intrinsic, Phi, MakeAccessor,
+//!   MakeRef, Reload) is removed if its dest is unused
 
 use crate::externs::ExternRegistry;
 use crate::ir::{Function, Instruction, Terminator, VarId};
@@ -79,12 +79,6 @@ fn collect_reads(inst: &Instruction, used: &mut HashSet<VarId>) {
             used.insert(*key);
         }
 
-        Instruction::SetIndex { base, key, value } => {
-            used.insert(*base);
-            used.insert(*key);
-            used.insert(*value);
-        }
-
         Instruction::Intrinsic { args, .. } => {
             for arg in args {
                 used.insert(*arg);
@@ -97,15 +91,23 @@ fn collect_reads(inst: &Instruction, used: &mut HashSet<VarId>) {
             }
         }
 
-        Instruction::MakeRef { base, key, .. } => {
+        Instruction::MakeAccessor { base, key, .. } => {
             used.insert(*base);
-            if let Some(k) = key {
-                used.insert(*k);
-            }
+            used.insert(*key);
+        }
+
+        Instruction::MakeRef { base, .. } => {
+            used.insert(*base);
         }
 
         Instruction::WriteRef { ref_var, value } => {
             used.insert(*ref_var);
+            used.insert(*value);
+        }
+
+        Instruction::WriteAccessor { base, key, value } => {
+            used.insert(*base);
+            used.insert(*key);
             used.insert(*value);
         }
 
@@ -158,6 +160,7 @@ fn is_removable(
         | Instruction::Index { .. }
         | Instruction::Intrinsic { .. }
         | Instruction::Phi { .. }
+        | Instruction::MakeAccessor { .. }
         | Instruction::MakeRef { .. }
         | Instruction::Reload { .. } => true,
 
@@ -174,8 +177,8 @@ fn is_removable(
         }
 
         // No dest or side effects — always keep
-        Instruction::SetIndex { .. }
-        | Instruction::WriteRef { .. }
+        Instruction::WriteRef { .. }
+        | Instruction::WriteAccessor { .. }
         | Instruction::Append { .. } => false,
 
         Instruction::Assign { .. } | Instruction::Read { .. } => {
@@ -192,12 +195,13 @@ fn get_dest(inst: &Instruction) -> Option<VarId> {
         | Instruction::Index { dest, .. }
         | Instruction::Intrinsic { dest, .. }
         | Instruction::Phi { dest, .. }
+        | Instruction::MakeAccessor { dest, .. }
         | Instruction::MakeRef { dest, .. }
         | Instruction::Append { dest, .. }
         | Instruction::Call { dest, .. }
         | Instruction::Reload { dest, .. } => Some(*dest),
 
-        Instruction::SetIndex { .. } | Instruction::WriteRef { .. } => None,
+        Instruction::WriteRef { .. } | Instruction::WriteAccessor { .. } => None,
 
         Instruction::Assign { .. } | Instruction::Read { .. } => {
             unreachable!("pre-SSA instruction; removed by mem2reg")
@@ -371,47 +375,6 @@ mod tests {
 
         assert_eq!(removed, 0);
         assert_eq!(func.blocks[0].instructions.len(), 1);
-    }
-
-    #[test]
-    fn test_keep_setindex() {
-        // SetIndex has side effects — keep even though it has no dest
-        let locals = vec![
-            Var::new(
-                var(0),
-                ast::Identifier("arr".into()),
-                TypeSet::single(crate::types::BaseType::Array),
-            ),
-            Var::new(var(1), ast::Identifier("idx".into()), TypeSet::uint()),
-            Var::new(var(2), ast::Identifier("val".into()), TypeSet::uint()),
-        ];
-        let blocks = vec![BasicBlock {
-            id: block(0),
-            instructions: vec![
-                si(Instruction::Const {
-                    dest: var(1),
-                    value: Literal::UInt(0),
-                }),
-                si(Instruction::Const {
-                    dest: var(2),
-                    value: Literal::UInt(42),
-                }),
-                si(Instruction::SetIndex {
-                    base: var(0),
-                    key: var(1),
-                    value: var(2),
-                }),
-            ],
-            terminator: Terminator::Return {
-                value: Some(var(0)),
-            },
-        }];
-
-        let mut func = make_function(blocks, locals);
-        let removed = eliminate_dead_code(&mut func);
-
-        assert_eq!(removed, 0);
-        assert_eq!(func.blocks[0].instructions.len(), 3);
     }
 
     #[test]

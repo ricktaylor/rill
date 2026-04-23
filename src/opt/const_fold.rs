@@ -74,6 +74,44 @@ pub fn fold_constants(
 
 /// Collect constant values from instructions (SSA: each VarId assigned once)
 fn collect_constants(function: &Function, constants: &mut ConstantMap, externs: &ExternRegistry) {
+    // Build Copy chain map for resolving through Copies.
+    let copy_sources: HashMap<VarId, VarId> = function
+        .blocks
+        .iter()
+        .flat_map(|b| b.instructions.iter())
+        .filter_map(|inst| {
+            if let Instruction::Copy { dest, src } = &inst.node {
+                Some((*dest, *src))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Follow Copy chains to find the ultimate source VarId.
+    let resolve_copies = |mut var: VarId| -> VarId {
+        for _ in 0..64 {
+            match copy_sources.get(&var) {
+                Some(&src) => var = src,
+                None => break,
+            }
+        }
+        var
+    };
+
+    // Build ref base map for precise WriteRef invalidation.
+    // Maps MakeAccessor/MakeRef dest → ULTIMATE base VarId (following Copy chains).
+    let ref_bases: HashMap<VarId, VarId> = function
+        .blocks
+        .iter()
+        .flat_map(|b| b.instructions.iter())
+        .filter_map(|inst| match &inst.node {
+            Instruction::MakeAccessor { dest, base, .. }
+            | Instruction::MakeRef { dest, base, .. } => Some((*dest, resolve_copies(*base))),
+            _ => None,
+        })
+        .collect();
+
     for block in &function.blocks {
         for spanned_inst in &block.instructions {
             match &spanned_inst.node {
@@ -123,8 +161,21 @@ fn collect_constants(function: &Function, constants: &mut ConstantMap, externs: 
                 Instruction::Append { arr, .. } => {
                     constants.remove(arr);
                 }
-                Instruction::SetIndex { base, .. } => {
+                Instruction::WriteAccessor { base, .. } => {
                     constants.remove(base);
+                }
+                Instruction::WriteRef { ref_var, .. } => {
+                    // WriteRef mutates through a MakeRef. Trace the ref_var
+                    // back to the MakeRef's base and invalidate that.
+                    if let Some(base) = ref_bases.get(ref_var) {
+                        constants.remove(base);
+                    } else {
+                        // Ref created externally (by-ref param) — whole-value
+                        // ref that writes to the caller's frame. Only the
+                        // ref target itself needs invalidation, not local
+                        // collections.
+                        constants.remove(ref_var);
+                    }
                 }
 
                 _ => {}

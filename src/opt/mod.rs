@@ -168,7 +168,7 @@ pub fn optimize(program: &mut IrProgram, externs: &ExternRegistry, diagnostics: 
 
 /// Infer which user functions are pure (no side effects).
 ///
-/// A function is pure if it contains no SetIndex, WriteRef, or calls to
+/// A function is pure if it contains no WriteRef, or calls to
 /// impure functions. Iterates until stable for mutual recursion.
 fn collect_pure_functions(
     program: &IrProgram,
@@ -194,7 +194,7 @@ fn collect_pure_functions(
             let is_pure = function.blocks.iter().all(|block| {
                 block.instructions.iter().all(|inst| match &inst.node {
                     // Side effects → impure
-                    Instruction::SetIndex { .. } | Instruction::WriteRef { .. } => false,
+                    Instruction::WriteRef { .. } | Instruction::WriteAccessor { .. } => false,
                     // Call to impure function → impure
                     Instruction::Call {
                         function: func_ref, ..

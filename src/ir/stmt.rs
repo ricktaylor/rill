@@ -106,20 +106,25 @@ impl<'a> Lowerer<'a> {
                     }
                 };
 
-                // If this variable is ref-backed, emit WriteRef to write
-                // the new value back to the source location.
+                // If this variable is ref-backed, emit the appropriate
+                // write-back instruction, then Reload the base for SSA.
                 if let Some(origin) = self.lookup_ref(name).cloned() {
-                    self.emit(Instruction::WriteRef {
-                        ref_var: origin.ref_var,
-                        value: final_value,
-                    });
-                    // Whole-value refs can change the base's type entirely
-                    // (e.g., `with y = x; y = "hello"` changes x from UInt to Text).
-                    // Reload creates a fresh SSA def so type analysis sees the change.
-                    // Element refs (arr[i] = val) don't change the container type.
-                    if origin.whole_value
-                        && let Some(base_name) = &origin.base_name
-                    {
+                    if let Some(key_var) = origin.key_var {
+                        // Accessor (far ref): direct element write
+                        self.emit(Instruction::WriteAccessor {
+                            base: origin.base_var,
+                            key: key_var,
+                            value: final_value,
+                        });
+                    } else {
+                        // Ref (near ref): write through the ref binding
+                        self.emit(Instruction::WriteRef {
+                            ref_var: origin.ref_var,
+                            value: final_value,
+                        });
+                    }
+                    // Reload the base so SSA models the mutation
+                    if let Some(base_name) = &origin.base_name {
                         let reloaded = self.emit_reload(origin.base_var);
                         self.reassign(base_name, reloaded);
                     }
@@ -131,15 +136,25 @@ impl<'a> Lowerer<'a> {
             }
 
             ast::Expression::ArrayAccess { array, index } => {
+                let base_name = if let ast::Expression::Variable(name) = array.as_ref() {
+                    Some(name.clone())
+                } else {
+                    None
+                };
                 let base = self.lower_expression(array);
                 let key = self.lower_expression(index);
-                self.lower_indexed_assignment(base, key, op, value)
+                self.lower_indexed_assignment(base, key, op, value, base_name)
             }
 
             ast::Expression::MemberAccess { object, member } => {
+                let base_name = if let ast::Expression::Variable(name) = object.as_ref() {
+                    Some(name.clone())
+                } else {
+                    None
+                };
                 let base = self.lower_expression(object);
                 let key = self.lower_expression(member);
-                self.lower_indexed_assignment(base, key, op, value)
+                self.lower_indexed_assignment(base, key, op, value, base_name)
             }
 
             // Bit test as lvalue: x @ b = bool_value
@@ -225,8 +240,9 @@ impl<'a> Lowerer<'a> {
 
     /// Lower assignment to an indexed location (arr[i] or obj.field).
     ///
-    /// For plain `=`: emits SetIndex directly (maps insert new keys,
-    /// arrays update in-bounds only).
+    /// All collection mutations go through MakeAccessor + WriteRef + Reload.
+    /// This makes every mutation visible to SSA. The peephole layer can
+    /// fuse the pattern into a single write-back closure at code generation.
     ///
     /// For compound assignment (`+=`, `-=`, etc.): guards on the slot
     /// existing first (needs the current value for the operation).
@@ -236,16 +252,27 @@ impl<'a> Lowerer<'a> {
         key: VarId,
         op: &ast::AssignmentOp,
         value: &ast::Expression,
+        base_name: Option<ast::Identifier>,
     ) -> VarId {
         if matches!(op, ast::AssignmentOp::Assign) {
-            // Plain assignment: SetIndex directly, no guard needed.
-            // Maps insert new keys; arrays update in-bounds (OOB is a no-op).
+            // Plain assignment via Accessor.
             let rhs = self.lower_expression(value);
-            self.emit(Instruction::SetIndex {
+            let acc = self.new_temp(TypeSet::any());
+            self.emit(Instruction::MakeAccessor {
+                dest: acc,
+                base,
+                key,
+            });
+            self.emit(Instruction::WriteAccessor {
                 base,
                 key,
                 value: rhs,
             });
+            // Reload the base so SSA models the mutation
+            if let Some(name) = &base_name {
+                let reloaded = self.emit_reload(base);
+                self.reassign(name, reloaded);
+            }
             rhs
         } else {
             // Compound assignment: need the current value for the operation.
@@ -263,18 +290,29 @@ impl<'a> Lowerer<'a> {
                 span: self.current_span,
             });
 
-            // Defined path: evaluate rhs, apply compound op, set
+            // Defined path: evaluate rhs, apply compound op, write
             self.current_block = defined_bb;
             self.current_instructions = Vec::new();
 
             let rhs = self.lower_expression(value);
             let final_value = self.lower_compound_op(slot_check, op, rhs);
 
-            self.emit(Instruction::SetIndex {
+            let acc = self.new_temp(TypeSet::any());
+            self.emit(Instruction::MakeAccessor {
+                dest: acc,
+                base,
+                key,
+            });
+            self.emit(Instruction::WriteAccessor {
                 base,
                 key,
                 value: final_value,
             });
+            // Reload the base so SSA models the mutation
+            if let Some(name) = &base_name {
+                let reloaded = self.emit_reload(base);
+                self.reassign(name, reloaded);
+            }
             let defined_exit = self.current_block;
             self.finish_block(Terminator::Jump { target: join_bb });
 

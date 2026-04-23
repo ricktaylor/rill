@@ -261,44 +261,9 @@ fn link_functions(
     link_map
 }
 
-/// Metadata for a reference created by MakeRef — used by WriteRef at compile time
-/// to determine how to emit the write-back.
-pub(crate) struct RefMeta {
-    pub base_var: VarId,
-    pub key_slot: Option<usize>,
-}
-
-impl RefMeta {
-    pub fn base_slot(&self) -> usize {
-        slot(self.base_var)
-    }
-}
-
-/// Build a map from MakeRef dest VarId → RefMeta for WriteRef resolution.
-fn build_ref_map(blocks: &[BasicBlock]) -> HashMap<VarId, RefMeta> {
-    let mut map = HashMap::new();
-    for block in blocks {
-        for inst in &block.instructions {
-            if let Instruction::MakeRef { dest, base, key } = &inst.node {
-                map.insert(
-                    *dest,
-                    RefMeta {
-                        base_var: *base,
-                        key_slot: key.map(slot),
-                    },
-                );
-            }
-        }
-    }
-    map
-}
-
 fn compile_function(func: &Function, link_map: &LinkMap) -> Result<CompiledFunction, ExecError> {
     let block_map = build_block_map(&func.blocks);
     let frame_size = 1 + func.locals.len(); // slot 0 = Frame, then locals
-
-    // Collect MakeRef metadata for WriteRef resolution
-    let ref_map = build_ref_map(&func.blocks);
 
     // Type analysis for specialization — when both operands of an arithmetic
     // op are provably the same type, the compiler emits a direct closure
@@ -335,7 +300,7 @@ fn compile_function(func: &Function, link_map: &LinkMap) -> Result<CompiledFunct
         }
 
         blocks.push(compile_block(
-            ir_block, &block_map, link_map, &ref_map, &types, frame_size,
+            ir_block, &block_map, link_map, &types, frame_size,
         )?);
     }
 
@@ -385,7 +350,6 @@ fn compile_block(
     block: &BasicBlock,
     block_map: &HashMap<BlockId, usize>,
     link_map: &LinkMap,
-    ref_map: &HashMap<VarId, RefMeta>,
     types: &TypeAnalysis,
     frame_size: usize,
 ) -> Result<Vec<Step>, ExecError> {
@@ -397,8 +361,7 @@ fn compile_block(
             // copies are inserted into predecessor blocks
             Instruction::Phi { .. } => {}
             inst => {
-                if let Some(step) =
-                    compile_instruction(inst, block_map, link_map, ref_map, types, block.id)?
+                if let Some(step) = compile_instruction(inst, block_map, link_map, types, block.id)?
                 {
                     steps.push(step);
                 }
@@ -422,7 +385,6 @@ fn compile_instruction(
     inst: &Instruction,
     _block_map: &HashMap<BlockId, usize>,
     link_map: &LinkMap,
-    ref_map: &HashMap<VarId, RefMeta>,
     types: &TypeAnalysis,
     block_id: BlockId,
 ) -> Result<Option<Step>, ExecError> {
@@ -600,49 +562,6 @@ fn compile_instruction(
             }
         }
 
-        Instruction::SetIndex { base, key, value } => {
-            let b = slot(*base);
-            let k = slot(*key);
-            let v = slot(*value);
-
-            // Specialize based on known base type
-            let base_type = types.get(*base).filter(|t| t.is_single());
-
-            if base_type.is_some_and(|t| t.contains(BaseType::Array)) {
-                // Array: key is UInt index
-                Box::new(move |vm: &mut VM, _prog| {
-                    if let Value::UInt(idx) = vm.local(k) {
-                        let new_val = vm.local(v).clone();
-                        let _ = vm.set_array_elem(vm.bp() + b, *idx as usize, new_val);
-                    }
-                    Ok(Action::Continue)
-                })
-            } else if base_type.is_some_and(|t| t.contains(BaseType::Map)) {
-                // Map: any key type
-                Box::new(move |vm: &mut VM, _prog| {
-                    let key_val = vm.local(k).clone();
-                    let new_val = vm.local(v).clone();
-                    let _ = vm.set_map_entry(vm.bp() + b, key_val, new_val);
-                    Ok(Action::Continue)
-                })
-            } else {
-                // Unknown base: dispatch on key type at runtime
-                Box::new(move |vm: &mut VM, _prog| {
-                    let key_val = vm.local(k).clone();
-                    let new_val = vm.local(v).clone();
-                    match &key_val {
-                        Value::UInt(idx) => {
-                            let _ = vm.set_array_elem(vm.bp() + b, *idx as usize, new_val);
-                        }
-                        _ => {
-                            let _ = vm.set_map_entry(vm.bp() + b, key_val, new_val);
-                        }
-                    }
-                    Ok(Action::Continue)
-                })
-            }
-        }
-
         Instruction::Call {
             dest,
             function,
@@ -770,136 +689,85 @@ fn compile_instruction(
             compile_intrinsic_dispatch(op, arg_slots, d)
         }
 
-        Instruction::MakeRef { dest, base, key } => {
+        Instruction::MakeAccessor { dest, base, key } => {
             let d = slot(*dest);
             let b = slot(*base);
-            match key {
-                Some(k) => {
-                    // Element reference: read base[key] into dest
-                    // Specialize based on known base type (same as Index)
-                    let k_slot = slot(*k);
-                    let base_type = types.get(*base).filter(|t| t.is_single());
+            let k = slot(*key);
+            // Create Slot::Accessor — a far pointer into a collection.
+            // The base slot holds the collection, the key slot holds the index/key.
+            // Reading through the Accessor does base[key].
+            // Writing through the Accessor mutates the collection element.
+            Box::new(move |vm: &mut VM, _prog| {
+                let base_abs = vm.resolve(vm.bp() + b);
+                let key_abs = vm.bp() + k;
+                vm.set_accessor(d, base_abs, key_abs);
+                Ok(Action::Continue)
+            })
+        }
 
-                    if base_type.is_some_and(|t| t.contains(BaseType::Array)) {
-                        Box::new(move |vm: &mut VM, _prog| {
-                            let result = match (vm.local(b), vm.local(k_slot)) {
-                                (Value::Array(arr), Value::UInt(idx)) => {
-                                    arr.get(*idx as usize).cloned()
-                                }
-                                (Value::Array(arr), Value::Int(idx)) if *idx >= 0 => {
-                                    arr.get(*idx as usize).cloned()
-                                }
-                                _ => None,
-                            };
-                            match result {
-                                Some(val) => vm.set_local(d, val),
-                                None => vm.set_local(d, Value::Undefined),
-                            }
-                            Ok(Action::Continue)
-                        })
-                    } else if base_type.is_some_and(|t| t.contains(BaseType::Map)) {
-                        Box::new(move |vm: &mut VM, _prog| {
-                            let result = match (vm.local(b), vm.local(k_slot)) {
-                                (Value::Map(map), key_val) => map.get(key_val).cloned(),
-                                _ => None,
-                            };
-                            match result {
-                                Some(val) => vm.set_local(d, val),
-                                None => vm.set_local(d, Value::Undefined),
-                            }
-                            Ok(Action::Continue)
-                        })
-                    } else {
-                        // Unknown base: full runtime dispatch
-                        Box::new(move |vm: &mut VM, _prog| {
-                            let result = match (vm.local(b), vm.local(k_slot)) {
-                                (base_val, key_val) if base_val.is_defined() => {
-                                    index_value(base_val, key_val)
-                                }
-                                _ => Value::Undefined,
-                            };
-                            vm.set_local(d, result);
-                            Ok(Action::Continue)
-                        })
-                    }
-                }
-                None => {
-                    // Whole-value reference: create a Slot::Ref to base's slot
-                    Box::new(move |vm: &mut VM, _prog| {
-                        vm.set_local_ref(d, vm.bp() + b);
-                        Ok(Action::Continue)
-                    })
-                }
-            }
+        Instruction::MakeRef { dest, base } => {
+            let d = slot(*dest);
+            let b = slot(*base);
+            // Whole-value reference: create a Slot::Ref to base's
+            // ultimate target (path compression — resolve the chain
+            // once here, not on every subsequent read/write).
+            Box::new(move |vm: &mut VM, _prog| {
+                let target = vm.resolve(vm.bp() + b);
+                vm.set_local_ref(d, target);
+                Ok(Action::Continue)
+            })
         }
 
         Instruction::WriteRef { ref_var, value } => {
+            let r = slot(*ref_var);
             let v = slot(*value);
-            // Look up the MakeRef that created this ref_var to find
-            // the base and key slots for write-back.
-            if let Some(meta) = ref_map.get(ref_var) {
-                let base_slot = meta.base_slot();
-                match meta.key_slot {
-                    Some(key_slot) => {
-                        // Element write-back: specialize based on known base type
-                        let base_type = types.get(meta.base_var).filter(|t| t.is_single());
+            // Write through the ref_var's slot. The VM's set_local resolves
+            // through Slot::Ref (near pointer) and Slot::Accessor (far pointer)
+            // automatically — no build_ref_map tracing needed.
+            Box::new(move |vm: &mut VM, _prog| {
+                vm.set_local(r, vm.local(v).clone());
+                Ok(Action::Continue)
+            })
+        }
 
-                        if base_type.is_some_and(|t| t.contains(BaseType::Array)) {
-                            // Array: key is UInt index
-                            Box::new(move |vm: &mut VM, _prog| {
-                                if let Value::UInt(idx) = vm.local(key_slot) {
-                                    let new_val = vm.local(v).clone();
-                                    let _ = vm.set_array_elem(
-                                        vm.bp() + base_slot,
-                                        *idx as usize,
-                                        new_val,
-                                    );
-                                }
-                                Ok(Action::Continue)
-                            })
-                        } else if base_type.is_some_and(|t| t.contains(BaseType::Map)) {
-                            // Map: any key type
-                            Box::new(move |vm: &mut VM, _prog| {
-                                let key_val = vm.local(key_slot).clone();
-                                let new_val = vm.local(v).clone();
-                                let _ = vm.set_map_entry(vm.bp() + base_slot, key_val, new_val);
-                                Ok(Action::Continue)
-                            })
-                        } else {
-                            // Unknown base: dispatch on key type at runtime
-                            Box::new(move |vm: &mut VM, _prog| {
-                                let key_val = vm.local(key_slot).clone();
-                                let new_val = vm.local(v).clone();
-                                match &key_val {
-                                    Value::UInt(idx) => {
-                                        let _ = vm.set_array_elem(
-                                            vm.bp() + base_slot,
-                                            *idx as usize,
-                                            new_val,
-                                        );
-                                    }
-                                    _ => {
-                                        let _ =
-                                            vm.set_map_entry(vm.bp() + base_slot, key_val, new_val);
-                                    }
-                                }
-                                Ok(Action::Continue)
-                            })
+        Instruction::WriteAccessor { base, key, value } => {
+            let b = slot(*base);
+            let k = slot(*key);
+            let v = slot(*value);
+            let base_type = types.get(*base).filter(|t| t.is_single());
+
+            if base_type.is_some_and(|t| t.contains(BaseType::Array)) {
+                Box::new(move |vm: &mut VM, _prog| {
+                    if let Value::UInt(idx) = vm.local(k) {
+                        let val = vm.local(v).clone();
+                        let _ = vm.set_array_elem(vm.bp() + b, *idx as usize, val);
+                    }
+                    Ok(Action::Continue)
+                })
+            } else if base_type.is_some_and(|t| t.contains(BaseType::Map)) {
+                Box::new(move |vm: &mut VM, _prog| {
+                    let key_val = vm.local(k).clone();
+                    let val = vm.local(v).clone();
+                    let _ = vm.set_map_entry(vm.bp() + b, key_val, val);
+                    Ok(Action::Continue)
+                })
+            } else {
+                Box::new(move |vm: &mut VM, _prog| {
+                    let key_val = vm.local(k).clone();
+                    let val = vm.local(v).clone();
+                    // Dispatch on BASE type, not key type
+                    match vm.local(b) {
+                        Value::Array(_) => {
+                            if let Value::UInt(idx) = &key_val {
+                                let _ = vm.set_array_elem(vm.bp() + b, *idx as usize, val);
+                            }
+                        }
+                        _ => {
+                            let _ = vm.set_map_entry(vm.bp() + b, key_val, val);
                         }
                     }
-                    None => {
-                        // Whole-value write-back: write to base's slot directly
-                        Box::new(move |vm: &mut VM, _prog| {
-                            let val = vm.local(v).clone();
-                            vm.set_local(base_slot, val);
-                            Ok(Action::Continue)
-                        })
-                    }
-                }
-            } else {
-                // MakeRef not found — shouldn't happen in well-formed IR.
-                // No-op fallback.
-                return Ok(None);
+                    Ok(Action::Continue)
+                })
             }
         }
 

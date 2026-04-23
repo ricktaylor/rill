@@ -265,8 +265,12 @@ pub struct FrameInfo {
 pub enum Slot {
     /// A value (including Value::Undefined for uninitialized slots)
     Val(Value),
-    /// Reference to another stack slot (absolute index)
+    /// Near pointer: reference to another stack slot (absolute index)
     Ref(usize),
+    /// Far pointer: accessor into a collection element (base slot + key slot)
+    /// Reading resolves to base_collection[key_value].
+    /// Writing mutates the collection element at base[key].
+    Accessor { base: usize, key: usize },
     /// Saved frame info (slot 0 of each frame)
     Frame(Box<FrameInfo>),
 }
@@ -700,38 +704,62 @@ impl VM {
         current
     }
 
-    /// Get value at absolute index, following refs
-    pub fn get(&self, idx: usize) -> Option<&Value> {
-        let resolved = self.resolve(idx);
-        self.stack.get(resolved).and_then(|s| s.as_value())
-    }
-
-    /// Get mutable value at absolute index, following refs
-    pub fn get_mut(&mut self, idx: usize) -> Option<&mut Value> {
-        let resolved = self.resolve(idx);
-        self.stack.get_mut(resolved).and_then(|s| s.as_value_mut())
-    }
-
-    /// Get value at local offset (bp + offset), following refs.
+    /// Read a value from a slot, following Refs and reading through Accessors.
     ///
-    /// Variable slots are always `Slot::Val` — this panics if the resolved
-    /// slot is a Frame (compiler bug: slot 0 is never a variable).
+    /// - Val: returns the value directly
+    /// - Ref: follows the chain recursively
+    /// - Accessor: reads base_collection[key_value] from the collection
+    pub fn get(&self, idx: usize) -> Option<&Value> {
+        match self.stack.get(idx)? {
+            Slot::Val(v) => Some(v),
+            Slot::Ref(target) => self.get(*target),
+            Slot::Accessor { base, key } => {
+                let base_val = self.get(*base)?;
+                let key_val = self.get(*key)?;
+                match (base_val, key_val) {
+                    (Value::Array(arr), Value::UInt(i)) => arr.get(*i as usize),
+                    (Value::Array(arr), Value::Int(i)) if *i >= 0 => arr.get(*i as usize),
+                    (Value::Map(map), k) => map.get(k),
+                    _ => None,
+                }
+            }
+            Slot::Frame(_) => None,
+        }
+    }
+
+    /// Get value at local offset (bp + offset), resolving Refs and Accessors.
     pub fn local(&self, offset: usize) -> &Value {
         self.get(self.bp + offset)
-            .expect("local: resolved slot is not a value")
+            .expect("local: could not read slot")
     }
 
-    /// Get mutable value at local offset
-    pub fn local_mut(&mut self, offset: usize) -> &mut Value {
-        self.get_mut(self.bp + offset)
-            .expect("local_mut: resolved slot is not a value")
-    }
-
-    /// Set value at absolute index (resolves refs first)
+    /// Write a value to a slot, following Refs and writing through Accessors.
+    ///
+    /// - Val: replaces the value
+    /// - Ref: follows the chain recursively
+    /// - Accessor: mutates the collection element at base[key]
     pub fn set(&mut self, idx: usize, value: Value) {
-        let resolved = self.resolve(idx);
-        if let Some(slot) = self.stack.get_mut(resolved) {
-            *slot = Slot::Val(value);
+        let (base, key) = match &self.stack[idx] {
+            Slot::Val(_) => {
+                self.stack[idx] = Slot::Val(value);
+                return;
+            }
+            Slot::Ref(target) => {
+                let t = *target;
+                return self.set(t, value);
+            }
+            Slot::Accessor { base, key } => (*base, *key),
+            Slot::Frame(_) => return,
+        };
+        // Write through Accessor: mutate the collection element
+        let key_val = self.get(key).cloned().unwrap_or(Value::Undefined);
+        match &key_val {
+            Value::UInt(i) => {
+                let _ = self.set_array_elem(base, *i as usize, value);
+            }
+            _ => {
+                let _ = self.set_map_entry(base, key_val, value);
+            }
         }
     }
 
@@ -740,9 +768,28 @@ impl VM {
         self.set(self.bp + offset, value);
     }
 
+    /// Reset a local slot to Val(Undefined), regardless of its current type
+    /// (Val, Ref, or Accessor). Used by TailCall to simulate a fresh frame.
+    /// Unlike set_local, this does NOT resolve through Refs or Accessors.
+    pub fn reset_local(&mut self, offset: usize) {
+        self.stack[self.bp + offset] = Slot::Val(Value::Undefined);
+    }
+
+    /// Create a Slot::Accessor (far pointer) at a local offset.
+    /// The accessor indexes into a collection at base_abs[key_abs].
+    pub fn set_accessor(&mut self, offset: usize, base_abs: usize, key_abs: usize) {
+        let idx = self.bp + offset;
+        if idx < self.stack.len() {
+            self.stack[idx] = Slot::Accessor {
+                base: base_abs,
+                key: key_abs,
+            };
+        }
+    }
+
     /// Shallow-copy a slot from an absolute source address to a local destination.
-    /// Preserves Slot::Ref identity — if source is a Ref, dest becomes a Ref to
-    /// the same target. Used for uniform call arg setup (ref-agnostic).
+    /// Preserves Slot::Ref/Accessor identity — copies the slot as-is.
+    /// Used for uniform call arg setup (ref-agnostic).
     pub fn copy_slot_from(&mut self, dst_offset: usize, src_abs: usize) {
         let dst = self.bp + dst_offset;
         if src_abs < self.stack.len() && dst < self.stack.len() {
