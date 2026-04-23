@@ -1,23 +1,26 @@
 //! Reference Elision Optimization
 //!
-//! Simplifies MakeRef and MakeAccessor instructions when the full reference
-//! indirection is unnecessary. Three rewrites, in order of application:
+//! Simplifies MakeRef instructions when the full reference indirection is
+//! unnecessary. Three rewrites:
 //!
-//! 1. **Ref chain shortening** — `MakeRef(dest, base)` where `base` is itself
+//! 1. **Ref→Accessor flattening** — `MakeRef(dest, base)` where `base` is from
+//!    `MakeAccessor(_, arr, key)`: rewrite to `MakeAccessor(dest, arr, key)`.
+//!    Eliminates Ref(Accessor) double indirection.
+//!
+//! 2. **Ref chain shortening** — `MakeRef(dest, base)` where `base` is itself
 //!    from `MakeRef(_, original)`: rewrite to `MakeRef(dest, original)`.
-//!    Eliminates multi-hop `Slot::Ref` chains at runtime.
+//!    Eliminates multi-hop `Slot::Ref` chains.
 //!
-//! 2. **Read-only element ref demotion** — `MakeAccessor(dest, base, k)` where no
-//!    `WriteRef` targets `dest`: demote to `Index(dest, base, k)`. The ref metadata
-//!    was only needed for write-back; without it, a plain read suffices.
+//! 3. **Read-only ref demotion** — `MakeRef(dest, base)` where no `WriteRef`
+//!    targets `dest`, base not in `written_bases`, and not a call arg:
+//!    demote to `Copy(dest, base)`. Eliminates `Slot::Ref` entirely.
 //!
-//! 3. **Read-only whole-value ref demotion** — `MakeRef(dest, base)` where no
-//!    `WriteRef` in the function modifies `base` (directly or transitively): demote
-//!    to `Copy(dest, base)`. Eliminates the `Slot::Ref` indirection entirely.
+//! 4. **Read-only Accessor demotion** — `MakeAccessor(dest, base, key)` where
+//!    no `WriteRef` or `WriteAccessor` targets `dest`: demote to
+//!    `Index(dest, base, key)`. A read-only Accessor is just an expensive
+//!    Index (double dereference on every read). No write-back to preserve.
 //!
-//! Safe to run repeatedly in the optimizer fixpoint loop — each pass may expose
-//! new opportunities as other passes (const fold, DCE, CFG simplify) remove WriteRefs
-//! or MakeRefs.
+//! Safe to run repeatedly in the optimizer fixpoint loop.
 
 use crate::ir::{Function, Instruction, VarId};
 use std::collections::{HashMap, HashSet};
@@ -28,10 +31,10 @@ struct RefInfo {
     key: Option<VarId>,
 }
 
-/// Follow whole-value MakeRef chains to find the ultimate base.
+/// Follow MakeRef chains to find the ultimate base.
 ///
-/// For `MakeRef(v2, v1, None)` where `v1 = MakeRef(_, v0, None)`, returns `v0`.
-/// Stops at element refs (`key: Some`) or non-MakeRef origins.
+/// For `MakeRef(v2, v1)` where `v1 = MakeRef(_, v0)`, returns `v0`.
+/// Stops at MakeAccessor origins (key: Some) or non-ref VarIds.
 /// Bounded iteration prevents infinite loops on malformed IR.
 fn resolve_base(var: VarId, make_refs: &HashMap<VarId, RefInfo>) -> VarId {
     let mut current = var;
@@ -52,6 +55,7 @@ pub fn elide_refs(function: &mut Function) -> usize {
 
     let mut make_refs: HashMap<VarId, RefInfo> = HashMap::new();
     let mut write_ref_targets: HashSet<VarId> = HashSet::new();
+    let mut write_accessor_bases: HashSet<VarId> = HashSet::new();
     let mut call_arg_refs: HashSet<VarId> = HashSet::new();
 
     for block in &function.blocks {
@@ -78,6 +82,10 @@ pub fn elide_refs(function: &mut Function) -> usize {
                 Instruction::WriteRef { ref_var, .. } => {
                     write_ref_targets.insert(*ref_var);
                 }
+                Instruction::WriteAccessor { base, .. } => {
+                    // WriteAccessor targets the base directly — mark it as written
+                    write_accessor_bases.insert(*base);
+                }
                 // MakeRef dests passed as Call args must not be demoted —
                 // the callee may write through the Slot::Ref.
                 Instruction::Call { args, .. } => {
@@ -96,18 +104,21 @@ pub fn elide_refs(function: &mut Function) -> usize {
 
     // ── Phase 2: Compute written bases ───────────────────────────────────
     //
-    // A base is "written" if any WriteRef in the function modifies it —
-    // either as a whole-value write (key: None) or an element write
-    // (key: Some, which mutates the collection at that base). In both
-    // cases, a Slot::Ref alias to that base must stay live so reads
-    // through the ref see the mutation.
+    // A base is "written" if any WriteRef or WriteAccessor modifies it.
+    // Refs aliasing a written base must stay live so reads see the mutation.
 
     let mut written_bases: HashSet<VarId> = HashSet::new();
+    // WriteRef: trace through the ref to find the ultimate base
     for ref_var in &write_ref_targets {
         if let Some(info) = make_refs.get(ref_var) {
             let resolved = resolve_base(info.base, &make_refs);
             written_bases.insert(resolved);
         }
+    }
+    // WriteAccessor: base is written directly
+    for base in &write_accessor_bases {
+        let resolved = resolve_base(*base, &make_refs);
+        written_bases.insert(resolved);
     }
 
     // ── Phase 3: Rewrite ─────────────────────────────────────────────────
@@ -116,33 +127,40 @@ pub fn elide_refs(function: &mut Function) -> usize {
 
     for block in &mut function.blocks {
         for inst in &mut block.instructions {
-            // Extract dest, base, key from MakeAccessor or MakeRef
-            let (dest, base, key) = match &inst.node {
-                Instruction::MakeAccessor { dest, base, key } => (*dest, *base, Some(*key)),
-                Instruction::MakeRef { dest, base } => (*dest, *base, None),
-                _ => continue,
-            };
+            match &inst.node {
+                Instruction::MakeRef { dest, base } => {
+                    let dest = *dest;
+                    let base = *base;
 
-            match key {
-                None => {
+                    // Ref(Accessor) → Accessor: flatten double indirection
+                    if let Some(RefInfo {
+                        base: acc_base,
+                        key: Some(acc_key),
+                    }) = make_refs.get(&base)
+                    {
+                        inst.node = Instruction::MakeAccessor {
+                            dest,
+                            base: *acc_base,
+                            key: *acc_key,
+                        };
+                        rewrites += 1;
+                        continue;
+                    }
+
                     let resolved = resolve_base(base, &make_refs);
 
                     if !write_ref_targets.contains(&dest)
                         && !written_bases.contains(&resolved)
                         && !call_arg_refs.contains(&dest)
                     {
-                        // No writes through this ref, no writes to its base,
-                        // and not passed as a call arg → Slot::Ref is unnecessary.
-                        // Demote to Copy (uses the resolved base to also
-                        // eliminate any chain in a single step).
+                        // Read-only ref → demote to Copy
                         inst.node = Instruction::Copy {
                             dest,
                             src: resolved,
                         };
                         rewrites += 1;
                     } else if resolved != base {
-                        // Base IS written, but the chain can be shortened
-                        // so the runtime Slot::Ref is 1 hop instead of N.
+                        // Shorten ref chain
                         inst.node = Instruction::MakeRef {
                             dest,
                             base: resolved,
@@ -151,14 +169,20 @@ pub fn elide_refs(function: &mut Function) -> usize {
                     }
                 }
 
-                Some(k) => {
+                Instruction::MakeAccessor { dest, base, key } => {
+                    let dest = *dest;
+                    let base = *base;
+                    let key = *key;
+
+                    // Read-only Accessor (no WriteRef/WriteAccessor targets it)
+                    // → demote to Index (plain read, no Slot::Accessor overhead)
                     if !write_ref_targets.contains(&dest) {
-                        // No write-back through this element ref → the ref
-                        // metadata is unused. A plain Index read suffices.
-                        inst.node = Instruction::Index { dest, base, key: k };
+                        inst.node = Instruction::Index { dest, base, key };
                         rewrites += 1;
                     }
                 }
+
+                _ => continue,
             }
         }
     }
@@ -196,8 +220,9 @@ mod tests {
     }
 
     #[test]
-    fn test_read_only_element_ref_demoted_to_index() {
-        // MakeAccessor(v2, v0, v1) with no WriteRef → becomes Index
+    fn test_read_only_accessor_demoted_to_index() {
+        // MakeAccessor(v2, v0, v1) with no WriteRef/WriteAccessor → becomes Index
+        // A read-only Accessor is just an expensive Index.
         let blocks = vec![BasicBlock {
             id: block(0),
             instructions: vec![
@@ -477,11 +502,9 @@ mod tests {
     }
 
     #[test]
-    fn test_element_ref_kept_when_base_written_by_sibling() {
-        // v1 = MakeAccessor(v0, v_idx)  — read-only element ref
-        // v2 = MakeAccessor(v0, v_idx2) — has WriteRef
-        // v1 can still be demoted to Index because element MakeAccessor reads
-        // a copy of the element value, not a Slot::Ref.
+    fn test_read_only_accessor_demoted_when_sibling_has_write() {
+        // v1 = MakeAccessor(v0, v_idx)  — read-only → demoted to Index
+        // v2 = MakeAccessor(v0, v_idx2) — has WriteRef → stays MakeAccessor
         let blocks = vec![BasicBlock {
             id: block(0),
             instructions: vec![
@@ -520,8 +543,8 @@ mod tests {
         let mut func = make_function(blocks);
         let rewrites = elide_refs(&mut func);
 
-        // v1 demoted to Index (no WriteRef targets v1 specifically)
-        // v2 stays MakeRef (has WriteRef)
+        // v1 demoted to Index (no write targets it)
+        // v2 stays MakeAccessor (has WriteRef)
         assert_eq!(rewrites, 1);
         assert!(matches!(
             &func.blocks[0].instructions[2].node,

@@ -246,6 +246,12 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
       The peephole layer (future StepKind) can fuse back to a single closure.
 - [x] **build_ref_map/RefMeta removed** — WriteAccessor carries base+key directly.
       WriteRef uses vm.set_local which resolves through Slot types. No tracing.
+- [x] **ref_elision updated** for Accessor/Ref split:
+      - Ref(Accessor) → Accessor: flattens double indirection
+      - Read-only Accessor → Index: removes Slot::Accessor overhead
+      - Read-only Ref → Copy: removes Slot::Ref overhead
+      - `with` without write-back optimises to same IR as `let`
+      - WriteAccessor bases tracked in written_bases (prevents incorrect Ref demotion)
 
 ### P2 — Known Issues
 
@@ -413,7 +419,7 @@ src/
     cse.rs            — Common subexpression elimination
     copy_prop.rs      — Copy propagation (skips narrowing copies)
     dce.rs            — Dead code elimination
-    ref_elision.rs    — Ref elision (MakeRef → Copy/Index, chain shortening)
+    ref_elision.rs    — Ref/Accessor elision (Ref→Copy, Accessor→Index, Ref(Accessor)→Accessor)
     coercion.rs       — Coercion insertion + elision (checked Convert for mixed types)
     cfg_simplify.rs   — CFG simplification (unreachable block removal, block merging)
     type_refinement.rs — Type analysis (per-VarId TypeSet, Match refinement)
