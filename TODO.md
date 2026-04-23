@@ -115,10 +115,10 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
     - [ ] `ToCbor` / `FromCbor` impls for primitive wrappers: `VarId`, `BlockId`, `TypeSet`
     - [ ] `ToCbor` / `FromCbor` for `Literal`, `ConstValue` (tagged `[type, value]` pairs)
     - [ ] `ToCbor` / `FromCbor` for `Instruction` (opcode + operands array)
-    - [ ] `ToCbor` / `FromCbor` for `FunctionRef`, `CallArg` (variable-length arrays)
-    - [ ] `ToCbor` / `FromCbor` for `Terminator` (opcode + operands)
+    - [ ] `ToCbor` / `FromCbor` for `FunctionRef` (namespace + name)
+    - [ ] `ToCbor` / `FromCbor` for `Terminator` (opcode + operands, including TailCall)
     - [ ] `ToCbor` / `FromCbor` for `MatchPattern`
-    - [ ] `ToCbor` / `FromCbor` for containers: `Var`, `Param`, `BasicBlock`
+    - [ ] `ToCbor` / `FromCbor` for containers: `Var`, `BasicBlock`
     - [ ] `ToCbor` / `FromCbor` for top-level: `Function`, `ConstBinding`, `IrProgram`
     - [ ] `BytecodeError` type for decode errors
   - Phase 2: Top-level API

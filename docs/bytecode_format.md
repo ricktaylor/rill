@@ -265,17 +265,18 @@ integers with no wrapper:
 
 Encoded as a CBOR unsigned integer via `From<BaseType> for u64`:
 
-| Variant    | Value |
-|------------|-------|
-| `Bool`     | 0     |
-| `UInt`     | 1     |
-| `Int`      | 2     |
-| `Float`    | 3     |
-| `Text`     | 4     |
-| `Bytes`    | 5     |
-| `Array`    | 6     |
-| `Map`      | 7     |
-| `Sequence` | 8     |
+| Variant     | Value |
+|-------------|-------|
+| `Bool`      | 0     |
+| `UInt`      | 1     |
+| `Int`       | 2     |
+| `Float`     | 3     |
+| `Text`      | 4     |
+| `Bytes`     | 5     |
+| `Array`     | 6     |
+| `Map`       | 7     |
+| `Sequence`  | 8     |
+| `Undefined` | 9     |
 
 ### Identifier
 
@@ -293,6 +294,7 @@ Encoded as a 2-element CBOR array `[type_tag, value]`:
 | `Literal::Float` | 3   | CBOR float           | `3.14` -> `[3, 3.14]`      |
 | `Literal::Text`  | 4   | CBOR text string     | `"hi"` -> `[4, "hi"]`      |
 | `Literal::Bytes` | 5   | CBOR byte string     | `b"\x01\x02"` -> `[5, h'0102']` |
+| `Literal::Undefined` | 6 | (no value)         | `[6]`                           |
 
 ## ConstValue Encoding
 
@@ -330,7 +332,11 @@ Encoded as a CBOR unsigned integer:
 | `BitAnd`   | 9     | | `ArraySeq`| 22   |
 | `BitOr`    | 10    | | `SeqNext` | 23   |
 | `BitXor`   | 11    | | `Collect` | 24   |
-| `Widen`    | 12    | | `Cast`    | 25   |
+
+`Convert(NumericType, ConvertMode)` is encoded as `[25, target, mode]` where
+`target` is `NumericType` (0=UInt, 1=Int, 2=Float) and `mode` is
+`ConvertMode` (0=Checked, 1=Unchecked). `ArraySeq(SliceMode)` is encoded
+as `[22, mode]` where `mode` is `SliceMode` (0=ReadOnly, 1=Mutable).
 
 These values are defined in the `From<IntrinsicOp> for u64` impl. New
 intrinsics are appended at the end; existing values never change.
@@ -344,15 +350,15 @@ Remaining elements are the instruction's operands.
 |--------|---------------|-----------------------------------------------|
 | 0      | `Phi`         | `[0, dest, [[block, var], ...]]`              |
 | 1      | `Copy`        | `[1, dest, src]`                              |
-| 2      | `Undefined`   | `[2, dest]`                                   |
-| 3      | `Const`       | `[3, dest, <Literal>]`                        |
-| 4      | `Index`       | `[4, dest, base, key]`                        |
-| 5      | `SetIndex`    | `[5, base, key, value]`                       |
-| 6      | `Intrinsic`   | `[6, dest, op, [args...]]`                    |
-| 7      | `Call`        | `[7, dest, <FunctionRef>, [<CallArg>, ...]]`  |
-| 8      | `MakeRef`     | `[8, dest, base, key_or_null]`                |
-| 9      | `WriteRef`    | `[9, ref_var, value]`                         |
-| 10     | `Drop`        | `[10, [vars...]]`                             |
+| 2      | `Const`       | `[2, dest, <Literal>]`                        |
+| 3      | `Index`       | `[3, dest, base, key]`                        |
+| 4      | `SetIndex`    | `[4, base, key, value]`                       |
+| 5      | `Intrinsic`   | `[5, dest, op, [args...]]`                    |
+| 6      | `Call`        | `[6, dest, <FunctionRef>, [var, ...]]`        |
+| 7      | `MakeRef`     | `[7, dest, base, key_or_null]`                |
+| 8      | `WriteRef`    | `[8, ref_var, value]`                         |
+| 9      | `Append`      | `[9, dest, arr, value]`                       |
+| 10     | `Reload`      | `[10, dest, src]`                             |
 
 ### FunctionRef
 
@@ -366,17 +372,11 @@ FunctionRef { namespace: Some("str"), name: "len" } -> ["str", "len"]
 Single-element array = unqualified; two-element array = qualified. This
 avoids encoding `null` for the common unqualified case.
 
-### CallArg
+### Call Args
 
-Encoded as a CBOR array:
-
-```
-CallArg { value: VarId(3), by_ref: false } -> [3]
-CallArg { value: VarId(3), by_ref: true }  -> [3, true]
-```
-
-Single-element = by-value (common case); two-element = by-ref. The `by_ref`
-flag is only emitted when true, saving a byte per argument in the common case.
+Call args are plain VarIds (encoded as CBOR unsigned integers). By-ref is
+handled at the IR level via MakeRef instructions at the call site, not in
+the Call encoding.
 
 ### Const Instruction Detail
 
@@ -384,12 +384,12 @@ The Literal is inlined (not wrapped in an extra array):
 
 ```
 Instruction::Const { dest: VarId(3), value: Literal::UInt(42) }
--> [3, 3, 1, 42]
+-> [2, 3, 1, 42]
     ^  ^  ^   ^
     |  |  |   +-- literal value
     |  |  +------ literal type tag (UInt=1)
     |  +--------- dest
-    +------------ opcode (Const=3)
+    +------------ opcode (Const=2)
 ```
 
 The literal's `[type, value]` pair is flattened into the instruction array
@@ -404,10 +404,9 @@ Each terminator is a CBOR array with an integer opcode:
 | 0      | `Jump`        | `[0, target]`                                |
 | 1      | `If`          | `[1, condition, then_target, else_target]`   |
 | 2      | `Match`       | `[2, value, [<MatchArm>, ...], default]`     |
-| 3      | `Guard`       | `[3, value, defined, undefined]`             |
-| 4      | `Return`      | `[4]` or `[4, var]`                          |
-| 5      | `Exit`        | `[5, var]`                                   |
-| 6      | `Unreachable` | `[6]`                                        |
+| 3      | `Return`      | `[3]` or `[3, var]`                          |
+| 4      | `Unreachable` | `[4]`                                        |
+| 5      | `TailCall`    | `[5, [args...]]`                             |
 
 ### MatchPattern
 
@@ -429,29 +428,20 @@ A match arm is a 2-element array: `[<MatchPattern>, target_block]`.
 Variable-length encoding:
 
 ```
-Terminator::Return { value: None }          -> [4]
-Terminator::Return { value: Some(VarId(2)) } -> [4, 2]
+Terminator::Return { value: None }          -> [3]
+Terminator::Return { value: Some(VarId(2)) } -> [3, 2]
 ```
 
 ## Var Encoding
 
 ```
-Var { id: VarId(0), name: "x", type_set: TypeSet::all() }
--> [0, "x", 511]
+Var { id: VarId(0), name: "x", type_set: TypeSet::any() }
+-> [0, "x", 1023]
     ^   ^    ^
-    |   |    +-- type_set bits as uint
+    |   |    +-- type_set bits as uint (any() = all 10 bits set)
     |   +------- name
     +----------- id
 ```
-
-## Param Encoding
-
-```
-Param { var: VarId(1), by_ref: false } -> [1]
-Param { var: VarId(1), by_ref: true }  -> [1, true]
-```
-
-Same optimization as CallArg — omit `by_ref` when false.
 
 ## BasicBlock Encoding
 
@@ -471,8 +461,8 @@ CBOR map with integer keys for forward compatibility:
 ```
 {
   0: "function_name",       ; name
-  1: [<Param>, ...],        ; params
-  2: <Param> or null,       ; rest_param (null if absent)
+  1: [<VarId>, ...],        ; params (plain VarIds)
+  2: <VarId> or null,       ; rest_param (null if absent)
   3: [<Var>, ...],          ; locals
   4: [<BasicBlock>, ...],   ; blocks
   5: <uint>                 ; entry_block id
