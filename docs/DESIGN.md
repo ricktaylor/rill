@@ -52,7 +52,7 @@ Source Code
 └─────────┘
 ```
 
-## Terminology: Core, Standard Prelude, Externs
+## Terminology: Core and Externs
 
 Rill has three distinct categories of functionality. These terms are used
 consistently throughout the codebase and documentation.
@@ -70,88 +70,68 @@ as lowering targets for syntax. `x + y` lowers to `Intrinsic(Add, [x, y])`.
 They are encoded as `IntrinsicOp` discriminants in bytecode and are always
 available — no registry, no linking, no import.
 
-### Standard Prelude
+### Prelude (convention, not a feature)
 
-The rill crate provides `STANDARD_PRELUDE` — a const string of Rill source
-code containing convenience functions like `is_defined()`, `is_uint()`,
-and `default()`. The embedder includes it via the `SourceLoader` trait's
-`preamble()` method (see **Module System > Source Loader** for details):
-
-```rust
-impl SourceLoader for MyLoader {
-    fn load(&self, path: &str, relative_to: &str) -> Result<String, LoadError> {
-        // resolve import paths...
-    }
-
-    fn preamble(&self) -> &[&str] {
-        &[rill::STANDARD_PRELUDE]   // include standard prelude
-    }
-}
-```
-
-The prelude is **not a language feature** — it is an embedder API
-convenience. Preamble source is compiled into the same scope as the
-user's root file, available unqualified with no import or require. These
-are regular Rill functions that compile to identical IR to hand-written
-equivalents:
+There is no built-in prelude. Utility functions like `is_defined()`,
+`is_uint()`, and `default()` are ordinary Rill source that the embedder
+provides via the import system:
 
 ```rill
-fn is_defined(x) { if let _ = x { true } else { false } }
-fn is_uint(x) { match x { UInt(_) => true, _ => false } }
-fn default(value, fallback) { if let v = value { v } else { fallback } }
+// prelude.rill — provided by the embedder via the SourceLoader
+fn is_defined(x) { match x { _ => { true } } }
+fn is_uint(x) { match x { UInt _ => { true }, _ => { false } } }
+fn default(value, fallback) { if is_defined(value) { value } else { fallback } }
 ```
 
-If the user defines a function with the same name as a preamble function,
-the compiler emits a duplicate definition error. The user must either
-rename their function or the embedder must customise the preamble to
-remove the conflict.
+Scripts that need these functions import them explicitly:
+
+```rill
+import "prelude.rill" as _;    // merge into root scope
+```
+
+No special compiler support — this is the regular import mechanism.
+The embedder controls what's available by configuring the SourceLoader.
 
 ### Externs (ExternRegistry)
 
 Rust functions registered by the embedder. This is the embedding API.
-Externs can be **global** (always available, called unqualified) or
-**namespaced** (grouped under a namespace, require a `require` declaration
-in the script).
-
-Global externs are available without any declaration — like `exit()` or
-`print()`. Namespaced externs are grouped by the embedder into named
-namespaces and require the script to declare the dependency:
+All externs are namespaced — grouped under a namespace by the embedder.
+Scripts use `require` to declare dependencies:
 
 ```rust
 // Embedder (Rust side):
-registry.register(ExternDef::new("exit", exit_impl));           // global
-registry.register_in("cbor", ExternDef::new("decode", ...));    // namespaced
-registry.register_in("console", ExternDef::new("log", ...));    // namespaced
+registry.register(ExternDef::new("runtime", "exit", exit_impl))?;
+registry.register(ExternDef::new("cbor", "decode", decode_impl))?;
+registry.register(ExternDef::new("console", "log", log_impl))?;
 ```
 
 ```rill
 // Script (Rill side):
-require cbor;       // declares dependency on "cbor" namespace
-require console;    // declares dependency on "console" namespace
+require cbor;           // cbor::decode() available qualified
+require console;        // console::log() available qualified
+require runtime as _;   // exit() available unqualified
 
 cbor::decode(bytes)
 console::log("hello")
-exit(0)             // global — no require needed
+exit(0)                 // unqualified via `as _`
 ```
 
-Externs are registered via the `ExternRegistry` with metadata (parameter
-types, return type, purity). In bytecode, they appear as symbolic
-`FunctionRef` names resolved at load time. The standard registry is empty —
-all language-defined operations are core intrinsics.
+`ExternDef` is self-describing — carries namespace, name, metadata
+(parameter types, return type, purity), and implementation. Registered
+via `ExternRegistry::register(def)`. In bytecode, externs appear as
+symbolic `FunctionRef` names resolved at load time.
 
 ### Summary
 
 | Category | Implementation | Callable by name? | In bytecode as | Available without registry? |
 |----------|---------------|-------------------|----------------|---------------------------|
 | **Core** | `IntrinsicOp` (Rust enum) | No (lowering targets) | Integer opcode | Yes — always |
-| **Standard prelude** | Rill source (embedder opt-in) | Yes (unqualified) | Internal function | Yes — compiled into program |
-| **Externs (global)** | Rust (embedder-provided) | Yes (unqualified) | Symbolic `FunctionRef` | No — needs `ExternRegistry` |
-| **Externs (namespaced)** | Rust (embedder-provided) | Yes (`ns::func()`) | Symbolic `FunctionRef` | No — needs `ExternRegistry` + `require` |
+| **Externs** | Rust (embedder-provided) | Yes (`ns::func()` or unqualified via `as _`) | Symbolic `FunctionRef` | No — needs `ExternRegistry` + `require` |
 
-The key architectural boundary is between **resolved** (core + prelude
-source — compiled into the program) and **late-bound** (externs — resolved
-against `ExternRegistry` at load time). Bytecode contains everything
-resolved; only late-bound symbols require the host.
+The key architectural boundary is between **resolved** (core intrinsics +
+user/imported source — compiled into the program) and **late-bound**
+(externs — resolved against `ExternRegistry` at load time). Bytecode
+contains everything resolved; only late-bound symbols require the host.
 
 ## Files
 
@@ -704,8 +684,8 @@ folds to `3` using the inline const evaluator.
 **Extern calls** (`Instruction::Call`) are for embedder-provided functions
 registered via the `ExternRegistry`. The standard registry is empty — all
 language-defined operations are core intrinsics. `Call` is also used for
-user-defined functions (including standard prelude and functions from
-imported source files), which resolve internally within the program rather
+user-defined functions (including functions from imported source files),
+which resolve internally within the program rather
 than against the registry.
 
 ### Pattern Lowering Example
@@ -1903,11 +1883,10 @@ if with UInt(n) = record.priority {
 }
 ```
 
-### Standard Prelude Functions
+### Prelude Functions (convention)
 
-Utility functions provided as Rill source by the standard prelude (see
-Terminology section). Available unqualified when the embedder includes the
-prelude at compilation time.
+Utility functions typically provided as a `prelude.rill` source file.
+Scripts import them with `import "prelude.rill" as _;`.
 
 **Type checking** (regular Rill code, inlined by the optimizer):
 
@@ -2124,33 +2103,22 @@ with another `import`), the compiler emits an error.
 **Unqualified calls** (`func()`):
 
 1. Intrinsics — `len()`, `collect()`, `append()` (compiler built-in, cannot be shadowed)
-2. Global externs — registered without namespace, error if ambiguous
-3. Functions in the root scope — from the current file, `as _` imports/requires,
-   and standard prelude (if provided)
+2. Local user functions — defined in the same source file
+3. Merged imports — from `import "file" as _`
+4. Merged externs — from `require ns as _`
 
-**Qualified constant access** (`ns::CONSTANT`):
-
-Same lookup as qualified calls — checks extern namespaces first, then
-imported source modules.
+Local functions and imports shadow externs — a warning is emitted.
+The original is always reachable via qualified `ns::func()` syntax.
 
 ### Name Clash Rules
 
-Duplicate names are always an error — no shadowing, no precedence, no
-silent surprises:
-
 | Clash | Behavior |
 |-------|----------|
-| Any duplicate function or constant name in the root scope | Error |
-| Any name vs intrinsic (`len`, `collect`) | Error |
-| Any duplicate namespace alias | Error |
-
-This applies uniformly regardless of origin: user code, standard prelude,
-`as _` imports, `as _` requires, and global externs all share the same
-root scope. If two of them define the same name, the compiler errors.
-
-If a standard prelude function clashes with a user function, the user
-must either rename their function or the embedder must provide a
-customised prelude without the conflicting definition.
+| Function/constant name vs intrinsic (`len`, `collect`) | Error |
+| Duplicate function or constant name in the same file | Error |
+| Duplicate namespace alias (import vs import, import vs require) | Error |
+| Local function shadows merged import or extern | Warning |
+| Merged import shadows merged extern | Warning |
 
 ### Source Loader
 
@@ -2159,74 +2127,45 @@ The compiler does not hardcode file I/O. Instead, the embedder provides a
 resolution. This keeps the compiler platform-agnostic (works in no-std
 environments, WASM, etc.).
 
-The `SourceLoader` trait serves two purposes:
-
-1. **Import resolution** — loading source files referenced by `import`
-   statements
-2. **Preamble** — providing additional source to compile in the root
-   scope before user code (e.g., the standard prelude)
+The `SourceLoader` trait resolves import paths to source text:
 
 ```rust
 pub trait SourceLoader {
-    /// Resolve an import path to source text.
-    /// `path` is the quoted string from `import "path";`.
-    /// `relative_to` is the path of the file containing the import.
-    fn load(&self, path: &str, relative_to: &str) -> Result<String, LoadError>;
+    /// Load source text.
+    /// `identifier` is the import path (e.g., "utils.rill").
+    /// `from` is the canonical_id of the importing file (None for root).
+    fn load(&self, identifier: &str, from: Option<&str>) -> Result<SourceResult, String>;
+}
 
-    /// Additional source to compile in the root scope before user code.
-    /// Default: empty (no preamble). Embedders typically return
-    /// `&[rill::STANDARD_PRELUDE]` to include the standard prelude.
-    fn preamble(&self) -> &[&str] {
-        &[]
-    }
+pub struct SourceResult {
+    pub source: String,        // UTF-8 source text
+    pub namespace: String,     // default namespace for this module
+    pub canonical_id: String,  // unique identity for deduplication
 }
 ```
 
-The `compile()` function takes an optional source loader. When `None`,
-imports are not supported and there is no preamble:
+The `Compiler` builder takes a single loader at construction:
 
 ```rust
-// Simple: no imports, no preamble (backwards-compatible)
-let (program, _) = rill::compile(source, &externs, None)?;
-
-// Full: with imports and standard prelude
-let (program, _) = rill::compile(source, &externs, Some(&my_loader))?;
+let loader = FileLoader::new("./scripts");
+let mut compiler = Compiler::new(&loader);
+compiler.add_extern(ExternDef::new("math", "sqrt", sqrt_impl))?;
+compiler.add("main.rill");
+let (program, warnings) = compiler.build()?;
 ```
 
-Example embedder implementation:
+Provided implementations: `FileLoader` (filesystem, resolves relative
+paths, canonical = absolute path) and `MemoryLoader` (in-memory map
+for testing/embedding).
 
-```rust
-struct MyLoader;
-
-impl SourceLoader for MyLoader {
-    fn load(&self, path: &str, relative_to: &str) -> Result<String, LoadError> {
-        let resolved = resolve_path(path, relative_to);
-        std::fs::read_to_string(&resolved)
-            .map_err(|_| LoadError::NotFound(resolved))
-    }
-
-    fn preamble(&self) -> &[&str] {
-        &[rill::STANDARD_PRELUDE]
-    }
-}
-```
-
-Preamble sources are compiled into the root scope — their functions and
-constants are available unqualified, just like the user's own definitions.
-Duplicate names between preamble and user code are a compile error (see
-**Name Clash Rules**). The embedder controls what goes into the preamble:
-the standard prelude, custom utility functions, or nothing at all.
-
-The only core intrinsics that are user-callable by name are `len()` and
-`collect()`, which the compiler recognizes in `try_lower_intrinsic` and
-emits as `Intrinsic(Len/Collect, [x])`. These cannot be shadowed.
+The only core intrinsics that are user-callable by name are `len()`,
+`collect()`, and `append()`, which the compiler recognizes in
+`try_lower_intrinsic`. These cannot be shadowed by user definitions
+(detected at definition time).
 
 ---
 
 ## Core Intrinsics and Externs
-
-See the **Terminology** section above for definitions of core, standard
-prelude, and externs.
 
 | Concept | Definition | When Evaluated | Registered? |
 |---------|------------|----------------|-------------|
@@ -2238,7 +2177,7 @@ prelude, and externs.
 **Core intrinsics are minimal.** Only operations that require compiler
 knowledge are intrinsics: operators (need type dispatch), `len()` (used in
 for-loop lowering), and literal constructors. Functions like `is_defined()`
-and `is_uint()` are standard prelude functions — regular Rill code that the
+and `is_uint()` are prelude functions (convention) — regular Rill code that the
 embedder optionally includes at compilation time.
 
 **Externs are the embedding API.** Host applications register functions via
@@ -2249,13 +2188,11 @@ the script).
 ### Extern Registration
 
 ```rust
-// Global extern — always available, called unqualified
-registry.register(ExternDef::new("print", print_fn));
-
-// Namespaced extern — requires `require cbor;` in script
-registry.register_in("cbor", ExternDef::new("decode", decode_fn));
-registry.register_in("cbor", ExternDef::new("encode", encode_fn));
-registry.register_in("console", ExternDef::new("log", log_fn));
+// All externs are namespaced — ExternDef carries namespace + name
+registry.register(ExternDef::new("console", "print", print_fn))?;
+registry.register(ExternDef::new("cbor", "decode", decode_fn))?;
+registry.register(ExternDef::new("cbor", "encode", encode_fn))?;
+registry.register(ExternDef::new("console", "log", log_fn))?;
 ```
 
 Scripts declare their extern dependencies explicitly:
@@ -2322,11 +2259,11 @@ sufficient because Rill uses `undefined` instead of IEEE-754 NaN. Without NaN's
 special comparison semantics (where `NaN != NaN` is true), mathematical reflexivity
 holds and these expansions are equivalent to dedicated operators.
 
-### Standard Prelude Functions (Not Intrinsics)
+### Prelude Functions (Not Intrinsics)
 
 Functions like `is_defined()`, `is_uint()`, `default()`, etc. are **not
-core intrinsics** — they are standard prelude functions, written in Rill
-source and optionally included by the embedder at compilation time. They
+core intrinsics** — they are regular Rill functions, typically provided
+in a `prelude.rill` file that scripts import. They
 compile to identical IR as hand-written code:
 
 ```rill
@@ -2348,14 +2285,13 @@ Rust functions that Rill scripts can call. It follows Lua embedding patterns.
 
 The standard registry is **empty**. All language-defined operations (`+`,
 `len()`, etc.) are core intrinsics. Convenience functions (`is_uint()`,
-`is_defined()`, etc.) are standard prelude functions (Rill source compiled
+`is_defined()`, etc.) are prelude functions (convention) (Rill source compiled
 alongside user code). The registry exists for embedder-provided
-functionality — both global functions (like `exit()`) and namespaced
+functionality — namespaced
 function groups (like `cbor::decode()`, `console::log()`).
 
-Namespaced externs require a `require` declaration in the script to bring
-the namespace into scope. Global externs are always available without any
-declaration. See the **Module System** section for details.
+All externs are namespaced — scripts use `require namespace;` to bring
+them into scope. See the **Module System** section for details.
 
 ### Extern Metadata
 
@@ -2446,26 +2382,25 @@ runtime overhead for the variant selection itself.
 ```rust
 let mut registry = ExternRegistry::new();
 
-// Global extern — always available, no `require` needed in script
+// All externs are namespaced — scripts use `require` to access
 registry.register(
-    ExternDef::new("exit", exit_impl)
+    ExternDef::new("runtime", "exit", exit_impl)
         .param_optional("code", TypeSet::uint())
         .exits(TypeSet::uint())
-);
+)?;
 
-// Namespaced externs — script must declare `require cbor;`
-registry.register_in("cbor",
-    ExternDef::new("decode", cbor_decode_impl)
+registry.register(
+    ExternDef::new("cbor", "decode", cbor_decode_impl)
         .param("data", TypeSet::bytes())
         .returns(TypeSet::all())
         .pure()
-);
-registry.register_in("cbor",
-    ExternDef::new("encode", cbor_encode_impl)
+)?;
+registry.register(
+    ExternDef::new("cbor", "encode", cbor_encode_impl)
         .param("value", TypeSet::all())
         .returns(TypeSet::bytes())
         .pure()
-);
+)?;
 ```
 
 ### Intrinsic vs Extern: Compilation
@@ -2634,18 +2569,18 @@ fn transform(record) {
 ### Host Driver (Rust)
 
 ```rust
-use rill::{compile, ExternRegistry, SourceLoader, STANDARD_PRELUDE, VM, Value};
+use rill::{Compiler, ExternDef, ExternRegistry, FileLoader, VM, Value};
 
 // Register domain externs
 let mut externs = ExternRegistry::new();
-externs.register(ExternDef::new("exit", exit_impl).exits(TypeSet::uint()));
-externs.register_in("time", ExternDef::new("now", time_now_impl));
-
-// Set up source loader with standard prelude
-let loader = MyLoader;  // implements SourceLoader
+externs.register(ExternDef::new("runtime", "exit", exit_impl).exits(TypeSet::uint()))?;
+externs.register(ExternDef::new("time", "now", time_now_impl))?;
 
 // Compile once, execute many times
-let (program, _warnings) = compile(source, &externs, Some(&loader)).unwrap();
+let loader = FileLoader::new("./scripts");
+let mut compiler = Compiler::with_externs(externs, &loader);
+compiler.add("main.rill");
+let (program, _warnings) = compiler.build().unwrap();
 
 // Resolve function handles for hot-path execution
 let check_age = program.function("check_age").unwrap();
@@ -2734,8 +2669,8 @@ fn extern_exit(_vm: &mut VM, args: &[Value]) -> Result<ExecResult, ExecError> {
 - [ ] `if with` / match arm ref origin tracking (Phase 2)
 - [ ] Dead write-back elimination (WriteRef where collection is never read after)
 - [ ] Host sequence support (`SeqState::Host` variant)
-- [ ] Module system (`import` for source files, `require` for extern namespaces)
-- [ ] `ExternRegistry::register_in()` for namespaced externs
+- [x] Module system (`import` for source files, `require` for extern namespaces)
+- [x] `ExternRegistry::register()` with self-describing `ExternDef`
 - [ ] CBOR encode/decode integration
 - [ ] Compiled binary format
 - [ ] Dead code elimination pass

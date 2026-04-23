@@ -433,7 +433,7 @@ CR = %x0D                  ; Carriage return
 ;    - Imports are private: if A imports B, and B imports C, A cannot see C
 ;    - No re-exports, no chained namespaces
 ;    - Call sites use single-segment qualification: namespace::function()
-;      (or just function() for `as _` and global externs)
+;      (or just function() for `as _` imports/requires)
 ;
 ; 12. Declaration ordering:
 ;    - Imports, requires, constants, and functions can appear in any order
@@ -455,14 +455,11 @@ CR = %x0D                  ; Carriage return
 ;      const [A, B, C] = [1, 2, 3];           // destructuring
 ;      const {x: X, y: Y} = {x: 10, y: 20};   // map destructuring
 ;
-; 14. Standard Prelude:
-;    - Rill source provided by the rill crate as STANDARD_PRELUDE
-;    - Embedder passes to compile() as optional additional source
-;    - Provides is_defined, is_uint, is_int, ..., default, etc.
-;    - These are regular user-defined functions, not intrinsics or externs
-;    - No import or require needed — compiled into the root scope
-;    - Embedder can skip, customize, or extend
-;    - Duplicate names between prelude and user code are a compile error
+; 14. Prelude (convention, not a language feature):
+;    - Utility functions (is_defined, is_uint, default, etc.) as regular Rill source
+;    - Provided by the embedder as a source file via the SourceLoader
+;    - Scripts import explicitly: import "prelude.rill" as _;
+;    - No special compiler support — uses the regular import mechanism
 ;
 ; 15. Type checking, casting, and type patterns:
 ;    - Type TEST (pattern): is this value already a UInt?

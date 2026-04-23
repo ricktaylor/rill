@@ -105,10 +105,9 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
       not the enclosing statement. Currently `lower_expression` uses `self.current_span` which
       is the statement span. Requires parser changes (`.map_with()` on expression combinators)
       and lowerer changes (`lower_expression` takes/sets span).
-- [ ] **Standard prelude** — `STANDARD_PRELUDE` const string of Rill source
-      containing is_defined, is_uint, is_int, ..., default, etc.
-      Embedder includes via `SourceLoader::preamble()`.
-      Not a language feature — an embedder API convenience.
+- [ ] **Standard prelude** — Not a language feature. A conventional `prelude.rill`
+      source file (is_defined, is_uint, default, etc.) that embedders provide
+      via the SourceLoader. Scripts import it with `import "prelude.rill" as _;`.
 - [x] **By-ref parameter passing** — Unified caller-emitted model:
       - Default is by-value (CoW clone — Rc increment). `with` opts into by-reference.
       - Caller emits `MakeRef` for by-ref args, plain value for by-val, at the call site.

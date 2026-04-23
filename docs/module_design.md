@@ -61,131 +61,87 @@ pub trait LibraryLoader {
 
 ## Public API
 
-Two builders — Compiler (source → bytecode/program) and Linker (bytecode + source → program).
-
 ### Traits
 
 ```rust
 pub struct SourceResult {
-    pub source: String,       // UTF-8 source text
-    pub namespace: String,    // default namespace (loader decides)
+    pub source: String,        // UTF-8 source text
+    pub namespace: String,     // default namespace for this module
+    pub canonical_id: String,  // unique identity for deduplication
 }
 
 pub trait SourceLoader {
-    /// Load source text. `from` is the importing file (None for root).
+    /// Load source text. `from` is the canonical_id of the importing file (None for root).
     fn load(&self, identifier: &str, from: Option<&str>) -> Result<SourceResult, String>;
 }
-
-pub trait LibraryLoader {
-    /// Load pre-compiled bytecode.
-    fn load(&self, identifier: &str) -> Result<Vec<u8>, String>;
-}
 ```
 
-### Compiler
+### ExternDef
+
+All externs are namespaced. `ExternDef` is self-describing — carries
+namespace, name, and implementation:
 
 ```rust
-let mut compiler = Compiler::new();
+ExternDef::new("math", "sqrt", sqrt_impl)
+    .param("x", TypeSet::numeric())
+    .returns(TypeSet::numeric())
+    .pure_infallible()
+```
 
-// Extern declarations — signatures only (:: for namespaces)
-compiler.add_extern("sqrt", &sqrt_def)?;
-compiler.add_extern("math::sin", &sin_def)?;
+Scripts access externs via `require`:
+```rill
+require math;           // math::sqrt() available qualified
+require math as _;      // sqrt() available unqualified
+```
+
+### Compiler (implemented)
+
+The Compiler takes a single SourceLoader at construction — guarantees
+canonical_id consistency across all files.
+
+```rust
+let loader = FileLoader::new("./scripts");
+let mut compiler = Compiler::new(&loader);
+
+// Register externs (namespace is part of the ExternDef)
+compiler.add_extern(ExternDef::new("math", "sqrt", sqrt_impl))?;
 
 // Add source (imports resolved recursively via the loader)
-compiler.add(&source_loader, "main.rill")?;
+compiler.add("main.rill");
 
-// Two output options:
-let program = compiler.build()?;   // → Program (compile + link + run)
-let bytecode = compiler.save()?;   // → ByteCode (serialise for later)
+// Build → Program with all functions compiled
+let (program, warnings) = compiler.build()?;
+
+// Execute
+let mut vm = VM::new();
+let result = program.call(&mut vm, "main", 0)?;
 ```
 
-### Linker
+### Linker (planned — Phase 2b)
+
+For bytecode serialization and the prelude template pattern:
 
 ```rust
-let mut linker = Linker::new();
-
-// Extern implementations — signatures + function pointers
-linker.add_extern("sqrt", &sqrt_def)?;
-linker.add_extern("math::sin", &sin_def)?;
-
-// Add pre-compiled bytecode
-linker.add(&lib_loader, "utils.rillc")?;
-linker.add(&lib_loader, "proto.rillc")?;
-
-// Compile source on the fly (same as Compiler::add)
-linker.compile(&source_loader, "main.rill")?;
-
-// Build — merge + interprocedural opt + resolve + compile closures
-let program = linker.build()?;
+let mut linker = Linker::new(&loader);
+linker.add_extern(ExternDef::new("math", "sqrt", sqrt_impl))?;
+linker.add_bytecode(&lib_loader, "prelude.rillc")?;  // pre-compiled
+linker.add("main.rill");                               // compile on the fly
+let (program, warnings) = linker.build()?;
 ```
 
-`build()` verifies: every extern declared at compile time has a matching
-implementation. Signature mismatch or missing → diagnostic.
+### Entry points (planned — Phase 4)
 
-### Entry points
-
-Entry points declare which functions are embedder-callable and their
-expected param types. Drives DCE (unreachable functions eliminated)
+Entry points would declare which functions are embedder-callable and
+their expected param types. Drives DCE (unreachable functions eliminated)
 and type propagation (param types seed interprocedural analysis).
 
 ```rust
-compiler.entry("main", &[TypeSet::uint()])?;
-compiler.entry("on_receive", &[TypeSet::array()])?;
+// Future API:
+let (program, warnings) = compiler.build_entry("main", &[TypeSet::uint()])?;
 ```
 
 No entries declared → all functions kept, params default to `any()`.
-
-Available on both Compiler and Linker.
-
-### Execution
-
-`build()` returns a `Function` — the compiled entry point with everything
-reachable from it. No `Program` wrapper, no runtime name lookup.
-
-```rust
-let main = compiler.build("main", &[TypeSet::uint()])?;
-
-let mut vm = VM::new();
-vm.push(Value::UInt(42))?;
-let result = main.call(&mut vm)?;  // arity checked: 1 pushed == 1 expected
-```
-
-The Function knows its arity from the `build()` declaration. Push count
-mismatch at `call()` is a runtime error. No manual argc needed.
-
-### Three paths
-
-```rust
-// Development: source → function (no bytecode)
-let mut compiler = Compiler::new();
-compiler.add_extern("sqrt", &sqrt_def)?;
-compiler.add(&source_loader, "main.rill")?;
-let main = compiler.build("main", &[TypeSet::uint()])?;
-
-// Distribution: source → bytecode
-let bytecode = compiler.save()?;
-
-// Deployment: bytecode + source → function
-let mut linker = Linker::new();
-linker.add_extern("sqrt", &sqrt_def)?;
-linker.add(&lib_loader, "prelude.rillc")?;
-linker.compile(&source_loader, "main.rill")?;
-let main = linker.build("main", &[TypeSet::uint()])?;
-```
-
-### Template pattern
-
-```rust
-// Shared linker base with pre-compiled prelude
-let mut base = Linker::new();
-base.add_extern("len", &len_def)?;
-base.add(&lib_loader, "prelude.rillc")?;
-
-// Fork per user script — clones IR (cheap)
-let mut user_a = base.clone();
-user_a.compile(&source_loader, "a.rill")?;
-let main_a = user_a.build("main", &[TypeSet::uint()])?;
-```
+This is the current behavior.
 
 ## Import Resolution
 
@@ -272,8 +228,7 @@ When resolving an unqualified call `foo()`:
 
 First match wins. Local functions and imports shadow externs — a warning
 is emitted. The original is always reachable via qualified `ns::func()`
-syntax. Global externs and merged externs have the same priority — both
-bring functions into root scope.
+syntax.
 
 ### Visibility
 
@@ -319,28 +274,27 @@ This can be:
 - Stored in a `SourceMap` that accumulates during compilation
 - Threaded through the `Diagnostics` struct itself
 
-## Standard Prelude
+## Standard Prelude (embedder convention, not a language feature)
 
-The standard prelude is Rill source (not externs) that the embedder
-prepends or compiles separately. Not part of SourceLoader — it's
-embedder setup:
+There is no built-in prelude. Utility functions like `is_defined()`,
+`is_uint()`, `default()` are ordinary Rill source that the embedder
+can provide via the import system:
 
-```rust
-const STANDARD_PRELUDE: &str = r#"
+```rill
+// prelude.rill — written once, imported by scripts that need it
 fn is_defined(x) { match x { _ => { true } } }
 fn is_uint(x) { match x { UInt _ => { true }, _ => { false } } }
 fn default(x, fallback) { if is_defined(x) { x } else { fallback } }
-"#;
-
-// Option A: prepend to user source
-let full_source = format!("{}\n{}", STANDARD_PRELUDE, user_source);
-let program = rill::compile(&full_source, "main.rill", &externs, None)?;
-
-// Option B: compile separately and merge (future API)
 ```
 
-The prelude is the embedder's choice — Rill provides a suggested set
-but doesn't mandate it.
+```rill
+// user script
+import "prelude.rill" as _;
+fn process(data) { default(data.value, 0) }
+```
+
+No special compiler support needed — this is just regular imports.
+The embedder controls what's available by configuring the SourceLoader.
 
 ## Future: Incremental Compilation + Deferred Link
 

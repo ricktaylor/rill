@@ -1,17 +1,11 @@
 # Rill Function Library
 
-See the **Terminology** section in `DESIGN.md` for definitions of core,
-standard prelude, and externs.
+## Prelude (convention)
 
-## Standard Prelude
-
-The rill crate provides `STANDARD_PRELUDE` — Rill source code containing
-common utility functions. The embedder includes it via the `SourceLoader`
-trait's `preamble()` method — see `DESIGN.md` for the full API. These are
-regular Rill functions compiled alongside user code — not intrinsics, not
-externs. The embedder can skip, customize, or extend the preamble.
-Duplicate names between preamble and user code are a compile error — the
-embedder must customise the preamble to resolve conflicts.
+Utility functions like `is_defined()`, `is_uint()`, `default()` are
+regular Rill source — not intrinsics, not externs. Embedders provide
+them as a `prelude.rill` file via the SourceLoader. Scripts that need
+them import explicitly: `import "prelude.rill" as _;`
 
 ### Existence Checking
 - `is_defined(x)` - Returns `Bool` (true if present, false if undefined)
@@ -48,15 +42,15 @@ Type patterns are syntax, not functions:
 ## Extern Namespaces (Registered by Embedder)
 
 Extern namespaces are groups of Rust functions registered by the embedder
-via `ExternRegistry::register_in()`. Scripts declare their dependency on
-an extern namespace with `require`. In bytecode, they appear as symbolic
-`FunctionRef` names resolved at load time.
+via `ExternRegistry::register(ExternDef::new("namespace", "name", impl))`.
+Scripts declare their dependency with `require`. In bytecode, they appear
+as symbolic `FunctionRef` names resolved at load time.
 
 ### Domain-Specific Namespaces (DTN/Bundle Protocol)
 
 The following are domain-specific examples for DTN bundle processing
 applications. Host applications provide their own namespaces using the
-same `register_in()` API.
+same `ExternDef` API.
 
 #### `codes`
 Bundle Protocol and BPSec status report reason codes (RFC 9171, RFC 9172)
@@ -160,12 +154,12 @@ require encoding as _;                  // No namespace — functions available 
 cbor::decode(bytes)
 validation::check_structure(bundle)
 
-// Unqualified: `as _` imports, global externs, intrinsics, standard prelude
+// Unqualified: `as _` imports/requires, intrinsics
 hex_encode(data)                        // from `require encoding as _`
 my_util(x)                             // from `import "utils.rill" as _`
 len(array)                             // core intrinsic
-is_uint(value)                         // standard prelude (if included)
-exit(0)                                // global extern
+is_uint(value)                         // from `import "prelude.rill" as _`
+exit(0)                                // from `require runtime as _`
 ```
 
 ### Aliases
@@ -176,7 +170,7 @@ exit(0)                                // global extern
 
 ## Design Principles
 
-1. **Standard prelude for essentials** — common functions as Rill source, embedder opt-in
+1. **Prelude as convention** — utility functions as Rill source, imported explicitly
 2. **Explicit dependencies** — extern namespaces require `require` declarations
 3. **Consistent semantics** — failed operations return undefined, not exceptions
 4. **No magic** — prelude is embedder-provided source; core intrinsics are minimal
