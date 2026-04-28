@@ -104,6 +104,33 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
 - [x] **Expression spans** — `type Expr = Spanned<Expression>`. Parser wraps every expression
       node with its source span. `lower_expression` sets `current_span` from the expression
       span, giving precise error locations for undefined variables, type mismatches, etc.
+- [ ] **Optional `let` initializer** — allow `let x;` without initializer.
+      Variable starts as Undefined. Consistent with Rill's SQL NULL semantics:
+      Undefined is a real value, not an error. `with` still requires an
+      initializer (a reference needs a target). Parser change only — the
+      lowerer already handles Undefined as the default slot value.
+- [ ] **File-scope variables (globals)** — `let x = expr;` or `let x;` at file scope.
+      See `docs/globals_design.md` for full design.
+  - [ ] Parser: allow `let` at top level, optional initializer
+  - [ ] Parser: `::name` syntax for global access in function bodies
+  - [ ] Parser: reject `let _ = expr;` and pattern destructuring at file scope
+  - [ ] Lowerer: two-pass scan — collect all global names/slots, then lower initializers
+  - [ ] Lowerer: `::name` resolves to `LoadGlobal`/`StoreGlobal`, bare name never resolves to global
+  - [ ] IR: `LoadGlobal { dest, slot }` and `StoreGlobal { slot, value }` instructions
+  - [ ] VM: globals in first N stack slots (persistent across calls), frames allocated above
+  - [ ] VM: `Linker::exec(self) -> Result<VM>` runs `__init__`, returns initialized VM
+  - [ ] VM: `VM::fork(&self) -> VM` deep copy, `VM::new()` not public, no `derive(Clone)`
+  - [ ] Compiler: synthetic `__init__` function per source file, evaluates initializers in source order
+  - [ ] Linker: chain init functions in import order (dependencies first) during `exec()`
+  - [ ] Mutable: functions can reassign globals via `::name = value;`
+  - [ ] Private to source file (not visible to importers)
+  - [ ] Type analysis: `any()` at compile time, narrowed at link time from initializer + write analysis
+  - [ ] Purity analysis: functions accessing globals marked impure
+- [ ] **Remove `const` keyword** — replaced by file-scope `let`. The optimizer
+      detects never-written globals with foldable initializers and inlines them.
+      Avoids stale compile-time values in pre-compiled bytecode loaded with
+      different externs. Migrate existing `const NAME = value;` to `let NAME = value;`.
+      See `docs/globals_design.md` for rationale.
 - [ ] **Standard prelude** — Not a language feature. A conventional `prelude.rill`
       source file (is_defined, is_uint, default, etc.) that embedders provide
       via the SourceLoader. Scripts import it with `import "prelude.rill" as _;`.
@@ -222,6 +249,10 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
       Non-overlapping VarIds can share slots, reducing frame_size. Accessor pairs
       allocated as two adjacent physical slots. Linear scan or graph colouring.
       Prerequisite: liveness intervals from the SSA graph.
+      Runs as Phase S after all optimization (A, M, B, T) and before closure
+      compilation. Globals occupy slots 0..N of the VM stack (persistent across
+      calls); function frames start at N. The slot allocator assigns local VarIds
+      (including LoadGlobal dests) into the function-local slot range above N.
 
 ### P2 — Architecture
 
@@ -291,6 +322,10 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
 - [ ] **Optional braces in match arms** — allow `pattern => expr,` in addition to
       `pattern => { stmts; expr }`. The `=>` token disambiguates; trailing `,` or `}`
       delimits the bare expression. Currently `block_body()` always requires braces.
+- [ ] **Forbid `let _ = expr;`** — redundant; `expr;` already discards the result.
+      Rill has no `#[must_use]` warnings to silence. `_` remains valid inside
+      patterns (`let [_, b] = arr;`, `match x { _ => ... }`) but not as a
+      standalone `let` binding. Emit a compile error with hint: "use `expr;` instead".
 
 ### P2 — Diagnostics
 
@@ -324,7 +359,17 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
       generation. Enables multi-instruction fusion (counter increment, accumulator
       update, compare+branch, index+guard, seq advance+guard). Only fuse when
       type-specialized variants exist. See design notes below.
-- [ ] **CLI tool** (`rill run script.rl func`, `rill check`, `rill dump --function f`)
+- [ ] **`rill` script runner** (`tools/rill/`) — shebang-compatible interpreter.
+      See `docs/cli_design.md` for full design.
+  - [ ] `tools/rill/` crate with stdlib externs (io, process, str, math, encoding, fmt)
+  - [ ] `fn main(args)` entry point convention, exit code from return value
+  - [ ] Standard prelude auto-imported (`prelude.rill` via `include_str!`)
+  - [ ] `rill script.rill [args]` — no subcommands (shebang-compatible)
+  - [ ] `rill` with no args → runs built-in REPL (written in Rill, using stdlib externs)
+- [ ] **`rillc` compiler toolchain** — separate binary with subcommands.
+  - [ ] `rillc check` — parse + optimize, report diagnostics
+  - [ ] `rillc dump` — dump optimized IR
+  - [ ] `rillc build` — compile to bytecode
 - [ ] LSP support
 - [ ] Performance benchmarks against Lua, Python (fibonacci, n-body, binary trees, etc.)
 - [ ] Domain-specific embedding examples

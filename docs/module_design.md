@@ -161,23 +161,28 @@ import "utils.rill" as _;         // merge into root scope
 4. Recursively lowers the imported `AstProgram`
 5. Functions/constants added to the caller's scope under the namespace
 
-### Import Resolution (BFS Queue)
+### Two-Pass Import Resolution
 
-No recursive resolution, no cycle detection needed. Imports are
-processed as a breadth-first queue:
+Imports are resolved in two passes, not recursively:
 
-1. Parse root file → collect `import` statements → add to queue
-2. Load + parse each queued file → collect more imports → add to queue
-3. Deduplicate by `canonical_id` (already queued → skip)
-4. Continue until queue is empty
-5. All IR fragments accumulated in the compiler
+**Pass 1: `parse_source_tree()`** — BFS load and parse all files.
+Uses a `VecDeque` for breadth-first traversal. Each file is parsed
+with `ast::parser::parse()`, collecting ASTs and import metadata
+(aliases, canonical IDs). Deduplicates by `canonical_id` — two
+different relative paths resolving to the same file are loaded once.
+Detects namespace clashes (duplicate aliases, import vs require
+conflicts) during this pass.
 
-"A imports B, B imports A" just means both are in the queue — each is
-loaded once, the linker resolves cross-references. No recursion, no
-stack, no cycles.
+**Pass 2: `lower_parsed_sources()`** — Lower each parsed file with
+its `merged_imports` populated from `as _` imports. Builds a
+`file_functions` index from all ASTs, then for each file constructs
+a `merged_imports: HashMap<Identifier, Identifier>` mapping function
+names to their canonical namespace. Calls `ir::lower_with_imports()`
+with this map so the lowerer can resolve unqualified calls to
+`as _`-imported functions.
 
 ```
-Queue processing:
+Pass 1 (BFS parse):
   main.rill → imports "utils", "proto"
   queue: [utils, proto]
   
@@ -187,8 +192,17 @@ Queue processing:
   
   proto.rill → imports "../common"
   common already queued (same canonical_id, skip)
-  queue: []  → done
+  queue: []  → all parsed
+
+Pass 2 (lower each file):
+  For each parsed file, build merged_imports from its `as _` imports,
+  then lower with the merged_imports map.
 ```
+
+Finally, `merge_ir()` combines all lowered IR programs into a single
+`IrProgram`, rewriting call instructions to use canonical namespaces
+(e.g., `helpers::foo()` → `utils::foo()` if the file was loaded as
+`utils` by the SourceLoader).
 
 Bytecode has no `import` statements — all imports were resolved at
 `save()` time. Loading bytecode just deserialises IR fragments.
@@ -205,6 +219,9 @@ Bytecode has no `import` statements — all imports were resolved at
   No imports inside function bodies.
 - **Re-imports** — A and B both import "common". Loaded once (deduplicated by
   canonical_id). Each file gets its own namespace binding independently.
+- **Visibility enforcement** — The two-pass design provides structural
+  enforcement: each file's `merged_imports` is built independently from its
+  own import declarations, so transitive imports are never visible.
 
 ### Namespace Resolution
 
@@ -239,8 +256,8 @@ syntax.
 This means: if A imports B, and B imports C, A cannot call C's functions.
 Each file's imports are private.
 
-Implementation: track which functions came from which import. During
-lowering, the scope only includes the current file's imports + root scope.
+The two-pass design enforces this structurally: each file's
+`merged_imports` is built from its own import declarations only.
 
 ## Diagnostics
 
@@ -259,20 +276,21 @@ error[E100]: undefined variable `foo`
 
 The filename comes from `span.context` (the `Rc<str>`).
 
-### New Error Codes
+### Error Codes
 
-- `E501_CircularImport` — "circular import: A imports B imports A"
-- `E502_ImportNotFound` — "source file not found: utils.rill"
-- `E503_DuplicateNamespace` — "namespace 'utils' already defined (import vs require)"
+Module-related errors use existing diagnostic codes:
+
+- `E400_DuplicateDefinition` — duplicate import namespace alias, import
+  vs require namespace clash, or duplicate function name across files
+- `E501_MissingEntryPoint` — required entry point function not found
+- `E502_CyclicDependency` — cyclic dependency detected during import resolution
 
 ### Source Text for Caret Display
 
-Diagnostics need the source text to show the line with the caret. With
-multi-file, the diagnostics system needs a map from filename → source text.
-This can be:
-- Passed alongside compilation results
-- Stored in a `SourceMap` that accumulates during compilation
-- Threaded through the `Diagnostics` struct itself
+Diagnostics need the source text to show the line with the caret. The
+`Diagnostics` struct contains a `SourceMap` that accumulates source text
+during compilation, keyed by `canonical_id`. The `render()` method looks
+up the relevant source text via the diagnostic's `source_id` field.
 
 ## Standard Prelude (embedder convention, not a language feature)
 
@@ -282,9 +300,9 @@ can provide via the import system:
 
 ```rill
 // prelude.rill — written once, imported by scripts that need it
-fn is_defined(x) { match x { _ => { true } } }
-fn is_uint(x) { match x { UInt _ => { true }, _ => { false } } }
-fn default(x, fallback) { if is_defined(x) { x } else { fallback } }
+fn is_defined(x) { if let _ = x { true } else { false } }
+fn is_uint(x) { match x { UInt(_) => true, _ => false } }
+fn default(value, fallback) { if let v = value { v } else { fallback } }
 ```
 
 ```rill
@@ -320,19 +338,21 @@ gymnastics.
 3. `SourceLoader` trait + `FileLoader` + `MemoryLoader` implementations
 4. `Compiler` builder: `new(&loader)`, `add_extern()`, `add()`, `add_source()`, `build()`
    - Single loader per Compiler — guarantees canonical_id consistency
-   - BFS import queue with canonical_id deduplication
+   - Two-pass architecture: `parse_source_tree()` + `lower_parsed_sources()`
    - Call-site rewriting: import alias → canonical namespace
    - Imported functions prefixed with canonical namespace in merged IR
 5. Duplicate namespace alias detection, import-not-found errors
-
 6. `import "x" as _` (root merge) — two-pass parse/lower, `merged_imports` in lowerer
+7. Multi-file diagnostic rendering: `render()`, `format_location()`, `render_all()`
+   with `file:line:col` format and source context with caret display
 
 ### Remaining (Phase 2b)
 
-7. Multi-file diagnostic rendering with `file:line:col` format
 8. Linker builder (bytecode + prelude template pattern)
 9. Entry-point-driven DCE
 
 Note: per-file visibility enforcement is not needed — the grammar only allows
 single-level `namespace::func()`, so there's no syntax to reach through
-another file's imports.
+another file's imports. The two-pass design provides the structural guarantee:
+each file's `merged_imports` is built independently from its own import
+declarations.

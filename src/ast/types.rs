@@ -116,7 +116,7 @@ pub struct Constant {
 /// Source file import: `import "path/to/file.rill" [as alias];`
 ///
 /// Loads a .rill source file. Namespace defaults to filename stem.
-/// `as _` merges functions into the root scope (not yet supported).
+/// `as _` merges functions into the root scope.
 ///
 /// Import resolution is handled by the Compiler builder, which loads and
 /// parses imported files via the SourceLoader, then merges their IR.

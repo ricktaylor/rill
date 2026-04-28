@@ -531,8 +531,6 @@ impl<'a> Compiler<'a> {
     ///    E.g., if file A has `import "utils.rill" as helpers`, calls to `helpers::foo()`
     ///    are rewritten to `utils::foo()` (the canonical namespace from the loader).
     ///
-    /// Note: `import "x" as _` (root merge) is not yet supported for imports.
-    /// Use explicit namespace aliases or `require ns as _` for externs.
     fn merge_ir(&self, diagnostics: &mut Diagnostics) -> ir::IrProgram {
         use std::collections::HashMap;
 
@@ -556,7 +554,7 @@ impl<'a> Compiler<'a> {
                         .unwrap_or_else(|| "unknown".to_string());
                     alias_to_canonical.insert(alias_name.clone(), canonical_ns);
                 }
-                // `as _` (None) is not yet supported for imports — ignored here.
+                // `as _` imports are handled in lower_parsed_sources() via merged_imports.
             }
 
             // Clone and rewrite call instructions to use canonical namespaces
