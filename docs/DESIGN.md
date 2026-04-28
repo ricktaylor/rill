@@ -154,7 +154,8 @@ program contains resolved closures; only extern symbols require the host.
 | `src/ir/program.rs` | Program-level lowering (functions, imports) |
 | `src/ir/const_eval.rs` | Compile-time constant evaluation for intrinsics |
 | `src/ir/constant.rs` | Constant binding handling |
-| `src/ssa/promote.rs` | SSA promotion (mem2reg: Assign/Read → VarId + Phi) |
+| `src/ssa/promote.rs` | SSA promotion: Cytron phi placement + dominator-tree renaming |
+| `src/ssa/domtree.rs` | Dominator tree (Cooper-Harvey-Kennedy 2001) |
 | `src/opt/` | Optimization passes (see Optimization Pipeline) |
 | `src/compile/mod.rs` | IR-to-closure compilation, CompiledProgram, Step, Action |
 | `src/compile/exec.rs` | Instruction compilation to closures (intrinsics, calls, refs) |

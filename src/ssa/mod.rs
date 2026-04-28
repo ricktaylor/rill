@@ -1,30 +1,36 @@
-//! SSA Construction via mem2reg (Braun et al. 2013)
+//! SSA Construction via Cytron et al. (1991) with Cooper-Harvey-Kennedy
+//! dominator tree.
 //!
 //! Converts pre-SSA IR (containing `Assign` and `Read` instructions) into
 //! proper SSA form with Phi nodes at control flow merge points.
 //!
 //! # Algorithm
 //!
-//! Implements "Simple and Efficient Construction of Static Single Assignment
-//! Form" (Braun, Buchwald, Hack, Leißa, Mallon, Zwinkau — CC 2013).
+//! Two-phase Cytron approach backed by a dominator tree:
 //!
-//! The algorithm constructs SSA form on-the-fly by recursively querying
-//! predecessor blocks for variable definitions:
+//! 1. **Phi placement:** Compute the iterated dominance frontier (IDF) for
+//!    each variable's definition sites. Insert placeholder Phi nodes at
+//!    each IDF block.
 //!
-//! - **Single predecessor:** inherit the value directly
-//! - **Multiple predecessors:** insert a Phi node, fill operands recursively
-//! - **No predecessors (entry block):** variable is a parameter or undefined
+//! 2. **Variable renaming:** Walk the dominator tree in pre-order, maintaining
+//!    a definition stack per variable. Reads resolve to the top of the stack;
+//!    assignments and phis push new definitions.
+//!
+//! The dominator tree is computed using the Cooper-Harvey-Kennedy (2001)
+//! iterative algorithm and is available for reuse by optimizer passes
+//! (LICM, GVN, bounds checking).
 //!
 //! Trivial Phi nodes (all operands are the same value, or self-referential)
-//! are eliminated during construction. Remaining redundancies are handled
+//! are eliminated after renaming. Remaining redundancies are handled
 //! by the existing copy propagation and DCE optimizer passes.
 //!
 //! # Usage
 //!
 //! After the lowerer emits `Assign`/`Read` instructions, call
-//! `mem2reg::promote(&mut function)` to convert to SSA form. This replaces
+//! `promote(&mut function)` to convert to SSA form. This replaces
 //! all `Assign`/`Read` instructions with proper SSA VarIds and Phi nodes.
 
+pub(crate) mod domtree;
 mod promote;
 
 pub use promote::promote;

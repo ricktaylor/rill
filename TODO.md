@@ -190,15 +190,15 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
 ### P1 — SSA Construction — Done
 
 - [x] **LLVM-style lowering + mem2reg split** — lowerer emits Assign/Read,
-      `ssa/promote.rs` implements Braun et al. (2013) mem2reg. Old ad-hoc
-      phi insertion (snapshot_scope, merge_branch_bindings, etc.) removed.
+      `ssa/promote.rs` converts to SSA. Old ad-hoc phi insertion removed.
   - Phase 1: Pre-SSA IR — **done**
     - [x] `Instruction::Assign { slot, value }` and `Instruction::Read { slot, dest }`
     - [x] Lowerer emits Assign/Read instead of managing VarIds and scopes
     - [x] Old manual phi insertion removed
-  - Phase 2: mem2reg pass (Braun et al. 2013) — **done** (`src/ssa/promote.rs`)
-    - [x] `read_variable(slot, block)` — recursive predecessor lookup
-    - [x] `write_variable` via `current_def` tracking
+  - Phase 2: mem2reg pass — **done** (`src/ssa/promote.rs`)
+    - [x] Cytron et al. (1991): IDF-based phi placement + dominator-tree renaming
+    - [x] Cooper-Harvey-Kennedy (2001) dominator tree (`src/ssa/domtree.rs`)
+    - [x] `DominatorTree` reusable analysis: `idom()`, `dominates()`, `dominance_frontier()`, `children()`
     - [x] Phi insertion at control flow merge points
     - [x] Trivial phi elimination
   - Phase 3: Validate — **done**
@@ -229,14 +229,15 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
       already type-specialized, so the inlined body folds further via
       const fold + coercion elision. Decision: inline if callee is pure,
       small (< ~10 instructions), and called with known-type args.
-- [ ] **Dominator tree + Cytron SSA** — when LICM or GVN is needed, build a
-      dominator tree and switch from Braun et al. to Cytron et al. for SSA
-      construction. The tree enables three things at once:
+- [x] **Dominator tree + Cytron SSA** — replaced Braun et al. (2013) with
+      Cytron et al. (1991) SSA construction. Cooper-Harvey-Kennedy (2001)
+      dominator tree in `src/ssa/domtree.rs`, IDF-based phi placement +
+      dominator-tree renaming in `src/ssa/promote.rs`. The tree is a reusable
+      analysis (`DominatorTree::build()`) available for future passes:
       1. LICM (lift loop-invariant code to pre-header)
       2. GVN (more powerful CSE across blocks)
       3. Array bounds checking (recognise `i < len(arr)` guards dominating
          `arr[i]` and mark Index results as defined)
-      Braun has no advantage once the tree exists. Single migration, three wins.
       Note: for-loop element bindings currently use explicit narrowing copies
       (`emit_copy(raw, TypeSet::defined())` in `lower_for_idx`, `emit_narrowing`
       in `lower_for_seq`) because the lowerer knows `i < len` holds. With
@@ -497,7 +498,8 @@ src/
     const_eval.rs     — Compile-time constant evaluation (intrinsic + extern)
   ssa/
     mod.rs            — SSA module entry
-    promote.rs        — Braun et al. (2013) mem2reg pass (Assign/Read → Phi/VarId)
+    domtree.rs        — Dominator tree (Cooper-Harvey-Kennedy 2001)
+    promote.rs        — Cytron et al. (1991) SSA construction (IDF phi placement + dom-tree renaming)
   opt/
     mod.rs            — Optimizer pass runner (Phase 1 fixpoint + Phase 2 type-informed)
     const_fold.rs     — Constant folding

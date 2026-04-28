@@ -1,13 +1,15 @@
 //! mem2reg: Promote Assign/Read instructions to SSA form.
 //!
-//! Implements the Braun et al. (2013) algorithm for on-demand SSA construction.
+//! Implements Cytron et al. (1991) SSA construction using a dominator tree
+//! (Cooper-Harvey-Kennedy 2001). Phi nodes are placed at iterated dominance
+//! frontier blocks, then variables are renamed via a dominator-tree pre-order
+//! walk.
 
 use crate::ast;
 use crate::ir::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 
-/// Phi insertion map: block → [(dest_var, [(pred_block, pred_var)])]
-type PhiMap = HashMap<BlockId, Vec<(VarId, Vec<(BlockId, VarId)>)>>;
+use super::domtree::DominatorTree;
 
 /// Promote all `Assign`/`Read` instructions in a function to SSA form.
 ///
@@ -17,90 +19,38 @@ type PhiMap = HashMap<BlockId, Vec<(VarId, Vec<(BlockId, VarId)>)>>;
 /// - Phi nodes are inserted at control flow merge points
 /// - The function is in proper SSA form
 pub fn promote(function: &mut Function) {
-    let mut ctx = PromoteCtx::new(function);
-    ctx.run_on_blocks(&function.blocks);
+    let tree = DominatorTree::build(function);
+    let mut ctx = PromoteCtx::new(function, &tree);
+    ctx.place_phis(function, &tree);
+    ctx.rename(function, &tree);
+    ctx.eliminate_trivial_phis();
 
     ctx.apply(function);
-}
-
-// ============================================================================
-// Predecessor map
-// ============================================================================
-
-/// Build a map from each block to its predecessor blocks.
-///
-/// Only includes reachable blocks (those reachable from the entry block via
-/// forward traversal). Dead blocks — created after return/break/continue
-/// statements — have no predecessors and would poison phi construction
-/// with spurious undefined values if included.
-fn build_predecessors(function: &Function) -> HashMap<BlockId, Vec<BlockId>> {
-    // First: find all reachable blocks via BFS from entry
-    let block_map: HashMap<BlockId, &BasicBlock> =
-        function.blocks.iter().map(|b| (b.id, b)).collect();
-    let mut reachable = std::collections::HashSet::new();
-    let mut queue = std::collections::VecDeque::new();
-    queue.push_back(function.entry_block);
-    while let Some(bid) = queue.pop_front() {
-        if !reachable.insert(bid) {
-            continue;
-        }
-        if let Some(block) = block_map.get(&bid) {
-            for succ in block.terminator.successors() {
-                queue.push_back(succ);
-            }
-        }
-    }
-
-    // Build predecessor map using only reachable blocks
-    let mut preds: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
-    for &bid in &reachable {
-        preds.entry(bid).or_default();
-    }
-    for &bid in &reachable {
-        if let Some(block) = block_map.get(&bid) {
-            for succ in block.terminator.successors() {
-                if reachable.contains(&succ) {
-                    preds.entry(succ).or_default().push(bid);
-                }
-            }
-        }
-    }
-
-    preds
 }
 
 // ============================================================================
 // Promote context
 // ============================================================================
 
+/// Phi insertion map: block → [(dest_var, slot, [(pred_block, pred_var)])]
+///
+/// During phi placement, we insert placeholder phis with the slot they
+/// correspond to. During renaming, the source operands are filled in.
+struct PlacedPhi {
+    dest: VarId,
+    slot: u32,
+    sources: Vec<(BlockId, VarId)>,
+}
+
 struct PromoteCtx {
-    /// Predecessor map: block → [predecessor blocks]
-    predecessors: HashMap<BlockId, Vec<BlockId>>,
-
-    /// Block-exit definitions from Pass 1 (immutable during Pass 2).
-    /// Records the value of each slot at the END of each block (last Assign).
-    /// Used for cross-block lookups during phi construction.
-    block_exit_def: HashMap<(u32, BlockId), VarId>,
-
-    /// Resolved definitions from Pass 2 (memoization).
-    /// Caches the result of read_variable lookups so the same (slot, block)
-    /// pair isn't resolved twice. Written during Pass 2, does NOT overwrite
-    /// block_exit_def.
-    resolved_def: HashMap<(u32, BlockId), VarId>,
-
-    /// Phi nodes to insert at the start of blocks.
-    /// `block_id → [(dest_var, [(pred_block, pred_var)])]`
-    inserted_phis: PhiMap,
+    /// Placed phis per block (filled during place_phis, operands set during rename).
+    placed_phis: HashMap<BlockId, Vec<PlacedPhi>>,
 
     /// Replacement map: for each `Read` instruction's dest VarId,
     /// the resolved SSA VarId to use instead.
     read_replacements: HashMap<VarId, VarId>,
 
     /// Substitution map for trivially eliminated phis.
-    /// When a phi is trivial (all operands are the same value), its VarId
-    /// is replaced by the simplified value. But the VarId may already be
-    /// referenced in other phis' source lists. This map tracks those
-    /// substitutions so they can be applied after all phis are constructed.
     trivial_subst: HashMap<VarId, VarId>,
 
     /// Next VarId for fresh phi variables.
@@ -108,15 +58,11 @@ struct PromoteCtx {
 }
 
 impl PromoteCtx {
-    fn new(function: &Function) -> Self {
-        // Find the highest existing VarId so new ones don't collide
+    fn new(function: &Function, _tree: &DominatorTree) -> Self {
         let max_var = function.locals.iter().map(|v| v.id.0).max().unwrap_or(0);
 
         PromoteCtx {
-            predecessors: build_predecessors(function),
-            block_exit_def: HashMap::new(),
-            resolved_def: HashMap::new(),
-            inserted_phis: HashMap::new(),
+            placed_phis: HashMap::new(),
             read_replacements: HashMap::new(),
             trivial_subst: HashMap::new(),
             next_var_id: max_var + 1,
@@ -129,287 +75,273 @@ impl PromoteCtx {
         id
     }
 
-    // ── Braun et al. core ────────────────────────────────────────────
+    // ── Phase A: Phi Placement ──────────────────────────────────────────
 
-    /// Look up the value for `slot` in `block`, checking block-exit
-    /// definitions first, then resolved cache.
-    ///
-    /// block_exit_def takes precedence because it records the value AFTER
-    /// all instructions in the block (the exit value). resolved_def records
-    /// the entry value (phi placeholder or memoized lookup). Successors
-    /// need the exit value — if the block assigns the slot, that assignment
-    /// is what flows out, not the entry phi.
-    fn lookup_def(&self, slot: u32, block: BlockId) -> Option<VarId> {
-        self.block_exit_def
-            .get(&(slot, block))
-            .or_else(|| self.resolved_def.get(&(slot, block)))
-            .copied()
-    }
+    /// Place phi nodes at iterated dominance frontier blocks for each slot.
+    fn place_phis(&mut self, function: &Function, tree: &DominatorTree) {
+        let df = tree.dominance_frontier();
 
-    /// Memoize a resolved value (Pass 2 only — does NOT touch block_exit_def).
-    fn memoize(&mut self, slot: u32, block: BlockId, value: VarId) {
-        self.resolved_def.insert((slot, block), value);
-    }
+        // Collect def sites: which blocks contain an Assign for each slot
+        let mut def_sites: HashMap<u32, HashSet<BlockId>> = HashMap::new();
+        // Also collect which slots exist at all
+        let mut all_slots: HashSet<u32> = HashSet::new();
 
-    /// Look up the current SSA value for `slot` in `block`.
-    ///
-    /// If defined locally (resolved cache or block-exit), returns it directly.
-    /// Otherwise, recursively queries predecessors, inserting Phi nodes at
-    /// merge points.
-    fn read_variable(&mut self, slot: u32, block: BlockId) -> VarId {
-        if let Some(val) = self.lookup_def(slot, block) {
-            return val;
-        }
-        self.read_variable_recursive(slot, block)
-    }
-
-    /// Predecessor lookup (the core of Braun et al.).
-    ///
-    /// Walks single-predecessor chains iteratively to avoid stack overflow
-    /// on deep CFGs (common in if-else-if chains). Only recurses at merge
-    /// points (multiple predecessors), where depth is bounded by the number
-    /// of merge points.
-    fn read_variable_recursive(&mut self, slot: u32, block: BlockId) -> VarId {
-        // Walk single-predecessor chains iteratively
-        let mut current = block;
-        loop {
-            let preds = self.predecessors.get(&current).cloned().unwrap_or_default();
-
-            if preds.is_empty() {
-                // Entry block — variable is undefined (read before assign).
-                let undef = self.fresh_var();
-                self.memoize(slot, current, undef);
-                return self.memoize_chain(slot, block, current, undef);
-            } else if preds.len() == 1 {
-                // Single predecessor: check if it has a definition
-                if let Some(val) = self.lookup_def(slot, preds[0]) {
-                    self.memoize(slot, current, val);
-                    return self.memoize_chain(slot, block, current, val);
-                }
-                // Keep walking (iterative, not recursive)
-                current = preds[0];
-            } else {
-                // Multiple predecessors: insert a Phi node.
-                //
-                // Write a placeholder BEFORE recursing to break cycles.
-                let phi_var = self.fresh_var();
-                self.memoize(slot, current, phi_var);
-
-                // Resolve each predecessor's value (recurses, but depth is
-                // bounded by merge point count, not block count).
-                let sources: Vec<(BlockId, VarId)> = preds
-                    .iter()
-                    .map(|&pred| (pred, self.read_variable(slot, pred)))
-                    .collect();
-
-                // Try to simplify trivial phis
-                let simplified = try_remove_trivial_phi(phi_var, &sources);
-
-                let val = if simplified != phi_var {
-                    self.memoize(slot, current, simplified);
-                    self.trivial_subst.insert(phi_var, simplified);
-                    simplified
-                } else {
-                    self.inserted_phis
-                        .entry(current)
-                        .or_default()
-                        .push((phi_var, sources));
-                    phi_var
-                };
-
-                return self.memoize_chain(slot, block, current, val);
-            }
-        }
-    }
-
-    /// Memoize a value along the single-predecessor chain from `start` to `end`.
-    fn memoize_chain(&mut self, slot: u32, start: BlockId, end: BlockId, val: VarId) -> VarId {
-        if start != end {
-            let mut current = start;
-            let mut safety = self.predecessors.len();
-            while current != end && safety > 0 {
-                self.memoize(slot, current, val);
-                let preds = self.predecessors.get(&current).cloned().unwrap_or_default();
-                if preds.len() == 1 {
-                    current = preds[0];
-                } else {
-                    break;
-                }
-                safety -= 1;
-            }
-        }
-        val
-    }
-
-    // ── Main pass ────────────────────────────────────────────────────
-
-    /// Resolve a Read by looking at predecessors, skipping the current block.
-    ///
-    /// Used when a Read appears before any Assign in the same block. We can't
-    /// use `read_variable` because `current_def` has the block-exit value
-    /// (from Pass 1), which would incorrectly return a later Assign's value.
-    fn read_from_predecessors(&mut self, slot: u32, block: BlockId) -> VarId {
-        let preds = self.predecessors.get(&block).cloned().unwrap_or_default();
-
-        if preds.is_empty() {
-            self.fresh_var()
-        } else if preds.len() == 1 {
-            self.read_variable(slot, preds[0])
-        } else {
-            // Multiple predecessors: insert phi.
-            // Write placeholder to resolved_def (not block_exit_def) to break
-            // cycles without corrupting Pass 1 data.
-            let phi_var = self.fresh_var();
-            self.memoize(slot, block, phi_var);
-
-            let sources: Vec<(BlockId, VarId)> = preds
-                .iter()
-                .map(|&pred| (pred, self.read_variable(slot, pred)))
-                .collect();
-
-            let simplified = try_remove_trivial_phi(phi_var, &sources);
-            if simplified != phi_var {
-                self.memoize(slot, block, simplified);
-                self.trivial_subst.insert(phi_var, simplified);
-                simplified
-            } else {
-                self.inserted_phis
-                    .entry(block)
-                    .or_default()
-                    .push((phi_var, sources));
-                phi_var
-            }
-        }
-    }
-
-    /// Process all blocks from the function, resolving Assign/Read.
-    ///
-    /// Two-phase approach:
-    /// - **Pass 1**: Record the block-exit value for each slot (last Assign per
-    ///   block). This is stored in `current_def` and is immutable during Pass 2.
-    ///   It ensures back-edge predecessors have definitions available for phi
-    ///   construction.
-    /// - **Pass 2**: Process instructions in order within each block. Uses a
-    ///   per-block `local_def` to track intra-block state. Reads before any
-    ///   same-block Assign use `read_from_predecessors` (skips the block-exit
-    ///   value). Reads after a same-block Assign use the local value.
-    ///
-    /// This separation ensures:
-    /// - Back-edges work: the body's Assign is in `current_def`, so the header
-    ///   phi picks up the correct post-body value.
-    /// - Intra-block ordering works: a Read before an Assign sees the incoming
-    ///   value, not the later assigned value.
-    fn run_on_blocks(&mut self, blocks: &[BasicBlock]) {
-        // Pass 1: record block-exit definitions (last Assign per slot per block)
-        // into block_exit_def. This map is immutable during Pass 2.
-        for block in blocks {
-            for spanned_inst in &block.instructions {
-                if let Instruction::Assign { slot, value } = &spanned_inst.node {
-                    self.block_exit_def.insert((*slot, block.id), *value);
+        for block in &function.blocks {
+            for inst in &block.instructions {
+                if let Instruction::Assign { slot, .. } = &inst.node {
+                    def_sites.entry(*slot).or_default().insert(block.id);
+                    all_slots.insert(*slot);
                 }
             }
         }
 
-        // Pass 2: resolve Reads using per-block local state.
-        for block in blocks {
-            // local_def tracks Assigns seen so far in THIS block (instruction order).
-            let mut local_def: HashMap<u32, VarId> = HashMap::new();
+        // For each slot, compute iterated dominance frontier and place phis
+        for slot in all_slots {
+            let sites = match def_sites.get(&slot) {
+                Some(s) => s,
+                None => continue,
+            };
 
-            for spanned_inst in &block.instructions {
-                match &spanned_inst.node {
-                    Instruction::Assign { slot, value } => {
-                        local_def.insert(*slot, *value);
+            // IDF computation: worklist algorithm
+            let mut idf: HashSet<BlockId> = HashSet::new();
+            let mut worklist: VecDeque<BlockId> = sites.iter().copied().collect();
+            let mut processed: HashSet<BlockId> = HashSet::new();
+
+            while let Some(block) = worklist.pop_front() {
+                if let Some(frontier) = df.get(&block) {
+                    for &df_block in frontier {
+                        if idf.insert(df_block) && processed.insert(df_block) {
+                            worklist.push_back(df_block);
+                        }
                     }
+                }
+            }
+
+            // Place a phi at each IDF block
+            for idf_block in idf {
+                let dest = self.fresh_var();
+                let preds = tree
+                    .predecessors()
+                    .get(&idf_block)
+                    .cloned()
+                    .unwrap_or_default();
+                let sources = preds.iter().map(|&p| (p, VarId(u32::MAX))).collect();
+                self.placed_phis
+                    .entry(idf_block)
+                    .or_default()
+                    .push(PlacedPhi {
+                        dest,
+                        slot,
+                        sources,
+                    });
+            }
+        }
+    }
+
+    // ── Phase B: Variable Renaming ──────────────────────────────────────
+
+    /// Rename variables by walking the dominator tree in pre-order.
+    fn rename(&mut self, function: &Function, tree: &DominatorTree) {
+        let block_map: HashMap<BlockId, &BasicBlock> =
+            function.blocks.iter().map(|b| (b.id, b)).collect();
+
+        // Per-slot definition stack: top is the current reaching definition
+        let mut stacks: HashMap<u32, Vec<VarId>> = HashMap::new();
+
+        self.rename_block(tree.entry(), tree, &block_map, &mut stacks);
+    }
+
+    fn rename_block(
+        &mut self,
+        block: BlockId,
+        tree: &DominatorTree,
+        block_map: &HashMap<BlockId, &BasicBlock>,
+        stacks: &mut HashMap<u32, Vec<VarId>>,
+    ) {
+        // Track how many definitions we push so we can pop them when leaving
+        let mut push_count: HashMap<u32, usize> = HashMap::new();
+
+        // 1. Process phis placed at this block — push their dests
+        if let Some(phis) = self.placed_phis.get(&block) {
+            for phi in phis {
+                stacks.entry(phi.slot).or_default().push(phi.dest);
+                *push_count.entry(phi.slot).or_default() += 1;
+            }
+        }
+
+        // 2. Process instructions in this block
+        if let Some(ir_block) = block_map.get(&block) {
+            for inst in &ir_block.instructions {
+                match &inst.node {
                     Instruction::Read { slot, dest } => {
-                        let resolved = if let Some(&val) = local_def.get(slot) {
-                            // A same-block Assign came before this Read — use it.
-                            val
-                        } else {
-                            // No same-block Assign yet — get the incoming value
-                            // from predecessors (NOT the block-exit value).
-                            self.read_from_predecessors(*slot, block.id)
-                        };
-                        self.read_replacements.insert(*dest, resolved);
+                        let current = stacks.get(slot).and_then(|s| s.last()).copied();
+                        match current {
+                            Some(val) => {
+                                self.read_replacements.insert(*dest, val);
+                            }
+                            None => {
+                                // Read before any assignment — undefined
+                                let undef = self.fresh_var();
+                                self.read_replacements.insert(*dest, undef);
+                            }
+                        }
+                    }
+                    Instruction::Assign { slot, value } => {
+                        stacks.entry(*slot).or_default().push(*value);
+                        *push_count.entry(*slot).or_default() += 1;
                     }
                     _ => {}
                 }
             }
         }
 
-        // Pass 3: Apply trivial phi substitutions.
-        //
-        // When a phi is trivially eliminated (all operands are the same value),
-        // its VarId may already be referenced in other phis' source lists
-        // (because those phis were constructed before the trivial phi was
-        // simplified). Replace eliminated VarIds with their simplified values.
-        if !self.trivial_subst.is_empty() {
-            // Resolve chains: if a → b and b → c, then a → c
-            let resolved_subst: HashMap<VarId, VarId> = self
-                .trivial_subst
-                .keys()
-                .map(|&k| {
-                    let mut v = k;
-                    for _ in 0..64 {
-                        match self.trivial_subst.get(&v) {
-                            Some(&next) if next != v => v = next,
-                            _ => break,
-                        }
-                    }
-                    (k, v)
-                })
-                .collect();
+        // 3. Fill phi operands in successor blocks.
+        //    Two sub-steps to satisfy the borrow checker: first collect
+        //    slots that need values (immutable borrow of placed_phis),
+        //    then resolve values (may need fresh_var for undefined), then
+        //    write back (mutable borrow of placed_phis).
+        if let Some(ir_block) = block_map.get(&block) {
+            for succ in ir_block.terminator.successors() {
+                // Collect the slots for phis in this successor
+                let slots: Vec<u32> = self
+                    .placed_phis
+                    .get(&succ)
+                    .map(|phis| phis.iter().map(|p| p.slot).collect())
+                    .unwrap_or_default();
 
-            for phis in self.inserted_phis.values_mut() {
-                for (_, sources) in phis {
-                    for (_, var) in sources.iter_mut() {
-                        if let Some(&replacement) = resolved_subst.get(var) {
-                            *var = replacement;
+                if slots.is_empty() {
+                    continue;
+                }
+
+                // Resolve values (may allocate fresh vars for undefined)
+                let vals: Vec<VarId> = slots
+                    .iter()
+                    .map(|slot| {
+                        stacks
+                            .get(slot)
+                            .and_then(|s| s.last())
+                            .copied()
+                            .unwrap_or_else(|| self.fresh_var())
+                    })
+                    .collect();
+
+                // Write values into phi sources
+                let phis = self.placed_phis.get_mut(&succ).unwrap();
+                for (phi, val) in phis.iter_mut().zip(vals) {
+                    for (pred, var) in &mut phi.sources {
+                        if *pred == block {
+                            *var = val;
                         }
                     }
                 }
             }
+        }
 
-            // Also fix read_replacements that reference eliminated phis
-            for val in self.read_replacements.values_mut() {
-                if let Some(&replacement) = resolved_subst.get(val) {
-                    *val = replacement;
+        // 4. Recurse into dominated children
+        let children = tree.children(block);
+        for child in children {
+            self.rename_block(child, tree, block_map, stacks);
+        }
+
+        // 5. Pop definitions pushed in this block
+        for (slot, count) in push_count {
+            if let Some(stack) = stacks.get_mut(&slot) {
+                for _ in 0..count {
+                    stack.pop();
                 }
             }
         }
     }
 
+    // ── Phase C: Trivial Phi Elimination ────────────────────────────────
+
+    fn eliminate_trivial_phis(&mut self) {
+        // First pass: identify trivial phis
+        for phis in self.placed_phis.values() {
+            for phi in phis {
+                let simplified = try_remove_trivial_phi(phi.dest, &phi.sources);
+                if simplified != phi.dest {
+                    self.trivial_subst.insert(phi.dest, simplified);
+                }
+            }
+        }
+
+        if self.trivial_subst.is_empty() {
+            return;
+        }
+
+        // Resolve chains: if a → b and b → c, then a → c
+        let resolved_subst: HashMap<VarId, VarId> = self
+            .trivial_subst
+            .keys()
+            .map(|&k| {
+                let mut v = k;
+                for _ in 0..64 {
+                    match self.trivial_subst.get(&v) {
+                        Some(&next) if next != v => v = next,
+                        _ => break,
+                    }
+                }
+                (k, v)
+            })
+            .collect();
+
+        // Apply substitutions to phi sources
+        for phis in self.placed_phis.values_mut() {
+            for phi in phis.iter_mut() {
+                for (_, var) in &mut phi.sources {
+                    if let Some(&replacement) = resolved_subst.get(var) {
+                        *var = replacement;
+                    }
+                }
+            }
+        }
+
+        // Also fix read_replacements that reference eliminated phis
+        for val in self.read_replacements.values_mut() {
+            if let Some(&replacement) = resolved_subst.get(val) {
+                *val = replacement;
+            }
+        }
+
+        self.trivial_subst = resolved_subst;
+    }
+
+    // ── Apply ───────────────────────────────────────────────────────────
+
     /// Apply the computed SSA form back to the function.
     fn apply(self, function: &mut Function) {
         // 1. Insert Phi nodes at the start of blocks that need them.
         for block in &mut function.blocks {
-            if let Some(phis) = self.inserted_phis.get(&block.id) {
-                let mut phi_instructions: Vec<SpannedInst> = phis
-                    .iter()
-                    .map(|(dest, sources)| {
-                        ast::Spanned::new(
-                            Instruction::Phi {
-                                dest: *dest,
-                                sources: sources.clone(),
-                            },
-                            ast::Span::default(),
-                        )
-                    })
-                    .collect();
-                // Prepend phis before existing instructions
-                phi_instructions.append(&mut block.instructions);
-                block.instructions = phi_instructions;
+            if let Some(phis) = self.placed_phis.get(&block.id) {
+                let mut phi_instructions: Vec<SpannedInst> = Vec::new();
+                for phi in phis {
+                    // Skip trivially eliminated phis
+                    if self.trivial_subst.contains_key(&phi.dest) {
+                        continue;
+                    }
+                    phi_instructions.push(ast::Spanned::new(
+                        Instruction::Phi {
+                            dest: phi.dest,
+                            sources: phi.sources.clone(),
+                        },
+                        ast::Span::default(),
+                    ));
+                }
+                if !phi_instructions.is_empty() {
+                    phi_instructions.append(&mut block.instructions);
+                    block.instructions = phi_instructions;
+                }
             }
         }
 
         // 2. Replace Read instructions with Copy, remove Assign instructions.
         for block in &mut function.blocks {
             block.instructions.retain_mut(|inst| match &inst.node {
-                Instruction::Assign { .. } => false, // Remove
+                Instruction::Assign { .. } => false,
                 Instruction::Read { dest, .. } => {
-                    // Replace with Copy to the resolved value
                     if let Some(&resolved) = self.read_replacements.get(dest) {
                         if resolved == *dest {
-                            // Self-copy: remove entirely
                             false
                         } else {
                             inst.node = Instruction::Copy {
@@ -419,20 +351,14 @@ impl PromoteCtx {
                             true
                         }
                     } else {
-                        // No resolution found — shouldn't happen in well-formed IR
                         false
                     }
                 }
-                _ => true, // Keep all other instructions
+                _ => true,
             });
         }
 
         // 3. Register new variables in the function's locals.
-        //
-        // The compiler maps VarId(n) → stack slot (1 + n), so ALL VarIds up to
-        // next_var_id must have entries in locals to avoid out-of-bounds slot
-        // access. fresh_var() may create VarIds for trivially eliminated phis
-        // that aren't in inserted_phis — we must fill those gaps too.
         let existing_max = function
             .locals
             .iter()
@@ -441,10 +367,6 @@ impl PromoteCtx {
             .map(|m| m + 1)
             .unwrap_or(0);
         for id in existing_max..self.next_var_id {
-            // Phi vars and uninitialized reads get any() — type refinement narrows later.
-            // Uninitialized reads (entry block, no Assign) produce Undefined at runtime
-            // but we use any() here because phis at loop headers merge defined values
-            // and shouldn't be constrained to Undefined.
             function.locals.push(Var::new(
                 VarId(id),
                 ast::Identifier("_phi".to_string()),
@@ -466,16 +388,14 @@ fn try_remove_trivial_phi(phi_var: VarId, sources: &[(BlockId, VarId)]) -> VarId
     let mut same: Option<VarId> = None;
     for &(_, val) in sources {
         if val == phi_var {
-            continue; // Self-reference: skip
+            continue;
         }
         match same {
             None => same = Some(val),
-            Some(s) if s == val => continue, // Same as existing: skip
-            Some(_) => return phi_var,       // Different values: non-trivial
+            Some(s) if s == val => continue,
+            Some(_) => return phi_var,
         }
     }
-    // If all operands were self-references, the phi is unreachable/undefined.
-    // Otherwise, return the single value.
     same.unwrap_or(phi_var)
 }
 
@@ -818,13 +738,17 @@ mod tests {
 
         promote(&mut func);
 
-        // Read of SLOT_OUTER should resolve to v0 — no phi needed
+        // Read of SLOT_OUTER should resolve to v0 (outer unaffected by inner).
+        // Cytron may place a dead phi for SLOT_INNER at the merge — DCE removes it.
         let b3 = &func.blocks[3];
-        let has_phi = b3
-            .instructions
-            .iter()
-            .any(|i| matches!(i.node, Instruction::Phi { .. }));
-        assert!(!has_phi, "Outer slot should not be affected by inner slot");
+        let outer_phi = b3.instructions.iter().any(|i| match &i.node {
+            Instruction::Phi { sources, .. } => {
+                // A phi sourcing VarId(0) would mean it's for SLOT_OUTER
+                sources.iter().any(|(_, v)| *v == VarId(0))
+            }
+            _ => false,
+        });
+        assert!(!outer_phi, "Outer slot should not have a phi");
 
         let copy = b3
             .instructions

@@ -305,23 +305,43 @@ fn compile_function(func: &Function, link_map: &LinkMap) -> Result<CompiledFunct
     }
 
     // Second pass: resolve phis by inserting copies into predecessor blocks.
-    // Each phi source (pred_block, src_slot) → insert Copy(dest, src) before
-    // the terminator (last element) of the predecessor block.
-    for (dest_slot, _join_idx, sources) in pending_phis {
-        for (pred_block_idx, src_slot) in sources {
-            if src_slot != dest_slot {
-                let d = dest_slot;
-                let s = src_slot;
-                let block = &mut blocks[pred_block_idx];
-                let insert_pos = if block.is_empty() { 0 } else { block.len() - 1 };
-                block.insert(
-                    insert_pos,
-                    Box::new(move |vm: &mut VM, _prog| {
-                        vm.set_local(d, vm.local(s).clone());
-                        Ok(Action::Continue)
-                    }),
-                );
+    //
+    // Multiple phis at the same join block may insert copies into the same
+    // predecessor. These copies must behave as parallel assignments — all
+    // sources are read before any dest is written. We group copies by
+    // predecessor and emit a single closure that reads all sources into
+    // temporaries, then writes all dests.
+    {
+        // Group: pred_block_idx → [(dest_slot, src_slot)]
+        let mut copies_per_pred: std::collections::HashMap<usize, Vec<(usize, usize)>> =
+            std::collections::HashMap::new();
+
+        for (dest_slot, _join_idx, sources) in pending_phis {
+            for (pred_block_idx, src_slot) in sources {
+                if src_slot != dest_slot {
+                    copies_per_pred
+                        .entry(pred_block_idx)
+                        .or_default()
+                        .push((dest_slot, src_slot));
+                }
             }
+        }
+
+        for (pred_block_idx, copies) in copies_per_pred {
+            let block = &mut blocks[pred_block_idx];
+            let insert_pos = if block.is_empty() { 0 } else { block.len() - 1 };
+            block.insert(
+                insert_pos,
+                Box::new(move |vm: &mut VM, _prog| {
+                    // Read all sources first (parallel semantics)
+                    let vals: Vec<_> = copies.iter().map(|&(_, s)| vm.local(s).clone()).collect();
+                    // Then write all dests
+                    for (i, &(d, _)) in copies.iter().enumerate() {
+                        vm.set_local(d, vals[i].clone());
+                    }
+                    Ok(Action::Continue)
+                }),
+            );
         }
     }
 
