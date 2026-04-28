@@ -16,9 +16,10 @@ processing structured data without schema declarations.
 - **Semi-compiled execution**: Source → SSA IR → optimized closures. No bytecode interpreter.
 - **Type-specialized arithmetic**: Static analysis narrows types; the compiler emits direct
   `u64::checked_add` instead of runtime type dispatch when types are provably known.
-- **Duck-typed values**: Nine base types covering scalars (Bool, UInt, Int, Float),
-  strings (Text, Bytes), and collections (Array, Map, Sequence). No type annotations
-  in source code — types are inferred by the optimizer.
+- **Duck-typed values**: Nine user-visible base types covering scalars (Bool, UInt, Int, Float),
+  strings (Text, Bytes), and collections (Array, Map, Sequence), plus an internal Undefined
+  type used by the compiler for type analysis. No type annotations in source code — types
+  are inferred by the optimizer.
 - **Pattern matching**: Rich destructuring with type narrowing and reference binding.
 - **Safe embedding**: Resource limits (stack, heap), no undefined behavior, host-provided externs.
 - **Undefined propagation**: Failed operations produce undefined values that propagate silently —
@@ -65,8 +66,9 @@ Operations required by the language runtime to function. These are the
 and const-eval behavior.
 
 Core operations are **not user-callable by name** (with the exception of
-`len()`, `collect()`, and `append()` which have syntactic shortcuts). They exist only
-as lowering targets for syntax. `x + y` lowers to `Intrinsic(Add, [x, y])`.
+`len()` and `collect()` which have syntactic shortcuts, and `append()` which
+has a dedicated `Instruction::Append`). They exist only as lowering targets
+for syntax. `x + y` lowers to `Intrinsic(Add, [x, y])`.
 They are encoded as `IntrinsicOp` discriminants in bytecode and are always
 available — no registry, no linking, no import.
 
@@ -78,9 +80,9 @@ provides via the import system:
 
 ```rill
 // prelude.rill — provided by the embedder via the SourceLoader
-fn is_defined(x) { match x { _ => { true } } }
-fn is_uint(x) { match x { UInt _ => { true }, _ => { false } } }
-fn default(value, fallback) { if is_defined(value) { value } else { fallback } }
+fn is_defined(x) { if let _ = x { true } else { false } }
+fn is_uint(x) { match x { UInt(_) => true, _ => false } }
+fn default(value, fallback) { if let v = value { v } else { fallback } }
 ```
 
 Scripts that need these functions import them explicitly:
@@ -118,32 +120,51 @@ exit(0)                 // unqualified via `as _`
 
 `ExternDef` is self-describing — carries namespace, name, metadata
 (parameter types, return type, purity), and implementation. Registered
-via `ExternRegistry::register(def)`. In bytecode, externs appear as
-symbolic `FunctionRef` names resolved at load time.
+via `ExternRegistry::register(def)`. In IR, externs appear as
+`FunctionRef { namespace, name }` — symbolic references resolved at
+compile/link time.
 
 ### Summary
 
 | Category | Implementation | Callable by name? | In bytecode as | Available without registry? |
 |----------|---------------|-------------------|----------------|---------------------------|
-| **Core** | `IntrinsicOp` (Rust enum) | No (lowering targets) | Integer opcode | Yes — always |
-| **Externs** | Rust (embedder-provided) | Yes (`ns::func()` or unqualified via `as _`) | Symbolic `FunctionRef` | No — needs `ExternRegistry` + `require` |
+| **Core** | `IntrinsicOp` (Rust enum) | No (lowering targets) | `Instruction::Intrinsic` | Yes — always |
+| **Externs** | Rust (embedder-provided) | Yes (`ns::func()` or unqualified via `as _`) | `FunctionRef { namespace, name }` | No — needs `ExternRegistry` + `require` |
 
 The key architectural boundary is between **resolved** (core intrinsics +
 user/imported source — compiled into the program) and **late-bound**
-(externs — resolved against `ExternRegistry` at load time). Bytecode
-contains everything resolved; only late-bound symbols require the host.
+(externs — resolved against `ExternRegistry` at link time). The compiled
+program contains resolved closures; only extern symbols require the host.
 
 ## Files
 
-| File | Purpose |
-|------|---------|
-| `grammar.abnf` | Formal grammar specification |
-| `types.rs` | Core type definitions (BaseType) shared by IR and exec |
-| `ast.rs` | Abstract syntax tree types |
-| `parser.rs` | Chumsky-based parser → AST |
-| `ir.rs` | Intermediate representation (SSA) |
-| `exec.rs` | Virtual machine and runtime values |
-| `externs.rs` | Extern function registry and metadata |
+| File / Directory | Purpose |
+|------------------|---------|
+| `docs/grammar.abnf` | Formal grammar specification |
+| `src/types.rs` | Core type definitions (BaseType, TypeSet, NumericType, ConvertMode, SliceMode) |
+| `src/ast/types.rs` | Abstract syntax tree types |
+| `src/ast/parser.rs` | Chumsky-based parser → AST |
+| `src/ast/mod.rs` | AST module root (re-exports) |
+| `src/ir/mod.rs` | IR types: Instruction, Terminator, MatchPattern, FunctionRef, Literal, BasicBlock |
+| `src/ir/types.rs` | IR enums: IntrinsicOp, Terminator, MatchPattern, Instruction |
+| `src/ir/expr.rs` | Expression lowering (AST → IR) |
+| `src/ir/stmt.rs` | Statement lowering |
+| `src/ir/control.rs` | Control flow lowering (if/while/for/loop/match) |
+| `src/ir/pattern.rs` | Pattern lowering |
+| `src/ir/program.rs` | Program-level lowering (functions, imports) |
+| `src/ir/const_eval.rs` | Compile-time constant evaluation for intrinsics |
+| `src/ir/constant.rs` | Constant binding handling |
+| `src/ssa/promote.rs` | SSA promotion (mem2reg: Assign/Read → VarId + Phi) |
+| `src/opt/` | Optimization passes (see Optimization Pipeline) |
+| `src/compile/mod.rs` | IR-to-closure compilation, CompiledProgram, Step, Action |
+| `src/compile/exec.rs` | Instruction compilation to closures (intrinsics, calls, refs) |
+| `src/compile/specialize.rs` | Type-specialized closure generation |
+| `src/compile/terminator.rs` | Terminator compilation (If, Match, Jump, Return, TailCall) |
+| `src/exec.rs` | Virtual machine, runtime values, stack, heap tracking |
+| `src/externs.rs` | Extern function registry and metadata |
+| `src/loader.rs` | SourceLoader trait, FileLoader, MemoryLoader |
+| `src/diagnostics.rs` | Diagnostic codes, severity, source location tracking |
+| `src/lib.rs` | Public API: compile(), Compiler, Program, FunctionHandle |
 
 ---
 
@@ -163,7 +184,7 @@ contains everything resolved; only late-bound symbols require the host.
 | `Map` | `HeapVal<IndexMap<Value, Value>>` | Insertion-ordered key-value map |
 | `Sequence` | `HeapVal<SeqState>` | Lazy single-pass iterator (internal) |
 
-**Note on Sequence:** Sequence is a 9th internal type for lazy, single-pass values
+**Note on Sequence:** Sequence is an internal type for lazy, single-pass values
 (e.g., `0..10` creates a Sequence, not an Array). It is not user-visible as a type
 name — users cannot pattern match on it. They interact with sequences through `for`
 loops and `collect()`. The `..` operator is described as creating "a sequence", not
@@ -171,7 +192,15 @@ loops and `collect()`. The `..` operator is described as creating "a sequence", 
 
 ### Undefined Values
 
-- **No null type**: Undefined values are tracked orthogonally
+Rill's undefined semantics are inspired by SQL's `NULL`: a missing or invalid
+value that propagates silently through operations. Like `NULL`, undefined poisons
+arithmetic (`undefined + 1` → `undefined`), comparisons (`undefined == undefined`
+→ `undefined`, not `true`), and field access (`undefined.field` → `undefined`).
+Scripts probe for presence with `if let` rather than catching exceptions.
+
+- **Internal tracking**: `Value::Undefined` and `BaseType::Undefined` are explicit enum
+  variants used internally by the VM and compiler. Users never name or pattern-match on
+  `Undefined` directly — it is the implicit result of failed operations.
 - **NaN → Undefined**: Float operations producing NaN return Undefined
 - **Failed operations → Undefined**: Type errors, out of bounds, overflow, division by zero
 - **Propagation**: Undefined propagates through operations; use `if let`/`if with` for handling
@@ -202,11 +231,17 @@ Value::Float(Float)
 ### Heap-Allocated (Tracked)
 
 ```rust
-Value::Text(HeapVal<String>)
 Value::Bytes(HeapVal<Vec<u8>>)
+Value::Text(HeapVal<String>)
 Value::Array(HeapVal<Vec<Value>>)
 Value::Map(HeapVal<IndexMap<Value, Value>>)
 Value::Sequence(HeapVal<SeqState>)
+```
+
+### Absence
+
+```rust
+Value::Undefined
 ```
 
 ### SeqState
@@ -215,16 +250,17 @@ Internal state for lazy sequences:
 
 ```rust
 pub enum SeqState {
-    RangeUInt { current: u64, end: u64, inclusive: bool },
-    RangeInt { current: i64, end: i64, inclusive: bool },
-    ArraySlice { source: HeapVal<Vec<Value>>, start: usize, end: usize, mutable: bool },
+    Range { current: u64, end: u64 },
+    ArraySlice { source: HeapVal<Vec<Value>>, start: usize, end: usize },
 }
 ```
 
-- **RangeUInt/RangeInt**: Created by `0..10` / `0..=10`. O(1) memory.
+- **Range**: Created by `0..10` / `0..=10`. O(1) memory. Always unsigned, always
+  exclusive — inclusive ranges are normalized at construction time by incrementing
+  `end` via `saturating_add(1)`.
 - **ArraySlice**: Created by `..rest` patterns. Zero-copy reference to source array.
-  The `mutable` flag follows the binding mode: `let` = false, `with` = true.
-  Mutable slices allow for-loop write-back to the source array.
+  Mutability (by-value vs write-back) is handled at the IR level via the `SliceMode`
+  parameter on the `ArraySeq` intrinsic — the runtime slice doesn't need to know.
 
 ### HeapVal<T>
 
@@ -271,15 +307,15 @@ let result = fold(arr);
 ### Stack Layout
 
 ```
-┌─────────────────┬────────┬────────┬─────┐
-│ Frame(bp,ret)   │ param0 │ local0 │ ... │
-└─────────────────┴────────┴────────┴─────┘
-  bp+0              bp+1     bp+2
+┌────────┬────────┬─────┐       ┌──────────────────┐
+│ param0 │ local0 │ ... │       │ FrameInfo(bp,ret) │
+└────────┴────────┴─────┘       └──────────────────┘
+  bp+0     bp+1                   frame_stack (separate)
 ```
 
-- **Slot 0**: Frame info (saved BP + return destination)
-- **Offsets 1+**: Parameters, then locals
-- **Single stack**: Values and call frames share one stack
+- **Slot 0+**: Parameters, then locals (no frame slot in the value stack)
+- **Separate frame stack**: FrameInfo stored in `VM.frame_stack: Vec<FrameInfo>`
+- Frame info is not interleaved with values — cleaner slot addressing
 
 ### Slot Types
 
@@ -293,7 +329,6 @@ pub enum Slot {
     Val(Value),                        // Actual value (16 bytes)
     Ref(usize),                        // Near pointer: another stack slot
     Accessor { base: usize, key: usize }, // Far pointer: collection[key]
-    Frame(Box<FrameInfo>),             // Frame info (boxed to keep Slot small)
 }
 // Slot is 16 bytes total (Value is largest; Accessor fits in 2×usize = 16 bytes)
 ```
@@ -318,12 +353,12 @@ automatically, enabling `with y = x; y = 10` where x is an Accessor.
 // For by-val params: pass value directly
 // For by-ref params: emit MakeRef (creates Slot::Ref to caller's slot)
 
-// Set up callee frame
-vm.call(frame_size, None)?;
+// Set up callee frame (frame info stored on separate frame_stack)
+vm.call(frame_size, return_slot)?;
 
 // Copy args via copy_slot_from (shallow: Ref stays Ref, Val stays Val)
 for (i, &s) in arg_slots.iter().enumerate() {
-    vm.copy_slot_from(i + 1, caller_bp + s);
+    vm.copy_slot_from(i, caller_bp + s);  // args start at slot 0
 }
 
 // ... execute callee ...
@@ -419,8 +454,8 @@ WriteRef uses `vm.set_local` which resolves through Slot::Ref and Slot::Accessor
 
 | Resource | Limit | Error |
 |----------|-------|-------|
-| Stack | 65,536 slots | `StackOverflow` |
-| Heap | 16 MB (default) | `HeapOverflow` |
+| Stack | 65,536 slots (`DEFAULT_STACK_SIZE`) | `StackOverflow` |
+| Heap | 16 MB (`DEFAULT_HEAP_LIMIT`) | `HeapOverflow` |
 
 ---
 
@@ -458,13 +493,15 @@ while remaining fully portable Rust. The Rust compiler can inline small closures
 struct CompiledProgram {
     functions: Vec<CompiledFunction>,
     func_index: HashMap<String, usize>,  // name → index
+    warnings: Diagnostics,               // link-phase warnings
 }
 
 struct CompiledFunction {
     steps: Vec<Step>,           // all closures, flattened contiguously
     block_starts: Vec<usize>,   // block i starts at steps[block_starts[i]]
     entry: usize,               // index into block_starts
-    frame_size: usize,          // VM slots to reserve (1 + locals)
+    frame_size: usize,          // VM slots to reserve
+    param_count: usize,         // number of parameters
 }
 
 type Step = Box<dyn Fn(&mut VM, &CompiledProgram) -> Result<Action, ExecError>>;
@@ -472,7 +509,9 @@ type Step = Box<dyn Fn(&mut VM, &CompiledProgram) -> Result<Action, ExecError>>;
 enum Action {
     Continue,                   // advance pc by 1
     NextBlock(usize),           // jump to block_starts[idx]
-    Return(Option<Value>),      // return from function
+    Call { func_id, frame_size }, // inline user function call
+    TailCall { func_id },       // self-recursive tail call (reuse frame)
+    Return(Value),              // return from function (Undefined = void)
     Exit(Value),                // hard exit to driver
 }
 ```
@@ -490,7 +529,7 @@ IR blocks (SSA with phis)
     │     (VarIds → slot offsets, externs → fn pointers)
     │
     ├─ 2. Compile each terminator to a Step closure
-    │     (If/Match/Guard → NextBlock closures)
+    │     (If/Match/TailCall → NextBlock closures)
     │
     ├─ 3. Resolve phis: insert Copy steps into predecessor blocks
     │     (eliminates ALL phi nodes — no runtime prev_block tracking)
@@ -522,7 +561,7 @@ Identity phis (all sources are the same slot as dest) are dropped entirely.
 
 | IR concept | Compile-time resolution |
 |------------|------------------------|
-| `VarId(n)` | Stack slot offset `n + 1` |
+| `VarId(n)` | Stack slot offset `n` |
 | `FunctionRef("cbor::decode")` | Native function pointer (via ExternRegistry) |
 | `Literal::UInt(42)` | Pre-computed `Value` captured directly |
 | `Literal::Text("key")` | Interned on first execution (Rc clone after) |
@@ -540,7 +579,7 @@ closures, eliminating runtime dispatches when static information is sufficient:
 | String/Bytes Const | Text/Bytes literal | Interned: allocates once, Rc clone after |
 | Intrinsic op dispatch | Always | Per-op closure (no `match op` at runtime) |
 | Binary arithmetic | Both args same single type | Direct typed operation (e.g. `u64::checked_add`) |
-| Cast/Widen target | Target always a constant | Target resolved at compile time, source-only dispatch |
+| Convert target | Target is compile-time parameter | Target resolved at compile time, source-only dispatch |
 | Index/MakeRef | Base type known | Type-specific indexing (no 5-way dispatch) |
 | WriteAccessor | Base type known | Direct `set_array_elem` or `set_map_entry` |
 | Match (single-arm) | From `if let` patterns | Inlined type/literal/length test |
@@ -549,8 +588,7 @@ closures, eliminating runtime dispatches when static information is sufficient:
 | If condition | Provably Bool + Defined | Direct bool read (no null/type check) |
 | Intrinsic args | All args provably Defined | `.unwrap()` then call (skip Option gate) |
 | Non-Bool condition | Optimizer folds to Jump | `debug_assert!` in compiler |
-| Identity Cast/Widen | Optimizer elides to Copy | `debug_assert!` in compiler |
-| Guard definedness | Optimizer folds to Jump | `debug_assert!(MaybeDefined)` in compiler |
+| Identity Convert | Optimizer elides to Copy | `debug_assert!` in compiler |
 
 ### Calling Convention
 
@@ -560,7 +598,7 @@ intermediate `Vec` allocation:
 - **User calls**: caller copies args slot-to-slot into callee's frame, executes
   callee body inline (same loop, no `execute_function` indirection)
 - **Extern calls**: frame set up with `call_with_args` (Lua-style: pre-pushed
-  args adopted into frame via `rotate_right`). Externs read args via `vm.arg(i)`
+  args adopted into frame, already in place at bp). Externs read args via `vm.arg(i)`
 - **Entry point**: embedder pushes args with `vm.push()`, calls with `argc`
 
 ### Execution Loop
@@ -615,11 +653,12 @@ enum StepKind {
 Candidates: copy-to-self elimination, dead store removal, constant + immediate
 use fusion, jump threading.
 
-### Future: Tail-Call Optimization
+### Tail-Call Optimization
 
-When a function's last action is calling another function (tail position), the
-current frame can be reused instead of pushing a new one. This is an IR-level
-transform:
+When a function's last action is calling itself (self-recursive tail position),
+the current frame is reused instead of pushing a new one. The TCO pass
+(`src/opt/tail_call.rs`) detects `Call + Return` chains where the callee is
+the enclosing function and rewrites them to `TailCall` terminators:
 
 ```
 // Before TCO:
@@ -633,13 +672,14 @@ fn factorial(n, acc) {
     if n == 0 { return acc; }
     n = n - 1;          // rewrite params in current frame
     acc = acc * n;
-    jump to entry;      // pc = block_starts[entry], no new frame
+    TailCall [n, acc];  // jump to entry, no new frame
 }
 ```
 
-The flat pc-based architecture supports this naturally — TCO just rewrites
+The flat pc-based architecture supports this naturally — `TailCall` overwrites
 params and sets `pc` to the entry offset instead of recursing through
-`execute_function`.
+`execute_function`. Currently self-recursive only — mutual tail calls are
+not optimized.
 
 ---
 
@@ -663,10 +703,11 @@ params and sets `pc` to the entry offset instead of recursing through
 
 - Arithmetic: `Add`, `Sub`, `Mul`, `Div`, `Mod`, `Neg`
 - Comparison: `Eq`, `Lt`
-- Logical: `Not`, `And`, `Or`
+- Logical: `Not` (note: `&&`/`||` lower to control flow, not intrinsics)
 - Bitwise: `BitAnd`, `BitOr`, `BitXor`, `BitNot`, `Shl`, `Shr`, `BitTest`, `BitSet`
-- Collection: `Len`, `MakeArray`, `MakeMap`
-- Sequence: `MakeSeq`, `ArraySeq`
+- Collection: `Len`, `MakeArray`, `MakeMap`, `Collect`
+- Sequence: `MakeSeq`, `ArraySeq(SliceMode)`, `SeqNext`
+- Coercion: `Convert(NumericType, ConvertMode)`
 
 Intrinsics emit `Instruction::Intrinsic { op, args }` in the IR. The compiler
 knows their exact semantics, arity, result types, and fallibility — enabling
@@ -677,7 +718,7 @@ folds to `3` using the inline const evaluator.
 **Some intrinsics expand to control flow** instead of a single instruction:
 
 - `is_uint(x)` → `Match(x, [(Type(UInt), BB_t)], BB_f)` + Phi → Bool
-- `is_some(x)` → `Guard(x, BB_t, BB_f)` + Phi → Bool
+- `is_defined(x)` → `Match(x, [(all defined types, BB_t)], BB_f)` + Phi → Bool
 - `x && y` → `If(x, evaluate_y, false)` + Phi (short-circuit)
 - `x || y` → `If(x, true, evaluate_y)` + Phi (short-circuit)
 
@@ -742,8 +783,8 @@ BB_continue:
     // execution continues
 ```
 
-**Reference pattern** — `with` bindings use `MakeRef` instead of `Index`,
-enabling write-back via `WriteRef`:
+**Reference pattern** — `with` bindings use `MakeAccessor` instead of `Index`,
+enabling write-back via `WriteAccessor`:
 
 ```
 AST: with [a, b] = arr;
@@ -753,8 +794,10 @@ BB0:
     Match(arr, [(Array(2), BB_bind)], BB_fail)
 
 BB_bind:
-    %a = MakeRef(arr, Some(0))     // ref to arr[0]
-    %b = MakeRef(arr, Some(1))     // ref to arr[1]
+    %k0 = Const(0)
+    %a = MakeAccessor(arr, %k0)    // accessor to arr[0]
+    %k1 = Const(1)
+    %b = MakeAccessor(arr, %k1)    // accessor to arr[1]
     Jump(BB_continue)
 
 BB_fail:
@@ -763,8 +806,8 @@ BB_fail:
     Jump(BB_continue)
 
 BB_continue:
-    // a and b are ref-backed: assignment emits WriteRef
-    // e.g. a = 10  →  WriteRef(%a, 10) + rebind
+    // a and b are accessor-backed: assignment emits WriteAccessor
+    // e.g. a = 10  →  WriteAccessor(arr, %k0, 10) + Reload(arr)
 ```
 
 ### Intrinsic Operations
@@ -782,17 +825,20 @@ without registry lookup. Each intrinsic carries metadata methods:
 | Arithmetic | `+` `-` `*` `/` `%` `-x` | `Add`, `Sub`, `Mul`, `Div`, `Mod`, `Neg` | Yes (overflow) |
 | Comparison | `==` `<` | `Eq`, `Lt` | No / Yes |
 | Comparison | `!=` `>` `<=` `>=` | Expanded to `Eq`/`Lt`/`Not` | — |
-| Logical | `!` `&&` `\|\|` | `Not`, `And`, `Or` | No |
+| Logical | `!` | `Not` | No |
+| Logical | `&&` `\|\|` | Control flow (`If` + Phi), not intrinsics | — |
 | Bitwise | `&` `\|` `^` `~` `<<` `>>` | `BitAnd`, `BitOr`, `BitXor`, `BitNot`, `Shl`, `Shr` | No |
 | Bit access | `@` | `BitTest` (read), `BitSet` (write) | Yes (OOB) |
 | Collection | `len(x)` `[a,b]` `{k:v}` | `Len`, `MakeArray`, `MakeMap` | Yes / No / Yes |
-| Sequence | `start..end` `..rest` | `MakeSeq`, `ArraySeq` | No |
-| Coercion | (implicit) | `Widen` | Yes (overflow) |
-| Cast | `x as UInt` | `Cast` | No |
+| Collection | `collect(seq)` `append(arr,v)` | `Collect`, `Append` (via `Instruction::Append`) | No / No |
+| Sequence | `start..end` `..rest` `seq_next` | `MakeSeq`, `ArraySeq(SliceMode)`, `SeqNext` | No |
+| Coercion | (implicit promotion) | `Convert(target, Checked)` | Yes (overflow) |
+| Cast | `x as UInt` | `Convert(target, Unchecked)` | No |
 
-Short-circuit operators (`&&`, `||`) lower to control flow (If + Phi), not a
-single `Instruction::Intrinsic`. All other operators lower to
-`Instruction::Intrinsic { op, args }`.
+Short-circuit operators (`&&`, `||`) lower to control flow (If + Phi), not
+intrinsics. `append()` lowers to `Instruction::Append` (a separate instruction,
+not `Instruction::Intrinsic`, because it is side-effecting). All other operators
+lower to `Instruction::Intrinsic { op, args }`.
 
 Reflexive comparisons expand during lowering:
 - `a != b` → `Not(Eq(a, b))`
@@ -810,10 +856,10 @@ whether any intrinsic's operand types have zero intersection with the required
 types. If so, the result is guaranteed undefined — almost certainly a bug.
 Example: `"hello" + 5` warns because `Add` requires numeric but got Text.
 
-**Type cast operator (`as`):** Explicit infallible numeric cast. Distinct from
-both type patterns (which test types) and the compiler-inserted `Widen` (which
-is overflow-checked). `Cast` is user-requested and always succeeds for valid
-numeric pairs:
+**Type cast operator (`as`):** Explicit infallible numeric cast. Both user `as`
+casts and compiler-inserted promotions use `Convert(NumericType, ConvertMode)`:
+- `Unchecked`: user `as Type` — bit-reinterprets Int↔UInt, always succeeds
+- `Checked`: compiler coercion — follows the widening lattice, overflow-checked
 
 | Source | `as UInt` | `as Int` | `as Float` |
 |--------|-----------|----------|------------|
@@ -826,27 +872,27 @@ numeric pairs:
 - Bool/Text/Bytes/Array/Map sources produce undefined at runtime
 - Precedence: between unary and multiplicative — `-x as UInt` is `(-x) as UInt`
 
-Lowering: `x as UInt` → `Intrinsic(Cast, [x, Const(1)])` where the target is
-encoded as a UInt constant matching the `BaseType` discriminant (1=UInt, 2=Int,
-3=Float). Follows the same encoding convention as `Widen`.
+Lowering: `x as UInt` → `Intrinsic(Convert(UInt, Unchecked), [x])` where the
+target type and mode are compile-time properties of the instruction variant,
+not runtime operands.
 
 ### Control Flow Primitives
 
-Four fundamental control flow terminators, each with a single responsibility:
+Three fundamental control flow terminators, each with a single responsibility:
 
 | Terminator | Purpose | Branches On |
 |------------|---------|-------------|
 | `If` | Boolean logic | true/false |
 | `Match` | Type/structure dispatch | MatchPattern |
-| `Guard` | Presence check | Defined/Undefined |
 | `Jump` | Unconditional | - |
 
-Plus terminators that exit the function:
+Plus terminators that exit or restart the function:
 
 | Terminator | Purpose |
 |------------|---------|
 | `Return` | Return value to caller |
-| `Exit` | Hard exit to driver (from diverging externs) |
+| `TailCall` | Self-recursive tail call (overwrite params, jump to entry) |
+| `Unreachable` | Placeholder after dead code elimination |
 
 ```rust
 pub enum Terminator {
@@ -858,6 +904,7 @@ pub enum Terminator {
         condition: VarId,  // Must be Bool
         then_target: BlockId,
         else_target: BlockId,
+        span: Span,
     },
 
     /// Dispatch on type/structure (for type patterns)
@@ -865,21 +912,18 @@ pub enum Terminator {
         value: VarId,
         arms: Vec<(MatchPattern, BlockId)>,
         default: BlockId,
-    },
-
-    /// Presence guard (for if let/if with pattern matching)
-    /// In defined_target, value is known non-Undefined
-    Guard {
-        value: VarId,
-        defined: BlockId,
-        undefined: BlockId,
+        span: Span,
     },
 
     /// Return to caller
     Return { value: Option<VarId> },
 
-    /// Hard exit to driver (never returns to caller)
-    Exit { value: VarId },
+    /// Unreachable code (placeholder after merging)
+    Unreachable,
+
+    /// Self-recursive tail call: overwrite params and jump to entry.
+    /// Introduced by the TCO pass; has no successors.
+    TailCall { args: Vec<VarId> },
 }
 
 /// Pattern for Match terminator arms
@@ -891,15 +935,11 @@ pub enum MatchPattern {
 }
 ```
 
-### The Guard Terminator
+### Definedness Checking
 
-The `Guard` terminator checks if a value is defined (not Undefined) and branches:
-
-1. Checks if value is defined (not Undefined)
-2. In the defined block, value is known non-Undefined (type narrowing)
-3. In the undefined block, handles the absence case
-
-Used primarily for `if let`/`if with` pattern matching where presence determines execution:
+Definedness checks (`if let`/`if with`) are lowered using `Match` with type-based
+dispatch. The compiler uses `Match` to test whether a value is defined, with the
+`default` branch handling the undefined case:
 
 ```
 // Source
@@ -907,14 +947,13 @@ if let x = maybe_value {
     use(x);
 }
 
-// Lowered IR
+// Lowered IR — Match with all defined types vs default (undefined)
 BB0:
-    Guard(%maybe_value, BB_defined, BB_undefined)
+    Match(%maybe_value, [(Type(Bool), BB_defined), (Type(UInt), BB_defined), ...], BB_undefined)
 
 BB_defined:
     %x = Copy(%maybe_value)  // x is known non-Undefined here
     // ... use(x) ...
-    Drop(%x)
     Jump(BB_continue)
 
 BB_undefined:
@@ -930,7 +969,7 @@ All pattern matching lowers to combinations of these primitives:
 
 | Construct | Lowers To |
 |-----------|-----------|
-| `if let x = expr { }` | `Guard` + scoped binding |
+| `if let x = expr { }` | `Match` (type dispatch) + scoped binding |
 | Type patterns (`UInt`, `Text`, etc.) | `Match` with `Type(BaseType)` |
 | Array patterns (`[a, b]`) | `Match` with `Array(n)` + `Index` |
 | Literal patterns (`42`, `"hello"`) | `Match` with `Literal(value)` |
@@ -974,8 +1013,7 @@ Bindings come in two forms with different lifetime semantics:
 If the pattern fails to match, variables get Undefined values via Phi nodes.
 
 **Scoped bindings** create variables only within a block. The fail path never
-allocates these variables - they simply don't exist outside the success block.
-The `Drop` instruction marks when slots can be reclaimed.
+allocates these variables — they simply don't exist outside the success block.
 
 Example scoped binding lowering:
 
@@ -990,7 +1028,6 @@ BB_bind:
     %a = Index(arr, 0)
     %b = Index(arr, 1)
     // ... body uses %a, %b ...
-    Drop(%a, %b)          // slots reclaimed
     Jump(BB_continue)
 
 BB_else:
@@ -998,13 +1035,8 @@ BB_else:
     Jump(BB_continue)
 
 BB_continue:
-    // %a, %b not accessible
+    // %a, %b not accessible — scoped to BB_bind
 ```
-
-The `Drop` instruction serves two purposes:
-
-1. **Slot reclamation**: The slot allocator can reuse these slots for later variables
-2. **Scope enforcement**: Accessing dropped variables is a compile error
 
 Scoped bindings apply to:
 
@@ -1089,7 +1121,7 @@ x @ 128 = compute();     // compute() NOT called if bit 128 is invalid
 ```
 
 This is consistent with `&&` and `||` short-circuit behavior and avoids wasted
-computation when assigning to invalid locations. The generated IR uses Guard
+computation when assigning to invalid locations. The generated IR uses Match
 terminators to check lvalue validity before evaluating the rhs.
 
 ### Type Cast (`as`)
@@ -1233,79 +1265,32 @@ organized into two phases: **coarse** (before type info) and **type-informed**
 ### Pass Overview
 
 ```
-IR (lowered)
+IR (lowered, SSA-promoted)
     │
-    │  ── Phase 1: Fixpoint loop ──
+    │  ── Unified Optimization Fixpoint ──
     ▼
 ┌──────────────────────────────────────┐
-│  ┌─────────────────────┐            │
-│  │ Constant Folding    │            │
-│  └──────────┬──────────┘            │
-│             ▼                       │
-│  ┌─────────────────────┐            │
-│  │ Copy Propagation    │            │
-│  └──────────┬──────────┘            │
-│             ▼                       │
-│  ┌─────────────────────┐            │
-│  │ Dead Code Elim.     │            │
-│  └──────────┬──────────┘            │
-│             ▼                       │
-│  ┌─────────────────────┐            │
-│  │ Ref Elision         │            │
-│  └──────────┬──────────┘            │
-│             ▼                       │
-│  ┌─────────────────────┐            │
-│  │ Coercion Elision    │            │
-│  └──────────┬──────────┘            │
-│             ▼                       │
-│  ┌─────────────────────┐            │
-│  │ Definedness Analysis│  (guarded index, Match scrutinee)
-│  │ + Diagnostics (1st) │            │
-│  └──────────┬──────────┘            │
-│             ▼                       │
-│  ┌─────────────────────┐            │
-│  │ Guard Elimination   │            │
-│  │ + CFG Simplification│            │
-│  └──────────┬──────────┘            │
-│             │ ◄── repeat while      │
-│             │     any pass changed  │
+│  Constant Folding                    │
+│  Common Subexpression Elimination    │
+│  Copy Propagation                    │
+│  Dead Code Elimination               │
+│  Ref Elision                         │
+│  Coercion Elision                    │
+│  CFG Simplification                  │  Jump threading, Phi simplification
+│  ─── type analysis ───               │
+│  Type Refinement                     │  Intrinsic-aware: Add(UInt,UInt) → {UInt}
+│  Coercion Insertion                  │  Insert Convert(Checked) for mixed types
+│  Convert Elision                     │  Identity Convert → Copy
+│  Algebraic Simplification            │  x+0→x, x*1→x, x*0→0, !!x→x
+│  Condition Folding                   │  Non-Bool If condition → Jump(else)
+│  Dead Arm Elimination                │  Prune Match arms, collapse to Jump
+│             │ ◄── repeat while       │
+│             │     any pass changed   │
 └─────────────┴────────────────────────┘
     │
-    │  ── Phase 2: Type-informed ──
+    │  ── Diagnostics ──
     ▼
-┌─────────────────────┐
-│ Type Refinement     │  Intrinsic-aware: Add(UInt,UInt) → {UInt}
-└──────────┬──────────┘
-           ▼
-┌─────────────────────┐
-│ Type Diagnostics    │  W009: type mismatch → always undefined
-│                     │  W009: non-Bool If condition → always else
-└──────────┬──────────┘
-           ▼
-┌─────────────────────┐
-│ Coercion Insertion  │  Insert Widen for mixed-type arithmetic
-│                     │  Replace incompatible ops with Undefined
-└──────────┬──────────┘
-           ▼
-┌─────────────────────┐
-│ Cast/Widen Elision  │  Identity Cast/Widen (src==target) → Copy
-└──────────┬──────────┘
-           ▼
-┌─────────────────────┐
-│ Algebraic Simplify  │  x+0→x, x*1→x, x*0→0, x*2→x+x, !!x→x
-└──────────┬──────────┘
-           ▼
-┌─────────────────────┐
-│ Condition Folding   │  Non-Bool If condition → Jump(else)
-└──────────┬──────────┘
-           ▼
-┌─────────────────────┐
-│ Dead Arm Elimination│  Prune Match arms by TypeSet, collapse to Jump
-└──────────┬──────────┘
-           ▼
-  Phase 1 fixpoint       (re-run if Phase 2 changed anything)
-           ▼
-IR (per-function optimized)
+  W009 type mismatch, W201 definedness (on final converged IR)
     │
     │  ── Phase B: Interprocedural ──
     ▼
@@ -1326,8 +1311,8 @@ IR (per-function optimized)
 └──────────┬──────────┘
            ▼
 ┌─────────────────────┐
-│ B3: Re-optimize     │  Re-run Phase 2 + Phase 1 fixpoint on functions
-│                     │  with narrowed params/returns. Purity-aware DCE.
+│ B3: Re-optimize     │  Re-run unified fixpoint on functions with
+│                     │  narrowed params/returns. Purity-aware DCE.
 └──────────┬──────────┘
            ▼
 IR (optimized)
@@ -1335,33 +1320,40 @@ IR (optimized)
 
 ### Fixpoint Iteration
 
-The Phase 1 passes (const fold, copy prop, DCE, ref elision, coercion elision,
-definedness, guard elim, CFG simplify) run in a loop until no pass makes
-changes. This handles cascading effects:
+All optimization passes — both data-flow (const fold, CSE, copy prop, DCE,
+ref elision, coercion elision, CFG simplify) and type-informed (type refinement,
+coercion insertion, cast elision, algebraic simplification, condition folding,
+dead arm elimination) — run in a single unified loop until no pass makes changes.
+This avoids phase-ordering issues where type-informed passes expose new data-flow
+opportunities and vice versa. Cascading effects:
 
-- Const fold may turn a Phi into a constant → definedness sees Defined
+- Const fold may turn a Phi into a constant → type refinement sees single type
+- Dead arm elimination removes guard Matches → single-source Phi → copy prop
+- CSE deduplicates identical Phis and intrinsic operations
 - Ref elision demotes read-only MakeRefs → exposes Copy/Index for const fold
-- Guard elimination removes guards → CFG simplify removes dead blocks
-- Dead block removal simplifies Phi nodes → new constant folding opportunities
+- DCE removes dead instructions → CFG simplify removes dead blocks
+- Jump threading redirects through trivial blocks → Phi simplification
 - CFG simplify may remove WriteRefs → ref elision demotes more MakeRefs
 
-Typically converges in 1-2 iterations. Diagnostics (E200/E201) are emitted
-only on the first iteration, before guard elimination reshapes the flow.
+Typically converges in 2-3 iterations. Diagnostics (W009/W200/W201) are emitted
+once after final convergence so that dead code elimination has a chance to
+remove synthetic instructions before warnings are generated.
 
-### Two-Phase Definedness
+### Type-Informed Definedness
 
-The coercion insertion pass bridges type analysis into definedness:
+The coercion insertion pass bridges type analysis into definedness. Within the
+unified fixpoint, this happens naturally across iterations:
 
-1. **Phase 1** (coarse): Uses `is_fallible()` only. `Add(Text, UInt)` is
-   conservatively `MaybeDefined` — Add *can* fail, but we don't know from
-   definedness alone that it *always* fails for these types.
+1. **Early iterations**: Without type info, `Add(Text, UInt)` is conservatively
+   `MaybeDefined` — Add *can* fail, but we don't know from types alone that
+   it *always* fails.
 
-2. **After coercion insertion**: The coercion pass consults TypeAnalysis and
-   emits explicit `Instruction::Undefined` for invalid type combinations.
-   Re-running the Phase 1 fixpoint loop on the expanded IR sees these
-   Undefined instructions → proves `Undefined` instead of `MaybeDefined`
-   → eliminates guards → removes dead branches. No new infrastructure
-   needed — just re-enter the existing loop.
+2. **After type refinement + coercion insertion**: The coercion pass consults
+   TypeAnalysis and emits explicit `Instruction::Undefined` for invalid type
+   combinations. On the next fixpoint iteration, constant folding and DCE see
+   these Undefined instructions → proves `Undefined` instead of `MaybeDefined`
+   → dead arm elimination removes dead branches. No separate pass needed —
+   the unified loop handles the cascading naturally.
 
 ### Pass 1: Early Constant Folding
 
@@ -1449,8 +1441,8 @@ without knowing its concrete type, and vice versa. Definedness flows from source
 | `Undefined { dest }` | `Undefined` |
 | `Copy { dest, src }` | inherits from `src` |
 | `Index { dest, base, key }` | `Defined` if guarded, else `MaybeDefined` |
-| `MakeRef { dest, base, Some(key) }` | `Defined` if guarded, else `MaybeDefined` |
-| `MakeRef { dest, base, None }` | inherits from `base` |
+| `MakeAccessor { dest, base, key }` | `Defined` if guarded, else `MaybeDefined` |
+| `MakeRef { dest, base }` | inherits from `base` |
 | `WriteRef { .. }` | no dest (side effect only) |
 | `Intrinsic { op, .. }` infallible, all args Defined | `Defined` |
 | `Intrinsic { op, .. }` fallible or args MaybeDefined | `MaybeDefined` |
@@ -1458,10 +1450,6 @@ without knowing its concrete type, and vice versa. Definedness flows from source
 | `Phi { dest, sources }` | meet of all sources |
 
 **Control flow refinement:**
-
-At a `Guard` terminator:
-- In the `defined` branch: guarded value becomes `Defined`
-- In the `undefined` branch: guarded value becomes `Undefined`
 
 At a `Match` terminator:
 - In each arm block: scrutinee is `Defined` (it matched a pattern)
@@ -1484,24 +1472,24 @@ packet processing patterns like `if len(packet) >= 4 { packet[0] ... packet[3] }
 **Why flow-sensitive analysis in SSA form?**
 
 In SSA, each variable is assigned exactly once, so one might expect each variable
-to have a single fixed definedness. However, Guards create contexts where we know
-more than the variable's "intrinsic" definedness:
+to have a single fixed definedness. However, Match arms create contexts where we
+know more than the variable's "intrinsic" definedness:
 
 ```
 Block 0:
   v0 = param           // Intrinsic: MaybeDefined (caller might pass undefined)
-  Guard v0 -> B1, B2
+  Match v0 -> [(Type(UInt), B1), ...], default: B2
 
-Block 1:               // After Guard, we KNOW v0 is Defined
+Block 1:               // After Match, we KNOW v0 is Defined
   v1 = v0 + 1          // v1 is Defined (both operands are Defined)
-  Guard v1 -> ...      // Can eliminate! (v1 is provably Defined)
+  // Subsequent definedness checks on v1 can be eliminated
 ```
 
 Without flow-sensitivity, `v0` stays `MaybeDefined` everywhere, so `v1 = v0 + 1`
-would compute as `MaybeDefined`, and we couldn't eliminate the second Guard.
+would compute as `MaybeDefined`, and we couldn't optimize subsequent checks.
 
-With flow-sensitivity, after the Guard's defined branch, we track that `v0` is
-`Defined` in that context, so `v1` becomes `Defined`, enabling Guard elimination.
+With flow-sensitivity, after the Match's arm branch, we track that `v0` is
+`Defined` in that context, so `v1` becomes `Defined`, enabling dead arm elimination.
 
 The analysis tracks definedness at block entry/exit points, propagating refined
 knowledge through the CFG. This is a forward dataflow analysis with the meet
@@ -1522,8 +1510,8 @@ still intact.
 
 | Context | Definitely Undefined | Maybe Undefined |
 |---------|---------------------|-----------------|
-| Control flow (`if` condition, `match` scrutinee) | **E200** error | **E201** warning |
-| Data flow (intrinsic arg, index base/key, etc.) | **E200** warning | **E201** warning |
+| Control flow (`if` condition, `match` scrutinee) | **W200** warning | **W201** warning |
+| Data flow (intrinsic arg, index base/key, etc.) | **W200** warning | **W201** warning |
 
 **Provenance tracking:** Each diagnostic includes the root cause — where the
 undefined value originated. Traces propagation chains through Copy/Phi back to
@@ -1537,31 +1525,23 @@ warning[E201]: use of possibly undefined value `_5` as argument 1 to
   = note: value originates from call to `parse_input`
 ```
 
-### Pass 3: Guard Elimination
+### CFG Simplification
 
-**Goal:** Remove unnecessary Guard terminators.
+**Goal:** Simplify the control flow graph after other passes remove code.
 
-**Rules:**
-
-| Condition | Transformation |
-|-----------|----------------|
-| Guard value is `Defined` | Replace with `Jump { target: defined }` |
-| Guard value is `Undefined` | Replace with `Jump { target: undefined }` |
-| Guard value is `MaybeDefined` | Keep Guard (runtime check needed) |
-
-After Guard elimination, run CFG simplification:
 - Merge single-predecessor/single-successor blocks
 - Remove unreachable blocks (no predecessors)
 - Eliminate trivial jumps (jump to next block)
+- Fold If terminators with constant conditions → Jump
 
 ### Pass 4: Type Refinement
 
 **Goal:** Narrow the `types` set in each variable's TypeSet.
 
-This runs after Guard elimination so the CFG is simpler. Type refinement tracks
+This runs after Phase 1 has simplified the CFG. Type refinement tracks
 the possible concrete types (Bool, UInt, Int, etc.) at each program point.
 
-**Lattice:** Powerset of `{Bool, UInt, Int, Float, Text, Bytes, Array, Map, Sequence}`
+**Lattice:** Powerset of `{Bool, UInt, Int, Float, Text, Bytes, Array, Map, Sequence, Undefined}`
 
 Meet = intersection (narrowing), Join = union (at Phi nodes)
 
@@ -1615,7 +1595,7 @@ intersection with `{UInt, Int, Float}` → W009.
 
 **Goal:** Fold constants exposed by earlier passes.
 
-After Guard elimination and CFG simplification, new constant folding opportunities
+After CFG simplification, new constant folding opportunities
 may emerge. This pass runs the same constant folding logic as Pass 1 to clean up.
 
 **Transformations:**
@@ -1625,17 +1605,17 @@ may emerge. This pass runs the same constant folding logic as Pass 1 to clean up
 - Simplify `If` terminators: `If { condition: Const(true), .. }` → `Jump { target: then }`
 - Replace variable references with `Const` instructions when value is known
 
-### Pass 6: Dead Code Elimination (Planned)
+### Dead Code Elimination
 
 **Goal:** Remove computations whose results are never used.
 
 **Algorithm:**
 
 1. Mark as "live":
-   - Variables used in `Return`, `Exit` terminators
+   - Variables used in `Return`, `TailCall` terminators
    - Variables used in `WriteAccessor` or `WriteRef` (side effects)
    - Variables used in impure `Call` arguments
-   - Variables used in terminator conditions (`If`, `Guard`, `Match`)
+   - Variables used in terminator conditions (`If`, `Match`)
 
 2. Propagate liveness backwards:
    - If `dest` is live, mark all variables used in that instruction as live
@@ -1652,16 +1632,19 @@ branches, more code becomes unreachable.
 ### File Structure
 
 ```
-src/ir/
-├── opt/
-│   ├── mod.rs             # Pipeline orchestration, optimize()
-│   ├── const_fold.rs      # Passes 1 & 5: Constant folding
-│   ├── ref_elision.rs     # Pass 1.5: Ref elision (MakeRef → Copy/Index)
-│   ├── definedness.rs     # Pass 2: Definedness analysis + diagnostics
-│   ├── guard_elim.rs      # Pass 3: Guard elimination + CFG simplification
-│   ├── type_refinement.rs # Pass 4: Type refinement
-│   ├── coercion.rs        # Pass 4.75: Coercion insertion (Widen + Undefined)
-│   └── cast_elision.rs    # Pass 4.8: Identity Cast/Widen → Copy
+src/opt/
+├── mod.rs             # Pipeline orchestration, optimize(), definedness/diagnostics
+├── const_fold.rs      # Constant folding (intrinsic const-eval)
+├── cse.rs             # Common subexpression elimination
+├── copy_prop.rs       # Copy propagation
+├── dce.rs             # Dead code elimination
+├── ref_elision.rs     # Ref elision (MakeRef → Copy, MakeAccessor → Index)
+├── coercion.rs        # Coercion insertion (Convert + Undefined) and elision
+├── cfg_simplify.rs    # CFG simplification (merge blocks, remove unreachable)
+├── type_refinement.rs # Type refinement + interprocedural analysis
+├── cast_elision.rs    # Identity Convert → Copy
+├── algebra.rs         # Algebraic simplification (x+0→x, x*1→x, etc.)
+├── tail_call.rs       # Tail-call optimization (Call+Return → TailCall)
 ```
 
 ### Fixed-Point Iteration
@@ -1670,12 +1653,23 @@ Some passes may enable further optimizations by others. The pipeline can iterate
 
 ```rust
 loop {
-    let folded = fold_constants(&mut func, externs, diagnostics);
-    let refs = elide_refs(&mut func);
-    let analysis = analyze_definedness(&func, Some(externs));
-    let guards = eliminate_guards(&mut func, &analysis);
-    let blocks = simplify_cfg(&mut func);
-    if folded + refs + guards + blocks == 0 { break; }
+    let mut changed = 0;
+    changed += fold_constants(function, externs, diagnostics);
+    changed += eliminate_common_subexpressions(function);
+    changed += propagate_copies(function);
+    changed += eliminate_dead_code(function);
+    changed += elide_refs(function);
+    changed += elide_coercions(function);
+    changed += simplify_cfg(function);  // includes jump threading + Phi simplification
+
+    let types = analyze_types(function, Some(externs));
+    changed += insert_coercions(function, &types);
+    changed += elide_identity_casts(function, &types);
+    changed += simplify_algebra(function, &types);
+    changed += fold_non_bool_conditions(function, &types);
+    changed += eliminate_dead_match_arms(function, &types);
+
+    if changed == 0 { break; }
 }
 ```
 
@@ -1749,7 +1743,7 @@ x @ b = true;    // ⚠️ Warning: Unchecked assignment, destination may be und
 ```rust
 // Check result
 if let _ = (arr[i] = v) { }
-if is_some(arr[i] = v) { }
+if is_defined(arr[i] = v) { }
 
 // Explicit discard
 let _ = arr[i] = v;
@@ -1861,9 +1855,9 @@ printf("hello %s %d", name, age);   // args = [name, age]
 
 Rest parameters follow the same binding mode rules:
 
-- `..args` - by-reference (default)
-- `let ..args` - by-value (copy)
-- `with ..args` - explicit by-reference
+- `..args` - by-value (default)
+- `let ..args` - by-value (explicit)
+- `with ..args` - by-reference
 
 The rest parameter must be the last parameter in the function signature. At the call site,
 excess arguments are collected into an Array and passed as the rest parameter.
@@ -1892,10 +1886,10 @@ Scripts import them with `import "prelude.rill" as _;`.
 
 | Function | Returns | Compiles To |
 |----------|---------|-------------|
-| `is_defined(v)` | `Bool` | `Guard` + Phi |
+| `is_defined(v)` | `Bool` | `Match` (type dispatch) + Phi |
 | `is_uint(v)`, `is_int(v)`, ... | `Bool` | `Match` + Phi |
 | `to_uint(v)`, `to_int(v)`, ... | Value or Undefined | Type conversion |
-| `default(v, fallback)` | Value | `Guard` + Phi |
+| `default(v, fallback)` | Value | `Match` + Phi |
 
 **Core intrinsics** callable by name (not prelude — hard-coded in compiler):
 
@@ -1979,7 +1973,7 @@ Everything else returns Undefined:
 Scripts handle with:
 
 ```rust
-if is_some(x) { use(x) }     // Existence check
+if is_defined(x) { use(x) }  // Existence check
 if let v = to_uint(x) { }    // Conditional binding
 let y = x;                   // Undefined propagates through operations
 ```
@@ -2242,7 +2236,7 @@ to `Instruction::Intrinsic { op: IntrinsicOp, args }`. Some expand to control fl
 | `with x = arr[i]` | `MakeRef(arr, Some(i))` | Reference binding |
 | `with x = y` | `MakeRef(y, None)` | Reference binding |
 | `x = v` (ref-backed) | `WriteRef(ref_var, v)` + Copy + rebind | Write-back through reference |
-| `x as UInt` | `Intrinsic(Cast, [x, Const(1)])` | Single instruction |
+| `x as UInt` | `Intrinsic(Convert(UInt, Unchecked), [x])` | Single instruction |
 
 ### Reflexive Comparison Operators
 
@@ -2272,8 +2266,7 @@ fn is_uint(x) { match x { UInt(_) => true, _ => false } }
 fn default(value, fallback) { if let v = value { v } else { fallback } }
 ```
 
-These produce the same Guard/Match + Phi control flow that a core intrinsic
-would. There is no performance penalty — the IR is identical. In bytecode,
+These produce the same Match + Phi control flow that a core intrinsic would. There is no performance penalty — the IR is identical. In bytecode,
 they appear as internal functions in the function list.
 
 ---
@@ -2410,7 +2403,7 @@ registry.register(
 | **Registration** | Hard-coded in `IntrinsicOp` enum | `registry.register(ExternDef)` |
 | **IR instruction** | `Instruction::Intrinsic { op, args }` | `Instruction::Call { function, args }` |
 | **Const eval** | `eval_intrinsic_const()` in `const_eval.rs` | `Purity::Const { eval }` function pointer |
-| **Runtime** | `exec_intrinsic()` in `compile.rs` | Function pointer via `LinkMap` |
+| **Runtime** | `exec_intrinsic()` in `compile/exec.rs` | Function pointer via `LinkMap` |
 | **Type info** | `param_type()`, `result_type_refined()` | `ExternMeta.params`, `ExternMeta.returns` |
 | **Link phase** | Not needed — compiled directly | Resolved via `LinkMap` at link time |
 
@@ -2481,7 +2474,7 @@ struct ParamMeta {
 The host driver compiles scripts and resolves function handles by name:
 
 ```rust
-let (program, _) = compile(source, &externs, None).unwrap();
+let (program, _) = compile(source, &externs).unwrap();
 
 // Resolve once, call many times
 let process = program.function("process").unwrap();
@@ -2490,8 +2483,10 @@ let validate = program.function("validate").unwrap();
 // Execute with application data
 let mut vm = VM::new();
 for record in records {
-    validate.call(&mut vm, &[record.clone()])?;
-    process.call(&mut vm, &[record])?;
+    vm.push(record.clone())?;
+    validate.call(&mut vm, 1)?;
+    vm.push(record)?;
+    process.call(&mut vm, 1)?;
 }
 ```
 
@@ -2593,17 +2588,20 @@ for record in incoming_records {
     let data = record_to_value(&record);
 
     // Run validation — exit() returns Err with a disposition code
-    match check_age.call(&mut vm, &[data.clone()]) {
+    vm.push(data.clone())?;
+    match check_age.call(&mut vm, 1) {
         Ok(_) => {}  // passed
         Err(_) => { reject(record); continue; }
     }
-    match check_fields.call(&mut vm, &[data.clone()]) {
+    vm.push(data.clone())?;
+    match check_fields.call(&mut vm, 1) {
         Ok(_) => {}
         Err(_) => { reject(record); continue; }
     }
 
     // Transform in-place
-    transform.call(&mut vm, &[data]).unwrap();
+    vm.push(data)?;
+    transform.call(&mut vm, 1).unwrap();
 }
 ```
 
@@ -2621,8 +2619,8 @@ registry.register(
         .purity(Purity::Impure)
 );
 
-fn extern_exit(_vm: &mut VM, args: &[Value]) -> Result<ExecResult, ExecError> {
-    let code = args.first().cloned().unwrap_or(Value::UInt(0));
+fn extern_exit(vm: &mut VM, argc: usize) -> Result<ExecResult, ExecError> {
+    let code = if argc > 0 { vm.arg(0).clone() } else { Value::UInt(0) };
     Ok(ExecResult::Exit(code))
 }
 ```
@@ -2645,14 +2643,19 @@ fn extern_exit(_vm: &mut VM, args: &[Value]) -> Result<ExecResult, ExecError> {
 - [x] Call convention with return slots
 - [x] Reference binding via Slot::Ref (VM) + MakeRef/WriteRef (IR)
 - [x] Extern registry and metadata system
-- [x] Optimization passes:
-  - [x] Constant folding (early + cleanup)
-  - [x] Definedness analysis
-  - [x] Diagnostics (warnings/errors from definedness)
-  - [x] Guard elimination
-  - [x] CFG simplification
-  - [x] Type refinement
-- [x] Public API: opaque `Program`, `compile()`, `standard_externs()`
+- [x] Optimization passes (unified type-informed fixpoint loop):
+  - [x] Constant folding, common subexpression elimination, copy propagation
+  - [x] Dead code elimination, ref elision, coercion insertion and elision
+  - [x] CFG simplification with jump threading and Phi simplification
+  - [x] Type refinement, cast elision, algebraic simplification
+  - [x] Condition folding, dead arm elimination (with `arms_cover_type`)
+  - [x] Expression-level type guards (len, collect, append, cast, compound assignment, for-loop, range)
+  - [x] Guard cache for duplicate type guard prevention
+  - [x] Interprocedural analysis and function monomorphization
+  - [x] Tail-call optimization
+- [x] Diagnostics (W200/W201 definedness, W009 type mismatch, E300 cast errors)
+- [x] SSA promotion (mem2reg: Assign/Read → VarId + Phi)
+- [x] Public API: opaque `Program`, `compile()`, `Compiler` builder, `standard_externs()`
 - [x] Source location utilities: `span_to_line_col()`, `LineCol`
 - [x] For-loop pair binding: `for k, v in map { }`
 - [x] Pattern lowering: Type, Map, ArrayRest with after patterns
@@ -2660,20 +2663,15 @@ fn extern_exit(_vm: &mut VM, args: &[Value]) -> Result<ExecResult, ExecError> {
 
 ### Pending
 
-- [ ] Instruction execution (IR interpreter or VM codegen)
-- [ ] Extern implementations: `core::make_seq`, `core::seq_next`,
-      `core::array_seq`, `core::collect`
-- [ ] For-loop type dispatch (Match on iterable type for unknown types)
-- [ ] For-loop sequence path (seq_next-based loop for Sequence type)
 - [ ] Dead-store warnings for non-ref-backed loop variable mutations
 - [ ] `if with` / match arm ref origin tracking (Phase 2)
 - [ ] Dead write-back elimination (WriteRef where collection is never read after)
 - [ ] Host sequence support (`SeqState::Host` variant)
 - [x] Module system (`import` for source files, `require` for extern namespaces)
 - [x] `ExternRegistry::register()` with self-describing `ExternDef`
+- [x] Closure-threaded code execution (`src/compile/`)
 - [ ] CBOR encode/decode integration
 - [ ] Compiled binary format
-- [ ] Dead code elimination pass
 
 ---
 
@@ -2689,7 +2687,7 @@ One `MAX_STACK_SIZE` check catches both value overflow and deep recursion. Simpl
 
 ### Why Undefined instead of errors?
 
-Duck typing philosophy. Scripts can probe values without try/catch. Failed operations naturally propagate — no exceptions, no error types. This matches the duck-typed, schema-free nature of the language: any value can be probed for any field, and missing data is simply undefined rather than an error.
+Inspired by SQL's `NULL` — a value that means "absent" and propagates through operations without crashing. Scripts can probe data structures without defensive checks, just as SQL queries can reference nullable columns without explicit null guards. Failed operations naturally propagate — no exceptions, no error types. This matches the duck-typed, schema-free nature of the language: any value can be probed for any field, and missing data is simply undefined rather than an error. Use `if let` to test presence, like SQL's `IS NOT NULL`.
 
 ### Why IndexMap for maps?
 
@@ -2707,24 +2705,24 @@ Avoids copying return values. Caller specifies where to write; callee writes dir
 
 Drop::exit() takes no arguments, so deallocation tracking requires storing the heap reference somewhere accessible. By embedding HeapRef in the Rc'd allocation (Tracked<T>), HeapVal remains 8 bytes (one pointer). The cost is 8 extra bytes per allocation, not per HeapVal clone. This keeps Value at 16 bytes for better cache locality across the 65K-slot stack—a bigger win than saving 8 bytes per allocation.
 
-### Why Box<FrameInfo> instead of inline?
+### Why separate frame_stack instead of Frame slots?
 
-FrameInfo has two `usize` fields (16 bytes). Inlining would make Slot 24 bytes, wasting 8 bytes on every Val/Ref/Uninit slot. Boxing adds one allocation per call frame, but frames are rare (one per function) while value slots are common. The space savings on 65K slots far outweigh the allocation cost.
+FrameInfo is stored on a separate `Vec<FrameInfo>` stack rather than interleaved
+with value slots. This keeps Slot at 16 bytes (no Frame variant needed), simplifies
+slot addressing (params start at bp+0, not bp+1), and avoids boxing FrameInfo.
+The frame stack is bounded by call depth (already limited by the value stack).
 
-### Why not track FrameInfo allocations?
-
-Frame allocations are bounded by stack depth (already limited), tiny (16 bytes), and short-lived (freed on return). The heap limit is conceptually for script data, not VM bookkeeping. Stack overflow already catches runaway recursion.
-
-### Why four control flow primitives (If, Match, Guard, Jump)?
+### Why three control flow primitives (If, Match, Jump)?
 
 Each does exactly one thing:
 
 - **If**: Boolean logic (true/false)
-- **Match**: Type dispatch (BaseType)
-- **Guard**: Presence check (Defined/Undefined)
+- **Match**: Type/value dispatch (BaseType, Literal, Array length)
 - **Jump**: Unconditional
 
-This separation enables clean lowering: `if let` → Guard, type patterns → Match, conditions → If. No overloaded semantics. The optimizer can reason about each independently.
+This separation enables clean lowering: type patterns → Match, conditions → If,
+definedness checks → Match against defined types. No overloaded semantics.
+The optimizer can reason about each independently.
 
 ### Why no `?` operator?
 
@@ -2756,34 +2754,21 @@ CBOR is a good fit for the compiled format:
 - No dependency on platform-specific formats
 - Well-specified (RFC 8949), widely supported
 
-### Why separate Definedness and Type analysis passes?
+### Why unified Definedness and Type in a single TypeSet?
 
-These are independent concerns with different lattices:
-- **Definedness**: 3-value lattice (`Defined` / `MaybeDefined` / `Undefined`)
-- **Type**: powerset of `{Bool, UInt, Int, Float, Text, Bytes, Array, Map, Sequence}`
+Definedness and type are represented together in `TypeSet` — `Undefined` is a
+type alongside `Bool`, `UInt`, etc. This unified representation enables a single
+fixpoint loop where type-informed passes (coercion insertion, dead arm elimination)
+and data-flow passes (const fold, copy prop, DCE) reinforce each other without
+phase-ordering issues.
 
-A value can be "definitely defined" without knowing its type, and vice versa.
-
-Splitting the analyses provides:
-
-1. **Earlier CFG simplification**: Definedness analysis removes Guards, simplifying
-   the control flow graph before type analysis runs
-2. **Cleaner lattices**: Each pass has a simple, well-defined lattice
-3. **Better diagnostics**: Definedness errors ("value is undefined") are distinct
-   from type errors ("expected UInt, got Text")
-4. **Efficiency**: Type refinement runs on a simpler CFG with fewer blocks
-
-However, the two analyses are not fully independent — type analysis can *inform*
-definedness. For example, `Add(Text, UInt)` is conservatively `MaybeDefined` in
-the coarse pass (Add is fallible), but type analysis proves the result is always
-undefined (Text is not numeric).
-
-The coercion insertion pass (planned) bridges this gap: it consults type analysis
-and generates explicit `Instruction::Undefined` for invalid type combinations.
-Running definedness analysis again on the expanded IR tightens `MaybeDefined` to
-`Undefined` where types prove the operation cannot succeed — no unified lattice
-needed.
+For example, `Add(Text, UInt)` starts as `MaybeDefined` (Add is fallible). The
+coercion pass consults TypeAnalysis, sees the type mismatch, and replaces it with
+`Instruction::Undefined`. On the next fixpoint iteration, constant folding
+propagates the Undefined, dead arm elimination removes dead branches, and CFG
+simplify cleans up. No separate definedness lattice needed — `TypeSet` tracks
+both concerns in one powerset.
 
 ---
 
-*Last updated: IntrinsicOp refactor, two-phase definedness, type-informed optimization pipeline.*
+*Last updated: Reconciled with codebase — Convert unification, TCO, DCE, SSA, separate frame stack, updated pipeline.*

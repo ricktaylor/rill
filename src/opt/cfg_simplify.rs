@@ -4,7 +4,7 @@
 //! 1. Removing unreachable blocks (no predecessors except entry)
 //! 2. Merging single-predecessor/single-successor block chains
 
-use crate::ir::{BlockId, Function, Instruction, Terminator};
+use crate::ir::{BlockId, Function, Instruction, Terminator, VarId};
 use std::collections::{HashMap, HashSet};
 
 // ============================================================================
@@ -24,13 +24,180 @@ pub fn simplify_cfg(function: &mut Function) -> usize {
     // Phase 1: Remove unreachable blocks
     remove_unreachable_blocks(function);
 
-    // Phase 2: Merge block chains
+    // Phase 2: Thread jumps — redirect terminators that target empty
+    // jump-only blocks to the final destination. This handles blocks
+    // created by guard emissions or Match dispatch that ended up empty
+    // after optimization (e.g., B1: Jump B4 → redirect Match arm to B4).
+    thread_jumps(function);
+
+    // Phase 3: Merge block chains
     merge_block_chains(function);
 
-    // Phase 3: Remove unreachable blocks again (merging may create more)
+    // Phase 4: Remove unreachable blocks again (merging may create more)
     remove_unreachable_blocks(function);
 
     initial_count - function.blocks.len()
+}
+
+/// Redirect terminators that target empty jump-only blocks to the final
+/// destination. Follows chains (A→B→C where B and C are both empty jumps).
+///
+/// A block is "trivial" if it has no instructions (or only Phi instructions
+/// with no sources) and its terminator is an unconditional Jump.
+fn thread_jumps(function: &mut Function) {
+    // Build a map of trivial block redirections: block_id → final target
+    let mut redirects: HashMap<BlockId, BlockId> = HashMap::new();
+
+    for block in &function.blocks {
+        if let Terminator::Jump { target } = &block.terminator {
+            let is_trivial = block.instructions.iter().all(
+                |inst| matches!(&inst.node, Instruction::Phi { sources, .. } if sources.is_empty()),
+            );
+            if is_trivial {
+                redirects.insert(block.id, *target);
+            }
+        }
+    }
+
+    if redirects.is_empty() {
+        return;
+    }
+
+    // Resolve chains: if A→B and B→C, then A→C
+    let keys: Vec<BlockId> = redirects.keys().copied().collect();
+    for key in keys {
+        let mut target = redirects[&key];
+        let mut visited = HashSet::new();
+        visited.insert(key);
+        while let Some(&next) = redirects.get(&target) {
+            if !visited.insert(target) {
+                break; // cycle
+            }
+            target = next;
+        }
+        redirects.insert(key, target);
+    }
+
+    // Build reverse map: for each trivial block, which NON-TRIVIAL blocks
+    // reach it? We skip trivial blocks as predecessors and follow chains,
+    // so A→B→C→D (B, C trivial) records incoming[B]=[A], incoming[C]=[A].
+    // This ensures Phi sources are rewritten to the actual predecessors
+    // that will target the final destination after threading.
+    let mut incoming: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+    for block in &function.blocks {
+        if redirects.contains_key(&block.id) {
+            continue;
+        }
+        for succ in block.terminator.successors() {
+            let mut t = succ;
+            while redirects.contains_key(&t) {
+                incoming.entry(t).or_default().push(block.id);
+                t = redirects[&t];
+            }
+        }
+    }
+
+    // Check for conflicts: threading would be unsafe if it creates a Phi
+    // with two sources from the same predecessor carrying different values.
+    // This happens when an If/Match has both branches go through different
+    // trivial blocks to the same join — the Phi uses block identity to
+    // distinguish which edge was taken.
+    let mut unsafe_redirects: HashSet<BlockId> = HashSet::new();
+    for block in &function.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Phi { sources, .. } = &inst.node {
+                // Simulate the rewrite and check for conflicting predecessors
+                let mut pred_values: HashMap<BlockId, VarId> = HashMap::new();
+                for (src_block, var) in sources {
+                    if let Some(preds) = incoming.get(src_block) {
+                        for &pred in preds {
+                            if let Some(&existing) = pred_values.get(&pred) {
+                                if existing != *var {
+                                    // Conflict: same predecessor, different values.
+                                    // Don't thread this trivial block.
+                                    unsafe_redirects.insert(*src_block);
+                                }
+                            } else {
+                                pred_values.insert(pred, *var);
+                            }
+                        }
+                    } else {
+                        pred_values.insert(*src_block, *var);
+                    }
+                }
+            }
+        }
+    }
+
+    // Remove unsafe redirects
+    for block_id in &unsafe_redirects {
+        redirects.remove(block_id);
+        incoming.remove(block_id);
+    }
+
+    if redirects.is_empty() {
+        return;
+    }
+
+    // Rewrite Phi sources BEFORE rewriting terminators: Phis in the final
+    // target that reference the trivial block must be expanded to reference
+    // all predecessors that originally targeted the trivial block.
+    for block in &mut function.blocks {
+        for inst in &mut block.instructions {
+            if let Instruction::Phi { sources, .. } = &mut inst.node {
+                let mut new_sources = Vec::new();
+                for (src_block, var) in sources.drain(..) {
+                    if let Some(preds) = incoming.get(&src_block) {
+                        for &pred in preds {
+                            new_sources.push((pred, var));
+                        }
+                    } else {
+                        new_sources.push((src_block, var));
+                    }
+                }
+                *sources = new_sources;
+            }
+        }
+    }
+
+    // Rewrite all terminators
+    for block in &mut function.blocks {
+        rewrite_terminator_targets(&mut block.terminator, &redirects);
+    }
+}
+
+/// Rewrite all block targets in a terminator using the redirect map.
+fn rewrite_terminator_targets(terminator: &mut Terminator, redirects: &HashMap<BlockId, BlockId>) {
+    match terminator {
+        Terminator::Jump { target } => {
+            if let Some(&new) = redirects.get(target) {
+                *target = new;
+            }
+        }
+        Terminator::If {
+            then_target,
+            else_target,
+            ..
+        } => {
+            if let Some(&new) = redirects.get(then_target) {
+                *then_target = new;
+            }
+            if let Some(&new) = redirects.get(else_target) {
+                *else_target = new;
+            }
+        }
+        Terminator::Match { arms, default, .. } => {
+            for (_, target) in arms.iter_mut() {
+                if let Some(&new) = redirects.get(target) {
+                    *target = new;
+                }
+            }
+            if let Some(&new) = redirects.get(default) {
+                *default = new;
+            }
+        }
+        Terminator::Return { .. } | Terminator::Unreachable | Terminator::TailCall { .. } => {}
+    }
 }
 
 /// Remove blocks that have no predecessors (except the entry block)
@@ -63,6 +230,63 @@ fn remove_unreachable_blocks(function: &mut Function) {
         for inst in &mut block.instructions {
             if let Instruction::Phi { sources, .. } = &mut inst.node {
                 sources.retain(|(block_id, _)| reachable.contains(block_id));
+            }
+        }
+    }
+
+    simplify_phis(function);
+}
+
+/// Simplify Phi instructions:
+/// 1. Single-source Phi → Copy (source lost to unreachable block removal)
+/// 2. All-same-source Phi → Copy (all predecessors provide the same value)
+/// 3. Duplicate Phis → Copy of first (identical sources in the same block)
+fn simplify_phis(function: &mut Function) {
+    for block in &mut function.blocks {
+        // Pass 1: collapse trivial Phis to Copies
+        for inst in &mut block.instructions {
+            let replacement = match &inst.node {
+                Instruction::Phi { dest, sources } if sources.len() == 1 => {
+                    Some(Instruction::Copy {
+                        dest: *dest,
+                        src: sources[0].1,
+                    })
+                }
+                Instruction::Phi { dest, sources }
+                    if sources.len() > 1 && sources.iter().all(|(_, v)| *v == sources[0].1) =>
+                {
+                    Some(Instruction::Copy {
+                        dest: *dest,
+                        src: sources[0].1,
+                    })
+                }
+                _ => None,
+            };
+            if let Some(new_inst) = replacement {
+                inst.node = new_inst;
+            }
+        }
+
+        // Pass 2: deduplicate identical Phis within the same block.
+        // If two Phis have the same sources, the second becomes a Copy of the first.
+        let mut seen_phis: HashMap<Vec<(BlockId, VarId)>, VarId> = HashMap::new();
+        for inst in &mut block.instructions {
+            let replacement = match &inst.node {
+                Instruction::Phi { dest, sources } if !sources.is_empty() => {
+                    if let Some(&first_dest) = seen_phis.get(sources) {
+                        Some(Instruction::Copy {
+                            dest: *dest,
+                            src: first_dest,
+                        })
+                    } else {
+                        seen_phis.insert(sources.clone(), *dest);
+                        None
+                    }
+                }
+                _ => None,
+            };
+            if let Some(new_inst) = replacement {
+                inst.node = new_inst;
             }
         }
     }

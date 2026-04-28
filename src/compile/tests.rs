@@ -2607,3 +2607,184 @@ fn test_pretty_error_rendering() {
         rendered
     );
 }
+
+// ========================================================================
+// IR Guard Coverage — visual inspection tests
+// ========================================================================
+
+/// Helper: parse, lower, optimize, and dump the IR for a named function.
+/// Prints the IR to stderr (visible with `cargo test -- --nocapture`).
+fn dump_ir(source: &str, func_name: &str) -> String {
+    let externs = externs::standard_externs();
+    let mut diagnostics = crate::diagnostics::Diagnostics::new();
+    let source_id: std::rc::Rc<str> = std::rc::Rc::from("<test>");
+    diagnostics
+        .source_map
+        .add(source_id.clone(), source.to_string());
+    diagnostics.set_source(source_id);
+
+    let ast = crate::ast::parser::parse(source, "<test>", &mut diagnostics)
+        .expect("parse should succeed");
+    let mut ir_program =
+        crate::ir::lower(&ast, &externs, &mut diagnostics).expect("lowering should succeed");
+    crate::opt::optimize(&mut ir_program, &externs, &mut diagnostics);
+
+    if diagnostics.has_warnings() {
+        eprintln!("--- Diagnostics ---\n{}", diagnostics);
+    }
+
+    let func = ir_program
+        .functions
+        .iter()
+        .find(|f| f.name.as_ref() == func_name)
+        .unwrap_or_else(|| panic!("function '{}' not found in IR", func_name));
+
+    let ir = func.dump();
+    eprintln!("--- IR for {} ---\n{}", func_name, ir);
+    ir
+}
+
+#[test]
+fn inspect_for_loop_len_guards() {
+    // For-loop over an array — verify the index path has:
+    // 1. A narrowing Copy excluding Sequence
+    // 2. A type guard Match before Len
+    let ir = dump_ir(
+        "fn sum(arr) {
+            let total = 0;
+            for x in arr {
+                total = total + x;
+            }
+            total
+        }",
+        "sum",
+    );
+
+    // The Len intrinsic should appear in the IR
+    assert!(ir.contains("Len"), "IR should contain Len intrinsic");
+
+    // Verify it executes correctly
+    let val = run_expect(
+        "fn sum(arr) {
+            let total = 0;
+            for x in arr {
+                total = total + x;
+            }
+            total
+        }
+        fn test() { sum([1, 2, 3, 4, 5]) }",
+        "test",
+    );
+    assert_eq!(val, Value::UInt(15));
+}
+
+#[test]
+fn inspect_range_guards() {
+    // Range expression — verify type guards are emitted for
+    // user-supplied operands (Add, Lt, MakeSeq).
+    let ir = dump_ir(
+        "fn count(n) {
+            let total = 0;
+            for i in 0..n {
+                total = total + 1;
+            }
+            total
+        }",
+        "count",
+    );
+
+    // The MakeSeq intrinsic should appear in the IR
+    assert!(
+        ir.contains("MakeSeq"),
+        "IR should contain MakeSeq intrinsic"
+    );
+
+    // Verify it executes correctly
+    let val = run_expect(
+        "fn count(n) {
+            let total = 0;
+            for i in 0..n {
+                total = total + 1;
+            }
+            total
+        }
+        fn test() { count(10) }",
+        "test",
+    );
+    assert_eq!(val, Value::UInt(10));
+}
+
+#[test]
+fn inspect_inclusive_range_guards() {
+    // Inclusive range — verify end+1 Add guard works
+    let ir = dump_ir(
+        "fn count(n) {
+            let total = 0;
+            for i in 0..=n {
+                total = total + 1;
+            }
+            total
+        }",
+        "count",
+    );
+
+    assert!(
+        ir.contains("MakeSeq"),
+        "IR should contain MakeSeq intrinsic"
+    );
+
+    let val = run_expect(
+        "fn count(n) {
+            let total = 0;
+            for i in 0..=n {
+                total = total + 1;
+            }
+            total
+        }
+        fn test() { count(9) }",
+        "test",
+    );
+    assert_eq!(val, Value::UInt(10));
+}
+
+#[test]
+fn inspect_collect_range() {
+    dump_ir(
+        r#"
+            fn test() {
+                let arr = collect(0..5);
+                return len(arr);
+            }
+        "#,
+        "test",
+    );
+}
+
+#[test]
+fn inspect_benchmarks() {
+    let source = include_str!("../../docs/benchmarks.rill");
+    let funcs = [
+        "fib",
+        "fib_iter",
+        "make_tree",
+        "check_tree",
+        "binary_trees",
+        "ack",
+        "tak",
+        "is_prime",
+        "sum_primes",
+        "collatz_length",
+        "max_collatz",
+        "build_map",
+        "sum_map_values",
+        "map_benchmark",
+        "array_sum",
+        "matrix_trace",
+        "popcount",
+        "hamming_distance",
+        "bitwise_benchmark",
+    ];
+    for name in funcs {
+        dump_ir(source, name);
+    }
+}

@@ -636,7 +636,14 @@ impl<'a> Lowerer<'a> {
         // === Index path ===
         self.current_block = idx_bb;
         self.current_instructions = Vec::new();
-        self.lower_for_idx(iter_var, binding_is_value, binding, body, body_expr);
+        // Narrow iter_var to exclude Sequence — the Match dispatch guarantees
+        // only non-Sequence values reach this path. Without this narrowing copy,
+        // the SSA type would still include Sequence, causing type guards on Len
+        // (which requires collection types) to reject valid values.
+        let iter_type = self.var_type(iter_var);
+        let iter_narrowed =
+            self.emit_narrowing(iter_var, iter_type.difference(&TypeSet::sequence()));
+        self.lower_for_idx(iter_narrowed, binding_is_value, binding, body, body_expr);
         self.finish_block(Terminator::Jump { target: join_bb });
 
         // === Join ===
@@ -666,8 +673,17 @@ impl<'a> Lowerer<'a> {
         body: &[ast::Stmt],
         body_expr: &Option<Box<ast::Expr>>,
     ) {
-        // length = Len(iter)
-        let length = self.emit_unary_intrinsic(IntrinsicOp::Len, iter_var);
+        // Use default span for compiler-generated loop mechanics (Len, Lt, Add).
+        // These are internal control flow — diagnostics about them are noise.
+        // The user's span is restored for the loop body.
+        let user_span = self.current_span;
+        self.current_span = ast::Span::default();
+
+        // length = Len(iter) — guarded so the optimizer sees the collection type.
+        // iter_var has been narrowed to exclude Sequence by the caller (lower_for).
+        let length = self.lower_guarded_expression(|s: &mut Self| {
+            s.emit_unary_intrinsic(IntrinsicOp::Len, iter_var)
+        });
 
         // i = 0
         let i_init = self.emit_const(Literal::UInt(0));
@@ -696,8 +712,11 @@ impl<'a> Lowerer<'a> {
             condition: has_more,
             then_target: body_bb,
             else_target: exit_bb,
-            span: self.current_span,
+            span: ast::Span::default(),
         });
+
+        // Restore user span for the loop body
+        self.current_span = user_span;
 
         // Body
         self.current_block = body_bb;
@@ -778,9 +797,10 @@ impl<'a> Lowerer<'a> {
         self.pop_scope();
         self.finish_block(Terminator::Jump { target: latch_bb });
 
-        // Latch: increment counter
+        // Latch: increment counter (compiler-generated — default span)
         self.current_block = latch_bb;
         self.current_instructions = Vec::new();
+        self.current_span = ast::Span::default();
 
         let one = self.emit_const(Literal::UInt(1));
         let i_next = self.emit_binary_intrinsic(IntrinsicOp::Add, i_var, one);
@@ -828,6 +848,11 @@ impl<'a> Lowerer<'a> {
         body: &[ast::Stmt],
         body_expr: &Option<Box<ast::Expr>>,
     ) {
+        // Use default span for compiler-generated loop mechanics (SeqNext).
+        // Restore user span for the loop body.
+        let user_span = self.current_span;
+        self.current_span = ast::Span::default();
+
         let header_bb = self.fresh_block();
         let body_bb = self.fresh_block();
         let exit_bb = self.fresh_block();
@@ -848,6 +873,9 @@ impl<'a> Lowerer<'a> {
             default: body_bb,
             span: ast::Span::default(),
         });
+
+        // Restore user span for the loop body
+        self.current_span = user_span;
 
         // Body — elem is provably defined (Undefined took exit_bb)
         self.current_block = body_bb;
@@ -977,46 +1005,51 @@ impl<'a> Lowerer<'a> {
     /// undefined, and the optimizer can prove the range is non-empty when
     /// execution reaches the loop body.
     pub fn lower_range(&mut self, start: &ast::Expr, end: &ast::Expr, inclusive: bool) -> VarId {
-        let start_var = self.lower_expression(start);
-        let end_var = self.lower_expression(end);
+        self.lower_guarded_expression(|s: &mut Self| {
+            let start_var = s.lower_expression(start);
+            let end_var = s.lower_expression(end);
 
-        // For inclusive ranges, emit end_excl = end + 1 (checked)
-        let end_excl = if inclusive {
-            let one = self.emit_const(Literal::UInt(1));
-            self.emit_binary_intrinsic(IntrinsicOp::Add, end_var, one)
-        } else {
-            end_var
-        };
+            // For inclusive ranges, emit end_excl = end + 1 (checked)
+            let end_excl = if inclusive {
+                let one = s.emit_const(Literal::UInt(1));
+                s.emit_binary_intrinsic(IntrinsicOp::Add, end_var, one)
+            } else {
+                end_var
+            };
 
-        // Guard: start < end_excl — reversed ranges produce undefined
-        let valid = self.emit_binary_intrinsic(IntrinsicOp::Lt, start_var, end_excl);
+            // Guard: start < end_excl — reversed ranges produce undefined
+            let valid = s.emit_binary_intrinsic(IntrinsicOp::Lt, start_var, end_excl);
 
-        let seq_bb = self.fresh_block();
-        let undef_bb = self.fresh_block();
-        let join_bb = self.fresh_block();
+            let seq_bb = s.fresh_block();
+            let undef_bb = s.fresh_block();
+            let join_bb = s.fresh_block();
 
-        self.finish_block(Terminator::If {
-            condition: valid,
-            then_target: seq_bb,
-            else_target: undef_bb,
-            span: self.current_span,
-        });
+            s.finish_block(Terminator::If {
+                condition: valid,
+                then_target: seq_bb,
+                else_target: undef_bb,
+                span: s.current_span,
+            });
 
-        // Then: create the sequence
-        self.current_block = seq_bb;
-        self.current_instructions = Vec::new();
-        let seq_val = self.emit_binary_intrinsic(IntrinsicOp::MakeSeq, start_var, end_excl);
-        self.finish_block(Terminator::Jump { target: join_bb });
+            // Then: create the sequence
+            s.current_block = seq_bb;
+            s.current_instructions = Vec::new();
+            let seq_val = s.emit_binary_intrinsic(IntrinsicOp::MakeSeq, start_var, end_excl);
+            // Capture current_block AFTER emit_binary_intrinsic — the guard may
+            // have created new blocks, shifting current_block away from seq_bb.
+            let seq_exit = s.current_block;
+            s.finish_block(Terminator::Jump { target: join_bb });
 
-        // Else: undefined
-        self.current_block = undef_bb;
-        self.current_instructions = Vec::new();
-        let undef_val = self.emit_undefined();
-        self.finish_block(Terminator::Jump { target: join_bb });
+            // Else: undefined
+            s.current_block = undef_bb;
+            s.current_instructions = Vec::new();
+            let undef_val = s.emit_undefined();
+            s.finish_block(Terminator::Jump { target: join_bb });
 
-        // Join: phi
-        self.current_block = join_bb;
-        self.current_instructions = Vec::new();
-        self.emit_phi(vec![(seq_bb, seq_val), (undef_bb, undef_val)])
+            // Join: phi — use seq_exit (not seq_bb) as predecessor
+            s.current_block = join_bb;
+            s.current_instructions = Vec::new();
+            s.emit_phi(vec![(seq_exit, seq_val), (undef_bb, undef_val)])
+        })
     }
 }

@@ -689,6 +689,7 @@ impl Default for Function {
 // IR Dump (Debug)
 // ============================================================================
 
+#[cfg(test)]
 impl Function {
     /// Dump the function's IR to a string for debugging.
     pub fn dump(&self) -> String {
@@ -709,10 +710,12 @@ impl Function {
     }
 }
 
+#[cfg(test)]
 fn fmt_var(v: VarId) -> String {
     format!("v{}", v.0)
 }
 
+#[cfg(test)]
 fn fmt_instruction(inst: &Instruction) -> String {
     match inst {
         Instruction::Phi { dest, sources } => {
@@ -790,6 +793,7 @@ fn fmt_instruction(inst: &Instruction) -> String {
     }
 }
 
+#[cfg(test)]
 fn fmt_terminator(term: &Terminator) -> String {
     match term {
         Terminator::Jump { target } => format!("Jump B{}", target.0),

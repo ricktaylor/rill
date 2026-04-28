@@ -22,7 +22,7 @@ A *rill* is a small stream — a modest channel through which water flows. In lu
 - **Rust-like Syntax**: Familiar to Rust developers, but duck-typed and without fighting the borrow checker
 - **Duck-Typed Values**: Practical scalar and collection types (Bool, UInt, Int, Float, Text, Bytes, Array, Map) — the common denominator of JSON, CBOR, MessagePack, and similar data interchange formats
 - **Embeddable**: Extern registration system for seamless host integration
-- **Optimizing Compiler**: SSA IR with type inference, specialization, and 11 optimization passes — compiles to closure-threaded code, not a bytecode interpreter
+- **Optimizing Compiler**: SSA IR with type inference, specialization, and unified type-informed optimization fixpoint — compiles to closure-threaded code, not a bytecode interpreter
 - **Pattern Matching**: Rich destructuring with type narrowing and rest patterns
 - **Reference Semantics**: Explicit `with` bindings for in-place mutation vs `let` for value copies
 - **No Exceptions**: No error types, no panics, no stack unwinding — failed operations produce `undefined` values that propagate silently until handled. Scripts never crash; the host always gets a clean result.
@@ -72,9 +72,9 @@ Source Code
      │
      ▼
 ┌──────────────┐
-│  Optimizer   │  11 passes: const fold, type refinement, coercion,
-│              │  guard elim, definedness, copy prop, DCE, CSE,
-│              │  algebra, cast elision, ref elision
+│  Optimizer   │  Unified fixpoint: const fold, CSE, copy prop, DCE,
+│              │  ref elision, coercion, CFG simplify (jump threading),
+│              │  type refinement, cast elision, algebra, dead arm elim
 └──────┬───────┘
        │
        ▼
@@ -147,7 +147,7 @@ match bundle.payload {
 
 ### No Exceptions — Just Undefined
 
-Rill has no error type, no exceptions, and no stack unwinding. Operations that can't produce a meaningful result — a missing map key, division by zero, type mismatches — simply return `undefined`. Undefined propagates through subsequent operations without interrupting the script:
+Rill has no error type, no exceptions, and no stack unwinding. Operations that can't produce a meaningful result — a missing map key, division by zero, type mismatches — simply return `undefined`. Like SQL's `NULL`, undefined propagates silently through subsequent operations without interrupting the script:
 
 ```rust
 let x = data.missing_field.nested;  // → undefined (no KeyError)
@@ -170,14 +170,14 @@ use rill::{VM, ExternRegistry, Value};
 // Register custom externs
 let mut registry = ExternRegistry::new();
 registry.register(
-    ExternDef::new("send_report", my_send_impl)
+    ExternDef::new("reporting", "send_report", my_send_impl)
         .param("data", TypeSet::bytes())
         .returns(TypeSet::bool())
         .impure()
-);
+)?;
 
 // Compile and execute
-let (program, warnings) = rill::compile(source, &registry)?;
+let (program, diagnostics) = rill::compile(source, &registry)?;
 let mut vm = VM::new();
 
 // Push arguments and call
@@ -201,27 +201,27 @@ for input in inputs {
 - `with` reference bindings with write-back (MakeRef/WriteRef)
 - Pattern matching: type narrowing, destructuring, rest patterns, guards
 - Sequence type with lazy ranges and zero-copy array slices
-- 11 optimizer passes: constant folding, type refinement, coercion insertion, guard elimination, definedness analysis, copy propagation, dead code elimination, common subexpression elimination, algebraic simplification, cast elision, ref elision
+- Unified optimization fixpoint: constant folding, CSE, copy propagation, DCE, ref elision, coercion insertion/elision, CFG simplification (jump threading, Phi simplification), type refinement, cast elision, algebraic simplification, condition folding, dead arm elimination, expression-level type guards with guard cache, tail-call optimization, function monomorphization
 - Interprocedural return type inference and argument type propagation
 - Function monomorphization (up to 4 type-specialized variants)
 - Closure-threaded compiler with type-specialized arithmetic
 - Flat PC-based executor with stack/heap tracking
 - Extern registry with monomorphic variants and purity tracking
 - Diagnostics with source spans, line:column formatting, and error codes
+- Module system: `import` for source files, `require` for extern namespaces, `Compiler` builder
 - Public API: `compile()`, `Program::call()`, `FunctionHandle` for hot-path execution
 - 139+ end-to-end tests passing
 - Grammar specification (ABNF) and design documentation
 
 **In Progress:**
 
-- Module/import resolution system
 - Standard library (`std.time`, `std.cbor`, `std.encoding`, `std.parsing`)
-- Prelude (utility functions: `is_some`, `is_uint`, `default`, etc.)
+- Prelude (utility functions: `is_defined`, `is_uint`, `default`, etc.)
 
 **Planned:**
 
 - CLI tool (`rill run`, `rill check`, `rill dump`)
-- Tail-call optimization, function inlining, loop-invariant code motion
+- Function inlining, loop-invariant code motion
 - Bytecode serialization format
 - LSP support
 - StepKind peephole optimization layer

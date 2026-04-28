@@ -23,9 +23,10 @@ The full compilation and execution pipeline is working end-to-end with 270+ test
   - Inclusive ranges normalized to exclusive via `end + 1` checked Add in lowerer
   - Expression-level type guards (`lower_guarded_expression`, `emit_type_guard`)
   - Extern param type guards (Match guards inserted before constrained calls)
-- **Optimizer** — passes in two-phase pipeline (`src/opt/`)
-  - Phase 1 (fixpoint): const fold → CSE → copy prop → DCE → ref elision → coercion elision → CFG simplify
-  - Phase 2 (type-informed): type analysis → coercion insertion → cast elision → algebraic simplification → non-bool condition folding → dead match arm elimination → re-run Phase 1
+- **Optimizer** — unified type-informed fixpoint loop (`src/opt/`)
+  - All passes in single loop: const fold → CSE → copy prop → DCE → ref elision → coercion elision → CFG simplify → type analysis → coercion insertion → cast elision → algebra → condition fold → dead arm elim, repeating until convergence
+  - CFG simplify includes jump threading (with Phi conflict detection) and Phi simplification (single-source, all-same-source, duplicate dedup)
+  - Expression-level type guards for all intrinsics (len, collect, append, cast, compound assignment, for-loop Len, range), with guard cache for deduplication
   - Interprocedural return type inference + argument type propagation
   - Function monomorphization (up to 4 variants per function)
   - Type mismatch warnings (W009), definedness warnings (W201) via TypeSet
@@ -100,11 +101,9 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
     - [ ] DCE: imported functions not referenced from root → eliminate
     - [ ] Root file functions always kept (potential embedder entry points)
     - [ ] Unused import warning
-- [ ] **Expression spans** — Wrap `Expression` in `Spanned<Expression>` so expression-level
-      errors (undefined variable, type mismatch, invalid cast) point at the exact expression,
-      not the enclosing statement. Currently `lower_expression` uses `self.current_span` which
-      is the statement span. Requires parser changes (`.map_with()` on expression combinators)
-      and lowerer changes (`lower_expression` takes/sets span).
+- [x] **Expression spans** — `type Expr = Spanned<Expression>`. Parser wraps every expression
+      node with its source span. `lower_expression` sets `current_span` from the expression
+      span, giving precise error locations for undefined variables, type mismatches, etc.
 - [ ] **Standard prelude** — Not a language feature. A conventional `prelude.rill`
       source file (is_defined, is_uint, default, etc.) that embedders provide
       via the SourceLoader. Scripts import it with `import "prelude.rill" as _;`.
@@ -115,7 +114,15 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
       - TailCall uses `set_local` (writes through Refs) + `reset_local` (clears locals).
       - Reload instructions provide SSA visibility after by-ref calls.
       - Consistent across function params, for loops, and match arms.
-- [ ] **Host sequence support** (`SeqState::Host` variant, defer trait design to embedder API)
+- [ ] **Host objects** — `Value::Host(Box<dyn HostObject>)` with unified trait for
+      embedder-provided data structures. Combines host sequences and generic accessors:
+    - `HostObject` trait: `get(key)`, `set(key, value)`, `iter()`, `len()`
+    - Accessor works through trait for Host values (`with x = host[key]`)
+    - Sequence iteration works through trait (`for item in host { }`)
+    - `len()` intrinsic dispatches through trait
+    - Native Array/Map remain fast paths — trait dispatch only for Host values
+    - Compiler specialisation: type analysis can prove base is Array/Map and skip
+      trait dispatch, emitting direct closures (same pattern as arithmetic specialisation)
 - [ ] **Bytecode format** — CBOR serialization of optimized IR (see `docs/bytecode_format.md`)
   - Phase 1: Encoding infrastructure
     - [ ] Add `hardy-cbor` dependency (optional, behind `bytecode` feature flag)
@@ -296,6 +303,21 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
 - [ ] Fuzz testing for parser
 - [ ] Documentation: API docs, embedding guide
 
+### P2 — Portability
+
+- [ ] **`no_std` + `alloc` support** — the core library has no real `std` dependency
+      beyond import paths. All runtime types use `alloc` primitives (`Vec`, `String`,
+      `Rc`, `Box`). Dedicated pass to enable `#![no_std]` with `extern crate alloc`:
+  - [ ] `std` feature flag (enabled by default) — gates `FileLoader` and any future I/O
+  - [ ] Replace `std::collections::HashMap` with `hashbrown` (or re-export via feature)
+  - [ ] Switch all imports to `alloc::`/`core::` paths (`alloc::vec::Vec`, `alloc::rc::Rc`,
+        `alloc::string::String`, `core::fmt`, `core::hash`, etc.)
+  - [ ] `MemoryLoader` and `SourceLoader` trait remain available without `std`
+  - [ ] `FileLoader` behind `#[cfg(feature = "std")]`
+  - [ ] Verify `indexmap` `no_std` support (has it, needs `hashbrown` backend)
+  - [ ] Verify `chumsky` `no_std` compatibility (may need feature flag or parser behind `std`)
+  - [ ] WASM target smoke test
+
 ### P3 — Future
 
 - [ ] **StepKind peephole layer** — tagged enum between IR compilation and closure
@@ -387,15 +409,14 @@ the current closure-per-instruction approach.
 
 Optimizer pipeline:
 ```
-Phase 1 (fixpoint):
-  Const Fold → CSE → Copy Prop → DCE → Ref Elision → Coercion Elision → CFG Simplify
+Unified fixpoint (repeat until convergence):
+  Const Fold → CSE → Copy Prop → DCE → Ref Elision → Coercion Elision
+    → CFG Simplify (jump threading, Phi simplification)
+    → Type Analysis → Coercion Insertion → Cast Elision → Algebraic Simplification
+    → Non-Bool Condition Folding → Dead Match Arm Elimination
 
-Phase 2 (type-informed — on simplified CFG):
-  Type Analysis → Coercion Insertion → Cast Elision → Algebraic Simplification
-    → Non-Bool Condition Folding → Dead Match Arm Elimination → Re-run Phase 1
-
-Phase 3 (post-optimisation):
-  W201 definedness warnings (TypeSet-based)
+Diagnostics (post-convergence):
+  W009 type mismatch, W201 definedness warnings (TypeSet-based)
 
 Phase T (tail-call):
   Self-recursive tail call detection → TailCall rewrite → CFG Simplify

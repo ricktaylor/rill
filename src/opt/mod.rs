@@ -114,39 +114,40 @@ pub fn optimize(program: &mut IrProgram, externs: &ExternRegistry, diagnostics: 
             });
 
             if has_narrowed_params || has_user_calls {
-                // Re-run Phase 2 with full interprocedural type info
-                let types = type_refinement::analyze_types_full(
-                    function,
-                    Some(externs),
-                    &return_types,
-                    &param_types,
-                );
-                let coercions = insert_coercions(function, &types);
-                let cast_elisions = elide_identity_casts(function, &types);
-                let algebra = simplify_algebra(function, &types);
-                let condition_folds = fold_non_bool_conditions(function, &types);
-                let dead_arms = eliminate_dead_match_arms(function, &types);
+                // Re-optimize with full interprocedural type info
+                loop {
+                    let mut changed = 0;
 
-                if coercions + cast_elisions + algebra + condition_folds + dead_arms > 0 {
-                    loop {
-                        let folded = fold_constants(function, externs, diagnostics);
-                        let cse = cse::eliminate_common_subexpressions_with_purity(
-                            function,
-                            Some(externs),
-                            &pure_functions,
-                        );
-                        let copies = propagate_copies(function);
-                        let dead = dce::eliminate_dead_code_with_purity(
-                            function,
-                            Some(externs),
-                            &pure_functions,
-                        );
-                        let refs = elide_refs(function);
-                        let coerce = elide_coercions(function);
-                        let blocks = simplify_cfg(function);
-                        if folded + cse + copies + dead + refs + coerce + blocks == 0 {
-                            break;
-                        }
+                    changed += fold_constants(function, externs, diagnostics);
+                    changed += cse::eliminate_common_subexpressions_with_purity(
+                        function,
+                        Some(externs),
+                        &pure_functions,
+                    );
+                    changed += propagate_copies(function);
+                    changed += dce::eliminate_dead_code_with_purity(
+                        function,
+                        Some(externs),
+                        &pure_functions,
+                    );
+                    changed += elide_refs(function);
+                    changed += elide_coercions(function);
+                    changed += simplify_cfg(function);
+
+                    let types = type_refinement::analyze_types_full(
+                        function,
+                        Some(externs),
+                        &return_types,
+                        &param_types,
+                    );
+                    changed += insert_coercions(function, &types);
+                    changed += elide_identity_casts(function, &types);
+                    changed += simplify_algebra(function, &types);
+                    changed += fold_non_bool_conditions(function, &types);
+                    changed += eliminate_dead_match_arms(function, &types);
+
+                    if changed == 0 {
+                        break;
                     }
                 }
             }
@@ -163,6 +164,12 @@ pub fn optimize(program: &mut IrProgram, externs: &ExternRegistry, diagnostics: 
         if tco_count > 0 {
             simplify_cfg(function);
         }
+    }
+
+    // Final cleanup: one last CFG simplify pass to collapse trivial jump-only
+    // blocks left over from Phase B re-optimization and guard emission.
+    for function in &mut program.functions {
+        simplify_cfg(function);
     }
 }
 
@@ -458,74 +465,33 @@ pub fn optimize_function(
     externs: &ExternRegistry,
     diagnostics: &mut Diagnostics,
 ) {
-    // ── Phase 1: Optimize to fixpoint ────────────────────────────────────
+    // ── Unified optimization fixpoint ──────────────────────────────────
     //
-    // Loop const fold → definedness → guard elim → CFG simplify until
-    // no pass makes any changes. Typically converges in 1-2 iterations.
-    // Extra iterations handle cascading effects: const fold may expose
-    // new Defined values → guard elim removes guards → CFG simplify
-    // removes dead blocks → Phi nodes lose sources → new constants.
-
+    // All passes run in a single loop until nothing changes. This avoids
+    // phase-ordering issues where type-informed passes (dead arm elimination,
+    // coercion) expose opportunities for earlier passes (const fold, copy
+    // prop, CFG simplify) that in turn expose new type-informed opportunities.
+    // Typically converges in 2-3 iterations.
     loop {
-        let folded = fold_constants(function, externs, diagnostics);
-        let cse = eliminate_common_subexpressions(function);
-        let copies = propagate_copies(function);
-        let dead = eliminate_dead_code(function);
-        let refs = elide_refs(function);
-        let coerce = elide_coercions(function);
-        let blocks = simplify_cfg(function);
+        let mut changed = 0;
 
-        if folded + cse + copies + dead + refs + coerce + blocks == 0 {
+        changed += fold_constants(function, externs, diagnostics);
+        changed += eliminate_common_subexpressions(function);
+        changed += propagate_copies(function);
+        changed += eliminate_dead_code(function);
+        changed += elide_refs(function);
+        changed += elide_coercions(function);
+        changed += simplify_cfg(function);
+
+        let types = analyze_types(function, Some(externs));
+        changed += insert_coercions(function, &types);
+        changed += elide_identity_casts(function, &types);
+        changed += simplify_algebra(function, &types);
+        changed += fold_non_bool_conditions(function, &types);
+        changed += eliminate_dead_match_arms(function, &types);
+
+        if changed == 0 {
             break;
-        }
-    }
-
-    // ── Phase 2: Type-informed analysis (on simplified CFG) ────────────
-
-    // Type refinement — intrinsic-aware: Add(UInt, UInt) → {UInt}.
-    let types = analyze_types(function, Some(externs));
-
-    // Type mismatch diagnostics (W009)
-    check_intrinsic_types(function, &types, diagnostics);
-    check_condition_types(function, &types, diagnostics);
-
-    // Coercion insertion: makes implicit numeric promotion explicit via checked Convert.
-    // Also replaces provably-incompatible operations with Undefined.
-    let coercions = insert_coercions(function, &types);
-
-    // Identity conversion elimination: replaces Convert(T, _, [v]) with Copy
-    // when source type already matches target. Catches user-written redundant
-    // casts (e.g. `x as UInt` where x is UInt) and checked conversions that
-    // became identity after type narrowing.
-    let cast_elisions = elide_identity_casts(function, &types);
-
-    // Algebraic simplification: x+0→x, x*1→x, x*0→0, x-x→0, x==x→true,
-    // x*2→x+x, x*pow2→x<<log2 (UInt only).
-    let algebra = simplify_algebra(function, &types);
-
-    // Fold If terminators whose condition is provably not Bool → Jump(else).
-    // The then-branch becomes unreachable and is cleaned up by simplify_cfg
-    // in the fixpoint re-run below.
-    let condition_folds = fold_non_bool_conditions(function, &types);
-
-    // Prune Match arms where the scrutinee's type can never match the pattern.
-    // A Match with zero surviving arms → Jump(default).
-    // A Match with one surviving arm whose type covers the scrutinee → Jump(arm).
-    let dead_arms = eliminate_dead_match_arms(function, &types);
-
-    // If any Phase 2 pass changed the IR, re-run Phase 1 fixpoint.
-    if coercions + cast_elisions + algebra + condition_folds + dead_arms > 0 {
-        loop {
-            let folded = fold_constants(function, externs, diagnostics);
-            let cse = eliminate_common_subexpressions(function);
-            let copies = propagate_copies(function);
-            let dead = eliminate_dead_code(function);
-            let refs = elide_refs(function);
-            let coerce = elide_coercions(function);
-            let blocks = simplify_cfg(function);
-            if folded + cse + copies + dead + refs + coerce + blocks == 0 {
-                break;
-            }
         }
     }
 
@@ -534,6 +500,8 @@ pub fn optimize_function(
     // constant folding, and type narrowing have had a chance to prove
     // definedness. Any Undefined that survives is genuinely reachable.
     let final_types = analyze_types(function, Some(externs));
+    check_intrinsic_types(function, &final_types, diagnostics);
+    check_condition_types(function, &final_types, diagnostics);
     check_definedness_warnings(function, &final_types, diagnostics);
 }
 
@@ -679,6 +647,17 @@ fn eliminate_dead_match_arms(
                 target: surviving[0].1,
             };
             changes += 1;
+        } else if surviving.iter().all(|(_, t)| *t == surviving[0].1)
+            && arms_cover_type(&scrutinee_type, &surviving)
+        {
+            // All surviving arms target the same block and collectively
+            // cover the scrutinee type → Jump to that block. This handles
+            // redundant type guards where the scrutinee is already proven
+            // to be within the guard's required type set.
+            block.terminator = Terminator::Jump {
+                target: surviving[0].1,
+            };
+            changes += 1;
         } else {
             // Reduced arms — rebuild the Match
             block.terminator = Terminator::Match {
@@ -718,6 +697,20 @@ fn pattern_can_match(type_set: &crate::types::TypeSet, pattern: &MatchPattern) -
 
 /// Does this pattern fully cover the scrutinee's TypeSet?
 /// True when the scrutinee is a single type and the pattern matches that type.
+/// Check if a set of arms collectively covers all types in the scrutinee.
+fn arms_cover_type(type_set: &crate::types::TypeSet, arms: &[(MatchPattern, BlockId)]) -> bool {
+    let mut covered = crate::types::TypeSet::none();
+    for (pattern, _) in arms {
+        match pattern {
+            MatchPattern::Type(ty) => covered = covered.union(&crate::types::TypeSet::single(*ty)),
+            // Non-type patterns (Literal, Array, ArrayMin) don't cover full types
+            _ => return false,
+        }
+    }
+    // Check that every type in the scrutinee set is covered by an arm
+    type_set.difference(&covered).is_empty()
+}
+
 fn pattern_covers_type(type_set: &crate::types::TypeSet, pattern: &MatchPattern) -> bool {
     if !type_set.is_single() {
         return false;

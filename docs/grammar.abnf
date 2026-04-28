@@ -28,13 +28,13 @@ constant = "const" pattern "=" expression ";"
 
 function = "fn" identifier "(" [param-list] ")" block
 
-; Function parameters: default is by-reference, `let` makes by-value
-; `with` is explicit by-reference (optional, for symmetry)
+; Function parameters: default is by-value (CoW makes clones cheap)
+; `with` opts into by-reference for mutation propagation
 ; Rest parameter `..name` captures excess arguments as an Array
 param-list = [regular-params] ["," rest-param] / rest-param
 regular-params = function-param *("," function-param)
 
-function-param = ["let" / "with"] identifier   ; let = by-value, with/default = by-reference
+function-param = ["let" / "with"] identifier   ; default/let = by-value, with = by-reference
 rest-param = ["let" / "with"] ".." identifier  ; Variadic: excess args become Array
 
 ; A block is a sequence of items enclosed in braces.
@@ -63,8 +63,8 @@ var-decl = "let" pattern "=" expression ";"
 ; Reference binding with pattern: with x = expr; or with [a, b] = arr;
 ; Creates references to matched locations; mutations affect the original
 ; Pattern matching is total: if pattern doesn't match, all variables are missing
-; Use is_some() to check presence, or `if let`/`if with` for conditional binding
-; All bindings are by-reference (use `let` for by-value copies)
+; Use is_defined() to check presence, or `if let`/`if with` for conditional binding
+; All bindings are by-value by default (use `with` for by-reference mutation)
 ; Note: `with` is a declaration, not an expression
 with-stmt = "with" pattern "=" expression ";"
 
@@ -172,9 +172,9 @@ expr-list = expression *("," expression)
 match-expr = "match" expression "{" *match-arm "}"
 
 ; Match arm with optional `let` for by-value bindings
-; Without keyword: pattern bindings are by-reference (default)
+; Without keyword: pattern bindings are by-value (default)
 ; With `let`: pattern bindings are by-value (copies)
-; With `with`: explicit by-reference (same as default, for symmetry)
+; With `with`: opt into by-reference for mutation propagation
 match-arm = ["let" / "with"] pattern ["if" expression] "=>" "{" *statement "}" [","]
 
 ; If expression with optional let bindings
@@ -493,9 +493,9 @@ CR = %x0D                  ; Carriage return
 ;
 ; 18. For loop binding semantics:
 ;    - Single variable:
-;      for x in arr { }            // x refs each element (default = by-ref)
+;      for x in arr { }            // x copies each element (default = by-val)
 ;      for let x in arr { }        // x copies each element (by-value)
-;      for with x in arr { }       // explicit by-ref (same as default)
+;      for with x in arr { }       // explicit by-ref (opt-in mutation)
 ;    - Pair binding (key/index + value):
 ;      for k, v in map { }         // k = key (always by-val), v refs value
 ;      for let k, v in map { }     // k = key (always by-val), v copies value
@@ -540,11 +540,11 @@ CR = %x0D                  ; Carriage return
 ;      match [1, 2, 3] { [a, ..m, z] => { } }  // m = [2]
 ;    - Pattern fails to match if non-rest parts can't be satisfied:
 ;      match [1] { [a, ..m, z] => { } }  // NO MATCH (need at least 2 elements)
-;    - Rest bindings are by-reference (slice of original data)
+;    - Rest bindings are by-value by default (use `with` for by-reference slice)
 ;    - Zero captured elements → empty array, safe to iterate without checks
 ;
 ; 21. Pattern matching variable binding:
-;    - All pattern bindings are by-reference by default
+;    - All pattern bindings are by-value by default
 ;    - Variables refer to the matched data, not copies
 ;    - Mutations through pattern-bound variables affect the original
 ;    - Rest captures (..rest) are references to slices of the original
@@ -567,12 +567,12 @@ CR = %x0D                  ; Carriage return
 ;      with [a, b] = expr;     // by-reference destructure
 ;    - Pattern matching is total (never fails):
 ;      - If pattern doesn't match, all bound variables are `missing`
-;      - Use is_some(x) to check presence
+;      - Use is_defined(x) to check presence
 ;      - Use `if let` / `if with` for conditional execution when values are present
 ;    - Other contexts:
-;      Match arm:   [a, b] => { }        // by-reference (default)
+;      Match arm:   [a, b] => { }        // by-value (default)
 ;                   let [a, b] => { }    // by-value
-;      For loop:    for x in arr { }     // by-reference (default)
+;      For loop:    for x in arr { }     // by-value (default)
 ;                   for let x in arr { } // by-value
 ;    - Teaching: "want a copy? use let" / "want a reference? use with"
 ;
@@ -588,8 +588,8 @@ CR = %x0D                  ; Carriage return
 ;      let [a, b, ..] = [1,2,3];// a = 1, b = 2 (rest ignored)
 ;      let [a, ..r] = [1,2,3];  // a = 1, r = [2, 3] (rest captured)
 ;    - Rationale: [a, b] = [1] has no substitution making them equal
-;    - Use is_some() or `if let` to handle missing values:
-;      if is_some(a) && is_some(b) { ... }  // check presence
+;    - Use is_defined() or `if let` to handle missing values:
+;      if is_defined(a) && is_defined(b) { ... }  // check presence
 ;      if let [x, y] = [a, b] { sum = x + y; }  // conditional binding
 ;
 ; 26. Conditional pattern binding (if let / if with):
@@ -679,7 +679,7 @@ CR = %x0D                  ; Carriage return
 ;      let y = (x = 5);         // y is 5, x is 5
 ;      let z = (arr[i] = v);    // z is v if succeeded, undefined if OOB
 ;      a = b = c = 0;           // chained assignment, all get 0
-;      if is_some(x = v) { }    // check if assignment succeeded
+;      if is_defined(x = v) { }  // check if assignment succeeded
 ;    - Valid lvalues:
 ;      - identifier: x
 ;      - array-access: arr[i]
@@ -695,19 +695,19 @@ CR = %x0D                  ; Carriage return
 ;      - Example: `arr[i] = v` is valid, but undefined if i >= len(arr)
 ;
 ; 31. Binding modes - symmetric `let` and `with` keywords:
-;    - Default is by-reference (mutations flow back to original)
+;    - Default is by-value (CoW makes clones cheap)
 ;    - `let` prefix makes binding by-value (copy, mutations are local)
-;    - `with` prefix is explicit by-reference (same as default, for clarity)
+;    - `with` prefix opts into by-reference for mutation propagation
 ;    - Both keywords are optional where context is unambiguous
 ;    - Examples:
-;      fn process(data) { }             // by-reference (default)
+;      fn process(data) { }             // by-value (default)
 ;      fn process(with data) { }        // by-reference (explicit)
 ;      fn process(let data) { }         // by-value (copy)
-;      for x in arr { }                 // by-reference (default)
+;      for x in arr { }                 // by-value (default)
 ;      for with x in arr { }            // by-reference (explicit)
 ;      for let x in arr { }             // by-value (copy)
 ;    - Binding mode table (consistent across language):
-;      | Context          | by-ref (explicit) | by-ref (implicit) | by-value        |
+;      | Context          | by-ref (explicit) | by-val (default)  | by-val (explicit)|
 ;      |------------------|-------------------|-------------------|-----------------|
 ;      | Statement        | with x = expr     | —                 | let x = expr    |
 ;      | Conditional      | if with x = expr  | —                 | if let x = expr |

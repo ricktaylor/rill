@@ -123,7 +123,8 @@ Bit position >= 64 → Undefined                                           — i
 ### exec_len
 
 ```
-Type guard: Match(a, [Array, Map, Text, Bytes])                          — emitted
+Type guard: Match(a, [Array, Map, Text, Bytes, Sequence])                — emitted
+  (via lower_guarded_expression in try_lower_intrinsic)
 Infallible with collection input                                          — result: UInt
 (Sequence: remaining() may return None → Undefined)                      — in result_type()
 ```
@@ -164,8 +165,13 @@ Key not found: runtime only
 | **Done** | Expression-level type guards for binary/unary ops | `emit_type_guard` in lowerer |
 | **Done** | `result_type()` includes Undefined for fallible ops | Merged `is_fallible` |
 | **Done** | Undefined poisons everything (exec_eq, param_type) | All param_types use `defined()` |
-| **P1** | Convert `_ =>` arms to `debug_assert!` | After confirming guard coverage |
-| **P1** | Peephole layer: fuse `Match + Op` into single step | StepKind design in TODO.md |
+| **Done** | Convert `_ =>` arms to `debug_assert!` (guarded ops) | 12 exec functions: eq, mul, div, mod, neg, not, bitand/or/xor/not, shl, shr |
+| **Done** | Guard wrapping for `len()`, `collect()`, `append()` | `lower_guarded_expression` in `try_lower_intrinsic` |
+| **Done** | Guard wrapping for range expressions (`..`, `..=`) | `lower_guarded_expression` in `lower_range` + `seq_exit` block tracking |
+| **Done** | Guard wrapping for for-loop Len | Narrowing copy (exclude Sequence) in `lower_for` + `lower_guarded_expression` in `lower_for_idx` |
+| **Done** | Guard wrapping for cast expressions (`as`) | `lower_guarded_expression` in `lower_cast` |
+| **Done** | Guard wrapping for compound assignment (`+=` etc.) | `lower_guarded_expression` in `lower_assignment` |
+| **P3** | Peephole layer: fuse `Match + Op` into single step | StepKind design in TODO.md |
 | **P2** | Type guards for Index instruction | Not yet via emit helpers |
 | **P2** | `b != 0` divisor guard for Div/Mod | Domain-specific |
 | **P2** | `key < len(base)` bounds guard for Index | Domain-specific |

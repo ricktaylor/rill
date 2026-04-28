@@ -165,8 +165,6 @@ impl<'a> Lowerer<'a> {
 
     /// Lower a type cast expression (`value as Type`)
     fn lower_cast(&mut self, value: &ast::Expr, target_type: &ast::Identifier) -> VarId {
-        let val = self.lower_expression(value);
-
         // Validate target is a castable numeric type
         let target = match target_type.as_ref() {
             "UInt" => types::NumericType::UInt,
@@ -181,15 +179,17 @@ impl<'a> Lowerer<'a> {
                         other
                     ),
                 );
-                // Return undefined — error already emitted
                 return self.emit_undefined();
             }
         };
 
-        self.emit_unary_intrinsic(
-            IntrinsicOp::Convert(target, types::ConvertMode::Unchecked),
-            val,
-        )
+        self.lower_guarded_expression(|s| {
+            let val = s.lower_expression(value);
+            s.emit_unary_intrinsic(
+                IntrinsicOp::Convert(target, types::ConvertMode::Unchecked),
+                val,
+            )
+        })
     }
 
     /// Lower a literal value
@@ -237,7 +237,7 @@ impl<'a> Lowerer<'a> {
     /// the result with Undefined.
     ///
     /// If a guard is already active (nested expression), reuses it.
-    fn lower_guarded_expression(&mut self, f: impl FnOnce(&mut Self) -> VarId) -> VarId {
+    pub(super) fn lower_guarded_expression(&mut self, f: impl FnOnce(&mut Self) -> VarId) -> VarId {
         if self.expr_guard_fail.is_some() {
             // Already inside a guarded expression — just evaluate
             return f(self);
@@ -245,10 +245,12 @@ impl<'a> Lowerer<'a> {
 
         let fail_bb = self.fresh_block();
         self.expr_guard_fail = Some(fail_bb);
+        self.guard_cache.clear();
 
         let result = f(self);
 
         self.expr_guard_fail = None;
+        self.guard_cache.clear();
 
         // Check if any guard actually references fail_bb
         let fail_used = self
@@ -609,29 +611,37 @@ impl<'a> Lowerer<'a> {
     /// Returns Some(result) if recognized, None to fall through to normal call resolution.
     fn try_lower_intrinsic(&mut self, name: &str, arguments: &[ast::Expr]) -> Option<VarId> {
         match name {
-            "len" if arguments.len() == 1 => {
-                let arg = self.lower_expression(&arguments[0]);
-                Some(self.emit_unary_intrinsic(IntrinsicOp::Len, arg))
-            }
-            "collect" if arguments.len() == 1 => {
-                let arg = self.lower_expression(&arguments[0]);
-                Some(self.emit_unary_intrinsic(IntrinsicOp::Collect, arg))
-            }
+            "len" if arguments.len() == 1 => Some(self.lower_guarded_expression(|s| {
+                let arg = s.lower_expression(&arguments[0]);
+                s.emit_unary_intrinsic(IntrinsicOp::Len, arg)
+            })),
+            "collect" if arguments.len() == 1 => Some(self.lower_guarded_expression(|s| {
+                let arg = s.lower_expression(&arguments[0]);
+                s.emit_unary_intrinsic(IntrinsicOp::Collect, arg)
+            })),
             "append" if arguments.len() == 2 => {
-                let arr = self.lower_expression(&arguments[0]);
-                let val = self.lower_expression(&arguments[1]);
-                let dest = self.new_temp(TypeSet::array());
-                self.emit(Instruction::Append {
-                    dest,
-                    arr,
-                    value: val,
+                let result = self.lower_guarded_expression(|s| {
+                    let arr = s.lower_expression(&arguments[0]);
+                    let val = s.lower_expression(&arguments[1]);
+                    let arr = if let Some(fail_bb) = s.expr_guard_fail {
+                        s.emit_type_guard(arr, TypeSet::array(), fail_bb)
+                    } else {
+                        arr
+                    };
+                    let dest = s.new_temp(TypeSet::array());
+                    s.emit(Instruction::Append {
+                        dest,
+                        arr,
+                        value: val,
+                    });
+                    dest
                 });
                 // Reassign the array slot — append mutates via CoW, so the
                 // slot must be updated to the post-mutation value.
                 if let ast::Expression::Variable(name) = &arguments[0].node {
-                    self.reassign(name, dest);
+                    self.reassign(name, result);
                 }
-                Some(dest)
+                Some(result)
             }
             _ => None,
         }

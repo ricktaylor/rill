@@ -99,7 +99,9 @@ impl<'a> Lowerer<'a> {
                     rhs
                 } else {
                     if let Some(lhs) = self.read_var(name) {
-                        self.lower_compound_op(lhs, op, rhs)
+                        self.lower_guarded_expression(|s: &mut Self| {
+                            s.lower_compound_op(lhs, op, rhs)
+                        })
                     } else {
                         self.error_undefined_var(None, name, self.current_span);
                         return self.error_placeholder();

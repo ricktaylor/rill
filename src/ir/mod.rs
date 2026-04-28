@@ -137,6 +137,13 @@ pub struct Lowerer<'a> {
     /// an expression share the same fail block — no intermediate Phis.
     pub expr_guard_fail: Option<BlockId>,
 
+    /// Cache of type guards emitted in the current guard context.
+    /// Maps (original VarId, required TypeSet bits) → narrowed VarId.
+    /// Prevents duplicate guards when the same variable is used as multiple
+    /// operands in an expression (e.g., `x * x` — guard x once, reuse).
+    /// Cleared when expr_guard_fail is reset.
+    pub guard_cache: HashMap<(VarId, u16), VarId>,
+
     /// User function parameter by-ref modes, collected from AST before lowering.
     /// Used to emit Reload after calls for by-ref args from named variables.
     pub user_fn_params: HashMap<ast::Identifier, Vec<bool>>,
@@ -181,6 +188,7 @@ impl<'a> Lowerer<'a> {
             require_aliases: HashMap::new(),
             merged_externs: HashMap::new(),
             expr_guard_fail: None,
+            guard_cache: HashMap::new(),
             user_fn_params: HashMap::new(),
             byref_param_vars: HashMap::new(),
             merged_imports: HashMap::new(),
@@ -529,12 +537,65 @@ impl<'a> Lowerer<'a> {
     /// For single-type requirements (e.g. Bool), emits a single-arm Match.
     /// For multi-type requirements (e.g. numeric = UInt|Int|Float), emits
     /// a multi-arm Match with one arm per accepted type.
+    /// Find the slot that a VarId was read from (if it was produced by a Read
+    /// instruction in the current block).
+    fn read_slot_for(&self, value: VarId) -> Option<u32> {
+        for inst in &self.current_instructions {
+            if let Instruction::Read { slot, dest } = &inst.node
+                && *dest == value
+            {
+                return Some(*slot);
+            }
+        }
+        // Also check earlier blocks (the Read might be in a predecessor)
+        for block in &self.blocks {
+            for inst in &block.instructions {
+                if let Instruction::Read { slot, dest } = &inst.node
+                    && *dest == value
+                {
+                    return Some(*slot);
+                }
+            }
+        }
+        None
+    }
+
+    /// Look up the guard cache, also checking slot-based equivalence.
+    /// Two VarIds from separate Read instructions of the same slot should
+    /// share a guard.
+    fn lookup_guard_cache(&self, value: VarId, required: TypeSet) -> Option<VarId> {
+        let req_bits = required.bits();
+        // Direct VarId match
+        if let Some(&cached) = self.guard_cache.get(&(value, req_bits)) {
+            return Some(cached);
+        }
+        // Slot-based match: check if this VarId came from a Read, and if
+        // another VarId from the same slot was already guarded
+        if let Some(slot) = self.read_slot_for(value) {
+            for (&(cached_var, cached_req), &result) in &self.guard_cache {
+                if cached_req == req_bits && self.read_slot_for(cached_var) == Some(slot) {
+                    return Some(result);
+                }
+            }
+        }
+        None
+    }
+
     pub fn emit_type_guard(&mut self, value: VarId, required: TypeSet, fail_bb: BlockId) -> VarId {
         // If the value's declared type is already within the required set,
         // no guard needed.
         let src_type = self.var_type(value);
         if !src_type.is_empty() && src_type.difference(&required).is_empty() {
             return value;
+        }
+
+        // Check cache: if we've already guarded this value (or another read
+        // of the same variable slot) against the same required type in this
+        // expression, reuse the narrowed result. This prevents duplicate
+        // guards for `x * x`, `x + x`, etc. where the lowerer creates
+        // separate Read instructions that copy-prop later merges.
+        if let Some(cached) = self.lookup_guard_cache(value, required) {
+            return cached;
         }
 
         let ok_bb = self.fresh_block();
@@ -557,8 +618,21 @@ impl<'a> Lowerer<'a> {
         self.current_block = ok_bb;
         self.current_instructions = Vec::new();
 
-        // Narrowing: value is now known to be within the required type set
-        self.emit_narrowing(value, src_type.intersection(&required))
+        // Narrowing: value is now known to be within the required type set.
+        // Use the intersection when non-empty (common case: src includes required
+        // types plus extras). When the intersection is empty (src type has zero
+        // overlap with required — e.g., {Undefined} vs {Array, Map, Text, Bytes}),
+        // use required directly: the Match arm matched, so the value IS one of
+        // the required types regardless of the declared type.
+        let narrowed_type = src_type.intersection(&required);
+        let narrowed_type = if narrowed_type.is_empty() {
+            required
+        } else {
+            narrowed_type
+        };
+        let narrowed = self.emit_narrowing(value, narrowed_type);
+        self.guard_cache.insert((value, required.bits()), narrowed);
+        narrowed
     }
 
     /// Set the current span for subsequent instructions

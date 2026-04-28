@@ -402,4 +402,9 @@ impl TypeSet {
     pub const fn len(&self) -> usize {
         self.bits.count_ones() as usize
     }
+
+    /// Raw bitfield representation (for use as hash map key)
+    pub const fn bits(&self) -> u16 {
+        self.bits
+    }
 }

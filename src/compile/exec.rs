@@ -28,6 +28,13 @@ pub(super) fn index_value(base: &Value, key: &Value) -> Value {
 // Per-operation functions for compile-time dispatch
 // Each takes &Value directly (no slot lookup, no op dispatch).
 // Returns Value::Undefined for type mismatches or domain errors.
+//
+// Functions that are only reached from guarded paths (binary/unary operators
+// wrapped in lower_guarded_expression) have debug_assert! on their catch-all
+// arms to validate guard coverage. When the StepKind peephole layer fuses
+// Match + Op into single typed closures, these asserts must be reverted to
+// plain Value::Undefined — the fused path handles dispatch internally, and
+// the unfused fallback becomes reachable for unguarded contexts.
 // ========================================================================
 
 pub(super) fn exec_add(a: &Value, b: &Value) -> Value {
@@ -119,7 +126,13 @@ pub(super) fn exec_mul(a: &Value, b: &Value) -> Value {
         (Value::Float(a), Value::Int(b)) => {
             Float::new(a.get() * *b as f64).map_or(Value::Undefined, Value::Float)
         }
-        _ => Value::Undefined,
+        _ => {
+            debug_assert!(
+                false,
+                "exec_mul: type guard should have rejected non-numeric types"
+            );
+            Value::Undefined
+        }
     }
 }
 
@@ -150,7 +163,13 @@ pub(super) fn exec_div(a: &Value, b: &Value) -> Value {
         (Value::Float(a), Value::Int(b)) => {
             Float::new(a.get() / *b as f64).map_or(Value::Undefined, Value::Float)
         }
-        _ => Value::Undefined,
+        _ => {
+            debug_assert!(
+                false,
+                "exec_div: type guard should have rejected non-numeric types"
+            );
+            Value::Undefined
+        }
     }
 }
 
@@ -169,7 +188,13 @@ pub(super) fn exec_mod(a: &Value, b: &Value) -> Value {
             .ok()
             .and_then(|b| a.checked_rem(b))
             .map_or(Value::Undefined, Value::Int),
-        _ => Value::Undefined,
+        _ => {
+            debug_assert!(
+                false,
+                "exec_mod: type guard should have rejected non-numeric types"
+            );
+            Value::Undefined
+        }
     }
 }
 
@@ -181,13 +206,22 @@ pub(super) fn exec_neg(a: &Value) -> Value {
             .ok()
             .and_then(|v| v.checked_neg())
             .map_or(Value::Undefined, Value::Int),
-        _ => Value::Undefined,
+        _ => {
+            debug_assert!(
+                false,
+                "exec_neg: type guard should have rejected non-numeric types"
+            );
+            Value::Undefined
+        }
     }
 }
 
 pub(super) fn exec_eq(a: &Value, b: &Value) -> Value {
-    // Undefined poisons: any comparison with Undefined produces Undefined
     if a.is_undefined() || b.is_undefined() {
+        debug_assert!(
+            false,
+            "exec_eq: type guard should have rejected Undefined values"
+        );
         return Value::Undefined;
     }
     Value::Bool(a == b)
@@ -211,49 +245,91 @@ pub(super) fn exec_lt(a: &Value, b: &Value) -> Value {
 pub(super) fn exec_not(a: &Value) -> Value {
     match a {
         Value::Bool(b) => Value::Bool(!b),
-        _ => Value::Undefined,
+        _ => {
+            debug_assert!(
+                false,
+                "exec_not: type guard should have rejected non-Bool type"
+            );
+            Value::Undefined
+        }
     }
 }
 
 pub(super) fn exec_bitand(a: &Value, b: &Value) -> Value {
     match (a, b) {
         (Value::UInt(a), Value::UInt(b)) => Value::UInt(a & b),
-        _ => Value::Undefined,
+        _ => {
+            debug_assert!(
+                false,
+                "exec_bitand: type guard should have rejected non-UInt types"
+            );
+            Value::Undefined
+        }
     }
 }
 
 pub(super) fn exec_bitor(a: &Value, b: &Value) -> Value {
     match (a, b) {
         (Value::UInt(a), Value::UInt(b)) => Value::UInt(a | b),
-        _ => Value::Undefined,
+        _ => {
+            debug_assert!(
+                false,
+                "exec_bitor: type guard should have rejected non-UInt types"
+            );
+            Value::Undefined
+        }
     }
 }
 
 pub(super) fn exec_bitxor(a: &Value, b: &Value) -> Value {
     match (a, b) {
         (Value::UInt(a), Value::UInt(b)) => Value::UInt(a ^ b),
-        _ => Value::Undefined,
+        _ => {
+            debug_assert!(
+                false,
+                "exec_bitxor: type guard should have rejected non-UInt types"
+            );
+            Value::Undefined
+        }
     }
 }
 
 pub(super) fn exec_bitnot(a: &Value) -> Value {
     match a {
         Value::UInt(a) => Value::UInt(!a),
-        _ => Value::Undefined,
+        _ => {
+            debug_assert!(
+                false,
+                "exec_bitnot: type guard should have rejected non-UInt type"
+            );
+            Value::Undefined
+        }
     }
 }
 
 pub(super) fn exec_shl(a: &Value, b: &Value) -> Value {
     match (a, b) {
         (Value::UInt(a), Value::UInt(b)) => Value::UInt(a.wrapping_shl(*b as u32)),
-        _ => Value::Undefined,
+        _ => {
+            debug_assert!(
+                false,
+                "exec_shl: type guard should have rejected non-UInt types"
+            );
+            Value::Undefined
+        }
     }
 }
 
 pub(super) fn exec_shr(a: &Value, b: &Value) -> Value {
     match (a, b) {
         (Value::UInt(a), Value::UInt(b)) => Value::UInt(a.wrapping_shr(*b as u32)),
-        _ => Value::Undefined,
+        _ => {
+            debug_assert!(
+                false,
+                "exec_shr: type guard should have rejected non-UInt types"
+            );
+            Value::Undefined
+        }
     }
 }
 
