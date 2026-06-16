@@ -4,7 +4,7 @@
 //! 1. Removing unreachable blocks (no predecessors except entry)
 //! 2. Merging single-predecessor/single-successor block chains
 
-use crate::ir::{BlockId, Function, Instruction, Terminator, VarId};
+use crate::ir::{BlockId, Function, Instruction, Terminator, VarId, cfg};
 use std::collections::{HashMap, HashSet};
 
 // ============================================================================
@@ -202,25 +202,12 @@ fn rewrite_terminator_targets(terminator: &mut Terminator, redirects: &HashMap<B
 
 /// Remove blocks that have no predecessors (except the entry block)
 fn remove_unreachable_blocks(function: &mut Function) {
-    // Compute reachable blocks via BFS from entry
-    let mut reachable = HashSet::new();
-    let mut worklist = vec![function.entry_block];
-
-    while let Some(block_id) = worklist.pop() {
-        if reachable.contains(&block_id) {
-            continue;
-        }
-        reachable.insert(block_id);
-
-        // Find this block and add its successors
-        if let Some(block) = function.blocks.iter().find(|b| b.id == block_id) {
-            for succ in block.terminator.successors() {
-                if !reachable.contains(&succ) {
-                    worklist.push(succ);
-                }
-            }
-        }
-    }
+    // Compute reachable blocks from entry. Scope the block map so its borrow
+    // of `function` ends before the mutable `retain` below.
+    let reachable = {
+        let block_map = cfg::block_map(function);
+        cfg::reachable_blocks(function, &block_map)
+    };
 
     // Remove unreachable blocks
     function.blocks.retain(|b| reachable.contains(&b.id));

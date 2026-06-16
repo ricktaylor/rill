@@ -243,6 +243,43 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
       in `lower_for_seq`) because the lowerer knows `i < len` holds. With
       dominator-based bounds checking, the type analysis would prove this
       automatically and these manual annotations can be removed.
+- [ ] **SSA construction — code-review follow-ups** — remaining cleanups from
+      the post-migration review of `src/ssa/`. (Correctness/robustness items are
+      already fixed and committed: iterative dominator-tree renaming, no stack
+      overflow on deep CFGs; deterministic phi placement and operand order;
+      fixpoint trivial-phi elimination; O(1) precomputed dom-tree children;
+      single-clone phi-resolution copies.) Still open:
+  - [ ] **Pruned SSA placement** — `place_phis` inserts a phi at the IDF of
+        *every* assigned slot regardless of liveness, leaving dead phis (with
+        fresh undefined operands) for DCE to clear. Intersect IDF placement with
+        per-block liveness (semi-pruned SSA) so the invariant lives in one pass.
+        Shares a liveness analysis with the **Slot allocator** and **Dead
+        write-back elimination** items below.
+  - [ ] **Restore `test_shadowing_different_slots` assertion** — it was weakened
+        during the migration to only reject a phi sourcing `VarId(0)` (it now
+        tolerates the dead phi over an undefined operand). Restore a meaningful
+        check, ideally once pruned SSA removes the dead phi.
+  - [x] **Extract a shared CFG helper** — `ir::cfg::{block_map, reachable_blocks}`
+        now back the reachability/lookup in `ssa/domtree.rs` and
+        `opt/cfg_simplify.rs` (the latter also drops its O(n)-per-step
+        `blocks.iter().find()` BFS). A new `Terminator` shape only has to be
+        taught to `Terminator::successors()`. (The reachable+RPO-ordered+deduped
+        predecessor map in `domtree` and the all-blocks one in
+        `cfg_simplify::merge_block_chains` have different requirements and are
+        left separate.)
+  - [x] **Reuse `block_map`** — `DominatorTree::build` now takes a pre-built
+        block map; `promote` builds it once via `cfg::block_map` and shares it
+        with both the tree and renaming, so it is no longer built twice.
+  - [x] **Drop redundant `processed` set** — in `place_phis`' IDF worklist,
+        `idf` and `processed` were always mutated together; now `idf` doubles as
+        the visited set.
+  - [x] **Drop unused parameter** — `PromoteCtx::new` no longer takes the unused
+        `_tree`.
+  - [x] **Dedup duplicate successors (latent)** — `DominatorTree::build` now
+        dedups a block's successors before recording predecessors, so a
+        terminator naming the same target twice (`If` with `then == else`, or a
+        `Match` sharing a block) yields one predecessor entry, not two.
+        Covered by `test_duplicate_successor_dedup`.
 - [ ] **Dead write-back elimination** — a WriteRef exists but the base value is never
       read after the write-back point. Requires liveness analysis.
 - [ ] **Slot allocator** — map VarIds to physical slot offsets via liveness analysis.

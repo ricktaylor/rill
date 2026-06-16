@@ -22,6 +22,9 @@
 // IR type definitions
 mod types;
 
+// Shared control-flow-graph utilities (reachability, block lookup)
+pub(crate) mod cfg;
+
 // Shared constant evaluation utilities
 pub mod const_eval;
 

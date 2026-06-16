@@ -1,10 +1,11 @@
 //! Dominator tree computation using the Cooper-Harvey-Kennedy (2001) algorithm.
 //!
-//! Provides `DominatorTree::build(function)` which computes immediate dominators
-//! for all reachable blocks, and `dominance_frontier()` for SSA phi placement.
+//! Provides `DominatorTree::build(function, block_map)` which computes immediate
+//! dominators for all reachable blocks, and `dominance_frontier()` for SSA phi
+//! placement.
 
-use crate::ir::{BasicBlock, BlockId, Function};
-use std::collections::{HashMap, HashSet, VecDeque};
+use crate::ir::{BasicBlock, BlockId, Function, cfg};
+use std::collections::{HashMap, HashSet};
 
 /// Dominator tree for a function's control flow graph.
 pub struct DominatorTree {
@@ -27,27 +28,15 @@ pub struct DominatorTree {
 
 impl DominatorTree {
     /// Build a dominator tree for the given function.
-    pub fn build(function: &Function) -> Self {
-        let block_map: HashMap<BlockId, &BasicBlock> =
-            function.blocks.iter().map(|b| (b.id, b)).collect();
-
-        // 1. Find reachable blocks via BFS
-        let mut reachable = HashSet::new();
-        let mut queue = VecDeque::new();
-        queue.push_back(function.entry_block);
-        while let Some(bid) = queue.pop_front() {
-            if !reachable.insert(bid) {
-                continue;
-            }
-            if let Some(block) = block_map.get(&bid) {
-                for succ in block.terminator.successors() {
-                    queue.push_back(succ);
-                }
-            }
-        }
+    ///
+    /// Takes a pre-built block map (`cfg::block_map(function)`) so a caller
+    /// that already has one — e.g. SSA renaming — doesn't build it twice.
+    pub fn build(function: &Function, block_map: &HashMap<BlockId, &BasicBlock>) -> Self {
+        // 1. Find reachable blocks
+        let reachable = cfg::reachable_blocks(function, block_map);
 
         // 2. Compute reverse post-order via iterative DFS
-        let rpo = compute_rpo(function.entry_block, &block_map, &reachable);
+        let rpo = compute_rpo(function.entry_block, block_map, &reachable);
         let rpo_number: HashMap<BlockId, usize> =
             rpo.iter().enumerate().map(|(i, &b)| (b, i)).collect();
 
@@ -61,8 +50,15 @@ impl DominatorTree {
         }
         for &bid in &rpo {
             if let Some(block) = block_map.get(&bid) {
+                // Dedup successors so a terminator that names the same target
+                // twice (e.g. `If` with `then == else`, or a `Match` whose
+                // arms/default share a block) contributes only one predecessor
+                // entry — a phi takes one operand per predecessor block, not
+                // per edge.
+                let mut seen: Vec<BlockId> = Vec::new();
                 for succ in block.terminator.successors() {
-                    if reachable.contains(&succ) {
+                    if reachable.contains(&succ) && !seen.contains(&succ) {
+                        seen.push(succ);
                         predecessors.entry(succ).or_default().push(bid);
                     }
                 }
@@ -324,6 +320,10 @@ mod tests {
         }
     }
 
+    fn dom_tree(func: &Function) -> DominatorTree {
+        DominatorTree::build(func, &cfg::block_map(func))
+    }
+
     #[test]
     fn test_linear_chain() {
         // A(0) → B(1) → C(2) → return
@@ -333,7 +333,7 @@ mod tests {
             make_block(2, Terminator::Return { value: None }),
         ]);
 
-        let tree = DominatorTree::build(&func);
+        let tree = dom_tree(&func);
 
         assert_eq!(tree.idom(BlockId(0)), None); // entry
         assert_eq!(tree.idom(BlockId(1)), Some(BlockId(0)));
@@ -363,7 +363,7 @@ mod tests {
             make_block(3, Terminator::Return { value: None }),
         ]);
 
-        let tree = DominatorTree::build(&func);
+        let tree = dom_tree(&func);
 
         assert_eq!(tree.idom(BlockId(1)), Some(BlockId(0)));
         assert_eq!(tree.idom(BlockId(2)), Some(BlockId(0)));
@@ -397,7 +397,7 @@ mod tests {
             make_block(3, Terminator::Return { value: None }),
         ]);
 
-        let tree = DominatorTree::build(&func);
+        let tree = dom_tree(&func);
 
         assert_eq!(tree.idom(BlockId(1)), Some(BlockId(0)));
         assert_eq!(tree.idom(BlockId(2)), Some(BlockId(1)));
@@ -420,7 +420,7 @@ mod tests {
             make_block(2, Terminator::Return { value: None }), // dead
         ]);
 
-        let tree = DominatorTree::build(&func);
+        let tree = dom_tree(&func);
 
         assert_eq!(tree.idom(BlockId(0)), None);
         assert_eq!(tree.idom(BlockId(1)), Some(BlockId(0)));
@@ -445,9 +445,34 @@ mod tests {
             make_block(2, Terminator::Return { value: None }),
         ]);
 
-        let tree = DominatorTree::build(&func);
+        let tree = dom_tree(&func);
         let mut children = tree.children(BlockId(0)).to_vec();
         children.sort_by_key(|b| b.0);
         assert_eq!(children, vec![BlockId(1), BlockId(2)]);
+    }
+
+    #[test]
+    fn test_duplicate_successor_dedup() {
+        // B0 ends in an If whose two targets are the same block — a legal but
+        // degenerate CFG. B0 must appear once, not twice, as a predecessor.
+        let func = make_function(vec![
+            make_block(
+                0,
+                Terminator::If {
+                    condition: crate::ir::VarId(0),
+                    then_target: BlockId(1),
+                    else_target: BlockId(1),
+                    span: ast::Span::default(),
+                },
+            ),
+            make_block(1, Terminator::Return { value: None }),
+        ]);
+
+        let tree = dom_tree(&func);
+        assert_eq!(
+            tree.predecessors().get(&BlockId(1)),
+            Some(&vec![BlockId(0)])
+        );
+        assert_eq!(tree.idom(BlockId(1)), Some(BlockId(0)));
     }
 }

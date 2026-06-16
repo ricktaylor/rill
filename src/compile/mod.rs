@@ -59,13 +59,13 @@ use terminator::*;
 pub struct CompiledProgram {
     functions: Vec<CompiledFunction>,
     /// Function name → index into `functions`
-    pub(crate) func_index: HashMap<String, usize>,
+    pub func_index: HashMap<String, usize>,
     /// Warnings from compilation (unused functions, etc.)
     pub warnings: Diagnostics,
 }
 
 /// A compiled function — flat array of step closures with block offsets.
-pub(crate) struct CompiledFunction {
+pub struct CompiledFunction {
     /// All step closures for all blocks, flattened into a single contiguous array.
     /// Block boundaries are recorded in `block_starts`.
     pub steps: Vec<Step>,
@@ -79,10 +79,10 @@ pub(crate) struct CompiledFunction {
 
 /// A step closure. Captures operands, operates on VM.
 /// Instructions return Continue; terminators return NextBlock/Return/Exit.
-pub(crate) type Step = Box<dyn Fn(&mut VM, &CompiledProgram) -> Result<Action, ExecError>>;
+pub type Step = Box<dyn Fn(&mut VM, &CompiledProgram) -> Result<Action, ExecError>>;
 
 /// Result of executing a step.
-pub(crate) enum Action {
+pub enum Action {
     /// Continue to the next step in this block
     Continue,
     /// Jump to another block
@@ -99,7 +99,7 @@ pub(crate) enum Action {
 
 /// Maps VarIds to stack slot offsets.
 /// Slot 0 = Frame info. VarId(n) → slot n + 1.
-pub(crate) fn slot(var: VarId) -> usize {
+pub fn slot(var: VarId) -> usize {
     var.0 as usize // Frame info is on a separate stack — slot 0 is available
 }
 
@@ -180,7 +180,7 @@ pub fn compile_program(
 
 /// Resolution of a function call — determined at link time.
 #[derive(Clone)]
-pub(crate) enum CallTarget {
+pub enum CallTarget {
     /// Native extern — function pointer resolved at compile time.
     /// Includes optional type-specialized variants for monomorphic dispatch.
     Extern {
@@ -194,7 +194,7 @@ pub(crate) enum CallTarget {
 }
 
 /// Map from qualified function name to its resolved target.
-pub(crate) type LinkMap = HashMap<String, CallTarget>;
+pub type LinkMap = HashMap<String, CallTarget>;
 
 /// Link phase: resolve all function references and track usage.
 fn link_functions(

@@ -19,10 +19,11 @@ use super::domtree::DominatorTree;
 /// - Phi nodes are inserted at control flow merge points
 /// - The function is in proper SSA form
 pub fn promote(function: &mut Function) {
-    let tree = DominatorTree::build(function);
-    let mut ctx = PromoteCtx::new(function, &tree);
+    let block_map = cfg::block_map(function);
+    let tree = DominatorTree::build(function, &block_map);
+    let mut ctx = PromoteCtx::new(function);
     ctx.place_phis(function, &tree);
-    ctx.rename(function, &tree);
+    ctx.rename(&tree, &block_map);
     ctx.eliminate_trivial_phis();
 
     ctx.apply(function);
@@ -58,7 +59,7 @@ struct PromoteCtx {
 }
 
 impl PromoteCtx {
-    fn new(function: &Function, _tree: &DominatorTree) -> Self {
+    fn new(function: &Function) -> Self {
         let max_var = function.locals.iter().map(|v| v.id.0).max().unwrap_or(0);
 
         PromoteCtx {
@@ -99,15 +100,16 @@ impl PromoteCtx {
         for slot in slots {
             let sites = &def_sites[&slot];
 
-            // IDF computation: worklist algorithm
+            // IDF computation: worklist algorithm. `idf` doubles as the
+            // visited set — a block enters the worklist exactly once, when it
+            // is first added to the frontier.
             let mut idf: HashSet<BlockId> = HashSet::new();
             let mut worklist: VecDeque<BlockId> = sites.iter().copied().collect();
-            let mut processed: HashSet<BlockId> = HashSet::new();
 
             while let Some(block) = worklist.pop_front() {
                 if let Some(frontier) = df.get(&block) {
                     for &df_block in frontier {
-                        if idf.insert(df_block) && processed.insert(df_block) {
+                        if idf.insert(df_block) {
                             worklist.push_back(df_block);
                         }
                     }
@@ -150,10 +152,7 @@ impl PromoteCtx {
     /// `Enter` pushed so they don't leak into sibling subtrees. The `Leave`
     /// is queued before the children, so the whole subtree is processed
     /// before this block's definitions are popped.
-    fn rename(&mut self, function: &Function, tree: &DominatorTree) {
-        let block_map: HashMap<BlockId, &BasicBlock> =
-            function.blocks.iter().map(|b| (b.id, b)).collect();
-
+    fn rename(&mut self, tree: &DominatorTree, block_map: &HashMap<BlockId, &BasicBlock>) {
         // Per-slot definition stack: top is the current reaching definition
         let mut stacks: HashMap<u32, Vec<VarId>> = HashMap::new();
 
