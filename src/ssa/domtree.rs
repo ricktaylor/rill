@@ -46,12 +46,20 @@ impl DominatorTree {
             }
         }
 
-        // 2. Build predecessor map (reachable blocks only)
+        // 2. Compute reverse post-order via iterative DFS
+        let rpo = compute_rpo(function.entry_block, &block_map, &reachable);
+        let rpo_number: HashMap<BlockId, usize> =
+            rpo.iter().enumerate().map(|(i, &b)| (b, i)).collect();
+
+        // 3. Build predecessor map (reachable blocks only). Iterate in RPO
+        //    order so each predecessor list is deterministically ordered:
+        //    phi operand lists derive from this, and must not depend on
+        //    HashSet iteration order (which varies run to run).
         let mut predecessors: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
-        for &bid in &reachable {
+        for &bid in &rpo {
             predecessors.entry(bid).or_default();
         }
-        for &bid in &reachable {
+        for &bid in &rpo {
             if let Some(block) = block_map.get(&bid) {
                 for succ in block.terminator.successors() {
                     if reachable.contains(&succ) {
@@ -61,11 +69,6 @@ impl DominatorTree {
             }
         }
 
-        // 3. Compute reverse post-order via iterative DFS
-        let rpo = compute_rpo(function.entry_block, &block_map, &reachable);
-        let rpo_number: HashMap<BlockId, usize> =
-            rpo.iter().enumerate().map(|(i, &b)| (b, i)).collect();
-
         // 4. Compute immediate dominators (Cooper-Harvey-Kennedy)
         let idom = compute_idom(function.entry_block, &rpo, &rpo_number, &predecessors);
 
@@ -74,11 +77,10 @@ impl DominatorTree {
         //    self-sentinel). Building once here makes children() O(1).
         let mut children: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
         for &b in &rpo {
-            if let Some(&d) = idom.get(&b) {
-                if d != b {
+            if let Some(&d) = idom.get(&b)
+                && d != b {
                     children.entry(d).or_default().push(b);
                 }
-            }
         }
 
         DominatorTree {

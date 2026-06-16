@@ -81,26 +81,23 @@ impl PromoteCtx {
     fn place_phis(&mut self, function: &Function, tree: &DominatorTree) {
         let df = tree.dominance_frontier();
 
-        // Collect def sites: which blocks contain an Assign for each slot
+        // Collect def sites: which blocks contain an Assign for each slot.
         let mut def_sites: HashMap<u32, HashSet<BlockId>> = HashMap::new();
-        // Also collect which slots exist at all
-        let mut all_slots: HashSet<u32> = HashSet::new();
-
         for block in &function.blocks {
             for inst in &block.instructions {
                 if let Instruction::Assign { slot, .. } = &inst.node {
                     def_sites.entry(*slot).or_default().insert(block.id);
-                    all_slots.insert(*slot);
                 }
             }
         }
 
-        // For each slot, compute iterated dominance frontier and place phis
-        for slot in all_slots {
-            let sites = match def_sites.get(&slot) {
-                Some(s) => s,
-                None => continue,
-            };
+        // Process slots in sorted order so the fresh phi VarIds below are
+        // numbered deterministically (HashMap key order varies run to run).
+        let mut slots: Vec<u32> = def_sites.keys().copied().collect();
+        slots.sort_unstable();
+
+        for slot in slots {
+            let sites = &def_sites[&slot];
 
             // IDF computation: worklist algorithm
             let mut idf: HashSet<BlockId> = HashSet::new();
@@ -117,8 +114,12 @@ impl PromoteCtx {
                 }
             }
 
-            // Place a phi at each IDF block
-            for idf_block in idf {
+            // Place a phi at each IDF block, in sorted order so placement
+            // (and thus VarId numbering) does not depend on HashSet order.
+            let mut idf_blocks: Vec<BlockId> = idf.into_iter().collect();
+            idf_blocks.sort_unstable_by_key(|b| b.0);
+
+            for idf_block in idf_blocks {
                 let dest = self.fresh_var();
                 let preds = tree
                     .predecessors()
