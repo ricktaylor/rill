@@ -136,11 +136,14 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
         (`::config.timeout = x`; `with` on a global binds the value, no write-back)
   - [ ] DEFERRED: multi-file globals (per-file slot offsetting + `__init__` chaining;
         merge pipeline is BFS-order, needs topological sort)
-- [ ] **Remove `const` keyword** — replaced by file-scope `let`. The optimizer
-      detects never-written globals with foldable initializers and inlines them.
-      Avoids stale compile-time values in pre-compiled bytecode loaded with
-      different externs. Migrate existing `const NAME = value;` to `let NAME = value;`.
-      See `docs/globals_design.md` for rationale.
+- [x] **Remove `const` keyword** — done (2026-06-16). Replaced by file-scope `let`.
+      `const` declaration machinery deleted (parser/AST/`ir/constant.rs`); shared
+      `const_eval.rs` + `ConstValue` kept (optimizer uses them). New Phase G pass
+      `inline_const_globals` (`src/opt/const_globals.rs`) inlines never-written
+      foldable globals to constants and drops `__init__`/slots when none remain.
+      Globals read during init (chained/forward refs) stay runtime globals to
+      preserve source-order Undefined semantics. Migration: `const NAME` →
+      `let NAME` + `::NAME` at use sites; file-scope `let` takes no patterns.
 - [ ] **Standard prelude** — Not a language feature. A conventional `prelude.rill`
       source file (is_defined, is_uint, default, etc.) that embedders provide
       via the SourceLoader. Scripts import it with `import "prelude.rill" as _;`.

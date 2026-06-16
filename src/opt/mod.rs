@@ -15,6 +15,7 @@ mod cast_elision;
 mod cfg_simplify;
 mod coercion;
 mod const_fold;
+mod const_globals;
 mod copy_prop;
 mod cse;
 mod dce;
@@ -27,6 +28,7 @@ pub use cast_elision::elide_identity_casts;
 pub use cfg_simplify::simplify_cfg;
 pub use coercion::{elide_coercions, insert_coercions};
 pub use const_fold::fold_constants;
+pub use const_globals::inline_const_globals;
 pub use copy_prop::propagate_copies;
 pub use cse::eliminate_common_subexpressions;
 pub use dce::eliminate_dead_code;
@@ -51,6 +53,15 @@ pub fn optimize(program: &mut IrProgram, externs: &ExternRegistry, diagnostics: 
     // Phase A: per-function optimization (intraprocedural)
     for function in &mut program.functions {
         optimize_function(function, externs, diagnostics);
+    }
+
+    // Phase G: inline never-written foldable globals to constants (the former
+    // `const` behaviour). Runs before purity analysis so functions that only
+    // read inlined globals are correctly seen as pure.
+    if inline_const_globals(program, externs, diagnostics) {
+        for function in &mut program.functions {
+            optimize_function(function, externs, diagnostics);
+        }
     }
 
     // Phase M: Function monomorphization
@@ -1133,7 +1144,6 @@ mod tests {
 
         let program = IrProgram {
             functions: vec![callee, caller],
-            constants: vec![],
             global_count: 0,
         };
 

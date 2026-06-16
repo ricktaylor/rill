@@ -103,15 +103,8 @@ pub struct AstProgram {
     pub source_id: Rc<str>,
     pub imports: Vec<Spanned<Import>>,
     pub requires: Vec<Spanned<Require>>,
-    pub constants: Vec<Spanned<Constant>>,
     pub globals: Vec<Spanned<GlobalVar>>,
     pub functions: Vec<Spanned<Function>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct Constant {
-    pub pattern: Pat, // Pattern to bind (match failure = compile error)
-    pub value: Expr,  // Compiler verifies const-evaluability
 }
 
 /// File-scope variable (global): `let NAME [= expression];`

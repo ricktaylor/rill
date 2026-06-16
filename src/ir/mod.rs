@@ -29,7 +29,6 @@ pub(crate) mod cfg;
 pub mod const_eval;
 
 // Lowering submodules
-mod constant;
 mod control;
 mod expr;
 mod pattern;
@@ -87,9 +86,6 @@ pub struct Lowerer<'a> {
 
     /// Diagnostics accumulator for errors and warnings
     pub diagnostics: &'a mut Diagnostics,
-
-    /// Evaluated constant values (for referencing in other constants)
-    pub const_bindings: HashMap<ast::Identifier, ConstValue>,
 
     // ID generation
     pub next_var_id: u32,
@@ -166,11 +162,14 @@ pub struct Lowerer<'a> {
     /// pre-pass in `lower_program` before any function is lowered.
     pub global_slots: HashMap<ast::Identifier, u32>,
 
-    /// True while lowering the synthetic `__init__` body. In this mode a bare
-    /// `Variable(name)` falls back to a global read after local/const lookup
-    /// (file-scope initializers reference other globals without `::`). In
-    /// function bodies this stays false — bare names never resolve to globals.
-    pub in_global_init: bool,
+    /// Set while lowering the synthetic `__init__` body to the slot of the global
+    /// whose initializer is being lowered. Two effects: (1) a bare `Variable`
+    /// resolves to a global (file-scope initializers reference globals without
+    /// `::`), and (2) only globals declared *earlier* (slot < limit) are in scope
+    /// — a forward/self reference is a use-before-definition error, exactly as in
+    /// a function scope. `None` in function bodies: bare names never resolve to
+    /// globals, and `::name` sees every global regardless of order.
+    pub init_slot_limit: Option<u32>,
 }
 
 /// Context for a loop (for break/continue)
@@ -186,7 +185,6 @@ impl<'a> Lowerer<'a> {
         Lowerer {
             externs,
             diagnostics,
-            const_bindings: HashMap::new(),
             next_var_id: 0,
             next_block_id: 0,
             next_slot_id: 0,
@@ -206,7 +204,7 @@ impl<'a> Lowerer<'a> {
             byref_param_vars: HashMap::new(),
             merged_imports: HashMap::new(),
             global_slots: HashMap::new(),
-            in_global_init: false,
+            init_slot_limit: None,
         }
     }
 
@@ -237,12 +235,6 @@ impl<'a> Lowerer<'a> {
     pub fn error_invalid_pattern(&mut self, message: &str, span: ast::Span) {
         self.diagnostics
             .error(DiagnosticCode::E105_InvalidPattern, span, message);
-    }
-
-    /// Emit an error for failed constant evaluation
-    pub fn error_const_eval(&mut self, message: &str, span: ast::Span) {
-        self.diagnostics
-            .error(DiagnosticCode::E106_ConstEvalFailed, span, message);
     }
 
     /// Create an undefined value as error recovery placeholder
@@ -338,6 +330,19 @@ impl<'a> Lowerer<'a> {
             }
         }
         None
+    }
+
+    /// Resolve a file-scope global to its slot, honoring declaration order while
+    /// lowering `__init__`: a global is only visible to the initializers of
+    /// globals declared after it (slot < limit). In function bodies (no limit)
+    /// every global is visible. Returns `None` for a forward/self reference,
+    /// which the caller reports as an undefined variable.
+    pub fn resolve_global_slot(&self, name: &ast::Identifier) -> Option<u32> {
+        let slot = *self.global_slots.get(name)?;
+        match self.init_slot_limit {
+            Some(limit) if slot >= limit => None,
+            _ => Some(slot),
+        }
     }
 
     /// Emit an `Assign` instruction: write `value` to `slot`.
@@ -779,44 +784,5 @@ mod tests {
         let ir = try_lower(&ast, &registry);
 
         assert!(ir.functions[0].blocks.len() >= 3);
-    }
-
-    #[test]
-    fn test_lower_constant() {
-        let source = r#"
-            const MAX_TTL = 86400;
-            const DOUBLE = MAX_TTL * 2;
-            fn test() { }
-        "#;
-
-        let registry = test_registry();
-        let ast = try_parse(source);
-        let ir = try_lower(&ast, &registry);
-
-        assert_eq!(ir.constants.len(), 2);
-        assert_eq!(ir.constants[0].name.as_ref(), "MAX_TTL");
-        assert_eq!(ir.constants[0].value, ConstValue::UInt(86400));
-        assert_eq!(ir.constants[1].name.as_ref(), "DOUBLE");
-        assert_eq!(ir.constants[1].value, ConstValue::UInt(172800));
-    }
-
-    #[test]
-    fn test_lower_constant_array_destructure() {
-        let source = r#"
-            const [A, B, C] = [1, 2, 3];
-            fn test() { }
-        "#;
-
-        let registry = test_registry();
-        let ast = try_parse(source);
-        let ir = try_lower(&ast, &registry);
-
-        assert_eq!(ir.constants.len(), 3);
-        assert_eq!(ir.constants[0].name.as_ref(), "A");
-        assert_eq!(ir.constants[0].value, ConstValue::UInt(1));
-        assert_eq!(ir.constants[1].name.as_ref(), "B");
-        assert_eq!(ir.constants[1].value, ConstValue::UInt(2));
-        assert_eq!(ir.constants[2].name.as_ref(), "C");
-        assert_eq!(ir.constants[2].value, ConstValue::UInt(3));
     }
 }

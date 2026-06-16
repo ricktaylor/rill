@@ -2,16 +2,18 @@
 
 ## Motivation
 
-Rill currently supports two kinds of file-scope declarations:
-- `const pattern = expression;` — compile-time constants (any const-evaluable expression)
+Rill has two kinds of file-scope declarations:
+- `let NAME [= expression];` — file-scope variables (globals)
 - `fn name(...) { }` — functions
 
-This design replaces `const` with file-scope `let`, unifying all variable
+File-scope `let` replaced the former `const` keyword, unifying all variable
 bindings under one keyword. The optimizer determines which globals are
-effectively constant (never written, foldable initializer) and inlines them
-automatically. This avoids a class of bugs where compile-time const-evaluation
-of `Purity::Const` externs produces stale values when bytecode is loaded with
-different externs from those present at compile time.
+effectively constant (never written, foldable initializer, not read during
+init) and inlines them automatically (`src/opt/const_globals.rs`). This avoids
+a class of bugs where compile-time const-evaluation of `Purity::Const` externs
+produced stale values when bytecode is loaded with different externs from those
+present at compile time — non-foldable globals now initialize at load time with
+the actually-linked externs.
 
 Use cases for file-scope `let`:
 - **Memoization/singletons**: precomputed lookup tables, parsed config, cached results
@@ -33,21 +35,27 @@ fn process(x) {
 }
 ```
 
-### `const` Removal
+### `const` Removal (done)
 
-The `const` keyword is removed. File-scope `let` replaces it. The optimizer
-detects never-written globals with foldable initializers and inlines them:
+The `const` keyword has been removed; file-scope `let` replaces it. The
+`inline_const_globals` pass (Phase G, `src/opt/const_globals.rs`) detects
+never-written foldable globals and inlines them:
 
 | Pattern | Optimizer behavior |
 |---|---|
-| `let MAX = 100;` (never written) | Inlined as literal, slot eliminated |
-| `let TABLE = build(256);` (never written, const extern) | Const-folded at link time if possible, otherwise load-time init |
-| `let count = 0;` (written by functions) | True mutable global, kept in slot |
+| `let MAX = 100;` (never written, not read in init) | Inlined to a literal; slot eliminated, `__init__` dropped if it was the only global |
+| `let count = 0;` (written by a function) | True mutable global, kept in its slot |
+| `let DOUBLE = MAX * 2;` (reads another global in its init) | Left as a runtime global, computed once at load time |
+
+A global **read during `__init__`** (a chained or forward reference) is *not*
+inlined: forward references read `Undefined` by source-order semantics, so
+folding the constant in would change the result. Such globals stay runtime
+globals — correct, with a one-time load cost.
 
 `Purity::Const` externs remain useful for function-body const-folding
-(`sqrt(4.0)` → `2.0`) and for link-time optimization (Phase B3), but
-file-scope initialization always runs at load time with the actually-linked
-externs. This prevents stale values in pre-compiled bytecode.
+(`sqrt(4.0)` → `2.0`), but file-scope initialization always runs at load time
+with the actually-linked externs. This prevents stale values in pre-compiled
+bytecode.
 
 ### Semantics
 
@@ -136,19 +144,33 @@ program.call(&mut worker, "process", 1)?;
 
 ### Forward References
 
-Globals can be referenced regardless of declaration order. The lowerer
-scans all global declarations in a first pass to allocate slots, then
-lowers initializers in source order. A forward-referenced global that
-hasn't been initialized yet reads as Undefined — safe under SQL NULL
-semantics.
+A global's *initializer* may only reference globals declared **earlier** in the
+file. The root scope is a scope: referencing a global before its declaration is a
+use-before-definition error, exactly as it is inside a function. (Slots are still
+allocated in a first pass so that *function bodies* may reference any global via
+`::name` regardless of order — functions run after `__init__`.)
 
 ```rill
-let b = a + 1;    // a not yet initialized → Undefined + 1 → Undefined
-let a = 10;       // a initialized to 10
-// To fix: reorder declarations, or use a function.
+let a = 10;
+let b = a + 1;    // OK — a is declared earlier; b = 11
+
+let b = a + 1;    // ERROR: undefined variable `a` (declared later)
+let a = 10;
+
+let a = a + 1;    // ERROR: undefined variable `a` (not in scope during its own init)
 ```
 
-No dependency analysis needed — initialization is strictly source order.
+A global declared without an initializer is in scope (holds Undefined) for later
+initializers — that is the explicit meaning of `let g;`:
+
+```rill
+let g;            // Undefined
+let h = g;        // OK — g is declared earlier; h = Undefined
+```
+
+No dependency analysis or reordering is done — initialization is strictly source
+order, and out-of-order references are rejected rather than silently read as
+Undefined.
 
 ### Mutability
 

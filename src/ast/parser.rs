@@ -28,7 +28,7 @@ type BoxedParser<'a, T> = Boxed<'a, 'a, &'a str, T, Extra<'a>>;
 // ============================================================================
 
 const KEYWORDS: &[&str] = &[
-    "fn", "import", "require", "as", "const", "let", "with", "if", "else", "match", "while",
+    "fn", "import", "require", "as", "let", "with", "if", "else", "match", "while",
     "loop", "for", "in", "return", "break", "continue", "true", "false", "bytes",
 ];
 
@@ -1356,19 +1356,6 @@ fn require<'a>() -> BoxedParser<'a, Spanned<Require>> {
         .boxed()
 }
 
-fn constant<'a>() -> BoxedParser<'a, Spanned<Constant>> {
-    // const pattern = expression;
-    // Compiler validates const-evaluability; pattern match failure is compile error
-    kw("const")
-        .ignore_then(pattern())
-        .then_ignore(just('=').padded_by(whitespace()))
-        .then(expression())
-        .then_ignore(just(';').padded_by(whitespace()))
-        .map(|(pattern, value)| Constant { pattern, value })
-        .map_with(|c, extra| Spanned::new(c, extra.span()))
-        .boxed()
-}
-
 fn global<'a>() -> BoxedParser<'a, Spanned<GlobalVar>> {
     // File-scope variable: let NAME [= expression];
     // Only a bare identifier is allowed — patterns and `with` are not (using
@@ -1479,7 +1466,6 @@ fn function<'a>() -> BoxedParser<'a, Spanned<Function>> {
 enum TopLevel {
     Import(Spanned<Import>),
     Require(Spanned<Require>),
-    Constant(Spanned<Constant>),
     Global(Spanned<GlobalVar>),
     Function(Spanned<Function>),
 }
@@ -1488,7 +1474,6 @@ fn program<'a>(source_id: Rc<str>) -> BoxedParser<'a, AstProgram> {
     let top_level = choice((
         import().map(TopLevel::Import),
         require().map(TopLevel::Require),
-        constant().map(TopLevel::Constant),
         global().map(TopLevel::Global),
         function().map(TopLevel::Function),
     ))
@@ -1500,7 +1485,6 @@ fn program<'a>(source_id: Rc<str>) -> BoxedParser<'a, AstProgram> {
         .map(move |items| {
             let mut imports: Vec<Spanned<Import>> = Vec::new();
             let mut requires: Vec<Spanned<Require>> = Vec::new();
-            let mut constants: Vec<Spanned<Constant>> = Vec::new();
             let mut globals: Vec<Spanned<GlobalVar>> = Vec::new();
             let mut functions: Vec<Spanned<Function>> = Vec::new();
 
@@ -1508,7 +1492,6 @@ fn program<'a>(source_id: Rc<str>) -> BoxedParser<'a, AstProgram> {
                 match item {
                     TopLevel::Import(i) => imports.push(i),
                     TopLevel::Require(r) => requires.push(r),
-                    TopLevel::Constant(c) => constants.push(c),
                     TopLevel::Global(g) => globals.push(g),
                     TopLevel::Function(f) => functions.push(f),
                 }
@@ -1518,7 +1501,6 @@ fn program<'a>(source_id: Rc<str>) -> BoxedParser<'a, AstProgram> {
                 source_id: source_id.clone(),
                 imports,
                 requires,
-                constants,
                 globals,
                 functions,
             }
@@ -1947,10 +1929,10 @@ mod tests {
             require bpsec;
             import "../common/utils.rill" as utils;
 
-            const MAX_HOPS = 16;
+            let MAX_HOPS = 16;
 
             fn check_hops(bundle) {
-                if bundle.hops > MAX_HOPS {
+                if bundle.hops > ::MAX_HOPS {
                     drop();
                 }
             }
@@ -1964,7 +1946,7 @@ mod tests {
         let program = result.unwrap();
         assert_eq!(program.requires.len(), 1);
         assert_eq!(program.imports.len(), 1);
-        assert_eq!(program.constants.len(), 1);
+        assert_eq!(program.globals.len(), 1);
         assert_eq!(program.functions.len(), 2);
     }
 

@@ -142,7 +142,7 @@ impl<'a> Lowerer<'a> {
             }
 
             ast::Expression::GlobalAccess(name) => {
-                let slot = match self.global_slots.get(name).copied() {
+                let slot = match self.resolve_global_slot(name) {
                     Some(s) => s,
                     None => {
                         self.error_undefined_var(None, name, self.current_span);

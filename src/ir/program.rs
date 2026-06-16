@@ -13,7 +13,6 @@ impl<'a> Lowerer<'a> {
     /// Errors are emitted to the diagnostics accumulator.
     pub fn lower_program(&mut self, program: &ast::AstProgram) -> Option<IrProgram> {
         let mut functions = Vec::new();
-        let mut constants = Vec::new();
 
         let errors_before = self.diagnostics.error_count();
 
@@ -35,20 +34,11 @@ impl<'a> Lowerer<'a> {
         // namespace for each imported file.
 
         // Assign global slots (source order → 0..N) before name checks, so
-        // function/constant-vs-global clashes are caught via check_name_clash.
+        // function-vs-global clashes are caught via check_name_clash.
         self.collect_globals(&program.globals);
 
-        // Validate function and constant names for clashes
-        let function_names = self.check_function_names(&program.functions);
-        self.check_constant_names(&program.constants, &function_names);
-
-        // Lower constants (may emit errors but we continue)
-        for constant in &program.constants {
-            self.set_span(constant.span);
-            if let Some(bindings) = self.lower_constant(&constant.node) {
-                constants.extend(bindings);
-            }
-        }
+        // Validate function names for clashes (with intrinsics, externs, globals)
+        self.check_function_names(&program.functions);
 
         // Collect user function param by-ref modes before lowering bodies,
         // so the lowerer can emit Reload after calls for by-ref args.
@@ -81,7 +71,6 @@ impl<'a> Lowerer<'a> {
 
         Some(IrProgram {
             functions,
-            constants,
             global_count: program.globals.len(),
         })
     }
@@ -134,17 +123,19 @@ impl<'a> Lowerer<'a> {
         self.push_scope();
         let entry_block = self.start_block();
 
-        // In init mode, bare names in initializers resolve to other globals.
-        self.in_global_init = true;
-        for g in globals {
+        // Lower each initializer in source order. `init_slot_limit = i` makes
+        // bare names resolve to globals and restricts visibility to globals
+        // declared before slot `i` (forward/self references error).
+        for (i, g) in globals.iter().enumerate() {
             self.set_span(g.span);
+            self.init_slot_limit = Some(i as u32);
             let slot = self.global_slots.get(&g.node.name).copied();
             if let (Some(init), Some(slot)) = (&g.node.initializer, slot) {
                 let value = self.lower_expression(init);
                 self.emit_store_global(slot, value);
             }
         }
-        self.in_global_init = false;
+        self.init_slot_limit = None;
 
         self.finish_block(Terminator::Return { value: None });
         self.pop_scope();
@@ -166,13 +157,8 @@ impl<'a> Lowerer<'a> {
     }
 
     /// Check all function names for clashes with intrinsics, global externs,
-    /// merged externs (`as _`), and duplicate definitions.
-    ///
-    /// Returns the set of valid function names (for cross-checking with constants).
-    fn check_function_names(
-        &mut self,
-        functions: &[ast::Spanned<ast::Function>],
-    ) -> HashMap<ast::Identifier, ast::Span> {
+    /// merged externs (`as _`), file-scope globals, and duplicate definitions.
+    fn check_function_names(&mut self, functions: &[ast::Spanned<ast::Function>]) {
         let mut seen: HashMap<ast::Identifier, ast::Span> = HashMap::new();
 
         for func in functions {
@@ -197,77 +183,6 @@ impl<'a> Lowerer<'a> {
             }
 
             seen.insert(name.clone(), span);
-        }
-
-        seen
-    }
-
-    /// Check all constant names for clashes with intrinsics, global externs,
-    /// merged externs, function names, and duplicate definitions.
-    fn check_constant_names(
-        &mut self,
-        constants: &[ast::Spanned<ast::Constant>],
-        function_names: &HashMap<ast::Identifier, ast::Span>,
-    ) {
-        for constant in constants {
-            self.check_constant_pattern_names(
-                &constant.node.pattern.node,
-                constant.span,
-                function_names,
-            );
-        }
-    }
-
-    /// Check a single constant pattern for name clashes.
-    fn check_constant_pattern_names(
-        &mut self,
-        pattern: &ast::Pattern,
-        span: ast::Span,
-        function_names: &HashMap<ast::Identifier, ast::Span>,
-    ) {
-        match pattern {
-            ast::Pattern::Variable(name) => {
-                if let Some(msg) = self.check_name_clash(name, "constant") {
-                    self.diagnostics
-                        .error(DiagnosticCode::E400_DuplicateDefinition, span, msg);
-                } else if let Some(fn_span) = function_names.get(name) {
-                    self.diagnostics
-                        .error(
-                            DiagnosticCode::E400_DuplicateDefinition,
-                            span,
-                            format!("constant `{}` clashes with function of the same name", name),
-                        )
-                        .note(*fn_span, "function defined here");
-                }
-            }
-            ast::Pattern::Array(pats) => {
-                for pat in pats {
-                    self.check_constant_pattern_names(&pat.node, span, function_names);
-                }
-            }
-            ast::Pattern::ArrayRest {
-                before,
-                rest,
-                after,
-            } => {
-                for pat in before.iter().chain(after.iter()) {
-                    self.check_constant_pattern_names(&pat.node, span, function_names);
-                }
-                if let Some(name) = rest {
-                    self.check_constant_pattern_names(
-                        &ast::Pattern::Variable(name.clone()),
-                        span,
-                        function_names,
-                    );
-                }
-            }
-            ast::Pattern::Map(entries) => {
-                for (_, val_pat) in entries {
-                    self.check_constant_pattern_names(&val_pat.node, span, function_names);
-                }
-            }
-            // Wildcards, literals, type patterns — no names to check
-            _ => {}
         }
     }
 

@@ -16,12 +16,17 @@ require codes;                                  // Bundle status report reason c
 import "../common/validation.rill";             // Namespace: validation
 import "./helpers/routing.rill" as routing;     // Namespace: routing (explicit alias)
 
-// Constants (compile-time evaluated)
-const MAX_AGE = 86400;                          // 24 hours in seconds
-const DEFAULT_PRIORITY = 5;
-const URGENT_PRIORITY = DEFAULT_PRIORITY * 2;   // Expressions allowed
-const MAX_HOPS = 16;
-const [FLAG_URGENT, FLAG_PROCESSED, FLAG_SECURITY] = [0x01, 0x02, 0x04];
+// File-scope variables (globals). A never-written global with a foldable
+// initializer is the replacement for `const` — the optimizer inlines it to a
+// constant. Accessed inside functions via `::NAME`. No destructuring at file
+// scope, so flags are declared individually.
+let MAX_AGE = 86400;                            // 24 hours in seconds
+let DEFAULT_PRIORITY = 5;
+let URGENT_PRIORITY = DEFAULT_PRIORITY * 2;     // Initializers may use earlier globals
+let MAX_HOPS = 16;
+let FLAG_URGENT = 0x01;
+let FLAG_PROCESSED = 0x02;
+let FLAG_SECURITY = 0x04;
 
 // ============================================================================
 // Entry Points (callable by the embedder via FunctionHandle)
@@ -39,7 +44,7 @@ fn check_age(bundle) {
 
     // Use extern function and local constant
     let current = time::now();
-    if current - bundle.creation_time > MAX_AGE {
+    if current - bundle.creation_time > ::MAX_AGE {
         exit(codes::LIFETIME_EXPIRED);
     }
 }
@@ -88,7 +93,7 @@ fn process(bundle) {
             bundle.priority = converted;
         }
     } else {
-        bundle.priority = DEFAULT_PRIORITY;
+        bundle.priority = ::DEFAULT_PRIORITY;
     }
 
     // Chained conditions with && (all must succeed)
@@ -268,7 +273,7 @@ fn process_routes(bundle) {
 fn compute_priority(bundle) {
     // Block as expression: last expression (no ;) is the value
     let base = {
-        let urgency = bundle.flags & FLAG_URGENT;
+        let urgency = bundle.flags & ::FLAG_URGENT;
         let importance = default(bundle.importance, 1);
         urgency * 10 + importance
     };
@@ -299,7 +304,7 @@ fn calculate_score(data) {
 
     // Bitwise
     let masked = data.flags & 0xFF;
-    let combined = data.flags | FLAG_PROCESSED;
+    let combined = data.flags | ::FLAG_PROCESSED;
     let shifted = data.value << 2;
 
     // Bit test operator (@)

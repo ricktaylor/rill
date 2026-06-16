@@ -21,41 +21,19 @@ impl<'a> Lowerer<'a> {
             ast::Expression::Variable(name) => {
                 if let Some(var) = self.read_var(name) {
                     var
-                } else if let Some(cv) = self.const_bindings.get(name).cloned() {
-                    // Constant binding — emit inline literal
-                    let lit = match &cv {
-                        ConstValue::Bool(b) => Some(Literal::Bool(*b)),
-                        ConstValue::UInt(n) => Some(Literal::UInt(*n)),
-                        ConstValue::Int(n) => Some(Literal::Int(*n)),
-                        ConstValue::Float(f) => Some(Literal::Float(*f)),
-                        ConstValue::Text(s) => Some(Literal::Text(s.clone())),
-                        ConstValue::Bytes(b) => Some(Literal::Bytes(b.clone())),
-                        _ => None, // Array/Map constants can't be inlined as literals
-                    };
-                    if let Some(lit) = lit {
-                        self.emit_const(lit)
-                    } else {
-                        self.error_placeholder()
-                    }
+                } else if self.init_slot_limit.is_some()
+                    && let Some(slot) = self.resolve_global_slot(name)
+                {
+                    // Inside `__init__`, a bare name resolves to an earlier global.
+                    self.emit_load_global(slot)
                 } else {
-                    // In `__init__`, bare names resolve to other globals (no `::`
-                    // needed at file scope). In function bodies this is None.
-                    let global = if self.in_global_init {
-                        self.global_slots.get(name).copied()
-                    } else {
-                        None
-                    };
-                    if let Some(slot) = global {
-                        self.emit_load_global(slot)
-                    } else {
-                        self.error_undefined_var(None, name, self.current_span);
-                        self.error_placeholder()
-                    }
+                    self.error_undefined_var(None, name, self.current_span);
+                    self.error_placeholder()
                 }
             }
 
             ast::Expression::GlobalAccess(name) => {
-                if let Some(slot) = self.global_slots.get(name).copied() {
+                if let Some(slot) = self.resolve_global_slot(name) {
                     self.emit_load_global(slot)
                 } else {
                     self.error_undefined_var(None, name, self.current_span);

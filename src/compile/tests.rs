@@ -198,17 +198,22 @@ fn test_global_compound_assignment() {
 }
 
 #[test]
-fn test_global_initialized_in_source_order() {
-    // `a` is defined after `b`, so `b`'s initializer reads `a` as Undefined.
-    let src = r#"
+fn test_global_forward_reference_is_error() {
+    // `a` is declared after `b`, so `b`'s initializer references it before it is
+    // in scope — a use-before-definition error, exactly as in a function scope.
+    assert!(compile_fails(
+        r#"
         let b = a + 1;
         let a = 10;
-        fn read_a() { ::a }
-        fn read_b() { ::b }
-    "#;
-    assert_eq!(run_expect(src, "read_a"), Value::UInt(10));
-    // Undefined + 1 propagates to Undefined (guarded arithmetic).
-    assert!(run(src, "read_b").unwrap().is_undefined());
+        fn test() { ::b }
+        "#
+    ));
+}
+
+#[test]
+fn test_global_self_reference_is_error() {
+    // A global's initializer cannot reference itself (not yet in scope).
+    assert!(compile_fails("let a = a + 1; fn test() { ::a }"));
 }
 
 #[test]
@@ -428,15 +433,32 @@ fn test_recursive_function() {
 // ========================================================================
 
 #[test]
-fn test_const_binding() {
+fn test_const_global_inlined() {
+    // Former `const MAX = 100;` is now a file-scope global accessed via `::MAX`;
+    // the optimizer inlines the never-written foldable global back to a constant.
     let val = run_expect(
         r#"
-            const MAX = 100;
-            fn test() { return MAX; }
+            let MAX = 100;
+            fn test() { return ::MAX; }
             "#,
         "test",
     );
     assert_eq!(val, Value::UInt(100));
+}
+
+#[test]
+fn test_global_chained_initializer() {
+    // A global whose initializer references an earlier global is computed once at
+    // load time (it stays a runtime global, not inlined — but the value is right).
+    let val = run_expect(
+        r#"
+            let MAX_TTL = 86400;
+            let DOUBLE = MAX_TTL * 2;
+            fn test() { ::DOUBLE }
+            "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(172800));
 }
 
 // ========================================================================
@@ -1209,11 +1231,11 @@ fn test_cast_precedence() {
 
 #[test]
 fn test_cast_const_fold() {
-    // Constant cast should be folded at compile time
+    // A cast in a global initializer folds, and the global inlines to a constant.
     let val = run_expect(
         r#"
-            const X = -1 as UInt;
-            fn test() { X }
+            let X = -1 as UInt;
+            fn test() { ::X }
             "#,
         "test",
     );

@@ -2540,10 +2540,10 @@ and runs them against incoming data.
 // validation.rill
 require time;
 
-const MAX_AGE = 86400;
+let MAX_AGE = 86400;
 
 fn check_age(record) {
-    if record.age > MAX_AGE {
+    if record.age > ::MAX_AGE {
         exit(1);  // reject — too old
     }
 }

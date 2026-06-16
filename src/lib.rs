@@ -558,7 +558,6 @@ impl<'a> Compiler<'a> {
         use std::collections::HashMap;
 
         let mut functions: Vec<ir::Function> = Vec::new();
-        let mut constants: Vec<ir::ConstBinding> = Vec::new();
         let mut seen_names: HashMap<String, String> = HashMap::new();
         // Root-file globals occupy slots 0..N (the synthetic `__init__` stays
         // unqualified). Globals in imported files would need per-file slot
@@ -644,13 +643,10 @@ impl<'a> Compiler<'a> {
                 }
                 functions.push(func);
             }
-
-            constants.extend(source.ir.constants.iter().cloned());
         }
 
         ir::IrProgram {
             functions,
-            constants,
             global_count,
         }
     }

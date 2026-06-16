@@ -7,7 +7,7 @@
 
 ; Imports, requires, constants, and functions can appear in any order
 ; The compiler will collect and organize them during AST construction
-program = *(import / require / constant / global / function)
+program = *(import / require / global / function)
 
 ; Source file import — loads a .rill file, creates a namespace from filename stem
 ; `as identifier` overrides the namespace; `as _` merges into root scope (no namespace)
@@ -16,11 +16,6 @@ import = "import" string-literal ["as" (identifier / "_")] ";"
 ; Extern dependency — declares that the script needs an embedder-provided namespace
 ; `as identifier` aliases the namespace; `as _` merges into root scope (no namespace)
 require = "require" identifier ["as" (identifier / "_")] ";"
-
-; Constants: any expression that can be evaluated at compile-time
-; Compiler verifies the expression is const-evaluable and has a single type
-; Pattern match failure is a compile-time error (unlike let/with which produce missing)
-constant = "const" pattern "=" expression ";"
 
 ; File-scope variable (global): persistent mutable module state, initialized
 ; once in source order. Only a bare name (no patterns / `_`). Optional
@@ -450,20 +445,18 @@ CR = %x0D                  ; Carriage return
 ;    - Multi-pass compilation resolves all references regardless of order
 ;    - Convention: requires and imports at top for readability, but not required
 ;
-; 13. Constants:
-;    - Top-level only (const MaxAge = 86400;)
-;    - Takes a pattern (like let/with) for consistency
-;    - Pattern match failure is a compile-time error (not missing)
-;    - Can use any expression; compiler verifies const-evaluability
-;    - Const-evaluable: literals, other constants, pure operations, const fn calls
-;    - Must resolve to a single type (no union types)
-;    - Constants are visible to importers (part of the module's public surface)
+; 13. Constants (the `const` keyword was removed — use file-scope `let`):
+;    - A `let NAME = <foldable>;` global that no function writes is the
+;      replacement for `const`. The optimizer inlines never-written foldable
+;      globals back to constants, so they cost nothing at runtime.
+;    - Accessed inside functions via `::NAME`; initialized in source order.
+;    - Non-foldable initializers (`let t = build_table();`) run once at load
+;      time with the actually-linked externs (no stale baked-in values).
+;    - No destructuring at file scope: split `const [A,B,C] = [1,2,3];` into
+;      separate `let A = 1; let B = 2; let C = 3;`.
 ;    - Examples:
-;      const MaxAge = 86400;
-;      const Double = MaxAge * 2;
-;      const Flags = 0x01 | 0x02 | 0x04;
-;      const [A, B, C] = [1, 2, 3];           // destructuring
-;      const {x: X, y: Y} = {x: 10, y: 20};   // map destructuring
+;      let MaxAge = 86400;
+;      let Flags = 0x01 | 0x02 | 0x04;
 ;
 ; 14. Prelude (convention, not a language feature):
 ;    - Utility functions (is_defined, is_uint, default, etc.) as regular Rill source

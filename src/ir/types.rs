@@ -285,16 +285,6 @@ fn promote_union(a: TypeSet, b: TypeSet) -> TypeSet {
     }
 }
 
-/// Map a user-callable function name to its IntrinsicOp, if it's a
-/// language-defined intrinsic rather than a host-provided extern.
-pub fn intrinsic_by_name(name: &str) -> Option<IntrinsicOp> {
-    match name {
-        "len" => Some(IntrinsicOp::Len),
-        "collect" => Some(IntrinsicOp::Collect),
-        _ => None,
-    }
-}
-
 /// Names reserved by the compiler — intrinsics and special instructions.
 /// Used for name clash detection during lowering.
 pub fn is_reserved_name(name: &str) -> bool {
@@ -863,18 +853,10 @@ fn fmt_terminator(term: &Terminator) -> String {
 #[derive(Debug, Clone)]
 pub struct IrProgram {
     pub functions: Vec<Function>,
-    pub constants: Vec<ConstBinding>,
     /// Number of file-scope global slots (0..N of the VM stack). A synthetic
     /// `__init__` function (present in `functions` when this is non-zero)
     /// initializes them in source order.
     pub global_count: usize,
-}
-
-/// A constant binding (result of const pattern matching)
-#[derive(Debug, Clone)]
-pub struct ConstBinding {
-    pub name: ast::Identifier,
-    pub value: ConstValue,
 }
 
 /// Compile-time evaluated constant value
