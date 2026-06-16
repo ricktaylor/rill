@@ -333,11 +333,12 @@ fn compile_function(func: &Function, link_map: &LinkMap) -> Result<CompiledFunct
             block.insert(
                 insert_pos,
                 Box::new(move |vm: &mut VM, _prog| {
-                    // Read all sources first (parallel semantics)
+                    // Read all sources first (parallel semantics), then move
+                    // each into its dest — the read already owns a clone, so
+                    // no second clone is needed on write.
                     let vals: Vec<_> = copies.iter().map(|&(_, s)| vm.local(s).clone()).collect();
-                    // Then write all dests
-                    for (i, &(d, _)) in copies.iter().enumerate() {
-                        vm.set_local(d, vals[i].clone());
+                    for (&(d, _), val) in copies.iter().zip(vals) {
+                        vm.set_local(d, val);
                     }
                     Ok(Action::Continue)
                 }),

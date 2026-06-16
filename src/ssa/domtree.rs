@@ -78,9 +78,10 @@ impl DominatorTree {
         let mut children: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
         for &b in &rpo {
             if let Some(&d) = idom.get(&b)
-                && d != b {
-                    children.entry(d).or_default().push(b);
-                }
+                && d != b
+            {
+                children.entry(d).or_default().push(b);
+            }
         }
 
         DominatorTree {
