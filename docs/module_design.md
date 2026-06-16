@@ -112,8 +112,9 @@ compiler.add("main.rill");
 // Build → Program with all functions compiled
 let (program, warnings) = compiler.build()?;
 
-// Execute
+// Execute (exec initializes any file-scope globals; no-op otherwise)
 let mut vm = VM::new();
+vm.exec(&program)?;
 let result = program.call(&mut vm, "main", 0)?;
 ```
 

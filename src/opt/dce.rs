@@ -120,6 +120,13 @@ fn collect_reads(inst: &Instruction, used: &mut HashSet<VarId>) {
             used.insert(*src);
         }
 
+        // LoadGlobal reads no VarId operands; StoreGlobal reads its value.
+        Instruction::LoadGlobal { .. } => {}
+
+        Instruction::StoreGlobal { value, .. } => {
+            used.insert(*value);
+        }
+
         Instruction::Assign { .. } | Instruction::Read { .. } => {
             unreachable!("pre-SSA instruction; removed by mem2reg")
         }
@@ -162,7 +169,9 @@ fn is_removable(
         | Instruction::Phi { .. }
         | Instruction::MakeAccessor { .. }
         | Instruction::MakeRef { .. }
-        | Instruction::Reload { .. } => true,
+        | Instruction::Reload { .. }
+        // LoadGlobal is pure (reads a global): removable when its dest is unused.
+        | Instruction::LoadGlobal { .. } => true,
 
         // Call: removable only if the callee is proven pure
         Instruction::Call { function, .. } => {
@@ -179,6 +188,7 @@ fn is_removable(
         // No dest or side effects — always keep
         Instruction::WriteRef { .. }
         | Instruction::WriteAccessor { .. }
+        | Instruction::StoreGlobal { .. }
         | Instruction::Append { .. } => false,
 
         Instruction::Assign { .. } | Instruction::Read { .. } => {
@@ -199,9 +209,12 @@ fn get_dest(inst: &Instruction) -> Option<VarId> {
         | Instruction::MakeRef { dest, .. }
         | Instruction::Append { dest, .. }
         | Instruction::Call { dest, .. }
-        | Instruction::Reload { dest, .. } => Some(*dest),
+        | Instruction::Reload { dest, .. }
+        | Instruction::LoadGlobal { dest, .. } => Some(*dest),
 
-        Instruction::WriteRef { .. } | Instruction::WriteAccessor { .. } => None,
+        Instruction::WriteRef { .. }
+        | Instruction::WriteAccessor { .. }
+        | Instruction::StoreGlobal { .. } => None,
 
         Instruction::Assign { .. } | Instruction::Read { .. } => {
             unreachable!("pre-SSA instruction; removed by mem2reg")

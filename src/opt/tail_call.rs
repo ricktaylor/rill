@@ -140,6 +140,8 @@ fn instruction_reads(inst: &Instruction) -> Vec<VarId> {
         Instruction::WriteAccessor { base, key, value } => vec![*base, *key, *value],
         Instruction::Append { arr, value, .. } => vec![*arr, *value],
         Instruction::Reload { src, .. } => vec![*src],
+        Instruction::LoadGlobal { .. } => vec![],
+        Instruction::StoreGlobal { value, .. } => vec![*value],
         Instruction::Assign { value, .. } => vec![*value],
         Instruction::Read { .. } => vec![],
     }

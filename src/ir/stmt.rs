@@ -16,7 +16,11 @@ impl<'a> Lowerer<'a> {
                 pattern,
                 initializer,
             } => {
-                let value = self.lower_expression(initializer);
+                // An absent initializer (`let x;`) binds to Undefined.
+                let value = match initializer {
+                    Some(init) => self.lower_expression(init),
+                    None => self.emit_undefined(),
+                };
                 self.lower_pattern_binding(&pattern.node, value, BindingMode::Value);
             }
 
@@ -134,6 +138,25 @@ impl<'a> Lowerer<'a> {
 
                 // Reassign the variable via its slot. mem2reg handles phis.
                 self.reassign(name, final_value);
+                final_value
+            }
+
+            ast::Expression::GlobalAccess(name) => {
+                let slot = match self.global_slots.get(name).copied() {
+                    Some(s) => s,
+                    None => {
+                        self.error_undefined_var(None, name, self.current_span);
+                        return self.error_placeholder();
+                    }
+                };
+                let rhs = self.lower_expression(value);
+                let final_value = if matches!(op, ast::AssignmentOp::Assign) {
+                    rhs
+                } else {
+                    let lhs = self.emit_load_global(slot);
+                    self.lower_guarded_expression(|s: &mut Self| s.lower_compound_op(lhs, op, rhs))
+                };
+                self.emit_store_global(slot, final_value);
                 final_value
             }
 

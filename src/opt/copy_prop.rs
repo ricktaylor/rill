@@ -208,6 +208,16 @@ fn replace_vars_in_instruction(inst: &mut Instruction, map: &HashMap<VarId, VarI
             }
         }
 
+        // LoadGlobal reads no VarId operands (slot is a constant index).
+        Instruction::LoadGlobal { .. } => {}
+
+        Instruction::StoreGlobal { value, .. } => {
+            if let Some(&new) = map.get(value) {
+                *value = new;
+                count += 1;
+            }
+        }
+
         Instruction::Assign { .. } | Instruction::Read { .. } => {
             unreachable!("pre-SSA instruction; removed by mem2reg")
         }

@@ -161,6 +161,16 @@ pub struct Lowerer<'a> {
     /// Checked in `lower_function_call` for unqualified calls after
     /// externs and `merged_externs`.
     pub merged_imports: HashMap<ast::Identifier, ast::Identifier>,
+
+    /// File-scope global names → absolute VM slot index (0..N). Populated by a
+    /// pre-pass in `lower_program` before any function is lowered.
+    pub global_slots: HashMap<ast::Identifier, u32>,
+
+    /// True while lowering the synthetic `__init__` body. In this mode a bare
+    /// `Variable(name)` falls back to a global read after local/const lookup
+    /// (file-scope initializers reference other globals without `::`). In
+    /// function bodies this stays false — bare names never resolve to globals.
+    pub in_global_init: bool,
 }
 
 /// Context for a loop (for break/continue)
@@ -195,6 +205,8 @@ impl<'a> Lowerer<'a> {
             user_fn_params: HashMap::new(),
             byref_param_vars: HashMap::new(),
             merged_imports: HashMap::new(),
+            global_slots: HashMap::new(),
+            in_global_init: false,
         }
     }
 
@@ -474,6 +486,19 @@ impl<'a> Lowerer<'a> {
     /// Emit an Undefined constant.
     pub fn emit_undefined(&mut self) -> VarId {
         self.emit_const(Literal::Undefined)
+    }
+
+    /// Emit a read of a file-scope global into a fresh VarId.
+    /// The global's type is unknown at this layer, so the result is `any()`.
+    pub fn emit_load_global(&mut self, slot: u32) -> VarId {
+        let dest = self.new_temp(TypeSet::any());
+        self.emit(Instruction::LoadGlobal { dest, slot });
+        dest
+    }
+
+    /// Emit a write of `value` to a file-scope global slot.
+    pub fn emit_store_global(&mut self, slot: u32, value: VarId) {
+        self.emit(Instruction::StoreGlobal { slot, value });
     }
 
     /// Emit a Reload — SSA barrier after a mutation site.

@@ -60,6 +60,12 @@ pub struct CompiledProgram {
     functions: Vec<CompiledFunction>,
     /// Function name → index into `functions`
     pub func_index: HashMap<String, usize>,
+    /// Number of file-scope global slots (0..N of the VM stack), reserved by
+    /// `VM::exec` before any user call.
+    pub global_count: usize,
+    /// Index of the synthetic `__init__` function (if the program has globals).
+    /// Run by `VM::exec` to populate the global slots in source order.
+    pub init_func: Option<usize>,
     /// Warnings from compilation (unused functions, etc.)
     pub warnings: Diagnostics,
 }
@@ -166,9 +172,13 @@ pub fn compile_program(
         }
     }
 
+    let init_func = func_index.get("__init__").copied();
+
     let mut program = CompiledProgram {
         functions: compiled_functions,
         func_index,
+        global_count: ir.global_count,
+        init_func,
         warnings: Diagnostics::new(),
     };
 
@@ -813,6 +823,34 @@ fn compile_instruction(
             let s = slot(*src);
             Box::new(move |vm: &mut VM, _prog| {
                 vm.set_local(d, vm.local(s).clone());
+                Ok(Action::Continue)
+            })
+        }
+
+        // LoadGlobal: copy a global (absolute slot) into a local (bp-relative).
+        Instruction::LoadGlobal {
+            dest,
+            slot: global_slot,
+        } => {
+            let d = slot(*dest);
+            let g = *global_slot as usize;
+            Box::new(move |vm: &mut VM, _prog| {
+                let v = vm.get(g).cloned().unwrap_or(Value::Undefined);
+                vm.set_local(d, v);
+                Ok(Action::Continue)
+            })
+        }
+
+        // StoreGlobal: write a local (bp-relative) into a global (absolute slot).
+        Instruction::StoreGlobal {
+            slot: global_slot,
+            value,
+        } => {
+            let g = *global_slot as usize;
+            let v = slot(*value);
+            Box::new(move |vm: &mut VM, _prog| {
+                let val = vm.local(v).clone();
+                vm.set(g, val);
                 Ok(Action::Continue)
             })
         }

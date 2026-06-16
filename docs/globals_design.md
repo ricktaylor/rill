@@ -54,7 +54,7 @@ externs. This prevents stale values in pre-compiled bytecode.
 - **Optional initializer**: `let x = expr;` or `let x;` (starts as Undefined)
 - **Mutable**: functions in the same file can reassign globals
 - **Private to source file**: not visible to importing files
-- **Evaluation order**: initializers run top-to-bottom during `Linker::exec()`
+- **Evaluation order**: initializers run top-to-bottom during `vm.exec()`
 - **No `with` at file scope**: `with` creates a reference to another location —
   meaningless at file scope where there is no enclosing variable to reference.
   `with` inside function bodies can still bind to globals for structured mutation.
@@ -96,33 +96,42 @@ no `::` needed since there are no local scopes to conflict with.
 
 ### Initialization — exec/fork/call
 
-**Unix process model:**
+**Unix process model** (as implemented — `exec` is a method *on the VM* that
+loads a program's globals into it, not a constructor):
 
 | Operation | Unix | Rill |
 |---|---|---|
-| Load program | `exec()` | `Linker::exec(self) -> Result<VM>` |
-| Copy process | `fork()` | `VM::fork(&self) -> VM` |
-| Run function | system call | `VM::call()` |
+| Load program | `exec()` | `VM::exec(&mut self, &Program) -> Result<()>` |
+| Copy process | `fork()` | `vm.clone()` |
+| Run function | system call | `Program::call(&self, &mut vm, name, argc)` |
 
-- **`Linker::exec(self) -> Result<VM>`** — consumes the linker, runs
-  `__init__` (evaluates all global initializers in source order), returns
-  an initialized VM. This is the only way to create a VM.
-- **`VM::fork(&self) -> VM`** — deep copy of the VM state. Child inherits
-  initialized globals. Independent heap. No re-initialization.
-- **`VM::call()`** — run a function. No special first-call behavior —
-  the VM is always in a ready state after `exec()`.
+- **`VM::exec(&mut self, program: &Program)`** — resets the VM, reserves the
+  program's global slots (0..N), and runs `__init__` (evaluates all global
+  initializers in source order), leaving the VM ready. Call once after
+  `compile()`. A cheap reset for global-free programs.
+- **`vm.clone()`** — deep copy of the VM state (the child inherits initialized
+  globals; CoW values share heap accounting). `VM` derives `Clone`; there is no
+  separate `fork()` — `clone()` already expresses the copy.
+- **`Program::call(&self, &mut vm, name, argc)`** — run a function. No special
+  first-call behavior — the VM is ready after `exec()`.
 
-VM does NOT derive `Clone` and `VM::new()` is not public. The only way to
-create a VM is `exec()`, the only way to copy is `fork()`.
+`VM` derives `Clone` and `VM::new()` stays public (lowest-churn). This differs
+from an earlier sketch where `exec` was a linker method returning the VM and
+`new` was private; the method-on-VM form was chosen so `exec` reads naturally
+(`vm.exec(program)` loads) without forcing every existing `VM::new()` call site
+to change.
 
 ```rust
-let mut vm = linker.exec()?;           // __init__ runs, globals ready
+let (program, _diags) = rill::compile(source, &externs)?;
 
-vm.call("setup", 0)?;                  // just a function call
+let mut vm = VM::new();
+vm.exec(&program)?;                    // __init__ runs, globals ready
 
-let mut worker = vm.fork();            // independent, pre-initialized
+program.call(&mut vm, "setup", 0)?;    // just a function call
+
+let mut worker = vm.clone();           // independent, pre-initialized
 worker.push(batch)?;
-worker.call("process", 1)?;            // just a function call
+program.call(&mut worker, "process", 1)?;
 ```
 
 ### Forward References
@@ -249,8 +258,8 @@ between loads due to intervening function calls.
 
 The compiler generates a synthetic `__init__` function for each source file
 that has globals. This function evaluates each global initializer in source
-order and stores results via `StoreGlobal`. `Linker::exec()` runs `__init__`
-and returns the initialized VM.
+order and stores results via `StoreGlobal`. `vm.exec(&program)` runs `__init__`
+to leave the VM initialized.
 
 **Multi-file programs:** init functions run in import order (dependencies
 first) during `exec()`.
@@ -271,7 +280,7 @@ struct CompiledProgram {
 
 When file A imports file B:
 1. B's globals are part of B's compiled output
-2. B's `__init__` runs before A's during `Linker::exec()`
+2. B's `__init__` runs before A's during `vm.exec()`
 3. B's globals are in B's slot range; A's are in A's slot range
 4. A cannot reference B's globals (private) — only B's functions
 

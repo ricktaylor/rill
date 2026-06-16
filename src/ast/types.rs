@@ -104,6 +104,7 @@ pub struct AstProgram {
     pub imports: Vec<Spanned<Import>>,
     pub requires: Vec<Spanned<Require>>,
     pub constants: Vec<Spanned<Constant>>,
+    pub globals: Vec<Spanned<GlobalVar>>,
     pub functions: Vec<Spanned<Function>>,
 }
 
@@ -111,6 +112,17 @@ pub struct AstProgram {
 pub struct Constant {
     pub pattern: Pat, // Pattern to bind (match failure = compile error)
     pub value: Expr,  // Compiler verifies const-evaluability
+}
+
+/// File-scope variable (global): `let NAME [= expression];`
+///
+/// Persistent mutable module state, initialized once in source order at
+/// `vm.exec()` time. Read/written inside functions only via `::NAME`.
+/// The initializer is optional: `let g;` starts as Undefined.
+#[derive(Debug, Clone)]
+pub struct GlobalVar {
+    pub name: Identifier,
+    pub initializer: Option<Expr>,
 }
 
 /// Source file import: `import "path/to/file.rill" [as alias];`
@@ -169,12 +181,17 @@ pub struct Function {
 #[derive(Debug, Clone)]
 pub enum Statement {
     // Variable declaration with pattern: let x = 5; or let [a, b] = expr;
-    // Creates copies of values (value semantics, always by-value)
+    // Creates copies of values (value semantics, always by-value).
+    // The initializer is optional: `let x;` binds x to Undefined (SQL NULL
+    // semantics — an absent value, not an error).
     // Pattern can be:
-    //   - Single variable: let x = expr;
+    //   - Single variable: let x = expr; or let x;
     //   - Array destructure: let [a, b, c] = arr;
     //   - With rest: let [first, ..rest] = arr;
-    VarDecl { pattern: Pat, initializer: Expr },
+    VarDecl {
+        pattern: Pat,
+        initializer: Option<Expr>,
+    },
 
     // Reference binding with pattern: with x = expr; or with [a, b] = arr;
     // Creates references to matched locations (reference semantics)
@@ -204,6 +221,10 @@ pub enum Statement {
 pub enum Expression {
     Literal(Literal),
     Variable(Identifier),
+    /// File-scope global access: `::name`. Reads a global; valid as an
+    /// assignment target to write a global. A bare name never resolves to a
+    /// global — the `::` prefix is required inside function bodies.
+    GlobalAccess(Identifier),
     /// Qualified name for namespaced function calls: namespace::name
     /// Only valid as target of a function call (e.g., bpsec::validate())
     QualifiedName {

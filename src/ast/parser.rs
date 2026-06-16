@@ -399,6 +399,12 @@ fn primary_expr<'a>(expr: BoxedParser<'a, Expr>) -> BoxedParser<'a, Expr> {
                 Spanned::new(node, extra.span())
             });
 
+    // File-scope global access: `::name` (read; also a valid assignment target)
+    let global_access = just("::")
+        .padded_by(whitespace())
+        .ignore_then(ident())
+        .map_with(|name, extra| Spanned::new(Expression::GlobalAccess(name), extra.span()));
+
     let paren = expr.clone().padded_by(whitespace()).delimited_by(
         just('(').padded_by(whitespace()),
         just(')').padded_by(whitespace()),
@@ -425,6 +431,7 @@ fn primary_expr<'a>(expr: BoxedParser<'a, Expr>) -> BoxedParser<'a, Expr> {
         map_lit,
         block,
         paren,
+        global_access,
         callable_or_variable,
     ))
     .boxed()
@@ -1250,10 +1257,15 @@ fn match_expr<'a>(expr: BoxedParser<'a, Expr>) -> BoxedParser<'a, Expr> {
 
 fn statement<'a>(expr: BoxedParser<'a, Expr>) -> BoxedParser<'a, Stmt> {
     // Variable declaration with pattern: let x = expr; or let [a, b] = expr;
+    // The initializer is optional: `let x;` binds the pattern to Undefined.
     let var_decl = kw("let")
         .ignore_then(pattern())
-        .then_ignore(just('=').padded_by(whitespace()))
-        .then(expr.clone().padded_by(whitespace()))
+        .then(
+            just('=')
+                .padded_by(whitespace())
+                .ignore_then(expr.clone().padded_by(whitespace()))
+                .or_not(),
+        )
         .then_ignore(just(';').padded_by(whitespace()))
         .map(|(pattern, initializer)| Statement::VarDecl {
             pattern,
@@ -1357,6 +1369,25 @@ fn constant<'a>() -> BoxedParser<'a, Spanned<Constant>> {
         .boxed()
 }
 
+fn global<'a>() -> BoxedParser<'a, Spanned<GlobalVar>> {
+    // File-scope variable: let NAME [= expression];
+    // Only a bare identifier is allowed — patterns and `with` are not (using
+    // ident() restricts to a single name; `_` is rejected by the lowerer).
+    // The initializer is optional: `let g;` starts as Undefined.
+    kw("let")
+        .ignore_then(ident())
+        .then(
+            just('=')
+                .padded_by(whitespace())
+                .ignore_then(expression())
+                .or_not(),
+        )
+        .then_ignore(just(';').padded_by(whitespace()))
+        .map(|(name, initializer)| GlobalVar { name, initializer })
+        .map_with(|g, extra| Spanned::new(g, extra.span()))
+        .boxed()
+}
+
 /// Parse binding mode prefix: `let` (by-value) or `with` (by-reference)
 fn binding_mode<'a>() -> BoxedParser<'a, Option<bool>> {
     choice((
@@ -1449,6 +1480,7 @@ enum TopLevel {
     Import(Spanned<Import>),
     Require(Spanned<Require>),
     Constant(Spanned<Constant>),
+    Global(Spanned<GlobalVar>),
     Function(Spanned<Function>),
 }
 
@@ -1457,6 +1489,7 @@ fn program<'a>(source_id: Rc<str>) -> BoxedParser<'a, AstProgram> {
         import().map(TopLevel::Import),
         require().map(TopLevel::Require),
         constant().map(TopLevel::Constant),
+        global().map(TopLevel::Global),
         function().map(TopLevel::Function),
     ))
     .boxed();
@@ -1468,6 +1501,7 @@ fn program<'a>(source_id: Rc<str>) -> BoxedParser<'a, AstProgram> {
             let mut imports: Vec<Spanned<Import>> = Vec::new();
             let mut requires: Vec<Spanned<Require>> = Vec::new();
             let mut constants: Vec<Spanned<Constant>> = Vec::new();
+            let mut globals: Vec<Spanned<GlobalVar>> = Vec::new();
             let mut functions: Vec<Spanned<Function>> = Vec::new();
 
             for item in items {
@@ -1475,6 +1509,7 @@ fn program<'a>(source_id: Rc<str>) -> BoxedParser<'a, AstProgram> {
                     TopLevel::Import(i) => imports.push(i),
                     TopLevel::Require(r) => requires.push(r),
                     TopLevel::Constant(c) => constants.push(c),
+                    TopLevel::Global(g) => globals.push(g),
                     TopLevel::Function(f) => functions.push(f),
                 }
             }
@@ -1484,6 +1519,7 @@ fn program<'a>(source_id: Rc<str>) -> BoxedParser<'a, AstProgram> {
                 imports,
                 requires,
                 constants,
+                globals,
                 functions,
             }
         })

@@ -66,6 +66,23 @@ impl Program {
     }
 }
 
+impl VM {
+    /// Reset this VM and initialize a program's file-scope globals.
+    ///
+    /// Reserves the program's global slots (0..N) and runs its synthetic
+    /// `__init__` to evaluate the initializers in source order, leaving the VM
+    /// ready for [`Program::call`]. Call this once after [`compile()`], before
+    /// invoking any function in a program that declares globals. For global-free
+    /// programs it is a cheap reset.
+    pub fn exec(&mut self, program: &Program) -> Result<(), ExecError> {
+        self.reserve_globals(program.compiled.global_count);
+        if let Some(init_idx) = program.compiled.init_func {
+            compile::execute_by_index(&program.compiled, self, init_idx, 0)?;
+        }
+        Ok(())
+    }
+}
+
 /// A resolved function handle — no name lookup on each call.
 ///
 /// Obtained from [`Program::function()`]. Holds a reference to the program
@@ -504,6 +521,12 @@ impl<'a> Compiler<'a> {
         // Merge all IR programs with namespace remapping
         let merged = self.merge_ir(&mut diagnostics);
 
+        // Merge can surface cross-file errors (duplicate definitions, unsupported
+        // imported globals) — stop before optimizing/compiling invalid IR.
+        if diagnostics.has_errors() {
+            return Err(diagnostics);
+        }
+
         // Optimize
         let mut ir_program = merged;
         opt::optimize(&mut ir_program, &self.externs, &mut diagnostics);
@@ -537,9 +560,25 @@ impl<'a> Compiler<'a> {
         let mut functions: Vec<ir::Function> = Vec::new();
         let mut constants: Vec<ir::ConstBinding> = Vec::new();
         let mut seen_names: HashMap<String, String> = HashMap::new();
+        // Root-file globals occupy slots 0..N (the synthetic `__init__` stays
+        // unqualified). Globals in imported files would need per-file slot
+        // offsetting + init chaining in dependency order — deferred for now.
+        let mut global_count = 0;
 
         for (idx, source) in self.sources.iter().enumerate() {
             let is_root = idx == 0;
+
+            if is_root {
+                global_count = source.ir.global_count;
+            } else if source.ir.global_count > 0 {
+                diagnostics.error_no_span(
+                    diagnostics::DiagnosticCode::E400_DuplicateDefinition,
+                    format!(
+                        "file-scope globals in imported file '{}' are not yet supported",
+                        source.canonical_id
+                    ),
+                );
+            }
 
             // Build import alias → canonical namespace mapping for this file.
             // E.g., if this file has `import "utils.rill" as helpers`, then
@@ -612,6 +651,7 @@ impl<'a> Compiler<'a> {
         ir::IrProgram {
             functions,
             constants,
+            global_count,
         }
     }
 }

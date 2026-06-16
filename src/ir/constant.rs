@@ -128,6 +128,11 @@ impl<'a> Lowerer<'a> {
             ast::Expression::Assignment { .. } => {
                 Err("assignment not allowed in constant expression".to_string())
             }
+
+            // Globals are runtime state - not allowed in const expressions
+            ast::Expression::GlobalAccess(_) => {
+                Err("global access not allowed in constant expression".to_string())
+            }
         }
     }
 

@@ -2483,6 +2483,7 @@ let validate = program.function("validate").unwrap();
 
 // Execute with application data
 let mut vm = VM::new();
+vm.exec(&program)?;  // initialize file-scope globals (a no-op if there are none)
 for record in records {
     vm.push(record.clone())?;
     validate.call(&mut vm, 1)?;
@@ -2585,6 +2586,7 @@ let transform = program.function("transform").unwrap();
 
 // Process incoming records
 let mut vm = VM::new();
+vm.exec(&program)?;  // initialize file-scope globals (a no-op if there are none)
 for record in incoming_records {
     let data = record_to_value(&record);
 

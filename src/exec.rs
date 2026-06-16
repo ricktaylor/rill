@@ -503,6 +503,10 @@ impl Hash for Value {
 /// - Collections use HeapVal which tracks allocations via shared Heap
 /// - When HeapVal is dropped (refcount → 0), allocation is returned
 /// - CoW cloning checks heap limit before allocating
+///
+/// `clone()` is a deep copy that shares heap accounting (CoW values): use it to
+/// derive an independent worker VM that inherits already-initialized globals.
+#[derive(Clone)]
 pub struct VM {
     stack: Vec<Slot>,
     frame_stack: Vec<FrameInfo>,
@@ -528,6 +532,16 @@ impl VM {
             heap: Rc::new(Heap::new(heap_limit)),
             max_stack_size,
         }
+    }
+
+    /// Reset the VM to a fresh frame and reserve `count` file-scope global
+    /// slots (0..count), each initialized to Undefined. Called by `VM::exec`
+    /// before running the program's `__init__`.
+    pub fn reserve_globals(&mut self, count: usize) {
+        self.stack.clear();
+        self.frame_stack.clear();
+        self.bp = 0;
+        self.stack.resize(count, Slot::Val(Value::Undefined));
     }
 
     // ========================================================================

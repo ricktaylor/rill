@@ -12,6 +12,9 @@ fn run(source: &str, func_name: &str) -> Result<Value, String> {
     }
 
     let mut vm = VM::new();
+    // Initialize file-scope globals (a no-op for global-free programs).
+    vm.exec(&program)
+        .map_err(|e| format!("exec error: {}", e))?;
     program
         .call(&mut vm, func_name, 0)
         .map_err(|e| format!("exec error: {}", e))
@@ -98,6 +101,210 @@ fn test_let_binding() {
 fn test_variable_reassignment() {
     let val = run_expect("fn test() { let x = 1; x = x + 10; return x; }", "test");
     assert_eq!(val, Value::UInt(11));
+}
+
+#[test]
+fn test_let_no_initializer() {
+    // `let x;` binds x to Undefined (SQL NULL semantics).
+    let result = run("fn test() { let x; return x; }", "test").unwrap();
+    assert!(result.is_undefined());
+}
+
+#[test]
+fn test_let_no_initializer_then_assign() {
+    // An uninitialized binding can be assigned later.
+    let val = run_expect("fn test() { let x; x = 42; return x; }", "test");
+    assert_eq!(val, Value::UInt(42));
+}
+
+#[test]
+fn test_let_no_initializer_propagates_undefined() {
+    // Using an uninitialized variable propagates Undefined, not an error.
+    let result = run("fn test() { let x; return x + 1; }", "test").unwrap();
+    assert!(result.is_undefined());
+}
+
+// ========================================================================
+// File-Scope Globals
+// ========================================================================
+
+/// Helper: assert a single-file program fails to compile.
+fn compile_fails(source: &str) -> bool {
+    let externs = externs::standard_externs();
+    crate::compile(source, &externs).is_err()
+}
+
+#[test]
+fn test_global_persists_across_calls() {
+    // The global survives function returns: two inc() calls accumulate.
+    let val = run_expect(
+        r#"
+        let count = 0;
+        fn inc() { ::count = ::count + 1; }
+        fn test() { inc(); inc(); ::count }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(2));
+}
+
+#[test]
+fn test_global_const_like_read() {
+    let val = run_expect(
+        r#"
+        let max = 100;
+        fn test() { ::max }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(100));
+}
+
+#[test]
+fn test_global_uninitialized_is_undefined() {
+    let result = run(
+        r#"
+        let g;
+        fn test() { ::g }
+        "#,
+        "test",
+    )
+    .unwrap();
+    assert!(result.is_undefined());
+}
+
+#[test]
+fn test_global_assigned_then_read() {
+    let val = run_expect(
+        r#"
+        let g;
+        fn test() { ::g = 7; ::g }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(7));
+}
+
+#[test]
+fn test_global_compound_assignment() {
+    let val = run_expect(
+        r#"
+        let n = 5;
+        fn test() { ::n += 10; ::n }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(15));
+}
+
+#[test]
+fn test_global_initialized_in_source_order() {
+    // `a` is defined after `b`, so `b`'s initializer reads `a` as Undefined.
+    let src = r#"
+        let b = a + 1;
+        let a = 10;
+        fn read_a() { ::a }
+        fn read_b() { ::b }
+    "#;
+    assert_eq!(run_expect(src, "read_a"), Value::UInt(10));
+    // Undefined + 1 propagates to Undefined (guarded arithmetic).
+    assert!(run(src, "read_b").unwrap().is_undefined());
+}
+
+#[test]
+fn test_global_initializer_references_earlier_global() {
+    // Forward order: `a` then `b = a + 1` → b is 11.
+    let val = run_expect(
+        r#"
+        let a = 10;
+        let b = a + 1;
+        fn test() { ::b }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(11));
+}
+
+#[test]
+fn test_bare_name_does_not_resolve_to_global() {
+    // Inside a function, a bare name never resolves to a global — `::` required.
+    assert!(compile_fails(
+        r#"
+        let count = 0;
+        fn test() { count }
+        "#
+    ));
+}
+
+#[test]
+fn test_global_clashes_with_function() {
+    assert!(compile_fails(
+        r#"
+        let foo = 1;
+        fn foo() { 2 }
+        fn test() { 0 }
+        "#
+    ));
+}
+
+#[test]
+fn test_global_clashes_with_intrinsic() {
+    assert!(compile_fails("let len = 1;"));
+}
+
+#[test]
+fn test_duplicate_global() {
+    assert!(compile_fails("let x = 1; let x = 2;"));
+}
+
+#[test]
+fn test_global_discard_rejected() {
+    assert!(compile_fails("let _ = 5;"));
+}
+
+#[test]
+fn test_clone_inherits_globals_independently() {
+    // clone() is a deep copy: the child inherits initialized globals, then
+    // mutations on each VM are independent.
+    let externs = externs::standard_externs();
+    let (program, _) = crate::compile(
+        r#"
+        let count = 0;
+        fn inc() { ::count = ::count + 1; }
+        fn get() { ::count }
+        "#,
+        &externs,
+    )
+    .expect("should compile");
+
+    let mut vm = VM::new();
+    vm.exec(&program).expect("exec");
+    program.call(&mut vm, "inc", 0).expect("inc"); // parent: count = 1
+
+    let mut worker = vm.clone();
+    program.call(&mut worker, "inc", 0).expect("inc"); // worker: count = 2
+
+    assert_eq!(program.call(&mut vm, "get", 0).unwrap(), Value::UInt(1));
+    assert_eq!(program.call(&mut worker, "get", 0).unwrap(), Value::UInt(2));
+}
+
+#[test]
+fn test_global_in_imported_file_unsupported() {
+    // Multi-file globals are deferred — an imported file declaring a global
+    // must produce a clear error, not silently misbehave.
+    let mut loader = crate::loader::MemoryLoader::new();
+    loader.add_source("lib.rill", "let state = 0; fn get() { ::state }");
+    loader.add_source(
+        "main.rill",
+        r#"
+        import "lib.rill";
+        fn test() { lib::get() }
+        "#,
+    );
+
+    let mut compiler = crate::Compiler::new(&loader);
+    compiler.add("main.rill");
+    assert!(compiler.build().is_err());
 }
 
 // ========================================================================
@@ -1571,6 +1778,8 @@ fn run_with_args(source: &str, func_name: &str, args: &[Value]) -> Value {
     }
 
     let mut vm = VM::new();
+    // Initialize globals before pushing args (exec resets the stack).
+    vm.exec(&program).expect("exec failed");
     for arg in args {
         vm.push(arg.clone()).expect("push failed");
     }

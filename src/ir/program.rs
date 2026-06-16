@@ -34,6 +34,10 @@ impl<'a> Lowerer<'a> {
         // the Compiler builder (parse_source_tree), which has the loader's
         // namespace for each imported file.
 
+        // Assign global slots (source order → 0..N) before name checks, so
+        // function/constant-vs-global clashes are caught via check_name_clash.
+        self.collect_globals(&program.globals);
+
         // Validate function and constant names for clashes
         let function_names = self.check_function_names(&program.functions);
         self.check_constant_names(&program.constants, &function_names);
@@ -62,6 +66,14 @@ impl<'a> Lowerer<'a> {
             }
         }
 
+        // Synthesize the `__init__` function that evaluates global initializers
+        // in source order. Only emitted when the file declares globals.
+        if !program.globals.is_empty()
+            && let Some(init) = self.lower_init_function(&program.globals)
+        {
+            functions.push(init);
+        }
+
         // If any errors were emitted, return None
         if self.diagnostics.error_count() > errors_before {
             return None;
@@ -70,7 +82,87 @@ impl<'a> Lowerer<'a> {
         Some(IrProgram {
             functions,
             constants,
+            global_count: program.globals.len(),
         })
+    }
+
+    /// Assign each file-scope global a slot (source order → 0..N) and check for
+    /// name clashes (discard `_`, duplicates, intrinsics, merged externs).
+    fn collect_globals(&mut self, globals: &[ast::Spanned<ast::GlobalVar>]) {
+        for (i, g) in globals.iter().enumerate() {
+            let name = &g.node.name;
+            if name.0 == "_" {
+                self.diagnostics.error(
+                    DiagnosticCode::E400_DuplicateDefinition,
+                    g.span,
+                    "file-scope `let _` is not allowed; a global must be named".to_string(),
+                );
+                continue;
+            }
+            if self.global_slots.contains_key(name) {
+                self.diagnostics.error(
+                    DiagnosticCode::E400_DuplicateDefinition,
+                    g.span,
+                    format!("duplicate global `{}`", name),
+                );
+                continue;
+            }
+            if let Some(msg) = self.check_name_clash(name, "global") {
+                self.diagnostics
+                    .error(DiagnosticCode::E400_DuplicateDefinition, g.span, msg);
+                continue;
+            }
+            self.global_slots.insert(name.clone(), i as u32);
+        }
+    }
+
+    /// Lower the synthetic `__init__` function: evaluate each global's
+    /// initializer in source order and store it into the global's slot.
+    /// Absent initializers leave the slot Undefined (the reserved default).
+    fn lower_init_function(&mut self, globals: &[ast::Spanned<ast::GlobalVar>]) -> Option<Function> {
+        let errors_before = self.diagnostics.error_count();
+
+        // Reset per-function state (same as lower_function)
+        self.vars.clear();
+        self.blocks.clear();
+        self.next_var_id = 0;
+        self.next_block_id = 0;
+        self.next_slot_id = 0;
+        self.loop_stack.clear();
+        self.byref_param_vars.clear();
+
+        self.push_scope();
+        let entry_block = self.start_block();
+
+        // In init mode, bare names in initializers resolve to other globals.
+        self.in_global_init = true;
+        for g in globals {
+            self.set_span(g.span);
+            let slot = self.global_slots.get(&g.node.name).copied();
+            if let (Some(init), Some(slot)) = (&g.node.initializer, slot) {
+                let value = self.lower_expression(init);
+                self.emit_store_global(slot, value);
+            }
+        }
+        self.in_global_init = false;
+
+        self.finish_block(Terminator::Return { value: None });
+        self.pop_scope();
+
+        if self.diagnostics.error_count() > errors_before {
+            return None;
+        }
+
+        let mut function = Function {
+            name: ast::Identifier("__init__".to_string()),
+            params: Vec::new(),
+            rest_param: None,
+            locals: std::mem::take(&mut self.vars),
+            blocks: std::mem::take(&mut self.blocks),
+            entry_block,
+        };
+        crate::ssa::promote(&mut function);
+        Some(function)
     }
 
     /// Check all function names for clashes with intrinsics, global externs,
@@ -193,6 +285,15 @@ impl<'a> Lowerer<'a> {
             return Some(format!(
                 "{} `{}` clashes with extern from namespace `{}`",
                 kind, name, ns
+            ));
+        }
+        // Globals are assigned before function/constant checks, so this catches
+        // function-vs-global and constant-vs-global clashes. (For a global being
+        // collected, its own name is not yet in the map — no false positive.)
+        if self.global_slots.contains_key(name) {
+            return Some(format!(
+                "{} `{}` clashes with file-scope global of the same name",
+                kind, name
             ));
         }
         None

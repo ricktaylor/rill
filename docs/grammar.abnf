@@ -7,7 +7,7 @@
 
 ; Imports, requires, constants, and functions can appear in any order
 ; The compiler will collect and organize them during AST construction
-program = *(import / require / constant / function)
+program = *(import / require / constant / global / function)
 
 ; Source file import — loads a .rill file, creates a namespace from filename stem
 ; `as identifier` overrides the namespace; `as _` merges into root scope (no namespace)
@@ -21,6 +21,11 @@ require = "require" identifier ["as" (identifier / "_")] ";"
 ; Compiler verifies the expression is const-evaluable and has a single type
 ; Pattern match failure is a compile-time error (unlike let/with which produce missing)
 constant = "const" pattern "=" expression ";"
+
+; File-scope variable (global): persistent mutable module state, initialized
+; once in source order. Only a bare name (no patterns / `_`). Optional
+; initializer (`let g;` starts Undefined). Accessed in functions via `::name`.
+global = "let" identifier ["=" expression] ";"
 
 ; ============================================================================
 ; Functions
@@ -58,7 +63,8 @@ statement = var-decl
 ; Variable declaration with pattern destructuring
 ; All bindings are by-value (copies)
 ; Note: `let` is a declaration, not an expression
-var-decl = "let" pattern "=" expression ";"
+; The initializer is optional: `let x;` binds the pattern to Undefined
+var-decl = "let" pattern ["=" expression] ";"
 
 ; Reference binding with pattern: with x = expr; or with [a, b] = arr;
 ; Creates references to matched locations; mutations affect the original
@@ -159,9 +165,13 @@ postfix-op = "." (identifier / expression)          ; Member access
            / "(" [expr-list] ")"                    ; Function call
 
 primary-expr = literal
+             / global-access
              / identifier
              / "(" expression ")"
              / block-expr
+
+; File-scope global access (read; also valid as an assignment target)
+global-access = "::" identifier
 
 expr-list = expression *("," expression)
 

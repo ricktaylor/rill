@@ -265,6 +265,14 @@ fn transfer_instruction(
             }
         }
 
+        // LoadGlobal: the global's type is not tracked at this layer (link-time
+        // narrowing is a future task), so the result is `any()`. StoreGlobal has
+        // no dest and contributes no local type.
+        Instruction::LoadGlobal { dest, .. } => {
+            state.insert(*dest, TypeSet::any());
+        }
+        Instruction::StoreGlobal { .. } => {}
+
         Instruction::Assign { .. } | Instruction::Read { .. } => {
             unreachable!("pre-SSA instruction; removed by mem2reg")
         }
@@ -585,9 +593,11 @@ pub fn analyze_types_full(
                     | Instruction::Append { dest, .. }
                     | Instruction::Phi { dest, .. }
                     | Instruction::Read { dest, .. }
-                    | Instruction::Reload { dest, .. } => Some(*dest),
+                    | Instruction::Reload { dest, .. }
+                    | Instruction::LoadGlobal { dest, .. } => Some(*dest),
                     Instruction::WriteRef { .. }
                     | Instruction::WriteAccessor { .. }
+                    | Instruction::StoreGlobal { .. }
                     | Instruction::Assign { .. } => None,
                 };
 

@@ -193,15 +193,15 @@ fn run_script(path: &str, args: &[String]) -> Result<i32, Error> {
     compiler.add(path)?;
     let program = compiler.build()?;
 
-    // 3. Link and execute
-    let linker = program.link()?;
-    let mut vm = linker.exec()?;
+    // 3. Initialize globals and execute
+    let mut vm = VM::new();
+    vm.exec(&program)?;  // reserves global slots, runs __init__
 
     // 4. Call main
     let args_value = args_to_array(args);
     vm.push(args_value)?;
 
-    match vm.call("main", 1) {
+    match program.call(&mut vm, "main", 1) {
         Ok(Value::UInt(code)) => Ok(code as i32),
         Ok(_) => Ok(0),
         Err(ExecError::Exit(Value::UInt(code))) => Ok(code as i32),

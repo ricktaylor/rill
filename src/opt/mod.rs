@@ -202,6 +202,10 @@ fn collect_pure_functions(
                 block.instructions.iter().all(|inst| match &inst.node {
                     // Side effects → impure
                     Instruction::WriteRef { .. } | Instruction::WriteAccessor { .. } => false,
+                    // Reading or writing a global makes the function impure: it
+                    // depends on / mutates external state, so it can't be CSE'd,
+                    // reordered, or DCE'd away.
+                    Instruction::LoadGlobal { .. } | Instruction::StoreGlobal { .. } => false,
                     // Call to impure function → impure
                     Instruction::Call {
                         function: func_ref, ..
@@ -1130,6 +1134,7 @@ mod tests {
         let program = IrProgram {
             functions: vec![callee, caller],
             constants: vec![],
+            global_count: 0,
         };
 
         let param_types = collect_param_info(&program, None);

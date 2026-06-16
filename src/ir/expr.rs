@@ -38,6 +38,26 @@ impl<'a> Lowerer<'a> {
                         self.error_placeholder()
                     }
                 } else {
+                    // In `__init__`, bare names resolve to other globals (no `::`
+                    // needed at file scope). In function bodies this is None.
+                    let global = if self.in_global_init {
+                        self.global_slots.get(name).copied()
+                    } else {
+                        None
+                    };
+                    if let Some(slot) = global {
+                        self.emit_load_global(slot)
+                    } else {
+                        self.error_undefined_var(None, name, self.current_span);
+                        self.error_placeholder()
+                    }
+                }
+            }
+
+            ast::Expression::GlobalAccess(name) => {
+                if let Some(slot) = self.global_slots.get(name).copied() {
+                    self.emit_load_global(slot)
+                } else {
                     self.error_undefined_var(None, name, self.current_span);
                     self.error_placeholder()
                 }

@@ -452,6 +452,20 @@ pub enum Instruction {
     /// Append, or by-ref function call). At runtime, this is
     /// a slot copy (reads the current value of src's slot).
     Reload { dest: VarId, src: VarId },
+
+    /// Read a file-scope global into a fresh SSA VarId: `dest = global[slot]`.
+    ///
+    /// `slot` is an absolute VM stack index (globals occupy slots 0..N).
+    /// Each load produces a fresh VarId — the global may change between loads
+    /// due to intervening calls — so it is never CSE'd. Pure (no side effect):
+    /// removable if `dest` is unused.
+    LoadGlobal { dest: VarId, slot: u32 },
+
+    /// Write a value to a file-scope global: `global[slot] = value`.
+    ///
+    /// `slot` is an absolute VM stack index. This is a side effect (no `dest`)
+    /// and is never eliminated.
+    StoreGlobal { slot: u32, value: VarId },
 }
 
 /// Reference to a function (possibly namespaced)
@@ -790,6 +804,12 @@ fn fmt_instruction(inst: &Instruction) -> String {
         Instruction::Read { slot, dest } => {
             format!("{} = Read(slot_{})", fmt_var(*dest), slot)
         }
+        Instruction::LoadGlobal { dest, slot } => {
+            format!("{} = LoadGlobal(g{})", fmt_var(*dest), slot)
+        }
+        Instruction::StoreGlobal { slot, value } => {
+            format!("StoreGlobal(g{}, {})", slot, fmt_var(*value))
+        }
     }
 }
 
@@ -844,6 +864,10 @@ fn fmt_terminator(term: &Terminator) -> String {
 pub struct IrProgram {
     pub functions: Vec<Function>,
     pub constants: Vec<ConstBinding>,
+    /// Number of file-scope global slots (0..N of the VM stack). A synthetic
+    /// `__init__` function (present in `functions` when this is non-zero)
+    /// initializes them in source order.
+    pub global_count: usize,
 }
 
 /// A constant binding (result of const pattern matching)
