@@ -271,55 +271,72 @@ impl PromoteCtx {
     // ── Phase C: Trivial Phi Elimination ────────────────────────────────
 
     fn eliminate_trivial_phis(&mut self) {
-        // First pass: identify trivial phis
-        for phis in self.placed_phis.values() {
-            for phi in phis {
-                let simplified = try_remove_trivial_phi(phi.dest, &phi.sources);
-                if simplified != phi.dest {
-                    self.trivial_subst.insert(phi.dest, simplified);
+        // Iterate to a fixpoint. Eliminating a trivial phi rewrites its dest
+        // out of every other phi's operands, which can make those trivial in
+        // turn: `P2 = phi(P1, v)` only collapses once `P1 = phi(v, v)` has been
+        // replaced by `v`, and nested phis collapse from the inside out. A
+        // single pass would leave such phis behind for DCE, which cannot delete
+        // a phi whose dest still appears in another phi's operand list.
+        let mut changed = true;
+        while changed {
+            changed = false;
+
+            // Find phis that are trivial under the current (already-substituted)
+            // operands and not yet eliminated.
+            let mut found: Vec<(VarId, VarId)> = Vec::new();
+            for phis in self.placed_phis.values() {
+                for phi in phis {
+                    if self.trivial_subst.contains_key(&phi.dest) {
+                        continue;
+                    }
+                    let simplified = try_remove_trivial_phi(phi.dest, &phi.sources);
+                    if simplified != phi.dest {
+                        found.push((phi.dest, simplified));
+                    }
+                }
+            }
+
+            for (dest, simplified) in found {
+                // `simplified` may itself name a phi eliminated earlier; follow
+                // the chain to its final value.
+                let target = self.resolve_subst(simplified);
+                if self.trivial_subst.insert(dest, target).is_none() {
+                    self.substitute_var(dest, target);
+                    changed = true;
                 }
             }
         }
+    }
 
-        if self.trivial_subst.is_empty() {
-            return;
+    /// Follow the trivial-phi substitution chain to its final target.
+    fn resolve_subst(&self, mut var: VarId) -> VarId {
+        // Bounded to guard against an accidental cycle in the map.
+        for _ in 0..=self.trivial_subst.len() {
+            match self.trivial_subst.get(&var) {
+                Some(&next) if next != var => var = next,
+                _ => break,
+            }
         }
+        var
+    }
 
-        // Resolve chains: if a → b and b → c, then a → c
-        let resolved_subst: HashMap<VarId, VarId> = self
-            .trivial_subst
-            .keys()
-            .map(|&k| {
-                let mut v = k;
-                for _ in 0..64 {
-                    match self.trivial_subst.get(&v) {
-                        Some(&next) if next != v => v = next,
-                        _ => break,
-                    }
-                }
-                (k, v)
-            })
-            .collect();
-
-        // Apply substitutions to phi sources
+    /// Replace every reference to `from` with `to` in phi operands and read
+    /// replacements — the two places an eliminated phi dest can appear.
+    fn substitute_var(&mut self, from: VarId, to: VarId) {
         for phis in self.placed_phis.values_mut() {
             for phi in phis.iter_mut() {
                 for (_, var) in &mut phi.sources {
-                    if let Some(&replacement) = resolved_subst.get(var) {
-                        *var = replacement;
+                    if *var == from {
+                        *var = to;
                     }
                 }
             }
         }
-
-        // Also fix read_replacements that reference eliminated phis
         for val in self.read_replacements.values_mut() {
-            if let Some(&replacement) = resolved_subst.get(val) {
-                *val = replacement;
+            if *val == from {
+                *val = to;
             }
         }
-
-        self.trivial_subst = resolved_subst;
     }
 
     // ── Apply ───────────────────────────────────────────────────────────
@@ -695,6 +712,97 @@ mod tests {
             }
             _ => panic!("Expected Copy to v0"),
         }
+    }
+
+    /// Cascading trivial phis: a phi whose operand is another phi that is
+    /// itself trivial. Eliminating the inner phi must expose the outer one as
+    /// trivial too, so a single pass is not enough.
+    ///
+    /// ```text
+    /// B0: if -> B1 / B2
+    /// B1: x = v0; jump B3        B2: x = v0; jump B3
+    /// B3: [phi1 = phi(v0, v0)] if -> B4 / B5
+    /// B4: jump B6                B5: x = v0; jump B6
+    /// B6: [phi2 = phi(phi1, v0)] read x; return
+    /// ```
+    #[test]
+    fn test_cascading_trivial_phi_elimination() {
+        let assign = || Instruction::Assign {
+            slot: SLOT_X,
+            value: VarId(0),
+        };
+        let mut func = make_function(
+            vec![
+                make_block(
+                    0,
+                    vec![],
+                    Terminator::If {
+                        condition: VarId(10),
+                        then_target: BlockId(1),
+                        else_target: BlockId(2),
+                        span: ast::Span::default(),
+                    },
+                ),
+                make_block(1, vec![assign()], Terminator::Jump { target: BlockId(3) }),
+                make_block(2, vec![assign()], Terminator::Jump { target: BlockId(3) }),
+                make_block(
+                    3,
+                    vec![],
+                    Terminator::If {
+                        condition: VarId(11),
+                        then_target: BlockId(4),
+                        else_target: BlockId(5),
+                        span: ast::Span::default(),
+                    },
+                ),
+                make_block(4, vec![], Terminator::Jump { target: BlockId(6) }),
+                make_block(5, vec![assign()], Terminator::Jump { target: BlockId(6) }),
+                make_block(
+                    6,
+                    vec![Instruction::Read {
+                        slot: SLOT_X,
+                        dest: VarId(3),
+                    }],
+                    Terminator::Return {
+                        value: Some(VarId(3)),
+                    },
+                ),
+            ],
+            vec![
+                Var::new(VarId(0), ast::Identifier("v0".into()), TypeSet::any()),
+                Var::new(VarId(3), ast::Identifier("r".into()), TypeSet::any()),
+                Var::new(VarId(10), ast::Identifier("c1".into()), TypeSet::bool()),
+                Var::new(VarId(11), ast::Identifier("c2".into()), TypeSet::bool()),
+            ],
+        );
+
+        promote(&mut func);
+
+        // Both phis (B3 and B6) collapse to v0; neither block keeps a Phi.
+        for &b in &[3usize, 6] {
+            let has_phi = func.blocks[b]
+                .instructions
+                .iter()
+                .any(|i| matches!(i.node, Instruction::Phi { .. }));
+            assert!(
+                !has_phi,
+                "cascading trivial phi should be eliminated in B{b}"
+            );
+        }
+
+        // The read in B6 resolves straight to v0.
+        let copy = func.blocks[6]
+            .instructions
+            .iter()
+            .find_map(|i| match &i.node {
+                Instruction::Copy { dest, src } => Some((*dest, *src)),
+                _ => None,
+            });
+        assert_eq!(
+            copy,
+            Some((VarId(3), VarId(0))),
+            "B6 read should resolve to v0"
+        );
     }
 
     /// Shadowing: different slots for inner and outer variables with the same name.
