@@ -18,6 +18,10 @@ pub struct DominatorTree {
     /// Predecessor map (reachable blocks only).
     predecessors: HashMap<BlockId, Vec<BlockId>>,
 
+    /// Dominator-tree children, in RPO order (precomputed so `children()`
+    /// is O(1) rather than an O(n) scan of `rpo` on every call).
+    children: HashMap<BlockId, Vec<BlockId>>,
+
     entry: BlockId,
 }
 
@@ -65,10 +69,23 @@ impl DominatorTree {
         // 4. Compute immediate dominators (Cooper-Harvey-Kennedy)
         let idom = compute_idom(function.entry_block, &rpo, &rpo_number, &predecessors);
 
+        // 5. Precompute dominator-tree children, in RPO order. A block b is a
+        //    child of idom[b] (every block except the entry, whose idom is the
+        //    self-sentinel). Building once here makes children() O(1).
+        let mut children: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+        for &b in &rpo {
+            if let Some(&d) = idom.get(&b) {
+                if d != b {
+                    children.entry(d).or_default().push(b);
+                }
+            }
+        }
+
         DominatorTree {
             idom,
             rpo,
             predecessors,
+            children,
             entry: function.entry_block,
         }
     }
@@ -134,13 +151,9 @@ impl DominatorTree {
     }
 
     /// Children of `block` in the dominator tree (blocks immediately
-    /// dominated by `block`).
-    pub fn children(&self, block: BlockId) -> Vec<BlockId> {
-        self.rpo
-            .iter()
-            .filter(|&&b| b != block && self.idom.get(&b) == Some(&block))
-            .copied()
-            .collect()
+    /// dominated by `block`), in RPO order.
+    pub fn children(&self, block: BlockId) -> &[BlockId] {
+        self.children.get(&block).map_or(&[], |c| c.as_slice())
     }
 
     /// Predecessor blocks (reachable only). Used by SSA construction
@@ -430,7 +443,7 @@ mod tests {
         ]);
 
         let tree = DominatorTree::build(&func);
-        let mut children = tree.children(BlockId(0));
+        let mut children = tree.children(BlockId(0)).to_vec();
         children.sort_by_key(|b| b.0);
         assert_eq!(children, vec![BlockId(1), BlockId(2)]);
     }

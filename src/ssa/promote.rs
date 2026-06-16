@@ -141,6 +141,14 @@ impl PromoteCtx {
     // ── Phase B: Variable Renaming ──────────────────────────────────────
 
     /// Rename variables by walking the dominator tree in pre-order.
+    ///
+    /// Uses an explicit work stack rather than recursion: a deep dominator
+    /// tree (e.g. a long chain of sequential `if`/`for`/`match` statements)
+    /// would otherwise overflow the native stack. `Enter` does the pre-order
+    /// work and schedules a matching `Leave`; `Leave` pops the definitions
+    /// `Enter` pushed so they don't leak into sibling subtrees. The `Leave`
+    /// is queued before the children, so the whole subtree is processed
+    /// before this block's definitions are popped.
     fn rename(&mut self, function: &Function, tree: &DominatorTree) {
         let block_map: HashMap<BlockId, &BasicBlock> =
             function.blocks.iter().map(|b| (b.id, b)).collect();
@@ -148,107 +156,113 @@ impl PromoteCtx {
         // Per-slot definition stack: top is the current reaching definition
         let mut stacks: HashMap<u32, Vec<VarId>> = HashMap::new();
 
-        self.rename_block(tree.entry(), tree, &block_map, &mut stacks);
-    }
-
-    fn rename_block(
-        &mut self,
-        block: BlockId,
-        tree: &DominatorTree,
-        block_map: &HashMap<BlockId, &BasicBlock>,
-        stacks: &mut HashMap<u32, Vec<VarId>>,
-    ) {
-        // Track how many definitions we push so we can pop them when leaving
-        let mut push_count: HashMap<u32, usize> = HashMap::new();
-
-        // 1. Process phis placed at this block — push their dests
-        if let Some(phis) = self.placed_phis.get(&block) {
-            for phi in phis {
-                stacks.entry(phi.slot).or_default().push(phi.dest);
-                *push_count.entry(phi.slot).or_default() += 1;
-            }
+        enum Work {
+            Enter(BlockId),
+            Leave(HashMap<u32, usize>),
         }
 
-        // 2. Process instructions in this block
-        if let Some(ir_block) = block_map.get(&block) {
-            for inst in &ir_block.instructions {
-                match &inst.node {
-                    Instruction::Read { slot, dest } => {
-                        let current = stacks.get(slot).and_then(|s| s.last()).copied();
-                        match current {
-                            Some(val) => {
-                                self.read_replacements.insert(*dest, val);
-                            }
-                            None => {
-                                // Read before any assignment — undefined
-                                let undef = self.fresh_var();
-                                self.read_replacements.insert(*dest, undef);
+        let mut work: Vec<Work> = vec![Work::Enter(tree.entry())];
+        while let Some(item) = work.pop() {
+            let block = match item {
+                Work::Enter(block) => block,
+                Work::Leave(push_count) => {
+                    // Pop definitions pushed when this block was entered.
+                    for (slot, count) in push_count {
+                        if let Some(stack) = stacks.get_mut(&slot) {
+                            for _ in 0..count {
+                                stack.pop();
                             }
                         }
                     }
-                    Instruction::Assign { slot, value } => {
-                        stacks.entry(*slot).or_default().push(*value);
-                        *push_count.entry(*slot).or_default() += 1;
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        // 3. Fill phi operands in successor blocks.
-        //    Two sub-steps to satisfy the borrow checker: first collect
-        //    slots that need values (immutable borrow of placed_phis),
-        //    then resolve values (may need fresh_var for undefined), then
-        //    write back (mutable borrow of placed_phis).
-        if let Some(ir_block) = block_map.get(&block) {
-            for succ in ir_block.terminator.successors() {
-                // Collect the slots for phis in this successor
-                let slots: Vec<u32> = self
-                    .placed_phis
-                    .get(&succ)
-                    .map(|phis| phis.iter().map(|p| p.slot).collect())
-                    .unwrap_or_default();
-
-                if slots.is_empty() {
                     continue;
                 }
+            };
 
-                // Resolve values (may allocate fresh vars for undefined)
-                let vals: Vec<VarId> = slots
-                    .iter()
-                    .map(|slot| {
-                        stacks
-                            .get(slot)
-                            .and_then(|s| s.last())
-                            .copied()
-                            .unwrap_or_else(|| self.fresh_var())
-                    })
-                    .collect();
+            // Track how many definitions we push so the matching Leave can undo them
+            let mut push_count: HashMap<u32, usize> = HashMap::new();
 
-                // Write values into phi sources
-                let phis = self.placed_phis.get_mut(&succ).unwrap();
-                for (phi, val) in phis.iter_mut().zip(vals) {
-                    for (pred, var) in &mut phi.sources {
-                        if *pred == block {
-                            *var = val;
+            // 1. Process phis placed at this block — push their dests
+            if let Some(phis) = self.placed_phis.get(&block) {
+                for phi in phis {
+                    stacks.entry(phi.slot).or_default().push(phi.dest);
+                    *push_count.entry(phi.slot).or_default() += 1;
+                }
+            }
+
+            // 2. Process instructions in this block
+            if let Some(ir_block) = block_map.get(&block) {
+                for inst in &ir_block.instructions {
+                    match &inst.node {
+                        Instruction::Read { slot, dest } => {
+                            let current = stacks.get(slot).and_then(|s| s.last()).copied();
+                            match current {
+                                Some(val) => {
+                                    self.read_replacements.insert(*dest, val);
+                                }
+                                None => {
+                                    // Read before any assignment — undefined
+                                    let undef = self.fresh_var();
+                                    self.read_replacements.insert(*dest, undef);
+                                }
+                            }
+                        }
+                        Instruction::Assign { slot, value } => {
+                            stacks.entry(*slot).or_default().push(*value);
+                            *push_count.entry(*slot).or_default() += 1;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            // 3. Fill phi operands in successor blocks.
+            //    Two sub-steps to satisfy the borrow checker: first collect
+            //    slots that need values (immutable borrow of placed_phis),
+            //    then resolve values (may need fresh_var for undefined), then
+            //    write back (mutable borrow of placed_phis).
+            if let Some(ir_block) = block_map.get(&block) {
+                for succ in ir_block.terminator.successors() {
+                    // Collect the slots for phis in this successor
+                    let slots: Vec<u32> = self
+                        .placed_phis
+                        .get(&succ)
+                        .map(|phis| phis.iter().map(|p| p.slot).collect())
+                        .unwrap_or_default();
+
+                    if slots.is_empty() {
+                        continue;
+                    }
+
+                    // Resolve values (may allocate fresh vars for undefined)
+                    let vals: Vec<VarId> = slots
+                        .iter()
+                        .map(|slot| {
+                            stacks
+                                .get(slot)
+                                .and_then(|s| s.last())
+                                .copied()
+                                .unwrap_or_else(|| self.fresh_var())
+                        })
+                        .collect();
+
+                    // Write values into phi sources
+                    let phis = self.placed_phis.get_mut(&succ).unwrap();
+                    for (phi, val) in phis.iter_mut().zip(vals) {
+                        for (pred, var) in &mut phi.sources {
+                            if *pred == block {
+                                *var = val;
+                            }
                         }
                     }
                 }
             }
-        }
 
-        // 4. Recurse into dominated children
-        let children = tree.children(block);
-        for child in children {
-            self.rename_block(child, tree, block_map, stacks);
-        }
-
-        // 5. Pop definitions pushed in this block
-        for (slot, count) in push_count {
-            if let Some(stack) = stacks.get_mut(&slot) {
-                for _ in 0..count {
-                    stack.pop();
-                }
+            // 4. Schedule the pop, then enqueue dominated children. Pushing
+            //    children in reverse means they pop (and so are processed) in
+            //    tree.children() order, matching a pre-order recursion.
+            work.push(Work::Leave(push_count));
+            for &child in tree.children(block).iter().rev() {
+                work.push(Work::Enter(child));
             }
         }
     }
