@@ -44,7 +44,7 @@ use crate::ir::{
 use crate::opt::TypeAnalysis;
 use crate::types::{BaseType, ConvertMode, NumericType, TypeSet};
 use indexmap::IndexMap;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 // Re-export submodule items used internally by compile_instruction
 use exec::*;
@@ -138,24 +138,14 @@ pub fn compile_program(
         func_index.insert(ir_func.name.to_string(), idx);
     }
 
-    // Link phase: resolve all Call references, track usage
-    let mut used_functions: HashSet<usize> = HashSet::new();
-    let link_map = link_functions(
-        ir,
-        externs,
-        &func_index,
-        &mut used_functions,
-        &mut diagnostics,
-    );
+    // Link phase: resolve all Call references. Whole-program dead-import
+    // elimination already ran at merge time, so every function here is either a
+    // root entry point or reachable from one.
+    let link_map = link_functions(ir, externs, &func_index, &mut diagnostics);
 
     if diagnostics.has_errors() {
         return Err(diagnostics);
     }
-
-    // TODO: Warn about unused functions once pub/priv distinction exists.
-    // Currently all functions are potential entry points (callable by embedder),
-    // so we can't know which are truly unused without #[export] or pub/priv.
-    let _ = used_functions;
 
     // Compile functions to closures
     let mut compiled_functions = Vec::new();
@@ -206,12 +196,11 @@ pub enum CallTarget {
 /// Map from qualified function name to its resolved target.
 pub type LinkMap = HashMap<String, CallTarget>;
 
-/// Link phase: resolve all function references and track usage.
+/// Link phase: resolve all function references, erroring on any that don't.
 fn link_functions(
     ir: &IrProgram,
     externs: &ExternRegistry,
     func_index: &HashMap<String, usize>,
-    used_functions: &mut HashSet<usize>,
     diagnostics: &mut Diagnostics,
 ) -> LinkMap {
     let mut link_map = LinkMap::new();
@@ -251,12 +240,7 @@ fn link_functions(
             for inst in &block.instructions {
                 if let Instruction::Call { function, .. } = &inst.node {
                     let qname = function.qualified_name();
-                    if let Some(target) = link_map.get(&qname) {
-                        // Track user function usage
-                        if let CallTarget::UserFunction(idx) = target {
-                            used_functions.insert(*idx);
-                        }
-                    } else {
+                    if !link_map.contains_key(&qname) {
                         diagnostics.error(
                             crate::diagnostics::DiagnosticCode::E500_UndefinedExternal,
                             inst.span,

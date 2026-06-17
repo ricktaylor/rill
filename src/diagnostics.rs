@@ -168,6 +168,8 @@ pub enum DiagnosticCode {
     W008_Deprecated,
     /// Operation on incompatible types (always produces undefined)
     W009_TypeMismatch,
+    /// Unused import (imported file contributes no function used by the program)
+    W010_UnusedImport,
 }
 
 impl DiagnosticCode {
@@ -223,6 +225,7 @@ impl DiagnosticCode {
             DiagnosticCode::W007_ImplicitConversion => "W007",
             DiagnosticCode::W008_Deprecated => "W008",
             DiagnosticCode::W009_TypeMismatch => "W009",
+            DiagnosticCode::W010_UnusedImport => "W010",
         }
     }
 
@@ -238,7 +241,8 @@ impl DiagnosticCode {
             | DiagnosticCode::W006_RedundantTypeCheck
             | DiagnosticCode::W007_ImplicitConversion
             | DiagnosticCode::W008_Deprecated
-            | DiagnosticCode::W009_TypeMismatch => Severity::Warning,
+            | DiagnosticCode::W009_TypeMismatch
+            | DiagnosticCode::W010_UnusedImport => Severity::Warning,
 
             // Everything else is an error
             _ => Severity::Error,

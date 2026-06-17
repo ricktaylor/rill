@@ -2742,6 +2742,266 @@ fn test_compiler_import_as_underscore_multiple_functions() {
     assert_eq!(result, Value::UInt(12));
 }
 
+// ============================================================================
+// Module Phase 4 — visibility + dead-import elimination
+// ============================================================================
+
+/// Collect the unused-import (W010) warnings from a built program's diagnostics.
+fn w010_warnings(
+    diags: &crate::diagnostics::Diagnostics,
+) -> Vec<&crate::diagnostics::Diagnostic> {
+    diags
+        .warnings()
+        .filter(|d| d.code == crate::diagnostics::DiagnosticCode::W010_UnusedImport)
+        .collect()
+}
+
+#[test]
+fn test_dce_dead_import_pruned_and_warns() {
+    // main imports `dead.rill` but never calls anything from it.
+    let mut loader = crate::loader::MemoryLoader::new();
+    loader.add_source("dead.rill", "fn unused() { 1 }");
+    let main_src = "import \"dead.rill\";\nfn test() { 5 }\n";
+    loader.add_source("main.rill", main_src);
+
+    let mut compiler = crate::Compiler::new(&loader);
+    compiler.add("main.rill");
+    let (program, diags) = compiler.build().expect("build should succeed");
+
+    // The dead imported function is gone from the compiled program.
+    assert!(!program.compiled.func_index.contains_key("dead::unused"));
+
+    // Exactly one W010, attributed to the root file, pointing at the import.
+    let warnings = w010_warnings(&diags);
+    assert_eq!(warnings.len(), 1);
+    let w = warnings[0];
+    assert_eq!(w.source_id.as_deref(), Some("main.rill"));
+    // The span starts at the `import` keyword and covers through the `;`
+    // (the parser's trailing `padded_by(whitespace())` may extend it further).
+    let span = w.span.expect("W010 should carry a span");
+    let import_start = main_src.find("import").unwrap();
+    let import_end = main_src.find(';').unwrap();
+    assert_eq!(span.start, import_start);
+    assert!(span.end >= import_end + 1);
+
+    // The program still runs.
+    let mut vm = VM::new();
+    assert_eq!(program.call(&mut vm, "test", 0).unwrap(), Value::UInt(5));
+}
+
+#[test]
+fn test_dce_kept_import_works() {
+    let mut loader = crate::loader::MemoryLoader::new();
+    loader.add_source("utils.rill", "fn helper() { 42 }");
+    loader.add_source(
+        "main.rill",
+        r#"
+        import "utils.rill";
+        fn test() { utils::helper() }
+        "#,
+    );
+
+    let mut compiler = crate::Compiler::new(&loader);
+    compiler.add("main.rill");
+    let (program, diags) = compiler.build().expect("build should succeed");
+
+    assert!(program.compiled.func_index.contains_key("utils::helper"));
+    assert!(w010_warnings(&diags).is_empty());
+
+    let mut vm = VM::new();
+    assert_eq!(program.call(&mut vm, "test", 0).unwrap(), Value::UInt(42));
+}
+
+#[test]
+fn test_dce_partial_pruning_no_warning() {
+    // One imported function is used, another isn't: prune the dead one, but the
+    // import is still "used" so no warning.
+    let mut loader = crate::loader::MemoryLoader::new();
+    loader.add_source(
+        "lib.rill",
+        r#"
+        fn live() { 1 }
+        fn dead() { 2 }
+        "#,
+    );
+    loader.add_source(
+        "main.rill",
+        r#"
+        import "lib.rill";
+        fn test() { lib::live() }
+        "#,
+    );
+
+    let mut compiler = crate::Compiler::new(&loader);
+    compiler.add("main.rill");
+    let (program, diags) = compiler.build().expect("build should succeed");
+
+    assert!(program.compiled.func_index.contains_key("lib::live"));
+    assert!(!program.compiled.func_index.contains_key("lib::dead"));
+    assert!(w010_warnings(&diags).is_empty());
+}
+
+#[test]
+fn test_dce_as_underscore_unused_warns() {
+    // `as _` import whose merged function is never called.
+    let mut loader = crate::loader::MemoryLoader::new();
+    loader.add_source("extra.rill", "fn thing() { 1 }");
+    loader.add_source(
+        "main.rill",
+        r#"
+        import "extra.rill" as _;
+        fn test() { 9 }
+        "#,
+    );
+
+    let mut compiler = crate::Compiler::new(&loader);
+    compiler.add("main.rill");
+    let (program, diags) = compiler.build().expect("build should succeed");
+
+    assert!(!program.compiled.func_index.contains_key("extra::thing"));
+    assert_eq!(w010_warnings(&diags).len(), 1);
+}
+
+#[test]
+fn test_dce_as_underscore_used_no_warning() {
+    let mut loader = crate::loader::MemoryLoader::new();
+    loader.add_source("extra.rill", "fn thing() { 8 }");
+    loader.add_source(
+        "main.rill",
+        r#"
+        import "extra.rill" as _;
+        fn test() { thing() }
+        "#,
+    );
+
+    let mut compiler = crate::Compiler::new(&loader);
+    compiler.add("main.rill");
+    let (program, diags) = compiler.build().expect("build should succeed");
+
+    assert!(program.compiled.func_index.contains_key("extra::thing"));
+    assert!(w010_warnings(&diags).is_empty());
+    let mut vm = VM::new();
+    assert_eq!(program.call(&mut vm, "test", 0).unwrap(), Value::UInt(8));
+}
+
+#[test]
+fn test_dce_diamond_dead_leg() {
+    // main imports a and b; both import common; main uses only a.
+    // b::from_b is dead and pruned; common::shared stays live via a::from_a.
+    let mut loader = crate::loader::MemoryLoader::new();
+    loader.add_source("common.rill", "fn shared() { 7 }");
+    loader.add_source(
+        "a.rill",
+        r#"
+        import "common.rill";
+        fn from_a() { common::shared() + 1 }
+        "#,
+    );
+    loader.add_source(
+        "b.rill",
+        r#"
+        import "common.rill";
+        fn from_b() { common::shared() + 2 }
+        "#,
+    );
+    loader.add_source(
+        "main.rill",
+        r#"
+        import "a.rill";
+        import "b.rill";
+        fn test() { a::from_a() }
+        "#,
+    );
+
+    let mut compiler = crate::Compiler::new(&loader);
+    compiler.add("main.rill");
+    let (program, diags) = compiler.build().expect("build should succeed");
+
+    assert!(program.compiled.func_index.contains_key("a::from_a"));
+    assert!(program.compiled.func_index.contains_key("common::shared"));
+    assert!(!program.compiled.func_index.contains_key("b::from_b"));
+
+    // Only the `b` import is unused.
+    let warnings = w010_warnings(&diags);
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].message.contains("b.rill"));
+
+    let mut vm = VM::new();
+    assert_eq!(program.call(&mut vm, "test", 0).unwrap(), Value::UInt(8));
+}
+
+#[test]
+fn test_dce_init_only_reachability() {
+    // An imported function reachable only from a root global initializer (i.e.
+    // only via `__init__`) must survive — `__init__` is a root.
+    let mut loader = crate::loader::MemoryLoader::new();
+    loader.add_source("helper.rill", "fn compute() { 100 }");
+    loader.add_source(
+        "main.rill",
+        r#"
+        import "helper.rill";
+        let g = helper::compute();
+        fn test() { ::g }
+        "#,
+    );
+
+    let mut compiler = crate::Compiler::new(&loader);
+    compiler.add("main.rill");
+    let (program, diags) = compiler.build().expect("build should succeed");
+
+    assert!(program.compiled.func_index.contains_key("helper::compute"));
+    assert!(w010_warnings(&diags).is_empty());
+}
+
+#[test]
+fn test_dce_dead_import_cycle() {
+    // Mutually-recursive imported functions, neither reachable from root.
+    let mut loader = crate::loader::MemoryLoader::new();
+    loader.add_source(
+        "cyc.rill",
+        r#"
+        fn x() { cyc::y() }
+        fn y() { cyc::x() }
+        "#,
+    );
+    loader.add_source(
+        "main.rill",
+        r#"
+        import "cyc.rill";
+        fn test() { 3 }
+        "#,
+    );
+
+    let mut compiler = crate::Compiler::new(&loader);
+    compiler.add("main.rill");
+    let (program, diags) = compiler.build().expect("build should succeed");
+
+    assert!(!program.compiled.func_index.contains_key("cyc::x"));
+    assert!(!program.compiled.func_index.contains_key("cyc::y"));
+    assert_eq!(w010_warnings(&diags).len(), 1);
+}
+
+#[test]
+fn test_dce_uncalled_root_function_kept() {
+    // A root-file function nothing calls is a potential embedder entry point and
+    // must NOT be pruned (DCE keys on file origin, never on in-degree).
+    let loader = crate::loader::MemoryLoader::new();
+    let mut compiler = crate::Compiler::new(&loader);
+    compiler.add_source(
+        r#"
+        fn entry_a() { 1 }
+        fn entry_b() { 2 }
+        "#,
+        "main.rill",
+    );
+    let (program, _diags) = compiler.build().expect("build should succeed");
+
+    assert!(program.compiled.func_index.contains_key("entry_a"));
+    assert!(program.compiled.func_index.contains_key("entry_b"));
+    let mut vm = VM::new();
+    assert_eq!(program.call(&mut vm, "entry_b", 0).unwrap(), Value::UInt(2));
+}
+
 #[test]
 fn test_compiler_import_require_namespace_clash() {
     // import and require both claim the same namespace — should error

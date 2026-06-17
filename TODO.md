@@ -96,11 +96,22 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
     - [x] Constant name vs function name → error (with note)
     - [x] Global extern name vs intrinsic → `RegistryError` at registration time
     - [x] Shared `check_name_clash()` helper for consistent error messages
-  - Phase 4: Visibility and DCE
-    - [ ] Track function origin: root file (public) vs imported file (private)
-    - [ ] DCE: imported functions not referenced from root → eliminate
-    - [ ] Root file functions always kept (potential embedder entry points)
-    - [ ] Unused import warning
+  - Phase 4: Visibility and DCE — **done** (2026-06-17)
+    - [x] Track function origin: root file (public) vs imported file (private) —
+          via a merge-time `root_names` set in `merge_ir` (the one place root-ness
+          is structurally known), not a `Function` field that would ripple through
+          the IR for data needed once
+    - [x] DCE: imported functions not reachable from root → eliminate —
+          `prune_dead_imports` (BFS over `Call` `qualified_name()` edges) runs at
+          the end of `merge_ir`, before optimization, so dead functions are never
+          optimized/monomorphized/compiled
+    - [x] Root file functions always kept (potential embedder entry points) —
+          roots are seeded by file origin, never in-degree
+    - [x] Unused import warning — `W010_UnusedImport`, root file only, emitted at
+          the import statement's span (added `path`/`span` to per-source
+          `ImportEntry`). Predicate: no surviving `ns::*` function. Resolved the
+          stale `used_functions` TODO in `compile/mod.rs` (whole-program DCE now
+          lives at merge time)
 - [x] **Expression spans** — `type Expr = Spanned<Expression>`. Parser wraps every expression
       node with its source span. `lower_expression` sets `current_span` from the expression
       span, giving precise error locations for undefined variables, type mismatches, etc.

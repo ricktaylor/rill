@@ -174,13 +174,24 @@ pub fn standard_externs() -> ExternRegistry {
 /// let (program, warnings) = compiler.build()?;
 /// ```
 ///
+/// One `import` statement's metadata, retained for namespace resolution and
+/// the unused-import warning.
+struct ImportEntry {
+    /// canonical_id of the imported file
+    imported_canonical_id: String,
+    /// namespace alias; `None` = `as _` (root merge)
+    alias: Option<String>,
+    /// the import path as written (`import "<path>";`), for diagnostics
+    path: String,
+    /// span of the import statement, for the unused-import warning
+    span: ast::Span,
+}
+
 /// A parsed (but not yet lowered) source file with its import metadata.
 struct ParsedSource {
     ast: ast::AstProgram,
     canonical_id: String,
-    /// Import namespace mappings: (canonical_id of imported file) → (namespace alias)
-    /// None alias = `as _` (root merge).
-    import_aliases: Vec<(String, Option<String>)>,
+    imports: Vec<ImportEntry>,
 }
 
 /// Metadata for a loaded and lowered source file.
@@ -189,9 +200,7 @@ struct LoadedSource {
     ir: ir::IrProgram,
     /// The canonical_id of this source
     canonical_id: String,
-    /// Import namespace mappings: (canonical_id of imported file) → (namespace alias)
-    /// None alias = `as _` (root merge).
-    import_aliases: Vec<(String, Option<String>)>,
+    imports: Vec<ImportEntry>,
 }
 
 pub struct Compiler<'a> {
@@ -338,7 +347,7 @@ impl<'a> Compiler<'a> {
                 })
                 .collect();
 
-            let mut import_aliases = Vec::new();
+            let mut import_entries = Vec::new();
             let mut seen_aliases: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
 
@@ -382,7 +391,12 @@ impl<'a> Compiler<'a> {
                             }
                         }
 
-                        import_aliases.push((imported_canonical.clone(), namespace));
+                        import_entries.push(ImportEntry {
+                            imported_canonical_id: imported_canonical.clone(),
+                            alias: namespace,
+                            path: import_path.clone(),
+                            span: import.span,
+                        });
 
                         if self.loaded.insert(imported_canonical.clone()) {
                             self.default_namespaces
@@ -407,7 +421,7 @@ impl<'a> Compiler<'a> {
             parsed.push(ParsedSource {
                 ast,
                 canonical_id,
-                import_aliases,
+                imports: import_entries,
             });
         }
 
@@ -440,15 +454,15 @@ impl<'a> Compiler<'a> {
             //   3. Merged imports (import "x" as _)  ← this map
             //   4. Externs — global and merged (require ns as _)
             let mut merged_imports: HashMap<ast::Identifier, ast::Identifier> = HashMap::new();
-            for (imported_canonical_id, alias) in &p.import_aliases {
-                if alias.is_none() {
+            for entry in &p.imports {
+                if entry.alias.is_none() {
                     let canonical_ns = self
                         .default_namespaces
-                        .get(imported_canonical_id)
+                        .get(&entry.imported_canonical_id)
                         .cloned()
                         .unwrap_or_else(|| "unknown".to_string());
 
-                    if let Some(func_names) = file_functions.get(imported_canonical_id) {
+                    if let Some(func_names) = file_functions.get(&entry.imported_canonical_id) {
                         for name in func_names {
                             merged_imports.insert(
                                 ast::Identifier(name.clone()),
@@ -465,7 +479,7 @@ impl<'a> Compiler<'a> {
                 self.sources.push(LoadedSource {
                     ir: ir_program,
                     canonical_id: p.canonical_id,
-                    import_aliases: p.import_aliases,
+                    imports: p.imports,
                 });
             }
         }
@@ -497,7 +511,7 @@ impl<'a> Compiler<'a> {
             self.sources.push(LoadedSource {
                 ir: ir_program,
                 canonical_id,
-                import_aliases: Vec::new(),
+                imports: Vec::new(),
             });
         }
     }
@@ -559,6 +573,12 @@ impl<'a> Compiler<'a> {
 
         let mut functions: Vec<ir::Function> = Vec::new();
         let mut seen_names: HashMap<String, String> = HashMap::new();
+        // Qualified names of root-file functions. These are the program's public
+        // embedder entry points and seed dead-import elimination (see
+        // `prune_dead_imports`). Origin is tracked here, at the one place
+        // root-ness is structurally known (`is_root`), rather than as a
+        // `Function` field that would ripple through the IR for data needed once.
+        let mut root_names: std::collections::HashSet<String> = std::collections::HashSet::new();
         // Root-file globals occupy slots 0..N (the synthetic `__init__` stays
         // unqualified). Globals in imported files would need per-file slot
         // offsetting + init chaining in dependency order — deferred for now.
@@ -583,11 +603,11 @@ impl<'a> Compiler<'a> {
             // E.g., if this file has `import "utils.rill" as helpers`, then
             // helpers → utils (the canonical namespace from the loader).
             let mut alias_to_canonical: HashMap<String, String> = HashMap::new();
-            for (imported_canonical_id, alias) in &source.import_aliases {
-                if let Some(alias_name) = alias {
+            for entry in &source.imports {
+                if let Some(alias_name) = &entry.alias {
                     let canonical_ns = self
                         .default_namespaces
-                        .get(imported_canonical_id)
+                        .get(&entry.imported_canonical_id)
                         .cloned()
                         .unwrap_or_else(|| "unknown".to_string());
                     alias_to_canonical.insert(alias_name.clone(), canonical_ns);
@@ -638,10 +658,48 @@ impl<'a> Compiler<'a> {
 
                 seen_names.insert(qname.clone(), source.canonical_id.clone());
 
-                if !is_root {
+                if is_root {
+                    root_names.insert(qname);
+                } else {
                     func.name = ast::Identifier(qname);
                 }
                 functions.push(func);
+            }
+        }
+
+        // Whole-program dead-import elimination, before optimization: imported
+        // functions not transitively reachable from a root are dropped, so they
+        // are never optimized, monomorphized, or compiled. Root functions are
+        // always kept (entry points). `compile_program` rebuilds its name→index
+        // map from this pruned vec, so no indices need rebasing.
+        let (functions, live_names) = prune_dead_imports(functions, &root_names);
+
+        // Unused-import warning (root file only): an import contributes nothing
+        // if no surviving function comes from its namespace. Imported
+        // globals/constants are unsupported, so functions are the sole
+        // contribution. Scoped to the root source so library files the author
+        // does not own are not flagged.
+        if let Some(root) = self.sources.first() {
+            diagnostics.set_source(std::rc::Rc::from(root.canonical_id.as_str()));
+            for entry in &root.imports {
+                let ns = self
+                    .default_namespaces
+                    .get(&entry.imported_canonical_id)
+                    .map(|s| s.as_str())
+                    .unwrap_or("unknown");
+                let prefix = format!("{}::", ns);
+                if !live_names.iter().any(|n| n.starts_with(&prefix)) {
+                    diagnostics
+                        .warning(
+                            diagnostics::DiagnosticCode::W010_UnusedImport,
+                            entry.span,
+                            format!(
+                                "unused import `{}`: no function from namespace `{}` is used",
+                                entry.path, ns
+                            ),
+                        )
+                        .help("remove this import or call a function it provides");
+                }
             }
         }
 
@@ -650,6 +708,58 @@ impl<'a> Compiler<'a> {
             global_count,
         }
     }
+}
+
+/// Whole-program dead-import elimination.
+///
+/// Keeps every function reachable from a root (the `root_names` seed — all
+/// root-file functions, which are public embedder entry points) via transitive
+/// `Call` edges, and drops the rest. Returns the surviving functions (original
+/// order preserved for deterministic IR) and the set of their qualified names
+/// (reused for the unused-import warning). Names not in the program (externs)
+/// are ignored; they are resolved separately by the link phase.
+fn prune_dead_imports(
+    functions: Vec<ir::Function>,
+    root_names: &std::collections::HashSet<String>,
+) -> (Vec<ir::Function>, std::collections::HashSet<String>) {
+    use std::collections::{HashMap, HashSet};
+
+    // Index by qualified name (root: bare name; imported: `ns::name`).
+    let name_to_idx: HashMap<String, usize> = functions
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (f.name.to_string(), i))
+        .collect();
+
+    // BFS over Call edges, seeded with the roots.
+    let mut live: HashSet<String> = HashSet::new();
+    let mut worklist: Vec<String> = Vec::new();
+    for name in root_names {
+        if live.insert(name.clone()) {
+            worklist.push(name.clone());
+        }
+    }
+    while let Some(name) = worklist.pop() {
+        let Some(&idx) = name_to_idx.get(&name) else {
+            continue;
+        };
+        for block in &functions[idx].blocks {
+            for inst in &block.instructions {
+                if let ir::Instruction::Call { function, .. } = &inst.node {
+                    let callee = function.qualified_name();
+                    if name_to_idx.contains_key(&callee) && live.insert(callee.clone()) {
+                        worklist.push(callee);
+                    }
+                }
+            }
+        }
+    }
+
+    let kept = functions
+        .into_iter()
+        .filter(|f| live.contains(&f.name.to_string()))
+        .collect();
+    (kept, live)
 }
 
 // No Default impl for Compiler — requires a SourceLoader reference
