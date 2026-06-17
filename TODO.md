@@ -156,12 +156,12 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
       - Consistent across function params, for loops, and match arms.
 - [ ] **Host objects** — `Value::Host(Box<dyn HostObject>)` with unified trait for
       embedder-provided data structures. Combines host sequences and generic accessors:
-    - `HostObject` trait: `get(key)`, `set(key, value)`, `iter()`, `len()`
-    - Accessor works through trait for Host values (`with x = host[key]`)
-    - Sequence iteration works through trait (`for item in host { }`)
-    - `len()` intrinsic dispatches through trait
-    - Native Array/Map remain fast paths — trait dispatch only for Host values
-    - Compiler specialisation: type analysis can prove base is Array/Map and skip
+  - `HostObject` trait: `get(key)`, `set(key, value)`, `iter()`, `len()`
+  - Accessor works through trait for Host values (`with x = host[key]`)
+  - Sequence iteration works through trait (`for item in host { }`)
+  - `len()` intrinsic dispatches through trait
+  - Native Array/Map remain fast paths — trait dispatch only for Host values
+  - Compiler specialisation: type analysis can prove base is Array/Map and skip
       trait dispatch, emitting direct closures (same pattern as arithmetic specialisation)
 - [ ] **Bytecode format** — CBOR serialization of optimized IR (see `docs/bytecode_format.md`)
   - Phase 1: Encoding infrastructure
@@ -370,6 +370,7 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
       Loop-carried collections now get type-specialized dispatch.
 
 ### P2 — Parser
+
 - [ ] **Optional braces in match arms** — allow `pattern => expr,` in addition to
       `pattern => { stmts; expr }`. The `=>` token disambiguates; trailing `,` or `}`
       delimits the bare expression. Currently `block_body()` always requires braces.
@@ -446,6 +447,7 @@ Requires TypeAnalysis (already threaded to compiler) so type-specialized
 StepKind variants can be emitted (e.g. `AddUU` instead of generic `Add`).
 
 **StepKind sketch:**
+
 ```rust
 enum StepKind {
     Const { dest: usize, value: Value },
@@ -467,7 +469,7 @@ enum StepKind {
 
 **Common peephole patterns** (ordered by expected frequency):
 
-_Every loop iteration (highest impact):_
+*Every loop iteration (highest impact):*
 
 | Pattern | Source | Steps | Fused | Savings |
 |---------|--------|-------|-------|---------|
@@ -477,7 +479,7 @@ _Every loop iteration (highest impact):_
 | Array element read | `arr[i]` with guard | `Index` + `Guard` | `IndexGuard { dest, base, key, fail }` | 2→1 |
 | Seq advance | `SeqNext` + guard | `SeqNext` + `Guard` | `SeqNextGuard { dest, seq, fail }` | 2→1 |
 
-_Most functions (moderate impact):_
+*Most functions (moderate impact):*
 
 | Pattern | Source | Steps | Fused | Savings |
 |---------|--------|-------|-------|---------|
@@ -486,14 +488,14 @@ _Most functions (moderate impact):_
 | Negate + branch | `if !cond` | `Not(c)` + `BranchIf` | `BranchIf` with swapped targets | 2→1 |
 | Copy-to-self | SSA artifact | `Copy(x, x)` | eliminated | 1→0 |
 
-_Write-back paths (ref-backed mutations):_
+*Write-back paths (ref-backed mutations):*
 
 | Pattern | Source | Steps | Fused | Savings |
 |---------|--------|-------|-------|---------|
 | Compute + write-back | `x += 1` (ref) | `AddUU` + `WriteRef` + `Copy` | `AddWriteRefUU { ... }` | 3→1 |
 | Const array literal | `[1, 2, 3]` | `Const` × 3 + `MakeArray` | `MakeArrayConst { values }` | 4→1 |
 
-_Destructure-collect patterns (sub-slicing):_
+*Destructure-collect patterns (sub-slicing):*
 
 | Pattern | Source | Steps | Fused | Savings |
 |---------|--------|-------|-------|---------|
@@ -509,6 +511,7 @@ the current closure-per-instruction approach.
 ### Type-Specialized Compilation (completed)
 
 Optimizer pipeline:
+
 ```
 Unified fixpoint (repeat until convergence):
   Const Fold → CSE → Copy Prop → DCE → Ref Elision → Coercion Elision
