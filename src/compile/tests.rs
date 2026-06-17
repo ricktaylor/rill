@@ -3002,6 +3002,82 @@ fn test_dce_uncalled_root_function_kept() {
     assert_eq!(program.call(&mut vm, "entry_b", 0).unwrap(), Value::UInt(2));
 }
 
+// ============================================================================
+// Unused-variable lint (W001)
+// ============================================================================
+
+/// Collect the unused-variable (W001) warnings from a built program's diagnostics.
+fn w001_warnings(
+    diags: &crate::diagnostics::Diagnostics,
+) -> Vec<&crate::diagnostics::Diagnostic> {
+    diags
+        .warnings()
+        .filter(|d| d.code == crate::diagnostics::DiagnosticCode::W001_UnusedVariable)
+        .collect()
+}
+
+fn build_single(src: &str) -> (crate::Program, crate::diagnostics::Diagnostics) {
+    let loader = crate::loader::MemoryLoader::new();
+    let mut compiler = crate::Compiler::new(&loader);
+    compiler.add_source(src, "main.rill");
+    compiler.build().expect("build should succeed")
+}
+
+#[test]
+fn test_w001_unused_let_warns() {
+    let src = "fn test() { let x = 5; 0 }";
+    let (_program, diags) = build_single(src);
+
+    let warnings = w001_warnings(&diags);
+    assert_eq!(warnings.len(), 1);
+    let w = warnings[0];
+    assert!(w.message.contains("unused variable `x`"));
+    assert_eq!(w.source_id.as_deref(), Some("main.rill"));
+    let span = w.span.expect("W001 should carry a span");
+    assert_eq!(span.start, src.find('x').unwrap());
+}
+
+#[test]
+fn test_w001_used_let_no_warning() {
+    let (_program, diags) = build_single("fn test() { let x = 5; x }");
+    assert!(w001_warnings(&diags).is_empty());
+}
+
+#[test]
+fn test_w001_param_not_warned() {
+    // Parameters are contracts; a never-read param is not flagged.
+    let (_program, diags) = build_single("fn test(p) { 0 }");
+    assert!(w001_warnings(&diags).is_empty());
+}
+
+#[test]
+fn test_w001_discard_not_warned() {
+    // `_` creates no binding.
+    let (_program, diags) = build_single("fn test() { let _ = 5; 0 }");
+    assert!(w001_warnings(&diags).is_empty());
+}
+
+#[test]
+fn test_w001_with_binding_not_warned() {
+    // `with` bindings mutate their base via WriteRef — a never-read `with` is a
+    // side effect, not an unused variable.
+    let (_program, diags) = build_single("fn test() { let a = [10, 20]; with x = a[0]; x = 1; 0 }");
+    let ws = w001_warnings(&diags);
+    assert!(ws.is_empty(), "unexpected W001: {:?}", ws.iter().map(|w| &w.message).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_w001_shadowing_warns_first_only() {
+    // The first `x` is shadowed before any read → unused; the second is read.
+    let src = "fn test() { let x = 1; let x = 2; x }";
+    let (_program, diags) = build_single(src);
+    let warnings = w001_warnings(&diags);
+    assert_eq!(warnings.len(), 1);
+    // The flagged decl is the first `x`.
+    let span = warnings[0].span.expect("span");
+    assert_eq!(span.start, src.find('x').unwrap());
+}
+
 #[test]
 fn test_compiler_import_require_namespace_clash() {
     // import and require both claim the same namespace — should error

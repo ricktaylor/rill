@@ -13,7 +13,7 @@
 //!   MakeRef, Reload) is removed if its dest is unused
 
 use crate::externs::ExternRegistry;
-use crate::ir::{Function, Instruction, Terminator, VarId};
+use crate::ir::{Function, Instruction, VarId, uses};
 use std::collections::HashSet;
 
 /// Eliminate dead instructions. Returns the number removed.
@@ -51,107 +51,12 @@ fn collect_used_vars(function: &Function) -> HashSet<VarId> {
 
     for block in &function.blocks {
         for inst in &block.instructions {
-            collect_reads(&inst.node, &mut used);
+            used.extend(uses::instruction_reads(&inst.node));
         }
-        collect_terminator_reads(&block.terminator, &mut used);
+        used.extend(uses::terminator_reads(&block.terminator));
     }
 
     used
-}
-
-/// Collect VarIds read by an instruction (not the dest).
-fn collect_reads(inst: &Instruction, used: &mut HashSet<VarId>) {
-    match inst {
-        Instruction::Const { .. } => {}
-
-        Instruction::Copy { src, .. } => {
-            used.insert(*src);
-        }
-
-        Instruction::Phi { sources, .. } => {
-            for (_, var) in sources {
-                used.insert(*var);
-            }
-        }
-
-        Instruction::Index { base, key, .. } => {
-            used.insert(*base);
-            used.insert(*key);
-        }
-
-        Instruction::Intrinsic { args, .. } => {
-            for arg in args {
-                used.insert(*arg);
-            }
-        }
-
-        Instruction::Call { args, .. } => {
-            for v in args {
-                used.insert(*v);
-            }
-        }
-
-        Instruction::MakeAccessor { base, key, .. } => {
-            used.insert(*base);
-            used.insert(*key);
-        }
-
-        Instruction::MakeRef { base, .. } => {
-            used.insert(*base);
-        }
-
-        Instruction::WriteRef { ref_var, value } => {
-            used.insert(*ref_var);
-            used.insert(*value);
-        }
-
-        Instruction::WriteAccessor { base, key, value } => {
-            used.insert(*base);
-            used.insert(*key);
-            used.insert(*value);
-        }
-
-        Instruction::Append { arr, value, .. } => {
-            used.insert(*arr);
-            used.insert(*value);
-        }
-
-        Instruction::Reload { src, .. } => {
-            used.insert(*src);
-        }
-
-        // LoadGlobal reads no VarId operands; StoreGlobal reads its value.
-        Instruction::LoadGlobal { .. } => {}
-
-        Instruction::StoreGlobal { value, .. } => {
-            used.insert(*value);
-        }
-
-        Instruction::Assign { .. } | Instruction::Read { .. } => {
-            unreachable!("pre-SSA instruction; removed by mem2reg")
-        }
-    }
-}
-
-/// Collect VarIds read by a terminator.
-fn collect_terminator_reads(term: &Terminator, used: &mut HashSet<VarId>) {
-    match term {
-        Terminator::If { condition, .. } => {
-            used.insert(*condition);
-        }
-        Terminator::Match { value, .. } => {
-            used.insert(*value);
-        }
-        Terminator::Return { value: Some(v) } => {
-            used.insert(*v);
-        }
-        Terminator::TailCall { args, .. } => {
-            for v in args {
-                used.insert(*v);
-            }
-        }
-        Terminator::Jump { .. } | Terminator::Return { value: None } | Terminator::Unreachable => {}
-    }
 }
 
 /// Is this instruction safe to remove when its dest is unused?
@@ -198,30 +103,6 @@ fn is_removable(
 }
 
 /// Get the dest VarId of an instruction, if it has one.
-fn get_dest(inst: &Instruction) -> Option<VarId> {
-    match inst {
-        Instruction::Const { dest, .. }
-        | Instruction::Copy { dest, .. }
-        | Instruction::Index { dest, .. }
-        | Instruction::Intrinsic { dest, .. }
-        | Instruction::Phi { dest, .. }
-        | Instruction::MakeAccessor { dest, .. }
-        | Instruction::MakeRef { dest, .. }
-        | Instruction::Append { dest, .. }
-        | Instruction::Call { dest, .. }
-        | Instruction::Reload { dest, .. }
-        | Instruction::LoadGlobal { dest, .. } => Some(*dest),
-
-        Instruction::WriteRef { .. }
-        | Instruction::WriteAccessor { .. }
-        | Instruction::StoreGlobal { .. } => None,
-
-        Instruction::Assign { .. } | Instruction::Read { .. } => {
-            unreachable!("pre-SSA instruction; removed by mem2reg")
-        }
-    }
-}
-
 /// Remove dead instructions from all blocks. Returns count removed.
 fn remove_dead(
     function: &mut Function,
@@ -237,7 +118,7 @@ fn remove_dead(
             if !is_removable(&inst.node, externs, pure_functions) {
                 return true; // side-effectful — keep
             }
-            match get_dest(&inst.node) {
+            match uses::instruction_dest(&inst.node) {
                 Some(dest) => used.contains(&dest), // keep if used
                 None => true,                       // no dest — keep
             }
@@ -252,7 +133,7 @@ fn remove_dead(
 mod tests {
     use super::*;
     use crate::ast;
-    use crate::ir::{BasicBlock, BlockId, IntrinsicOp, Literal, Var};
+    use crate::ir::{BasicBlock, BlockId, IntrinsicOp, Literal, Terminator, Var};
     use crate::types::TypeSet;
 
     fn var(id: u32) -> VarId {

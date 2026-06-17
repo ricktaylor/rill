@@ -33,7 +33,9 @@ mod control;
 mod expr;
 mod pattern;
 mod program;
+mod lint;
 mod stmt;
+pub(crate) mod uses;
 
 // Re-export all IR types
 pub use types::*;
@@ -170,6 +172,17 @@ pub struct Lowerer<'a> {
     /// a function scope. `None` in function bodies: bare names never resolve to
     /// globals, and `::name` sees every global regardless of order.
     pub init_slot_limit: Option<u32>,
+
+    /// Declaration site (name + span) of each value-binding slot in the current
+    /// function — every `new_slot` for a non-`_` name (`let`/`for`/pattern/match
+    /// bindings; `with` goes through `bind_ref` and is excluded). Drives the
+    /// unused-variable lint (`check_unused_bindings`). Reset per function.
+    pub slot_decls: HashMap<u32, (ast::Identifier, ast::Span)>,
+
+    /// First slot id allocated to the current function's *body*, i.e. the slot
+    /// count after the parameter prologue. Slots below this are parameters,
+    /// which the unused-variable lint does not flag.
+    pub body_slot_start: u32,
 }
 
 /// Context for a loop (for break/continue)
@@ -205,6 +218,8 @@ impl<'a> Lowerer<'a> {
             merged_imports: HashMap::new(),
             global_slots: HashMap::new(),
             init_slot_limit: None,
+            slot_decls: HashMap::new(),
+            body_slot_start: 0,
         }
     }
 
@@ -314,10 +329,13 @@ impl<'a> Lowerer<'a> {
         let slot = self.next_slot_id;
         self.next_slot_id += 1;
         // `_` is a discard binding — don't enter scope
-        if name.0 != "_"
-            && let Some(scope) = self.scopes.last_mut()
-        {
-            scope.insert(name.clone(), slot);
+        if name.0 != "_" {
+            if let Some(scope) = self.scopes.last_mut() {
+                scope.insert(name.clone(), slot);
+            }
+            // Record the declaration site for the unused-variable lint.
+            self.slot_decls
+                .insert(slot, (name.clone(), self.current_span));
         }
         slot
     }
@@ -393,6 +411,12 @@ impl<'a> Lowerer<'a> {
 
     /// Record that `name` is a reference binding with the given origin.
     pub fn bind_ref(&mut self, name: &ast::Identifier, origin: RefOrigin) {
+        // A ref-backed binding (`with`, by-ref param) writes back to its base, so
+        // a write with no read is a side effect, not an unused variable — drop it
+        // from the unused-variable lint set.
+        if let Some(slot) = self.lookup_slot(name) {
+            self.slot_decls.remove(&slot);
+        }
         if let Some(scope) = self.ref_origins.last_mut() {
             scope.insert(name.clone(), origin);
         }

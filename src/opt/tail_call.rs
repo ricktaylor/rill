@@ -11,7 +11,7 @@
 //! - All args by-value (no by_ref)
 //! - No rest params
 
-use crate::ir::{BlockId, Function, Instruction, Terminator, VarId};
+use crate::ir::{BlockId, Function, Instruction, Terminator, VarId, uses};
 use std::collections::{HashMap, HashSet};
 
 /// Detect and rewrite self-recursive tail calls in a function.
@@ -112,52 +112,17 @@ fn count_var_uses(function: &Function) -> HashMap<VarId, usize> {
 
     for block in &function.blocks {
         for inst in &block.instructions {
-            for var in instruction_reads(&inst.node) {
+            for var in uses::instruction_reads(&inst.node) {
                 *counts.entry(var).or_insert(0) += 1;
             }
         }
 
-        for var in terminator_reads(&block.terminator) {
+        for var in uses::terminator_reads(&block.terminator) {
             *counts.entry(var).or_insert(0) += 1;
         }
     }
 
     counts
-}
-
-/// Get all VarIds read by an instruction (excluding the dest).
-fn instruction_reads(inst: &Instruction) -> Vec<VarId> {
-    match inst {
-        Instruction::Phi { sources, .. } => sources.iter().map(|(_, v)| *v).collect(),
-        Instruction::Copy { src, .. } => vec![*src],
-        Instruction::Const { .. } => vec![],
-        Instruction::Index { base, key, .. } => vec![*base, *key],
-        Instruction::Intrinsic { args, .. } => args.clone(),
-        Instruction::Call { args, .. } => args.clone(),
-        Instruction::MakeAccessor { base, key, .. } => vec![*base, *key],
-        Instruction::MakeRef { base, .. } => vec![*base],
-        Instruction::WriteRef { ref_var, value } => vec![*ref_var, *value],
-        Instruction::WriteAccessor { base, key, value } => vec![*base, *key, *value],
-        Instruction::Append { arr, value, .. } => vec![*arr, *value],
-        Instruction::Reload { src, .. } => vec![*src],
-        Instruction::LoadGlobal { .. } => vec![],
-        Instruction::StoreGlobal { value, .. } => vec![*value],
-        Instruction::Assign { value, .. } => vec![*value],
-        Instruction::Read { .. } => vec![],
-    }
-}
-
-/// Get all VarIds read by a terminator.
-fn terminator_reads(term: &Terminator) -> Vec<VarId> {
-    match term {
-        Terminator::If { condition, .. } => vec![*condition],
-        Terminator::Match { value, .. } => vec![*value],
-        Terminator::Return { value: Some(v) } => vec![*v],
-        Terminator::TailCall { args, .. } => args.clone(),
-        Terminator::Jump { .. } | Terminator::Return { value: None } | Terminator::Unreachable => {
-            vec![]
-        }
-    }
 }
 
 /// Find all VarIds that are "return-only": their only use is flowing

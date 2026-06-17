@@ -296,7 +296,7 @@ pub fn is_reserved_name(name: &str) -> bool {
 // ============================================================================
 
 /// SSA variable identifier
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct VarId(pub u32);
 
 /// SSA variable metadata

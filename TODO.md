@@ -304,8 +304,17 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
         terminator naming the same target twice (`If` with `then == else`, or a
         `Match` sharing a block) yields one predecessor entry, not two.
         Covered by `test_duplicate_successor_dedup`.
+- [x] **Liveness analysis** — done (2026-06-17). `src/ssa/liveness.rs`: backward
+      dataflow over SSA mirroring `DominatorTree` (`Liveness::build(function,
+      block_map)`, `live_in`/`live_out`/`used`/`is_used`), phi-aware (operands
+      credited to the predecessor's live-out), deterministic (`BTreeSet`). The
+      reusable keystone for the consumers below. `live_in`/`live_out` have no
+      production consumer yet (the slot allocator is next), so they are gated
+      `#[cfg_attr(not(test), allow(dead_code))]` and exercised by unit tests —
+      same staging as domtree's `idom`/`dominates`. Per-instruction operand
+      shape consolidated into `src/ir/uses.rs` (was duplicated in dce/tail_call).
 - [ ] **Dead write-back elimination** — a WriteRef exists but the base value is never
-      read after the write-back point. Requires liveness analysis.
+      read after the write-back point. Requires liveness analysis (now available).
 - [ ] **Slot allocator** — map VarIds to physical slot offsets via liveness analysis.
       Currently `slot(VarId) = var.0` (identity mapping, one slot per VarId).
       Non-overlapping VarIds can share slots, reducing frame_size. Accessor pairs
@@ -397,8 +406,15 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
 
 ### P2 — Diagnostics
 
-- [ ] Dead-store warnings for non-ref-backed loop variable mutations
-- [ ] Unused variable warnings (from DCE liveness data)
+- [ ] Dead-store warnings for non-ref-backed loop variable mutations — deferred.
+      A sound version needs per-slot reaching-definitions (the SSA use-set/liveness
+      doesn't express per-store deadness, and the loop-accumulator case is
+      false-positive-prone); not bundled with the unused-variable lint.
+- [x] Unused variable warnings — done (2026-06-17). `W001_UnusedVariable`, emitted
+      by `check_unused_bindings` (`src/ir/lint.rs`) on the **pre-SSA** function
+      (user names don't survive SSA), before `promote`. Flags body value bindings
+      (`let`/`for`/pattern/match) never read; excludes params, `with`/ref bindings,
+      and `_`. Points at the binding pattern; suggests an `_` prefix.
 
 ### P2 — Quality
 

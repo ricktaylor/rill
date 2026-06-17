@@ -307,6 +307,7 @@ impl<'a> Lowerer<'a> {
         self.next_slot_id = 0;
         self.loop_stack.clear();
         self.byref_param_vars.clear();
+        self.slot_decls.clear();
 
         // Start with a fresh scope for parameters
         self.push_scope();
@@ -345,6 +346,10 @@ impl<'a> Lowerer<'a> {
             None
         };
 
+        // Slots allocated from here on belong to the function body; slots below
+        // this are parameters, which the unused-variable lint does not flag.
+        self.body_slot_start = self.next_slot_id;
+
         // Lower statements (continue even on errors to report multiple issues)
         for stmt in &func.statements {
             self.lower_stmt(stmt);
@@ -375,6 +380,10 @@ impl<'a> Lowerer<'a> {
             blocks: std::mem::take(&mut self.blocks),
             entry_block,
         };
+
+        // Unused-variable lint runs on the pre-SSA function (slot↔name map and
+        // Read instructions still present), before SSA construction.
+        self.check_unused_bindings(&function);
 
         // Convert pre-SSA Assign/Read instructions to proper SSA with Phi nodes
         crate::ssa::promote(&mut function);

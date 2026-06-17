@@ -31,6 +31,7 @@
 //! all `Assign`/`Read` instructions with proper SSA VarIds and Phi nodes.
 
 pub(crate) mod domtree;
+pub(crate) mod liveness;
 mod promote;
 
 pub use promote::promote;

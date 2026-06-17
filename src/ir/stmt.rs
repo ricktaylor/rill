@@ -21,6 +21,9 @@ impl<'a> Lowerer<'a> {
                     Some(init) => self.lower_expression(init),
                     None => self.emit_undefined(),
                 };
+                // Point binding diagnostics (unused-variable) at the pattern,
+                // not the initializer expression just lowered above.
+                self.set_span(pattern.span);
                 self.lower_pattern_binding(&pattern.node, value, BindingMode::Value);
             }
 
