@@ -90,6 +90,10 @@ impl DominatorTree {
     }
 
     /// Immediate dominator of `block`. Returns `None` for the entry block.
+    ///
+    /// Reserved for upcoming dominator-based passes (LICM/GVN/bounds
+    /// checking); exercised by tests today.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn idom(&self, block: BlockId) -> Option<BlockId> {
         let dom = *self.idom.get(&block)?;
         if block == self.entry { None } else { Some(dom) }
@@ -97,6 +101,10 @@ impl DominatorTree {
 
     /// Does `a` dominate `b`? (a dom b means every path from entry to b
     /// passes through a). A block dominates itself.
+    ///
+    /// Reserved for upcoming dominator-based passes (LICM/GVN/bounds
+    /// checking); exercised by tests today.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn dominates(&self, a: BlockId, b: BlockId) -> bool {
         let mut current = b;
         loop {
