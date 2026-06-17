@@ -3078,6 +3078,63 @@ fn test_w001_shadowing_warns_first_only() {
     assert_eq!(span.start, src.find('x').unwrap());
 }
 
+// ============================================================================
+// Slot allocator
+// ============================================================================
+
+#[test]
+fn slot_alloc_accessor_survives_intervening_temps() {
+    // A `with` accessor into arr[1], then several temps that — without pinning —
+    // could be coalesced onto the accessor's base/key/ref slots, then a write
+    // through the accessor. Pinning keeps the accessor's captured slots valid,
+    // so the write lands in arr[1]. This would corrupt if pinning were dropped.
+    let val = run_expect(
+        r#"
+        fn test() {
+            let arr = [10, 20, 30];
+            with x = arr[1];
+            let t1 = 1;
+            let t2 = t1 + 10;
+            let t3 = t2 + 20;
+            let t4 = t3 + 5;
+            x = t1 + t2 + t3 + t4;
+            arr[1]
+        }
+        "#,
+        "test",
+    );
+    // t1=1, t2=11, t3=31, t4=36 → 79
+    assert_eq!(val, Value::UInt(79));
+}
+
+#[test]
+fn slot_alloc_shrinks_frame_for_disjoint_temps() {
+    // A chain of disjoint temporaries (each dies as the next is computed) packs
+    // into far fewer slots than the number of SSA variables. The param keeps the
+    // chain out of the constant folder.
+    let (program, _diags) = build_single(
+        r#"
+        fn test(n) {
+            let a = n + 1;
+            let b = a + 1;
+            let c = b + 1;
+            let d = c + 1;
+            let e = d + 1;
+            let f = e + 1;
+            return f;
+        }
+        "#,
+    );
+    let fs = program.function_frame_size("test").expect("frame size");
+    // ~38 SSA vars (each guarded `+` expands to const/guard/copy/add/phi) pack
+    // into a single-digit frame — coalescing is clearly working.
+    assert!(fs <= 12, "expected a tight frame, got {fs}");
+
+    let mut vm = VM::new();
+    vm.push(Value::UInt(0)).unwrap();
+    assert_eq!(program.call(&mut vm, "test", 1).unwrap(), Value::UInt(6));
+}
+
 #[test]
 fn test_compiler_import_require_namespace_clash() {
     // import and require both claim the same namespace — should error

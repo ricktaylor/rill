@@ -64,6 +64,12 @@ impl Program {
     pub fn call(&self, vm: &mut VM, func_name: &str, argc: usize) -> Result<Value, ExecError> {
         compile::execute(&self.compiled, vm, func_name, argc)
     }
+
+    /// Physical frame size (allocated slot count) of a compiled function, by
+    /// name. Exposed for tests and tooling that inspect slot allocation.
+    pub fn function_frame_size(&self, name: &str) -> Option<usize> {
+        self.compiled.function_frame_size(name)
+    }
 }
 
 impl VM {

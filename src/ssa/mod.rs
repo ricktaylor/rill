@@ -32,6 +32,7 @@
 
 pub(crate) mod domtree;
 pub(crate) mod liveness;
+pub(crate) mod slot_alloc;
 mod promote;
 
 pub use promote::promote;

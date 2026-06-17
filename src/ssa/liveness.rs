@@ -7,12 +7,11 @@
 //! the unique least solution, so the result is independent of iteration order;
 //! sets are stored as `BTreeSet` for deterministic iteration.
 //!
-//! Mirrors `DominatorTree`'s shape (`build(function, block_map)`). `live_in`/
-//! `live_out` are the live ranges the upcoming slot allocator will consume;
-//! `used` is the global "read anywhere" set. The module currently has no
-//! non-test consumer (the slot allocator lands next), so it is gated like
-//! domtree's reserved accessors and exercised by its unit tests.
-#![cfg_attr(not(test), allow(dead_code))]
+//! Mirrors `DominatorTree`'s shape (`build(function, block_map)`). `live_out` is
+//! consumed by the slot allocator (`ssa::slot_alloc`); `live_in`, `used`, and
+//! `is_used` are part of the reusable surface but have no production consumer
+//! yet, so they are gated like domtree's reserved accessors and exercised by the
+//! unit tests.
 
 use crate::ir::{BasicBlock, BlockId, Function, Instruction, VarId, cfg, uses};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -161,6 +160,7 @@ impl Liveness {
     }
 
     /// Variables live on entry to `block`.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn live_in(&self, block: BlockId) -> &BTreeSet<VarId> {
         self.live_in.get(&block).unwrap_or(&self.empty)
     }
@@ -171,11 +171,13 @@ impl Liveness {
     }
 
     /// Every VarId read somewhere in a reachable block.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn used(&self) -> &BTreeSet<VarId> {
         &self.used
     }
 
     /// Whether `var` is read anywhere in a reachable block.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_used(&self, var: VarId) -> bool {
         self.used.contains(&var)
     }

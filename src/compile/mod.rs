@@ -42,6 +42,7 @@ use crate::ir::{
     Terminator, VarId,
 };
 use crate::opt::TypeAnalysis;
+use crate::ssa::slot_alloc::SlotAlloc;
 use crate::types::{BaseType, ConvertMode, NumericType, TypeSet};
 use indexmap::IndexMap;
 use std::collections::HashMap;
@@ -83,6 +84,16 @@ pub struct CompiledFunction {
     pub param_count: usize,
 }
 
+impl CompiledProgram {
+    /// Frame size (allocated physical slot count) of a function by name.
+    pub fn function_frame_size(&self, name: &str) -> Option<usize> {
+        self.func_index
+            .get(name)
+            .and_then(|&i| self.functions.get(i))
+            .map(|f| f.frame_size)
+    }
+}
+
 /// A step closure. Captures operands, operates on VM.
 /// Instructions return Continue; terminators return NextBlock/Return/Exit.
 pub type Step = Box<dyn Fn(&mut VM, &CompiledProgram) -> Result<Action, ExecError>>;
@@ -102,12 +113,10 @@ pub enum Action {
 // ============================================================================
 // Slot Mapping
 // ============================================================================
-
-/// Maps VarIds to stack slot offsets.
-/// Slot 0 = Frame info. VarId(n) → slot n + 1.
-pub fn slot(var: VarId) -> usize {
-    var.0 as usize // Frame info is on a separate stack — slot 0 is available
-}
+//
+// Physical stack slots are assigned per function by `SlotAlloc` (built in
+// `compile_function`), which coalesces non-interfering VarIds. `alloc.slot(var)`
+// replaces the old identity `var.0` mapping.
 
 /// Maps BlockId to index in the compiled blocks array.
 fn build_block_map(blocks: &[BasicBlock]) -> HashMap<BlockId, usize> {
@@ -257,7 +266,13 @@ fn link_functions(
 
 fn compile_function(func: &Function, link_map: &LinkMap) -> Result<CompiledFunction, ExecError> {
     let block_map = build_block_map(&func.blocks);
-    let frame_size = func.locals.len(); // frame info on separate stack
+
+    // Slot allocation: coalesce non-interfering VarIds onto shared physical
+    // slots. `alloc.slot(var)` is the storage offset; `frame_size` is the
+    // number of slots needed. Built on the original IR so type analysis below
+    // keeps per-VarId precision.
+    let alloc = SlotAlloc::build(func, &crate::ir::cfg::block_map(func));
+    let frame_size = alloc.frame_size();
 
     // Type analysis for specialization — when both operands of an arithmetic
     // op are provably the same type, the compiler emits a direct closure
@@ -276,11 +291,11 @@ fn compile_function(func: &Function, link_map: &LinkMap) -> Result<CompiledFunct
         // Collect phis from this block
         for inst in &ir_block.instructions {
             if let Instruction::Phi { dest, sources } = &inst.node {
-                let d = slot(*dest);
+                let d = alloc.slot(*dest);
                 let compiled_sources: Vec<(usize, usize)> = sources
                     .iter()
                     .filter_map(|(block_id, var_id)| {
-                        block_map.get(block_id).map(|&idx| (idx, slot(*var_id)))
+                        block_map.get(block_id).map(|&idx| (idx, alloc.slot(*var_id)))
                     })
                     .collect();
 
@@ -294,7 +309,7 @@ fn compile_function(func: &Function, link_map: &LinkMap) -> Result<CompiledFunct
         }
 
         blocks.push(compile_block(
-            ir_block, &block_map, link_map, &types, frame_size,
+            ir_block, &block_map, link_map, &types, frame_size, &alloc,
         )?);
     }
 
@@ -367,6 +382,7 @@ fn compile_block(
     link_map: &LinkMap,
     types: &TypeAnalysis,
     frame_size: usize,
+    alloc: &SlotAlloc,
 ) -> Result<Vec<Step>, ExecError> {
     let mut steps: Vec<Step> = Vec::new();
 
@@ -376,7 +392,8 @@ fn compile_block(
             // copies are inserted into predecessor blocks
             Instruction::Phi { .. } => {}
             inst => {
-                if let Some(step) = compile_instruction(inst, block_map, link_map, types, block.id)?
+                if let Some(step) =
+                    compile_instruction(inst, block_map, link_map, types, block.id, alloc)?
                 {
                     steps.push(step);
                 }
@@ -391,6 +408,7 @@ fn compile_block(
         types,
         block.id,
         frame_size,
+        alloc,
     )?);
 
     Ok(steps)
@@ -402,10 +420,11 @@ fn compile_instruction(
     link_map: &LinkMap,
     types: &TypeAnalysis,
     block_id: BlockId,
+    alloc: &SlotAlloc,
 ) -> Result<Option<Step>, ExecError> {
     Ok(Some(match inst {
         Instruction::Const { dest, value } => {
-            let d = slot(*dest);
+            let d = alloc.slot(*dest);
             // Pre-compute scalar values at compile time — no runtime match needed.
             // Only Text/Bytes require runtime heap allocation.
             match value {
@@ -483,8 +502,8 @@ fn compile_instruction(
         }
 
         Instruction::Copy { dest, src } => {
-            let d = slot(*dest);
-            let s = slot(*src);
+            let d = alloc.slot(*dest);
+            let s = alloc.slot(*src);
             if types.get(*src).is_some_and(|t| t.is_defined()) {
                 Box::new(move |vm: &mut VM, _prog| {
                     let val = vm.local(s).clone();
@@ -500,9 +519,9 @@ fn compile_instruction(
         }
 
         Instruction::Index { dest, base, key } => {
-            let d = slot(*dest);
-            let b = slot(*base);
-            let k = slot(*key);
+            let d = alloc.slot(*dest);
+            let b = alloc.slot(*base);
+            let k = alloc.slot(*key);
 
             // Specialize based on known base type
             let base_type = types.get(*base).filter(|t| t.is_single());
@@ -582,8 +601,8 @@ fn compile_instruction(
             function,
             args,
         } => {
-            let d = slot(*dest);
-            let arg_slots: Vec<usize> = args.iter().map(|v| slot(*v)).collect();
+            let d = alloc.slot(*dest);
+            let arg_slots: Vec<usize> = args.iter().map(|v| alloc.slot(*v)).collect();
             let func_name = function.qualified_name();
 
             // Resolve via link map (all references verified at link time)
@@ -678,9 +697,9 @@ fn compile_instruction(
         }
 
         Instruction::Intrinsic { dest, op, args } => {
-            let d = slot(*dest);
+            let d = alloc.slot(*dest);
             let op = *op;
-            let arg_slots: Vec<usize> = args.iter().map(|v| slot(*v)).collect();
+            let arg_slots: Vec<usize> = args.iter().map(|v| alloc.slot(*v)).collect();
 
             // Try type-specialized compilation for binary arithmetic.
             // If both operands are provably the same single numeric type,
@@ -705,9 +724,9 @@ fn compile_instruction(
         }
 
         Instruction::MakeAccessor { dest, base, key } => {
-            let d = slot(*dest);
-            let b = slot(*base);
-            let k = slot(*key);
+            let d = alloc.slot(*dest);
+            let b = alloc.slot(*base);
+            let k = alloc.slot(*key);
             // Create Slot::Accessor — a far pointer into a collection.
             // The base slot holds the collection, the key slot holds the index/key.
             // Reading through the Accessor does base[key].
@@ -721,8 +740,8 @@ fn compile_instruction(
         }
 
         Instruction::MakeRef { dest, base } => {
-            let d = slot(*dest);
-            let b = slot(*base);
+            let d = alloc.slot(*dest);
+            let b = alloc.slot(*base);
             // Whole-value reference: create a Slot::Ref to base's
             // ultimate target (path compression — resolve the chain
             // once here, not on every subsequent read/write).
@@ -734,8 +753,8 @@ fn compile_instruction(
         }
 
         Instruction::WriteRef { ref_var, value } => {
-            let r = slot(*ref_var);
-            let v = slot(*value);
+            let r = alloc.slot(*ref_var);
+            let v = alloc.slot(*value);
             // Write through the ref_var's slot. The VM's set_local resolves
             // through Slot::Ref (near pointer) and Slot::Accessor (far pointer)
             // automatically — no build_ref_map tracing needed.
@@ -746,9 +765,9 @@ fn compile_instruction(
         }
 
         Instruction::WriteAccessor { base, key, value } => {
-            let b = slot(*base);
-            let k = slot(*key);
-            let v = slot(*value);
+            let b = alloc.slot(*base);
+            let k = alloc.slot(*key);
+            let v = alloc.slot(*value);
             let base_type = types.get(*base).filter(|t| t.is_single());
 
             if base_type.is_some_and(|t| t.contains(BaseType::Array)) {
@@ -787,9 +806,9 @@ fn compile_instruction(
         }
 
         Instruction::Append { dest, arr, value } => {
-            let d = slot(*dest);
-            let a = slot(*arr);
-            let v = slot(*value);
+            let d = alloc.slot(*dest);
+            let a = alloc.slot(*arr);
+            let v = alloc.slot(*value);
             Box::new(move |vm: &mut VM, _prog| {
                 let val = vm.local(v).clone();
                 if val.is_defined() && vm.array_append(vm.bp() + a, val)? {
@@ -803,8 +822,8 @@ fn compile_instruction(
 
         // Reload: read current slot value into a new slot (SSA barrier after mutation)
         Instruction::Reload { dest, src } => {
-            let d = slot(*dest);
-            let s = slot(*src);
+            let d = alloc.slot(*dest);
+            let s = alloc.slot(*src);
             Box::new(move |vm: &mut VM, _prog| {
                 vm.set_local(d, vm.local(s).clone());
                 Ok(Action::Continue)
@@ -816,7 +835,7 @@ fn compile_instruction(
             dest,
             slot: global_slot,
         } => {
-            let d = slot(*dest);
+            let d = alloc.slot(*dest);
             let g = *global_slot as usize;
             Box::new(move |vm: &mut VM, _prog| {
                 let v = vm.get(g).cloned().unwrap_or(Value::Undefined);
@@ -831,7 +850,7 @@ fn compile_instruction(
             value,
         } => {
             let g = *global_slot as usize;
-            let v = slot(*value);
+            let v = alloc.slot(*value);
             Box::new(move |vm: &mut VM, _prog| {
                 let val = vm.local(v).clone();
                 vm.set(g, val);

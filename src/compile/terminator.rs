@@ -6,6 +6,7 @@ pub(super) fn compile_terminator(
     types: &TypeAnalysis,
     _block_id: BlockId,
     frame_size: usize,
+    alloc: &SlotAlloc,
 ) -> Result<Step, ExecError> {
     Ok(match term {
         Terminator::Jump { target } => {
@@ -19,7 +20,7 @@ pub(super) fn compile_terminator(
             else_target,
             ..
         } => {
-            let cond_slot = slot(*condition);
+            let cond_slot = alloc.slot(*condition);
             let then_idx = block_map[then_target];
             let else_idx = block_map[else_target];
 
@@ -52,13 +53,13 @@ pub(super) fn compile_terminator(
             default,
             ..
         } => {
-            let val_slot = slot(*value);
+            let val_slot = alloc.slot(*value);
             let default_idx = block_map[default];
             compile_match(val_slot, arms, default_idx, block_map)
         }
 
         Terminator::Return { value } => {
-            let val_slot = value.map(slot);
+            let val_slot = value.map(|v| alloc.slot(v));
             Box::new(move |vm: &mut VM, _prog| {
                 let val = val_slot
                     .map(|s| vm.local(s).clone())
@@ -70,7 +71,7 @@ pub(super) fn compile_terminator(
         Terminator::Unreachable => Box::new(|_vm, _prog| Ok(Action::Return(Value::Undefined))),
 
         Terminator::TailCall { args, .. } => {
-            let arg_slots: Vec<usize> = args.iter().map(|v| slot(*v)).collect();
+            let arg_slots: Vec<usize> = args.iter().map(|v| alloc.slot(*v)).collect();
             let param_count = arg_slots.len();
             let entry_idx = block_map[&crate::ir::BlockId(0)];
 
@@ -86,8 +87,11 @@ pub(super) fn compile_terminator(
                     vm.set_local(i, val);
                 }
                 // Reset non-param locals — clears Val/Ref/Accessor unconditionally.
-                // Must NOT use set_local (would write through Accessors).
-                for i in (param_count + 1)..frame_size {
+                // Must NOT use set_local (would write through Accessors). Slots
+                // 0..param_count were just rewritten above; the slot allocator
+                // keeps the param region exclusive in tail-call functions, so
+                // every remaining slot here is a body local.
+                for i in param_count..frame_size {
                     vm.reset_local(i);
                 }
 

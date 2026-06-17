@@ -308,22 +308,32 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
       dataflow over SSA mirroring `DominatorTree` (`Liveness::build(function,
       block_map)`, `live_in`/`live_out`/`used`/`is_used`), phi-aware (operands
       credited to the predecessor's live-out), deterministic (`BTreeSet`). The
-      reusable keystone for the consumers below. `live_in`/`live_out` have no
-      production consumer yet (the slot allocator is next), so they are gated
-      `#[cfg_attr(not(test), allow(dead_code))]` and exercised by unit tests —
-      same staging as domtree's `idom`/`dominates`. Per-instruction operand
-      shape consolidated into `src/ir/uses.rs` (was duplicated in dce/tail_call).
+      reusable keystone for the consumers below. `live_out` is consumed by the
+      slot allocator; `live_in`/`used`/`is_used` stay gated
+      `#[cfg_attr(not(test), allow(dead_code))]` (reserved, exercised by unit
+      tests) like domtree's `idom`/`dominates`. Per-instruction operand shape
+      consolidated into `src/ir/uses.rs` (was duplicated in dce/tail_call).
 - [ ] **Dead write-back elimination** — a WriteRef exists but the base value is never
       read after the write-back point. Requires liveness analysis (now available).
-- [ ] **Slot allocator** — map VarIds to physical slot offsets via liveness analysis.
-      Currently `slot(VarId) = var.0` (identity mapping, one slot per VarId).
-      Non-overlapping VarIds can share slots, reducing frame_size. Accessor pairs
-      allocated as two adjacent physical slots. Linear scan or graph colouring.
-      Prerequisite: liveness intervals from the SSA graph.
-      Runs as Phase S after all optimization (A, M, B, T) and before closure
-      compilation. Globals occupy slots 0..N of the VM stack (persistent across
-      calls); function frames start at N. The slot allocator assigns local VarIds
-      (including LoadGlobal dests) into the function-local slot range above N.
+- [x] **Slot allocator** — done (2026-06-17). `src/ssa/slot_alloc.rs`:
+      `SlotAlloc::build(function, block_map)` coalesces non-interfering VarIds
+      onto shared physical slots via an interference graph (per-instruction
+      liveness from `Liveness`) + greedy coloring. Consumed at compile time in
+      `compile_function` (`alloc.slot(var)` replaced the identity `slot(var)=var.0`;
+      `frame_size` from the allocation) — **not** an opt phase and **no IR
+      renumbering**, so `analyze_types` keeps per-VarId type-specialization
+      precision. ~4.75x frame reduction measured (38 SSA vars → 8 slots).
+      - Params pre-colored to positional slots `0..param_count` (calling
+        convention adopts args there); tail-call functions keep the param region
+        exclusive and the reset loop covers `param_count..frame_size`.
+      - **Pinning** (private slot): Ref/Accessor dest/base/key (the VM stores slot
+        indices captured at creation) and **all phi dests** (phi-resolution copies
+        land at predecessor ends and run on critical edges, so a phi value can be
+        physically live beyond SSA liveness — e.g. a `break` value preloaded at a
+        loop header). v2 could refine to pin only critical-edge phis (or split
+        critical edges) to coalesce the ubiquitous guard-phis.
+      - Move/copy coalescing deferred to v2 (must be type-aware: narrowing copies
+        carry a tighter type). `Program::function_frame_size` exposes the result.
 
 ### P2 — Architecture
 
