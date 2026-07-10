@@ -1,24 +1,34 @@
 //! Algebraic Simplification
 //!
 //! Rewrites intrinsic operations using algebraic identities when one operand
-//! is a known constant. Uses TypeAnalysis for type-aware strength reduction.
+//! is a known constant.
 //!
-//! Identity rewrites (type-independent):
+//! Every rewrite is gated on TypeAnalysis proving the variable operand a
+//! SINGLE numeric type matching the constant operand's type:
+//! - a possibly-undefined operand must reach the runtime guard — folding
+//!   would manufacture a defined result from a failed computation
+//! - mixed-type operands promote at runtime (`Int + 0.0` is a Float
+//!   addition), so a Copy of the unpromoted operand has the wrong type
+//!
+//! The `Float` invariant (finite, single +0.0 zero) makes these folds
+//! bit-exact for floats too: no NaN, no infinities and no -0.0 means
+//! `x + 0`, `x - x` and `x * 0` have no IEEE edge cases left.
+//!
+//! Rewrites (UInt/Int/Float):
 //! - `x + 0` / `0 + x` → `Copy(dest, x)`
 //! - `x - 0` → `Copy(dest, x)`
 //! - `x * 1` / `1 * x` → `Copy(dest, x)`
-//! - `x * 0` / `0 * x` → `Const(dest, 0)` (same type as x)
 //! - `x / 1` → `Copy(dest, x)`
+//! - `x * 0` / `0 * x` → `Const(dest, 0)` (same type as x)
+//! - `x * 2` / `2 * x` → `x + x`
+//! - `x - x` → `Const(dest, 0)` (same type as x)
+//! - `x == x` → `Const(dest, true)` (any provably-defined operand)
 //! - `!!x` → `Copy(dest, x)`
 //!
-//! Strength reduction (type-dependent, requires TypeAnalysis):
-//! - `x * 2` → `x + x` (UInt/Int: avoids multiply)
-//! - `x * power_of_2` → `x << log2(n)` (UInt only: shift is cheaper)
-//! - `x / power_of_2` → `x >> log2(n)` (UInt only: unsigned shift)
-//!
-//! Self-identity:
-//! - `x - x` → `Const(dest, 0)` (same type)
-//! - `x == x` → `Const(dest, true)`
+//! `x * 2^k → x << k` strength reduction is deliberately absent: a rewrite
+//! here can only replace one instruction in place, and the shift amount
+//! would need a fresh Const. That fusion belongs to a pass that can emit
+//! instructions (the planned StepKind peephole layer).
 
 use crate::ir::Literal;
 use crate::ir::{Function, Instruction, IntrinsicOp, VarId};
@@ -71,14 +81,12 @@ pub fn simplify_algebra(function: &mut Function, types: &TypeAnalysis) -> usize 
     let mut changes = 0;
 
     for block_idx in 0..function.blocks.len() {
-        let block_id = function.blocks[block_idx].id;
-
         for inst_idx in 0..function.blocks[block_idx].instructions.len() {
             let inst = &function.blocks[block_idx].instructions[inst_idx].node;
 
             let replacement = match inst {
                 Instruction::Intrinsic { dest, op, args } => {
-                    try_simplify(*dest, *op, args, &constants, &not_sources, types, block_id)
+                    try_simplify(*dest, *op, args, &constants, &not_sources, types)
                 }
                 _ => None,
             };
@@ -100,87 +108,64 @@ fn try_simplify(
     constants: &HashMap<VarId, ConstVal>,
     not_sources: &HashMap<VarId, VarId>,
     types: &TypeAnalysis,
-    block_id: super::BlockId,
 ) -> Option<Instruction> {
     match op {
         // -- Additive identity: x + 0 → x, 0 + x → x --
         IntrinsicOp::Add if args.len() == 2 => {
-            if is_zero(args[1], constants) {
-                return Some(Instruction::Copy { dest, src: args[0] });
-            }
-            if is_zero(args[0], constants) {
-                return Some(Instruction::Copy { dest, src: args[1] });
+            for (x, c) in [(args[0], args[1]), (args[1], args[0])] {
+                if let Some(t) = single_numeric(x, types)
+                    && is_typed_const(c, t, 0, constants)
+                {
+                    return Some(Instruction::Copy { dest, src: x });
+                }
             }
             None
         }
 
         // -- Subtractive identity: x - 0 → x, x - x → 0 --
         IntrinsicOp::Sub if args.len() == 2 => {
-            if is_zero(args[1], constants) {
-                return Some(Instruction::Copy { dest, src: args[0] });
-            }
-            if args[0] == args[1] {
-                return Some(zero_const(dest, args[0], types, block_id));
+            if let Some(t) = single_numeric(args[0], types) {
+                if is_typed_const(args[1], t, 0, constants) {
+                    return Some(Instruction::Copy { dest, src: args[0] });
+                }
+                if args[0] == args[1] {
+                    return Some(typed_zero(dest, t));
+                }
             }
             None
         }
 
-        // -- Multiplicative identity/annihilation: x * 1 → x, x * 0 → 0 --
-        // -- Strength reduction: x * 2 → x + x, x * pow2 → x << log2 --
+        // -- Multiplicative identity/annihilation/doubling --
         IntrinsicOp::Mul if args.len() == 2 => {
-            // x * 1 → x
-            if is_one(args[1], constants) {
-                return Some(Instruction::Copy { dest, src: args[0] });
-            }
-            if is_one(args[0], constants) {
-                return Some(Instruction::Copy { dest, src: args[1] });
-            }
-            // x * 0 → 0
-            if is_zero(args[1], constants) {
-                return Some(zero_const(dest, args[0], types, block_id));
-            }
-            if is_zero(args[0], constants) {
-                return Some(zero_const(dest, args[1], types, block_id));
-            }
-            // x * 2 → x + x (any numeric type)
-            if is_two(args[1], constants) {
-                return Some(Instruction::Intrinsic {
-                    dest,
-                    op: IntrinsicOp::Add,
-                    args: vec![args[0], args[0]],
-                });
-            }
-            if is_two(args[0], constants) {
-                return Some(Instruction::Intrinsic {
-                    dest,
-                    op: IntrinsicOp::Add,
-                    args: vec![args[1], args[1]],
-                });
-            }
-            // x * pow2 → x << log2 (UInt only)
-            if let Some(shift) = uint_power_of_2(args[1], constants)
-                && is_uint(args[0], types, block_id)
-            {
-                return Some(shift_left(dest, args[0], shift, constants));
-            }
-            if let Some(shift) = uint_power_of_2(args[0], constants)
-                && is_uint(args[1], types, block_id)
-            {
-                return Some(shift_left(dest, args[1], shift, constants));
+            for (x, c) in [(args[0], args[1]), (args[1], args[0])] {
+                if let Some(t) = single_numeric(x, types) {
+                    // x * 1 → x
+                    if is_typed_const(c, t, 1, constants) {
+                        return Some(Instruction::Copy { dest, src: x });
+                    }
+                    // x * 0 → 0
+                    if is_typed_const(c, t, 0, constants) {
+                        return Some(typed_zero(dest, t));
+                    }
+                    // x * 2 → x + x (overflow to Undefined agrees both ways)
+                    if is_typed_const(c, t, 2, constants) {
+                        return Some(Instruction::Intrinsic {
+                            dest,
+                            op: IntrinsicOp::Add,
+                            args: vec![x, x],
+                        });
+                    }
+                }
             }
             None
         }
 
         // -- Division identity: x / 1 → x --
-        // -- Strength reduction: x / pow2 → x >> log2 (UInt only) --
         IntrinsicOp::Div if args.len() == 2 => {
-            if is_one(args[1], constants) {
-                return Some(Instruction::Copy { dest, src: args[0] });
-            }
-            if let Some(shift) = uint_power_of_2(args[1], constants)
-                && is_uint(args[0], types, block_id)
+            if let Some(t) = single_numeric(args[0], types)
+                && is_typed_const(args[1], t, 1, constants)
             {
-                return Some(shift_right(dest, args[0], shift, constants));
+                return Some(Instruction::Copy { dest, src: args[0] });
             }
             None
         }
@@ -193,11 +178,19 @@ fn try_simplify(
             None
         }
 
-        // -- Self-equality: x == x → true --
-        IntrinsicOp::Eq if args.len() == 2 && args[0] == args[1] => Some(Instruction::Const {
-            dest,
-            value: Literal::Bool(true),
-        }),
+        // -- Self-equality: x == x → true (only when x is provably defined:
+        // -- the runtime guards Eq operands, so an Undefined x yields
+        // -- Undefined, not true) --
+        IntrinsicOp::Eq
+            if args.len() == 2
+                && args[0] == args[1]
+                && types.get(args[0]).is_some_and(|t| t.is_defined()) =>
+        {
+            Some(Instruction::Const {
+                dest,
+                value: Literal::Bool(true),
+            })
+        }
 
         _ => None,
     }
@@ -207,98 +200,33 @@ fn try_simplify(
 // Helpers
 // ========================================================================
 
-fn is_zero(var: VarId, constants: &HashMap<VarId, ConstVal>) -> bool {
-    match constants.get(&var) {
-        Some(ConstVal::UInt(0)) | Some(ConstVal::Int(0)) => true,
-        Some(ConstVal::Float(f)) => *f == 0.0,
+/// The variable operand's proven single numeric type, if any.
+fn single_numeric(var: VarId, types: &TypeAnalysis) -> Option<BaseType> {
+    types
+        .get(var)
+        .and_then(|t| t.as_single())
+        .filter(|t| matches!(t, BaseType::UInt | BaseType::Int | BaseType::Float))
+}
+
+/// True when the constant operand holds `n` in EXACTLY the type `t` — a
+/// constant of another numeric type promotes the operation at runtime.
+fn is_typed_const(var: VarId, t: BaseType, n: u8, constants: &HashMap<VarId, ConstVal>) -> bool {
+    match (constants.get(&var), t) {
+        (Some(ConstVal::UInt(v)), BaseType::UInt) => *v == n as u64,
+        (Some(ConstVal::Int(v)), BaseType::Int) => *v == n as i64,
+        (Some(ConstVal::Float(v)), BaseType::Float) => *v == n as f64,
         _ => false,
     }
 }
 
-fn is_one(var: VarId, constants: &HashMap<VarId, ConstVal>) -> bool {
-    matches!(
-        constants.get(&var),
-        Some(ConstVal::UInt(1)) | Some(ConstVal::Int(1))
-    ) || matches!(constants.get(&var), Some(ConstVal::Float(f)) if *f == 1.0)
-}
-
-fn is_two(var: VarId, constants: &HashMap<VarId, ConstVal>) -> bool {
-    matches!(
-        constants.get(&var),
-        Some(ConstVal::UInt(2)) | Some(ConstVal::Int(2))
-    ) || matches!(constants.get(&var), Some(ConstVal::Float(f)) if *f == 2.0)
-}
-
-/// If the constant is a UInt power of 2 (> 2), return the shift amount.
-fn uint_power_of_2(var: VarId, constants: &HashMap<VarId, ConstVal>) -> Option<u32> {
-    match constants.get(&var) {
-        Some(ConstVal::UInt(n)) if *n > 2 && n.is_power_of_two() => Some(n.trailing_zeros()),
-        _ => None,
-    }
-}
-
-fn is_uint(var: VarId, types: &TypeAnalysis, _block_id: super::BlockId) -> bool {
-    types
-        .get(var)
-        .is_some_and(|t| t.is_single() && t.contains(BaseType::UInt))
-}
-
-/// Produce a zero constant matching the type of `ref_var`.
-fn zero_const(
-    dest: VarId,
-    ref_var: VarId,
-    types: &TypeAnalysis,
-    _block_id: super::BlockId,
-) -> Instruction {
-    let type_set = types.get(ref_var);
-    let value = if type_set.is_some_and(|t| t.contains(BaseType::Int)) {
-        Literal::Int(0)
-    } else if type_set.is_some_and(|t| t.contains(BaseType::Float)) {
-        Literal::Float(0.0)
-    } else {
-        Literal::UInt(0)
+/// Zero constant of type `t` (the Float zero is unique: always +0.0).
+fn typed_zero(dest: VarId, t: BaseType) -> Instruction {
+    let value = match t {
+        BaseType::Int => Literal::Int(0),
+        BaseType::Float => Literal::Float(0.0),
+        _ => Literal::UInt(0),
     };
     Instruction::Const { dest, value }
-}
-
-/// Emit `dest = x << shift` using a Const + Shl.
-/// Returns a Shl intrinsic (the caller must ensure the Const for the shift
-/// amount exists — we reuse the constant from the original power-of-2 operand
-/// position, but since we're replacing that operand, we need to emit inline).
-///
-/// Since we can't easily emit two instructions from a single rewrite, we
-/// produce `Intrinsic(Shl, [x, original_const_var])` and rely on the fact
-/// that the original power-of-2 constant var still exists. But the value is
-/// wrong (it's the power, not the shift). So instead, we only handle this
-/// when the shift constant already exists in the constants map.
-fn shift_left(
-    dest: VarId,
-    x: VarId,
-    _shift: u32,
-    _constants: &HashMap<VarId, ConstVal>,
-) -> Instruction {
-    // For now, emit x + x as a safe fallback for * 2.
-    // Full shift optimization requires emitting a new Const instruction,
-    // which needs allocating a new VarId — deferred to a future pass
-    // that can emit multiple instructions.
-    Instruction::Intrinsic {
-        dest,
-        op: IntrinsicOp::Add,
-        args: vec![x, x],
-    }
-}
-
-fn shift_right(
-    dest: VarId,
-    x: VarId,
-    _shift: u32,
-    _constants: &HashMap<VarId, ConstVal>,
-) -> Instruction {
-    // Same limitation as shift_left — can't emit new Const for shift amount.
-    // Return Copy as identity fallback (x / 1 case already handled).
-    // This path is only reached for pow2 > 2, where we can't simplify
-    // without emitting a shift constant.
-    Instruction::Copy { dest, src: x }
 }
 
 #[cfg(test)]
@@ -531,6 +459,155 @@ mod tests {
                 value: Literal::Bool(true),
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn test_float_self_subtract_folds_to_zero() {
+        // Float x - x folds to +0.0: the Float invariant (finite, single
+        // zero) leaves no inf - inf or -0.0 edge cases
+        let locals = vec![
+            Var::new(var(0), ast::Identifier("x".into()), TypeSet::float()),
+            Var::new(var(1), ast::Identifier("r".into()), TypeSet::float()),
+        ];
+        let blocks = vec![BasicBlock {
+            id: block(0),
+            instructions: vec![
+                si(Instruction::Const {
+                    dest: var(0),
+                    value: Literal::Float(1.5),
+                }),
+                si(Instruction::Intrinsic {
+                    dest: var(1),
+                    op: IntrinsicOp::Sub,
+                    args: vec![var(0), var(0)],
+                }),
+            ],
+            terminator: Terminator::Return {
+                value: Some(var(1)),
+            },
+        }];
+
+        let mut func = make_function(blocks, locals);
+        let types = analyze_types(&func, None);
+        let changes = simplify_algebra(&mut func, &types);
+
+        assert_eq!(changes, 1);
+        assert!(matches!(
+            &func.blocks[0].instructions[1].node,
+            Instruction::Const {
+                value: Literal::Float(f),
+                ..
+            } if *f == 0.0 && f.is_sign_positive()
+        ));
+    }
+
+    #[test]
+    fn test_mixed_type_zero_not_folded() {
+        // Int x + UInt 0 must NOT fold to Copy: runtime promotes the pair
+        let locals = vec![
+            Var::new(var(0), ast::Identifier("x".into()), TypeSet::int()),
+            Var::new(var(1), ast::Identifier("zero".into()), TypeSet::uint()),
+            Var::new(var(2), ast::Identifier("r".into()), TypeSet::any()),
+        ];
+        let blocks = vec![BasicBlock {
+            id: block(0),
+            instructions: vec![
+                si(Instruction::Const {
+                    dest: var(0),
+                    value: Literal::Int(-3),
+                }),
+                si(Instruction::Const {
+                    dest: var(1),
+                    value: Literal::UInt(0),
+                }),
+                si(Instruction::Intrinsic {
+                    dest: var(2),
+                    op: IntrinsicOp::Add,
+                    args: vec![var(0), var(1)],
+                }),
+            ],
+            terminator: Terminator::Return {
+                value: Some(var(2)),
+            },
+        }];
+
+        let mut func = make_function(blocks, locals);
+        let types = analyze_types(&func, None);
+        let changes = simplify_algebra(&mut func, &types);
+
+        assert_eq!(changes, 0);
+    }
+
+    #[test]
+    fn test_self_eq_possibly_undefined_not_folded() {
+        // x == x where x may be Undefined must NOT fold to true: the runtime
+        // guard yields Undefined for an undefined operand
+        let locals = vec![
+            Var::new(
+                var(0),
+                ast::Identifier("x".into()),
+                TypeSet::uint().union(&TypeSet::undefined()),
+            ),
+            Var::new(var(1), ast::Identifier("r".into()), TypeSet::any()),
+        ];
+        let blocks = vec![BasicBlock {
+            id: block(0),
+            instructions: vec![si(Instruction::Intrinsic {
+                dest: var(1),
+                op: IntrinsicOp::Eq,
+                args: vec![var(0), var(0)],
+            })],
+            terminator: Terminator::Return {
+                value: Some(var(1)),
+            },
+        }];
+
+        let mut func = make_function(blocks, locals);
+        let types = analyze_types(&func, None);
+        let changes = simplify_algebra(&mut func, &types);
+
+        assert_eq!(changes, 0);
+    }
+
+    #[test]
+    fn test_float_mul_one_still_folds() {
+        // x * 1.0 IS bit-exact for floats (including -0.0) — keep folding
+        let locals = vec![
+            Var::new(var(0), ast::Identifier("x".into()), TypeSet::float()),
+            Var::new(var(1), ast::Identifier("one".into()), TypeSet::float()),
+            Var::new(var(2), ast::Identifier("r".into()), TypeSet::float()),
+        ];
+        let blocks = vec![BasicBlock {
+            id: block(0),
+            instructions: vec![
+                si(Instruction::Const {
+                    dest: var(0),
+                    value: Literal::Float(2.5),
+                }),
+                si(Instruction::Const {
+                    dest: var(1),
+                    value: Literal::Float(1.0),
+                }),
+                si(Instruction::Intrinsic {
+                    dest: var(2),
+                    op: IntrinsicOp::Mul,
+                    args: vec![var(0), var(1)],
+                }),
+            ],
+            terminator: Terminator::Return {
+                value: Some(var(2)),
+            },
+        }];
+
+        let mut func = make_function(blocks, locals);
+        let types = analyze_types(&func, None);
+        let changes = simplify_algebra(&mut func, &types);
+
+        assert_eq!(changes, 1);
+        assert!(matches!(
+            &func.blocks[0].instructions[2].node,
+            Instruction::Copy { dest, src } if *dest == var(2) && *src == var(0)
         ));
     }
 

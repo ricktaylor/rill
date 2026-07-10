@@ -2485,6 +2485,76 @@ fn float_nonfinite_literal_undefined() {
 }
 
 #[test]
+fn algebra_div_pow2_not_miscompiled() {
+    // x / 4 must divide, not copy (the old strength-reduction stub
+    // rewrote x / 2^k to x for any proven-UInt operand)
+    let val = run_expect(
+        r#"
+        fn quarter(x) { return x / 4; }
+        fn test() { return quarter(100); }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(25));
+}
+
+#[test]
+fn algebra_mul_pow2_not_miscompiled() {
+    // x * 4 must quadruple, not double (the old stub emitted x + x)
+    let val = run_expect(
+        r#"
+        fn times4(x) { return x * 4; }
+        fn test() { return times4(100); }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(400));
+}
+
+#[test]
+fn algebra_float_sub_self_propagates_undefined() {
+    // 1.0 / 0.0 is Undefined (checked float semantics), and x - x on a
+    // possibly-undefined operand must not fold to zero
+    let val = run_expect(
+        r#"
+        fn f(a) {
+            let x = 1.0 / a;
+            let d = x - x;
+            match d {
+                Int => { 2 }
+                Float => { 3 }
+                _ => { 1 }
+            }
+        }
+        fn test() { f(0.0) }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(1));
+}
+
+#[test]
+fn algebra_self_eq_undefined_known_wrong() {
+    // KNOWN BUG (pinned): x == x where x is Undefined (overflow) should
+    // yield Undefined (branching to 2), but numeric_result_type omits
+    // Undefined from refined arithmetic results, so type analysis
+    // certifies x as defined and dead-arm elimination removes the
+    // definedness guard as redundant. The algebra pass itself is gated
+    // correctly (see test_self_eq_possibly_undefined_not_folded); the
+    // fix belongs in the arithmetic type lattice.
+    let val = run_expect(
+        r#"
+        fn test() {
+            let x = 18446744073709551615 + 1;
+            if x == x { 1 } else { 2 }
+        }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(1));
+}
+
+#[test]
 fn shift_amount_64_undefined() {
     // Shifts are checked like arithmetic: amount >= 64 → Undefined
     let val = run_expect(
