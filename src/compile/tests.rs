@@ -2374,6 +2374,131 @@ fn byref_with_binding_writeback() {
 }
 
 #[test]
+fn with_pattern_array_writeback() {
+    // Pattern-bound element refs write back to the named scrutinee
+    let val = run_expect(
+        r#"
+        fn test() {
+            let arr = [1, 2];
+            with [x, y] = arr;
+            x = 9;
+            y = 8;
+            arr[0] + arr[1]
+        }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(17));
+}
+
+#[test]
+fn with_pattern_map_writeback() {
+    let val = run_expect(
+        r#"
+        fn test() {
+            let m = {};
+            m["a"] = 1;
+            with {a: v} = m;
+            v = 5;
+            m["a"]
+        }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(5));
+}
+
+#[test]
+fn with_pattern_rest_edges_writeback() {
+    // Elements on both sides of a rest pattern write back
+    let val = run_expect(
+        r#"
+        fn test() {
+            let arr = [1, 2, 3, 4];
+            with [a, ..rest, z] = arr;
+            a = 10;
+            z = 40;
+            arr[0] + arr[3]
+        }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(50));
+}
+
+#[test]
+fn if_with_array_elem_writeback() {
+    let val = run_expect(
+        r#"
+        fn test() {
+            let arr = [1, 2];
+            if with [x, y] = arr {
+                x = 7;
+            }
+            arr[0]
+        }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(7));
+}
+
+#[test]
+fn if_with_map_value_writeback() {
+    let val = run_expect(
+        r#"
+        fn test() {
+            let m = {};
+            m["k"] = 1;
+            if with {k: v} = m {
+                v = 42;
+            }
+            m["k"]
+        }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(42));
+}
+
+#[test]
+fn let_pattern_no_writeback() {
+    // By-value pattern bindings copy; writes do not reach the scrutinee
+    let val = run_expect(
+        r#"
+        fn test() {
+            let arr = [1, 2];
+            let [x, y] = arr;
+            x = 9;
+            arr[0]
+        }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(1));
+}
+
+#[test]
+fn with_pattern_nested_scrutinee_no_writeback() {
+    // A scrutinee that is itself an element access (`m["a"]`) does not
+    // write back through the outer collection — nested accessor chains
+    // are unsupported (the element ref would need a reloadable base name).
+    let val = run_expect(
+        r#"
+        fn test() {
+            let m = {};
+            m["a"] = [1];
+            with [x] = m["a"];
+            x = 5;
+            m["a"][0]
+        }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(1));
+}
+
+#[test]
 fn byref_alias_sees_element_write() {
     // A read-only `with` alias over a written base must observe the write
     let val = run_expect(

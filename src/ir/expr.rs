@@ -660,6 +660,7 @@ impl<'a> Lowerer<'a> {
                 } else {
                     None
                 };
+                let base_slot = base_name.as_ref().and_then(|n| self.lookup_slot(n));
                 let base = self.lower_expression(array);
                 let key = self.lower_expression(index);
                 let dest = self.new_temp(TypeSet::any());
@@ -669,6 +670,7 @@ impl<'a> Lowerer<'a> {
                     base_var: base,
                     key_var: Some(key),
                     base_name,
+                    base_slot,
                 };
                 (dest, Some(origin))
             }
@@ -679,6 +681,7 @@ impl<'a> Lowerer<'a> {
                 } else {
                     None
                 };
+                let base_slot = base_name.as_ref().and_then(|n| self.lookup_slot(n));
                 let base = self.lower_expression(object);
                 let key = self.lower_expression(member);
                 let dest = self.new_temp(TypeSet::any());
@@ -688,6 +691,7 @@ impl<'a> Lowerer<'a> {
                     base_var: base,
                     key_var: Some(key),
                     base_name,
+                    base_slot,
                 };
                 (dest, Some(origin))
             }
@@ -701,6 +705,7 @@ impl<'a> Lowerer<'a> {
                         base_var: var,
                         key_var: None,
                         base_name: Some(name.clone()),
+                        base_slot: self.lookup_slot(name),
                     };
                     (dest, Some(origin))
                 } else {

@@ -330,6 +330,7 @@ impl<'a> Lowerer<'a> {
                     base_var: var,
                     key_var: None,
                     base_name: Some(param.name.clone()),
+                    base_slot: self.lookup_slot(&param.name),
                 };
                 self.bind_ref(&param.name, ref_origin);
                 self.byref_param_vars.insert(param.name.clone(), var);

@@ -152,30 +152,13 @@ impl<'a> Lowerer<'a> {
             ast::Pattern::Array(patterns) => {
                 // Match checks type AND rejects undefined (no Guard needed)
                 let value = self.emit_match(value, MatchPattern::Array(patterns.len()), else_bb);
+                let base_name = Self::element_base_name(ref_origin.as_ref());
 
                 // Bind each element
                 for (i, elem_pat) in patterns.iter().enumerate() {
                     let idx = self.emit_const(Literal::UInt(i as u64));
-
-                    let (elem, elem_origin) = if matches!(mode, BindingMode::Reference) {
-                        let dest = self.new_temp(TypeSet::any());
-                        self.emit(Instruction::MakeAccessor {
-                            dest,
-                            base: value,
-                            key: idx,
-                        });
-                        let origin = RefOrigin {
-                            ref_var: dest,
-                            base_var: value,
-                            key_var: Some(idx),
-                            base_name: None,
-                        };
-                        (dest, Some(origin))
-                    } else {
-                        let dest = self.emit_index(value, idx);
-                        (dest, None)
-                    };
-
+                    let (elem, elem_origin) =
+                        self.bind_element(value, idx, mode, base_name.clone(), TypeSet::any());
                     self.lower_if_pattern(elem_pat, elem, mode, else_bb, elem_origin);
                 }
             }
@@ -213,30 +196,13 @@ impl<'a> Lowerer<'a> {
                 // Match checks min length AND rejects undefined (no Guard needed)
                 let min_len = before.len() + after.len();
                 let value = self.emit_match(value, MatchPattern::ArrayMin(min_len), else_bb);
+                let base_name = Self::element_base_name(ref_origin.as_ref());
 
                 // Bind before elements
                 for (i, pat) in before.iter().enumerate() {
                     let idx = self.emit_const(Literal::UInt(i as u64));
-
-                    let (elem, elem_origin) = if matches!(mode, BindingMode::Reference) {
-                        let dest = self.new_temp(TypeSet::any());
-                        self.emit(Instruction::MakeAccessor {
-                            dest,
-                            base: value,
-                            key: idx,
-                        });
-                        let origin = RefOrigin {
-                            ref_var: dest,
-                            base_var: value,
-                            key_var: Some(idx),
-                            base_name: None,
-                        };
-                        (dest, Some(origin))
-                    } else {
-                        let dest = self.emit_index(value, idx);
-                        (dest, None)
-                    };
-
+                    let (elem, elem_origin) =
+                        self.bind_element(value, idx, mode, base_name.clone(), TypeSet::any());
                     self.lower_if_pattern(pat, elem, mode, else_bb, elem_origin);
                 }
 
@@ -306,26 +272,8 @@ impl<'a> Lowerer<'a> {
                     for (i, pat) in after.iter().enumerate() {
                         let offset = self.emit_const(Literal::UInt(i as u64));
                         let idx = self.emit_binary_intrinsic(IntrinsicOp::Add, after_start, offset);
-
-                        let (elem, elem_origin) = if matches!(mode, BindingMode::Reference) {
-                            let dest = self.new_temp(TypeSet::any());
-                            self.emit(Instruction::MakeAccessor {
-                                dest,
-                                base: value,
-                                key: idx,
-                            });
-                            let origin = RefOrigin {
-                                ref_var: dest,
-                                base_var: value,
-                                key_var: Some(idx),
-                                base_name: None,
-                            };
-                            (dest, Some(origin))
-                        } else {
-                            let dest = self.emit_index(value, idx);
-                            (dest, None)
-                        };
-
+                        let (elem, elem_origin) =
+                            self.bind_element(value, idx, mode, base_name.clone(), TypeSet::any());
                         self.lower_if_pattern(pat, elem, mode, else_bb, elem_origin);
                     }
                 }
@@ -356,24 +304,13 @@ impl<'a> Lowerer<'a> {
                         }
                     };
 
-                    let (val, val_origin) = if matches!(mode, BindingMode::Reference) {
-                        let dest = self.new_temp(TypeSet::any());
-                        self.emit(Instruction::MakeAccessor {
-                            dest,
-                            base: value,
-                            key: key_var,
-                        });
-                        let origin = RefOrigin {
-                            ref_var: dest,
-                            base_var: value,
-                            key_var: Some(key_var),
-                            base_name: None,
-                        };
-                        (dest, Some(origin))
-                    } else {
-                        let dest = self.emit_index(value, key_var);
-                        (dest, None)
-                    };
+                    let (val, val_origin) = self.bind_element(
+                        value,
+                        key_var,
+                        mode,
+                        Self::element_base_name(ref_origin.as_ref()),
+                        TypeSet::any(),
+                    );
 
                     // Value must be present for the pattern to match
                     let narrowed_val = self.emit_guard(val, else_bb);
@@ -750,25 +687,8 @@ impl<'a> Lowerer<'a> {
         };
 
         // Index is bounded by i < len(iter_var) — element is always defined.
-        let (elem, elem_origin) = if matches!(mode, BindingMode::Reference) {
-            let dest = self.new_temp(TypeSet::defined());
-            self.emit(Instruction::MakeAccessor {
-                dest,
-                base: iter_var,
-                key: i_var,
-            });
-            let origin = RefOrigin {
-                ref_var: dest,
-                base_var: iter_var,
-                key_var: Some(i_var),
-                base_name: None,
-            };
-            (dest, Some(origin))
-        } else {
-            let raw = self.emit_index(iter_var, i_var);
-            let dest = self.emit_copy(raw, TypeSet::defined());
-            (dest, None)
-        };
+        let (elem, elem_origin) =
+            self.bind_element(iter_var, i_var, mode, None, TypeSet::defined());
 
         match binding {
             ast::ForBinding::Single(name) => match mode {
@@ -924,25 +844,8 @@ impl<'a> Lowerer<'a> {
         });
 
         // Value = map[real_key]; by-ref binds an accessor for write-back.
-        let (elem, elem_origin) = if matches!(mode, BindingMode::Reference) {
-            let dest = self.new_temp(TypeSet::defined());
-            self.emit(Instruction::MakeAccessor {
-                dest,
-                base: iter_var,
-                key: real_key,
-            });
-            let origin = RefOrigin {
-                ref_var: dest,
-                base_var: iter_var,
-                key_var: Some(real_key),
-                base_name: None,
-            };
-            (dest, Some(origin))
-        } else {
-            let raw = self.emit_index(iter_var, real_key);
-            let dest = self.emit_copy(raw, TypeSet::defined());
-            (dest, None)
-        };
+        let (elem, elem_origin) =
+            self.bind_element(iter_var, real_key, mode, None, TypeSet::defined());
 
         match binding {
             // Single binding over a map yields the value.

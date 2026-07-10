@@ -58,27 +58,11 @@ impl<'a> Lowerer<'a> {
             }
 
             ast::Pattern::Array(patterns) => {
+                let base_name = Self::element_base_name(ref_origin.as_ref());
                 for (i, pat) in patterns.iter().enumerate() {
                     let idx = self.emit_const(Literal::UInt(i as u64));
-
-                    let (elem, elem_origin) = if matches!(mode, BindingMode::Reference) {
-                        let dest = self.new_temp(TypeSet::any());
-                        self.emit(Instruction::MakeAccessor {
-                            dest,
-                            base: value,
-                            key: idx,
-                        });
-                        let origin = RefOrigin {
-                            ref_var: dest,
-                            base_var: value,
-                            key_var: Some(idx),
-                            base_name: None,
-                        };
-                        (dest, Some(origin))
-                    } else {
-                        (self.emit_index(value, idx), None)
-                    };
-
+                    let (elem, elem_origin) =
+                        self.bind_element(value, idx, mode, base_name.clone(), TypeSet::any());
                     self.lower_pattern_binding_ref(&pat.node, elem, mode, elem_origin);
                 }
             }
@@ -88,28 +72,13 @@ impl<'a> Lowerer<'a> {
                 rest,
                 after,
             } => {
+                let base_name = Self::element_base_name(ref_origin.as_ref());
+
                 // Bind before elements (from start)
                 for (i, pat) in before.iter().enumerate() {
                     let idx = self.emit_const(Literal::UInt(i as u64));
-
-                    let (elem, elem_origin) = if matches!(mode, BindingMode::Reference) {
-                        let dest = self.new_temp(TypeSet::any());
-                        self.emit(Instruction::MakeAccessor {
-                            dest,
-                            base: value,
-                            key: idx,
-                        });
-                        let origin = RefOrigin {
-                            ref_var: dest,
-                            base_var: value,
-                            key_var: Some(idx),
-                            base_name: None,
-                        };
-                        (dest, Some(origin))
-                    } else {
-                        (self.emit_index(value, idx), None)
-                    };
-
+                    let (elem, elem_origin) =
+                        self.bind_element(value, idx, mode, base_name.clone(), TypeSet::any());
                     self.lower_pattern_binding_ref(&pat.node, elem, mode, elem_origin);
                 }
 
@@ -182,25 +151,8 @@ impl<'a> Lowerer<'a> {
                     for (i, pat) in after.iter().enumerate() {
                         let offset = self.emit_const(Literal::UInt(i as u64));
                         let idx = self.emit_binary_intrinsic(IntrinsicOp::Add, after_start, offset);
-
-                        let (elem, elem_origin) = if matches!(mode, BindingMode::Reference) {
-                            let dest = self.new_temp(TypeSet::any());
-                            self.emit(Instruction::MakeAccessor {
-                                dest,
-                                base: value,
-                                key: idx,
-                            });
-                            let origin = RefOrigin {
-                                ref_var: dest,
-                                base_var: value,
-                                key_var: Some(idx),
-                                base_name: None,
-                            };
-                            (dest, Some(origin))
-                        } else {
-                            (self.emit_index(value, idx), None)
-                        };
-
+                        let (elem, elem_origin) =
+                            self.bind_element(value, idx, mode, base_name.clone(), TypeSet::any());
                         self.lower_pattern_binding_ref(&pat.node, elem, mode, elem_origin);
                     }
                 }
@@ -227,23 +179,13 @@ impl<'a> Lowerer<'a> {
                         }
                     };
 
-                    let (val, val_origin) = if matches!(mode, BindingMode::Reference) {
-                        let dest = self.new_temp(TypeSet::any());
-                        self.emit(Instruction::MakeAccessor {
-                            dest,
-                            base: value,
-                            key: key_var,
-                        });
-                        let origin = RefOrigin {
-                            ref_var: dest,
-                            base_var: value,
-                            key_var: Some(key_var),
-                            base_name: None,
-                        };
-                        (dest, Some(origin))
-                    } else {
-                        (self.emit_index(value, key_var), None)
-                    };
+                    let (val, val_origin) = self.bind_element(
+                        value,
+                        key_var,
+                        mode,
+                        Self::element_base_name(ref_origin.as_ref()),
+                        TypeSet::any(),
+                    );
 
                     self.lower_pattern_binding_ref(&val_pat.node, val, mode, val_origin);
                 }

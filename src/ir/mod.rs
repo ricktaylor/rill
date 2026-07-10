@@ -75,6 +75,10 @@ pub struct RefOrigin {
     pub key_var: Option<VarId>,
     /// The named variable holding the base (for Reload after write-back)
     pub base_name: Option<ast::Identifier>,
+    /// The slot of `base_name` at bind time. Write-back assigns the reloaded
+    /// base here, so a shadowing inner binding of the same name cannot
+    /// receive it.
+    pub base_slot: Option<u32>,
 }
 
 // ============================================================================
@@ -430,6 +434,58 @@ impl<'a> Lowerer<'a> {
             }
         }
         None
+    }
+
+    /// Bind one element of a collection during pattern/loop lowering.
+    ///
+    /// Reference mode emits a MakeAccessor and returns its RefOrigin so the
+    /// caller can `bind_ref` the bound name: assignments then write through
+    /// the accessor and reload the base. Value mode emits a plain Index,
+    /// narrowed to `elem_type` when it is more precise than `any()`.
+    pub fn bind_element(
+        &mut self,
+        base: VarId,
+        key: VarId,
+        mode: BindingMode,
+        base_name: Option<ast::Identifier>,
+        elem_type: TypeSet,
+    ) -> (VarId, Option<RefOrigin>) {
+        match mode {
+            BindingMode::Reference => {
+                let base_slot = base_name.as_ref().and_then(|n| self.lookup_slot(n));
+                let dest = self.new_temp(elem_type);
+                self.emit(Instruction::MakeAccessor { dest, base, key });
+                let origin = RefOrigin {
+                    ref_var: dest,
+                    base_var: base,
+                    key_var: Some(key),
+                    base_name,
+                    base_slot,
+                };
+                (dest, Some(origin))
+            }
+            BindingMode::Value => {
+                let raw = self.emit_index(base, key);
+                if elem_type == TypeSet::any() {
+                    (raw, None)
+                } else {
+                    (self.emit_copy(raw, elem_type), None)
+                }
+            }
+        }
+    }
+
+    /// The scrutinee name to thread into element RefOrigins.
+    ///
+    /// Only a whole-variable parent (key_var None) supports write-back: its
+    /// Reload reads the full collection for reassignment. A parent that is
+    /// itself an element accessor (`with [x] = m["a"]`) yields None —
+    /// reloading it reads the ELEMENT, which must not be reassigned to the
+    /// outer name.
+    pub fn element_base_name(origin: Option<&RefOrigin>) -> Option<ast::Identifier> {
+        origin
+            .filter(|o| o.key_var.is_none())
+            .and_then(|o| o.base_name.clone())
     }
 
     // ========================================================================

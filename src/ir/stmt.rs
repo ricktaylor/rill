@@ -132,10 +132,16 @@ impl<'a> Lowerer<'a> {
                             value: final_value,
                         });
                     }
-                    // Reload the base so SSA models the mutation
+                    // Reload the base so SSA models the mutation. Prefer the
+                    // slot captured at bind time: a shadowing inner binding
+                    // of the base name must not receive the write-back.
                     if let Some(base_name) = &origin.base_name {
                         let reloaded = self.emit_reload(origin.base_var);
-                        self.reassign(base_name, reloaded);
+                        if let Some(slot) = origin.base_slot {
+                            self.emit_assign(slot, reloaded);
+                        } else {
+                            self.reassign(base_name, reloaded);
+                        }
                     }
                 }
 
