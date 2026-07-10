@@ -772,9 +772,19 @@ fn compile_instruction(
 
             if base_type.is_some_and(|t| t.contains(BaseType::Array)) {
                 Box::new(move |vm: &mut VM, _prog| {
-                    if let Value::UInt(idx) = vm.local(k) {
-                        let val = vm.local(v).clone();
-                        let _ = vm.set_array_elem(vm.bp() + b, *idx as usize, val);
+                    // Accept the same keys as the read path: UInt or Int >= 0
+                    match vm.local(k) {
+                        Value::UInt(idx) => {
+                            let idx = *idx as usize;
+                            let val = vm.local(v).clone();
+                            let _ = vm.set_array_elem(vm.bp() + b, idx, val);
+                        }
+                        Value::Int(idx) if *idx >= 0 => {
+                            let idx = *idx as usize;
+                            let val = vm.local(v).clone();
+                            let _ = vm.set_array_elem(vm.bp() + b, idx, val);
+                        }
+                        _ => {}
                     }
                     Ok(Action::Continue)
                 })
@@ -791,11 +801,15 @@ fn compile_instruction(
                     let val = vm.local(v).clone();
                     // Dispatch on BASE type, not key type
                     match vm.local(b) {
-                        Value::Array(_) => {
-                            if let Value::UInt(idx) = &key_val {
+                        Value::Array(_) => match &key_val {
+                            Value::UInt(idx) => {
                                 let _ = vm.set_array_elem(vm.bp() + b, *idx as usize, val);
                             }
-                        }
+                            Value::Int(idx) if *idx >= 0 => {
+                                let _ = vm.set_array_elem(vm.bp() + b, *idx as usize, val);
+                            }
+                            _ => {}
+                        },
                         _ => {
                             let _ = vm.set_map_entry(vm.bp() + b, key_val, val);
                         }

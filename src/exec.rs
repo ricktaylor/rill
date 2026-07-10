@@ -756,15 +756,25 @@ impl VM {
             }
             Slot::Accessor { base, key } => (*base, *key),
         };
-        // Write through Accessor: mutate the collection element
+        // Write through Accessor: dispatch on the BASE collection's type — the
+        // key alone is ambiguous (a UInt key may index an array or a UInt-keyed
+        // map). Mirrors the read dispatch in `get` above.
         let key_val = self.get(key).cloned().unwrap_or(Value::Undefined);
-        match &key_val {
-            Value::UInt(i) => {
-                let _ = self.set_array_elem(base, *i as usize, value);
+        let base_is_array = matches!(self.get(base), Some(Value::Array(_)));
+        if base_is_array {
+            match &key_val {
+                Value::UInt(i) => {
+                    let _ = self.set_array_elem(base, *i as usize, value);
+                }
+                Value::Int(i) if *i >= 0 => {
+                    let _ = self.set_array_elem(base, *i as usize, value);
+                }
+                // Non-numeric key on an array: dropped, as the read is Undefined
+                _ => {}
             }
-            _ => {
-                let _ = self.set_map_entry(base, key_val, value);
-            }
+        } else {
+            // set_map_entry no-ops (Ok(false)) when the base is not a map
+            let _ = self.set_map_entry(base, key_val, value);
         }
     }
 

@@ -2374,6 +2374,23 @@ fn byref_with_binding_writeback() {
 }
 
 #[test]
+fn byref_array_int_key_writeback() {
+    // Int (non-negative) index keys are accepted by writes, symmetric with reads
+    let val = run_expect(
+        r#"
+        fn test() {
+            let arr = [1, 2, 3];
+            let i = 0 as Int;
+            arr[i] = 99;
+            arr[0]
+        }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(99));
+}
+
+#[test]
 fn byref_let_binding_no_writeback() {
     // let x = arr[0]; x = 42 → arr[0] unchanged
     let val = run_expect(
@@ -3249,9 +3266,9 @@ fn test_map_iter_empty() {
 
 #[test]
 fn test_map_iter_numeric_key_writeback_limitation() {
-    // KNOWN LIMITATION (pre-existing): `vm.set` on an accessor dispatches on the
-    // key's value type, so by-ref write-back over a UInt-keyed map is a no-op.
-    // Pin current behavior so a future `vm.set` fix is intentional.
+    // KNOWN LIMITATION: by-ref loop bindings lower to a RefOrigin with no base
+    // name, so the write-back reload is never emitted and the mutation is not
+    // SSA-visible. Pin current behavior until the reload path exists.
     let val = run_expect(
         r#"
         fn test() {
