@@ -2485,6 +2485,43 @@ fn float_nonfinite_literal_undefined() {
 }
 
 #[test]
+fn while_never_run_yields_undefined_not_break_value() {
+    // A while whose body never executes must not leak its break value
+    let val = run_expect(
+        r#"
+        fn f(c) {
+            let v = while c == 1 { break 7; };
+            if let UInt(x) = v { x } else { 99 }
+        }
+        fn test() { f(0) * 1000 + f(1) }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(99007));
+}
+
+#[test]
+fn while_normal_exit_after_iterations_yields_undefined() {
+    // A loop that runs but exits via the condition (break not taken)
+    // also yields Undefined, not the break value
+    let val = run_expect(
+        r#"
+        fn f(c) {
+            let i = 0;
+            let v = while i < c {
+                i = i + 1;
+                if i == 100 { break 7; }
+            };
+            if let UInt(x) = v { x } else { 99 }
+        }
+        fn test() { f(2) * 1000 + f(200) }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(99007));
+}
+
+#[test]
 fn short_circuit_and_false_edge() {
     // The short-circuit (lhs false) edge must deliver Bool(false), not a
     // stale slot value — the constant used to be emitted in the join block
@@ -4169,3 +4206,4 @@ fn inspect_benchmarks() {
         dump_ir(source, name);
     }
 }
+

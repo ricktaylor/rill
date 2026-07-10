@@ -446,6 +446,12 @@ impl<'a> Lowerer<'a> {
         self.current_instructions = Vec::new();
 
         let cond = self.lower_expression(condition);
+        // The normal exit (condition false) contributes Undefined to the
+        // while-expression's value. The constant lives HERE, in the
+        // predecessor the exit edge leaves from: a phi operand is read by
+        // the edge's resolution copy before the exit block executes.
+        let normal_exit_val = self.emit_undefined();
+        let header_exit_bb = self.current_block;
         self.finish_block(Terminator::If {
             condition: cond,
             then_target: body_bb,
@@ -484,7 +490,13 @@ impl<'a> Lowerer<'a> {
         if break_values.is_empty() {
             self.emit_undefined()
         } else {
-            self.emit_phi(break_values)
+            // The exit phi covers EVERY incoming edge: the normal exit is
+            // Undefined, each break edge its break value. Omitting the
+            // normal edge would make a never-running loop yield the break
+            // value (a single-source phi folds to an unconditional Const).
+            let mut sources = vec![(header_exit_bb, normal_exit_val)];
+            sources.extend(break_values);
+            self.emit_phi(sources)
         }
     }
 
