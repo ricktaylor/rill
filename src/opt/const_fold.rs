@@ -157,12 +157,27 @@ fn collect_constants(function: &Function, constants: &mut ConstantMap, externs: 
 
                 // Mutating instructions invalidate the target's constant value.
                 // After `append(arr, val)` or `arr[i] = val`, arr is no longer
-                // the original constant — its contents have changed.
+                // the original constant — its contents have changed. The
+                // written operand may reach the real collection through Copy
+                // chains or a MakeRef wrapper (pattern bindings wrap the
+                // scrutinee in a ref), so invalidate the resolved ultimate
+                // base as well.
                 Instruction::Append { arr, .. } => {
                     constants.remove(arr);
+                    let resolved = resolve_copies(*arr);
+                    constants.remove(&resolved);
+                    if let Some(base) = ref_bases.get(arr).or_else(|| ref_bases.get(&resolved)) {
+                        constants.remove(base);
+                    }
                 }
                 Instruction::WriteAccessor { base, .. } => {
                     constants.remove(base);
+                    let resolved = resolve_copies(*base);
+                    constants.remove(&resolved);
+                    if let Some(ultimate) = ref_bases.get(base).or_else(|| ref_bases.get(&resolved))
+                    {
+                        constants.remove(ultimate);
+                    }
                 }
                 Instruction::WriteRef { ref_var, .. } => {
                     // WriteRef mutates through a MakeRef. Trace the ref_var

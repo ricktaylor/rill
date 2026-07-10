@@ -12,13 +12,17 @@
 //!    Eliminates multi-hop `Slot::Ref` chains.
 //!
 //! 3. **Read-only ref demotion** — `MakeRef(dest, base)` where no `WriteRef`
-//!    targets `dest`, base not in `written_bases`, and not a call arg:
-//!    demote to `Copy(dest, base)`. Eliminates `Slot::Ref` entirely.
+//!    targets `dest`, base not in `written_bases`, and `dest` does not escape
+//!    to a callee: demote to `Copy(dest, base)`. Eliminates `Slot::Ref`.
 //!
 //! 4. **Read-only Accessor demotion** — `MakeAccessor(dest, base, key)` where
-//!    no `WriteRef` or `WriteAccessor` targets `dest`: demote to
-//!    `Index(dest, base, key)`. A read-only Accessor is just an expensive
-//!    Index (double dereference on every read). No write-back to preserve.
+//!    no `WriteRef` targets `dest`, the resolved base is not in
+//!    `written_bases`, and `dest` does not escape to a callee: demote to
+//!    `Index(dest, base, key)`. A read-only Accessor over an unwritten base
+//!    is just an expensive Index (double dereference on every read). An
+//!    accessor over a WRITTEN base must stay live so reads through the alias
+//!    observe the mutation, and an escaped accessor may be written by the
+//!    callee through the copied slot.
 //!
 //! Safe to run repeatedly in the optimizer fixpoint loop.
 
@@ -121,6 +125,29 @@ pub fn elide_refs(function: &mut Function) -> usize {
         written_bases.insert(resolved);
     }
 
+    // ── Phase 2b: Compute escaped refs ───────────────────────────────────
+    //
+    // A ref/accessor passed as a Call argument escapes: the callee receives
+    // the slot as-is and may write through it. So does any ref/accessor a
+    // call arg was built FROM (the call site wraps the original binding in
+    // a MakeRef), transitively through ref chains — demoting the underlying
+    // binding would leave post-call reads on a stale snapshot.
+    let mut escaped: HashSet<VarId> = call_arg_refs;
+    loop {
+        let mut grew = false;
+        for (dest, info) in &make_refs {
+            if escaped.contains(dest)
+                && make_refs.contains_key(&info.base)
+                && escaped.insert(info.base)
+            {
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+
     // ── Phase 3: Rewrite ─────────────────────────────────────────────────
 
     let mut rewrites = 0;
@@ -151,7 +178,7 @@ pub fn elide_refs(function: &mut Function) -> usize {
 
                     if !write_ref_targets.contains(&dest)
                         && !written_bases.contains(&resolved)
-                        && !call_arg_refs.contains(&dest)
+                        && !escaped.contains(&dest)
                     {
                         // Read-only ref → demote to Copy
                         inst.node = Instruction::Copy {
@@ -174,9 +201,16 @@ pub fn elide_refs(function: &mut Function) -> usize {
                     let base = *base;
                     let key = *key;
 
-                    // Read-only Accessor (no WriteRef/WriteAccessor targets it)
-                    // → demote to Index (plain read, no Slot::Accessor overhead)
-                    if !write_ref_targets.contains(&dest) {
+                    let resolved = resolve_base(base, &make_refs);
+
+                    // Read-only Accessor over an unwritten, non-escaping base
+                    // → demote to Index (plain read, no Slot::Accessor
+                    // overhead). If the base is written through ANY path the
+                    // accessor must stay live so reads observe the mutation.
+                    if !write_ref_targets.contains(&dest)
+                        && !written_bases.contains(&resolved)
+                        && !escaped.contains(&dest)
+                    {
                         inst.node = Instruction::Index { dest, base, key };
                         rewrites += 1;
                     }
@@ -502,9 +536,10 @@ mod tests {
     }
 
     #[test]
-    fn test_read_only_accessor_demoted_when_sibling_has_write() {
-        // v1 = MakeAccessor(v0, v_idx)  — read-only → demoted to Index
+    fn test_accessor_kept_when_sibling_writes_same_base() {
+        // v1 = MakeAccessor(v0, v_idx)  — read-only, but v0 is written via v2
         // v2 = MakeAccessor(v0, v_idx2) — has WriteRef → stays MakeAccessor
+        // BOTH must stay live: reads through v1 must observe v2's mutation.
         let blocks = vec![BasicBlock {
             id: block(0),
             instructions: vec![
@@ -543,17 +578,116 @@ mod tests {
         let mut func = make_function(blocks);
         let rewrites = elide_refs(&mut func);
 
-        // v1 demoted to Index (no write targets it)
-        // v2 stays MakeAccessor (has WriteRef)
-        assert_eq!(rewrites, 1);
+        // v0 is in written_bases (v2's WriteRef), so neither accessor demotes
+        assert_eq!(rewrites, 0);
         assert!(matches!(
             &func.blocks[0].instructions[2].node,
-            Instruction::Index { dest, base, key }
-                if *dest == var(1) && *base == var(0) && *key == var(10)
+            Instruction::MakeAccessor { .. }
         ));
         assert!(matches!(
             &func.blocks[0].instructions[3].node,
             Instruction::MakeAccessor { .. }
+        ));
+    }
+
+    #[test]
+    fn test_accessor_kept_when_base_written_via_write_accessor() {
+        // v2 = MakeAccessor(v0, v1); WriteAccessor{base: v0} elsewhere
+        // → v2 must stay live so reads through it see the element write
+        let blocks = vec![BasicBlock {
+            id: block(0),
+            instructions: vec![
+                si(Instruction::Const {
+                    dest: var(0),
+                    value: Literal::UInt(0),
+                }),
+                si(Instruction::Const {
+                    dest: var(1),
+                    value: Literal::UInt(1),
+                }),
+                si(Instruction::MakeAccessor {
+                    dest: var(2),
+                    base: var(0),
+                    key: var(1),
+                }),
+                si(Instruction::Const {
+                    dest: var(3),
+                    value: Literal::UInt(99),
+                }),
+                si(Instruction::WriteAccessor {
+                    base: var(0),
+                    key: var(1),
+                    value: var(3),
+                }),
+            ],
+            terminator: Terminator::Return {
+                value: Some(var(2)),
+            },
+        }];
+
+        let mut func = make_function(blocks);
+        let rewrites = elide_refs(&mut func);
+
+        assert_eq!(rewrites, 0);
+        assert!(matches!(
+            &func.blocks[0].instructions[2].node,
+            Instruction::MakeAccessor { .. }
+        ));
+    }
+
+    #[test]
+    fn test_accessor_kept_when_it_escapes_via_call_arg_ref() {
+        // v2 = MakeAccessor(v0, v1); v3 = MakeRef(v2); Call(_, [v3])
+        // The callee may write through v3's copied slot, so both v3 (call
+        // arg) and v2 (what it aliases) must stay live. v3 is flattened to
+        // a direct Accessor (rewrite #1); v2 must NOT demote to Index.
+        let blocks = vec![BasicBlock {
+            id: block(0),
+            instructions: vec![
+                si(Instruction::Const {
+                    dest: var(0),
+                    value: Literal::UInt(0),
+                }),
+                si(Instruction::Const {
+                    dest: var(1),
+                    value: Literal::UInt(1),
+                }),
+                si(Instruction::MakeAccessor {
+                    dest: var(2),
+                    base: var(0),
+                    key: var(1),
+                }),
+                si(Instruction::MakeRef {
+                    dest: var(3),
+                    base: var(2),
+                }),
+                si(Instruction::Call {
+                    dest: var(4),
+                    function: crate::ir::FunctionRef {
+                        namespace: None,
+                        name: ast::Identifier("f".into()),
+                    },
+                    args: vec![var(3)],
+                }),
+            ],
+            terminator: Terminator::Return {
+                value: Some(var(2)),
+            },
+        }];
+
+        let mut func = make_function(blocks);
+        let rewrites = elide_refs(&mut func);
+
+        // Only the Ref(Accessor) flatten fires; no demotions
+        assert_eq!(rewrites, 1);
+        assert!(matches!(
+            &func.blocks[0].instructions[2].node,
+            Instruction::MakeAccessor { .. }
+        ));
+        assert!(matches!(
+            &func.blocks[0].instructions[3].node,
+            Instruction::MakeAccessor { dest, base, key }
+                if *dest == var(3) && *base == var(0) && *key == var(1)
         ));
     }
 }

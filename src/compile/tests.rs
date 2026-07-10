@@ -2374,6 +2374,43 @@ fn byref_with_binding_writeback() {
 }
 
 #[test]
+fn byref_alias_sees_element_write() {
+    // A read-only `with` alias over a written base must observe the write
+    let val = run_expect(
+        r#"
+        fn test() {
+            let arr = [1, 2, 3];
+            with x = arr[0];
+            arr[0] = 99;
+            x
+        }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(99));
+}
+
+#[test]
+fn byref_pattern_alias_no_stale_cse() {
+    // A write through a pattern-bound element ref must not let CSE serve
+    // the pre-write value for a later read of the same element
+    let val = run_expect(
+        r#"
+        fn test() {
+            let arr = [1, 2];
+            with [x] = arr;
+            let a = arr[0];
+            x = 99;
+            let b = arr[0];
+            a + b
+        }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(100));
+}
+
+#[test]
 fn byref_array_int_key_writeback() {
     // Int (non-negative) index keys are accepted by writes, symmetric with reads
     let val = run_expect(
