@@ -315,6 +315,13 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
       consolidated into `src/ir/uses.rs` (was duplicated in dce/tail_call).
 - [ ] **Dead write-back elimination** — a WriteRef exists but the base value is never
       read after the write-back point. Requires liveness analysis (now available).
+- [ ] **Value-range analysis to re-prove definedness** — refined arithmetic result
+      types now honestly include Undefined (checked ops can overflow), which keeps
+      operand definedness guards alive on arithmetic chains. A range/dominance
+      analysis (shares machinery with the dominator-based bounds-checking item)
+      could re-prove specific results defined — loop counters bounded by Len,
+      constants with in-range results, `i + 1` under an `i < len` guard — and
+      drop those guards soundly instead of by the old lattice lie.
 - [ ] **Reload-generation alias decay + Rc churn** — the write-back discipline
       (Reload + reassign after every mutation) migrates the live value to a fresh
       SSA def, so a slot-resident Accessor created earlier keeps aliasing the

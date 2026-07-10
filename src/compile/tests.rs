@@ -2601,14 +2601,11 @@ fn algebra_float_sub_self_propagates_undefined() {
 }
 
 #[test]
-fn algebra_self_eq_undefined_known_wrong() {
-    // KNOWN BUG (pinned): x == x where x is Undefined (overflow) should
-    // yield Undefined (branching to 2), but numeric_result_type omits
-    // Undefined from refined arithmetic results, so type analysis
-    // certifies x as defined and dead-arm elimination removes the
-    // definedness guard as redundant. The algebra pass itself is gated
-    // correctly (see test_self_eq_possibly_undefined_not_folded); the
-    // fix belongs in the arithmetic type lattice.
+fn algebra_self_eq_undefined_yields_undefined() {
+    // x == x where x is Undefined (overflow) yields Undefined, taking the
+    // else branch. Refined arithmetic result types include Undefined, so
+    // the definedness guard on the Eq operand survives optimization and
+    // the x == x fold stays gated on a provably-defined operand.
     let val = run_expect(
         r#"
         fn test() {
@@ -2618,7 +2615,7 @@ fn algebra_self_eq_undefined_known_wrong() {
         "#,
         "test",
     );
-    assert_eq!(val, Value::UInt(1));
+    assert_eq!(val, Value::UInt(2));
 }
 
 #[test]

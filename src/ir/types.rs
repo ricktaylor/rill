@@ -195,10 +195,15 @@ impl IntrinsicOp {
     /// If operand types are unknown or mixed, falls back to `result_type()`.
     pub fn result_type_refined(self, arg_types: &[TypeSet]) -> TypeSet {
         match self {
-            // Arithmetic: result type follows promotion rules
+            // Arithmetic: the value type follows the promotion lattice, but
+            // checked arithmetic can always fail (integer overflow, division
+            // by zero, non-finite float results), so the result is never
+            // certainly defined. Future value-range analysis may re-prove
+            // definedness for specific sites (e.g. a loop counter bounded by
+            // a collection length) and drop the Undefined again.
             Self::Add | Self::Sub | Self::Mul | Self::Div | Self::Mod => {
                 if let (Some(a), Some(b)) = (arg_types.first(), arg_types.get(1)) {
-                    numeric_result_type(*a, *b)
+                    numeric_result_type(*a, *b).union(&TypeSet::undefined())
                 } else {
                     self.result_type()
                 }
@@ -208,19 +213,22 @@ impl IntrinsicOp {
                     && a.is_single()
                 {
                     if a.contains(BaseType::UInt) || a.contains(BaseType::Int) {
-                        // neg(UInt) → Int, neg(Int) → Int
-                        return TypeSet::single(BaseType::Int);
+                        // neg(UInt) → Int, neg(Int) → Int; overflow (values
+                        // beyond i64, i64::MIN) → Undefined
+                        return TypeSet::int().union(&TypeSet::undefined());
                     }
                     if a.contains(BaseType::Float) {
+                        // Negating a finite float is infallible
                         return TypeSet::single(BaseType::Float);
                     }
                 }
                 self.result_type()
             }
-            // Comparison: result type follows promotion for the comparison,
-            // but the output is always Bool
-            Self::Eq | Self::Lt | Self::Not | Self::BitTest => TypeSet::bool(),
-            // Everything else has a fixed result type regardless of operands
+            // Comparison/logic: infallible on guard-accepted inputs
+            Self::Eq | Self::Lt | Self::Not => TypeSet::bool(),
+            // Everything else (including BitTest, which fails on valid UInt
+            // inputs when the bit position is out of range) keeps its fixed
+            // result type
             _ => self.result_type(),
         }
     }
@@ -655,17 +663,21 @@ impl Function {
 
     /// Trace a VarId back through SSA to describe its origin. `depth` guards
     /// against Copy chains that cycle (the diagnostic must always terminate).
+    ///
+    /// Only the instruction DEFINING `var` may recurse — recursing while
+    /// scanning past unrelated Copies multiplies the walk by the number of
+    /// Copies at every depth level, which is exponential.
     fn describe_var_origin(&self, var: VarId, depth: usize) -> String {
         if depth > 32 {
             return format!("_{}", var.0);
         }
         for block in &self.blocks {
             for inst in &block.instructions {
-                let (dest, desc) = match &inst.node {
-                    Instruction::Copy { dest, src } => {
-                        // Follow copies to find the real origin
+                match &inst.node {
+                    Instruction::Copy { dest, src } if *dest == var => {
+                        // Follow the copy to find the real origin
                         let src = *src;
-                        let src_desc = if self
+                        return if self
                             .locals
                             .get(src.0 as usize)
                             .is_some_and(|v| v.is_user_var())
@@ -674,24 +686,29 @@ impl Function {
                         } else {
                             self.describe_var_origin(src, depth + 1)
                         };
-                        (*dest, src_desc)
                     }
-                    Instruction::Index { dest, .. } => (*dest, "index result".to_string()),
-                    Instruction::Intrinsic { dest, op, .. } => {
-                        (*dest, format!("result of `{:?}`", op))
+                    Instruction::Index { dest, .. } if *dest == var => {
+                        return "index result".to_string();
                     }
-                    Instruction::Call { dest, function, .. } => (
-                        *dest,
-                        format!("result of call to `{}`", function.qualified_name()),
-                    ),
-                    Instruction::Phi { dest, .. } => (*dest, "merged value".to_string()),
-                    Instruction::MakeRef { dest, .. } => (*dest, "reference".to_string()),
-                    Instruction::Append { dest, .. } => (*dest, "append result".to_string()),
-                    Instruction::Const { dest, .. } => (*dest, "constant".to_string()),
-                    _ => continue,
-                };
-                if dest == var {
-                    return desc;
+                    Instruction::Intrinsic { dest, op, .. } if *dest == var => {
+                        return format!("result of `{:?}`", op);
+                    }
+                    Instruction::Call { dest, function, .. } if *dest == var => {
+                        return format!("result of call to `{}`", function.qualified_name());
+                    }
+                    Instruction::Phi { dest, .. } if *dest == var => {
+                        return "merged value".to_string();
+                    }
+                    Instruction::MakeRef { dest, .. } if *dest == var => {
+                        return "reference".to_string();
+                    }
+                    Instruction::Append { dest, .. } if *dest == var => {
+                        return "append result".to_string();
+                    }
+                    Instruction::Const { dest, .. } if *dest == var => {
+                        return "constant".to_string();
+                    }
+                    _ => {}
                 }
             }
         }
