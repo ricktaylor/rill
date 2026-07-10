@@ -3376,7 +3376,6 @@ fn test_map_iter_single_binding_is_value() {
 }
 
 #[test]
-#[ignore = "by-ref loop bindings lower to a RefOrigin with no base name, so the write-back reload is never emitted"]
 fn test_map_iter_byref_writeback_string_keys() {
     // `with` value binding writes back to map[key] for string-keyed maps.
     let val = run_expect(
@@ -3427,10 +3426,9 @@ fn test_map_iter_empty() {
 }
 
 #[test]
-fn test_map_iter_numeric_key_writeback_limitation() {
-    // KNOWN LIMITATION: by-ref loop bindings lower to a RefOrigin with no base
-    // name, so the write-back reload is never emitted and the mutation is not
-    // SSA-visible. Pin current behavior until the reload path exists.
+fn test_map_iter_numeric_key_writeback() {
+    // UInt-keyed maps write back like any other: VM::set dispatches on the
+    // base's type, and the loop accessor aliases the named map.
     let val = run_expect(
         r#"
         fn test() {
@@ -3442,7 +3440,115 @@ fn test_map_iter_numeric_key_writeback_limitation() {
         "#,
         "test",
     );
-    assert_eq!(val, Value::UInt(1));
+    assert_eq!(val, Value::UInt(99));
+}
+
+#[test]
+fn for_with_array_writeback() {
+    // By-ref loop over a locally-typed array writes back
+    let val = run_expect(
+        r#"
+        fn test() {
+            let arr = [1, 2, 3];
+            for with x in arr { x = x * 2; }
+            arr[0] + arr[2]
+        }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(8));
+}
+
+#[test]
+fn for_with_array_writeback_through_param() {
+    // The iterable's static type is any() here (function param) — the
+    // dispatcher's narrowing copy must not swallow the write-back.
+    let val = run_expect(
+        r#"
+        fn double(a) {
+            for with x in a { x = x * 2; }
+            a[0]
+        }
+        fn test() { double(collect(1..4)) }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(2));
+}
+
+#[test]
+fn for_with_array_pair_writeback() {
+    // Pair binding: index stays by-value, value writes back
+    let val = run_expect(
+        r#"
+        fn test() {
+            let arr = [10, 20];
+            for with i, v in arr { v = v + i; }
+            arr[0] + arr[1]
+        }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(31));
+}
+
+#[test]
+fn for_with_map_key_stays_byval() {
+    // Assigning the key binding must not touch the map's keys
+    let val = run_expect(
+        r#"
+        fn test() {
+            let m = {};
+            m["a"] = 1;
+            for with k, v in m { k = "z"; }
+            m["a"] + len(m)
+        }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(2));
+}
+
+#[test]
+fn for_with_monomorphized_array_and_map() {
+    // The same by-ref loop body works for both iterable types after
+    // monomorphization clones the function per call signature.
+    let val = run_expect(
+        r#"
+        fn scaled_at(c, k) {
+            for with v in c { v = v * 10; }
+            c[k]
+        }
+        fn test() {
+            let arr = [1];
+            let m = {};
+            m["k"] = 2;
+            scaled_at(arr, 0) + scaled_at(m, "k")
+        }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(30));
+}
+
+#[test]
+fn byref_param_iterable_loop_writeback() {
+    // A by-ref param iterated by-ref: writes reach the CALLER's array on
+    // every iteration (the accessor hangs off the param's stable ref var).
+    let val = run_expect(
+        r#"
+        fn dbl(with a) {
+            for with x in a { x = x * 2; }
+        }
+        fn test() {
+            let arr = [1, 2];
+            dbl(arr);
+            arr[0] + arr[1]
+        }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(6));
 }
 
 #[test]

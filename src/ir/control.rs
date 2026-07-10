@@ -549,6 +549,13 @@ impl<'a> Lowerer<'a> {
         body: &[ast::Stmt],
         body_expr: &Option<Box<ast::Expr>>,
     ) -> VarId {
+        // A named iterable lets by-ref bindings alias the variable itself
+        // (write-back); iterating a temporary keeps mutations loop-local.
+        let iter_name = if let ast::Expression::Variable(name) = &iterable.node {
+            Some(name.clone())
+        } else {
+            None
+        };
         let iter_var = self.lower_expression(iterable);
 
         let seq_bb = self.fresh_block();
@@ -582,7 +589,14 @@ impl<'a> Lowerer<'a> {
         // Narrow to Map so Len/MapKeyAt/Index see a known map base.
         let map_type = self.var_type(iter_var);
         let iter_map = self.emit_narrowing(iter_var, map_type.intersection(&TypeSet::map()));
-        self.lower_for_map(iter_map, binding_is_value, binding, body, body_expr);
+        self.lower_for_map(
+            iter_map,
+            iter_name.as_ref(),
+            binding_is_value,
+            binding,
+            body,
+            body_expr,
+        );
         self.finish_block(Terminator::Jump { target: join_bb });
 
         // === Index path (Array, Text, Bytes) ===
@@ -599,7 +613,14 @@ impl<'a> Lowerer<'a> {
                 .difference(&TypeSet::sequence())
                 .difference(&TypeSet::map()),
         );
-        self.lower_for_idx(iter_narrowed, binding_is_value, binding, body, body_expr);
+        self.lower_for_idx(
+            iter_narrowed,
+            iter_name.as_ref(),
+            binding_is_value,
+            binding,
+            body,
+            body_expr,
+        );
         self.finish_block(Terminator::Jump { target: join_bb });
 
         // === Join ===
@@ -607,6 +628,40 @@ impl<'a> Lowerer<'a> {
         self.current_instructions = Vec::new();
 
         self.emit_undefined()
+    }
+
+    /// Choose the base for a loop's by-ref element accessor.
+    ///
+    /// By-ref bindings must alias the NAMED iterable, not the narrowing copy
+    /// the dispatcher made for type-guard cleanliness — writes through the
+    /// copy would CoW-split away from the variable. A ref-backed iterable
+    /// (by-ref param) uses its stable ref var so every iteration writes
+    /// through to the origin; otherwise the name's current definition is
+    /// read so each iteration sees the previous write-back via the loop phi.
+    /// Value bindings and unnamed iterables keep the narrowed copy.
+    fn loop_accessor_base(
+        &mut self,
+        iter_var: VarId,
+        iter_name: Option<&ast::Identifier>,
+        mode: BindingMode,
+    ) -> (VarId, Option<ast::Identifier>) {
+        if !matches!(mode, BindingMode::Reference) {
+            return (iter_var, None);
+        }
+        let Some(name) = iter_name else {
+            return (iter_var, None);
+        };
+        if let Some(ref_var) = self
+            .lookup_ref(name)
+            .filter(|o| o.key_var.is_none())
+            .map(|o| o.ref_var)
+        {
+            (ref_var, Some(name.clone()))
+        } else if let Some(var) = self.read_var(name) {
+            (var, Some(name.clone()))
+        } else {
+            (iter_var, None)
+        }
     }
 
     /// Lower the index-based iteration path (for Array, Text, Bytes).
@@ -625,6 +680,7 @@ impl<'a> Lowerer<'a> {
     fn lower_for_idx(
         &mut self,
         iter_var: VarId,
+        iter_name: Option<&ast::Identifier>,
         binding_is_value: bool,
         binding: &ast::ForBinding,
         body: &[ast::Stmt],
@@ -687,8 +743,9 @@ impl<'a> Lowerer<'a> {
         };
 
         // Index is bounded by i < len(iter_var) — element is always defined.
+        let (acc_base, base_name) = self.loop_accessor_base(iter_var, iter_name, mode);
         let (elem, elem_origin) =
-            self.bind_element(iter_var, i_var, mode, None, TypeSet::defined());
+            self.bind_element(acc_base, i_var, mode, base_name, TypeSet::defined());
 
         match binding {
             ast::ForBinding::Single(name) => match mode {
@@ -780,6 +837,7 @@ impl<'a> Lowerer<'a> {
     fn lower_for_map(
         &mut self,
         iter_var: VarId,
+        iter_name: Option<&ast::Identifier>,
         binding_is_value: bool,
         binding: &ast::ForBinding,
         body: &[ast::Stmt],
@@ -844,8 +902,12 @@ impl<'a> Lowerer<'a> {
         });
 
         // Value = map[real_key]; by-ref binds an accessor for write-back.
+        // Element writes change neither map order nor Len, so the pre-loop
+        // MapKeyAt/Len snapshot stays consistent; inserting new keys during
+        // iteration was and remains unspecified.
+        let (acc_base, base_name) = self.loop_accessor_base(iter_var, iter_name, mode);
         let (elem, elem_origin) =
-            self.bind_element(iter_var, real_key, mode, None, TypeSet::defined());
+            self.bind_element(acc_base, real_key, mode, base_name, TypeSet::defined());
 
         match binding {
             // Single binding over a map yields the value.
