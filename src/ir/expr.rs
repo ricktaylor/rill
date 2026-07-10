@@ -747,8 +747,27 @@ impl<'a> Lowerer<'a> {
             if let ast::Expression::Variable(name) = &ast_arg.node
                 && let Some(&arg_var) = ir_args.get(i)
             {
-                let reloaded = self.emit_reload(arg_var);
-                self.reassign(name, reloaded);
+                // An accessor-bound arg aliases base[key]: the callee's
+                // writes landed in the BASE collection, so reload the base
+                // for SSA and leave the binding itself untouched — its
+                // accessor slot keeps reading the live element.
+                if let Some(origin) = self
+                    .lookup_ref(name)
+                    .filter(|o| o.key_var.is_some())
+                    .cloned()
+                {
+                    if let Some(base_name) = &origin.base_name {
+                        let reloaded = self.emit_reload(origin.base_var);
+                        if let Some(slot) = origin.base_slot {
+                            self.emit_assign(slot, reloaded);
+                        } else {
+                            self.reassign(base_name, reloaded);
+                        }
+                    }
+                } else {
+                    let reloaded = self.emit_reload(arg_var);
+                    self.reassign(name, reloaded);
+                }
             }
         }
     }

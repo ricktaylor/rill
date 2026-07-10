@@ -2499,6 +2499,47 @@ fn with_pattern_nested_scrutinee_no_writeback() {
 }
 
 #[test]
+fn byref_call_arg_base_writeback() {
+    // Passing an element ref to a by-ref param: the callee's write lands
+    // in the base collection and is visible through the base name
+    let val = run_expect(
+        r#"
+        fn set42(with p) { p = 42; }
+        fn test() {
+            let arr = [1, 2];
+            with x = arr[0];
+            set42(x);
+            arr[0]
+        }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(42));
+}
+
+#[test]
+fn byref_call_arg_alias_sees_callee_write() {
+    // After the call, the element binding reads the callee's write — the
+    // accessor survives optimization; it is not a bind-time snapshot.
+    // (An alias does NOT track the base across LATER reload generations:
+    // each write-back reload migrates the live value to a fresh SSA def,
+    // and slot-resident accessors keep aliasing the old one. See TODO.md.)
+    let val = run_expect(
+        r#"
+        fn set42(with p) { p = 42; }
+        fn test() {
+            let arr = [1, 2];
+            with x = arr[0];
+            set42(x);
+            x
+        }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(42));
+}
+
+#[test]
 fn byref_alias_sees_element_write() {
     // A read-only `with` alias over a written base must observe the write
     let val = run_expect(

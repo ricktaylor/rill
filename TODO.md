@@ -315,6 +315,16 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
       consolidated into `src/ir/uses.rs` (was duplicated in dce/tail_call).
 - [ ] **Dead write-back elimination** — a WriteRef exists but the base value is never
       read after the write-back point. Requires liveness analysis (now available).
+- [ ] **Reload-generation alias decay + Rc churn** — the write-back discipline
+      (Reload + reassign after every mutation) migrates the live value to a fresh
+      SSA def, so a slot-resident Accessor created earlier keeps aliasing the
+      pre-reload slot: it observes writes only up to the next reload generation
+      (`with x = arr[0]; arr[1] = 5; arr[0] = 99; x` → 1; likewise a direct write
+      after a by-ref call is invisible to the element binding). Each reload also
+      leaves a stale Rc in the dead slot, forcing one extra CoW split on the next
+      write. Candidate fixes: slot-allocator coalescing of reload chains onto one
+      physical slot (old aliases then stay valid), or re-emitting the accessor
+      from the name at each read.
 - [x] **Slot allocator** — done (2026-06-17). `src/ssa/slot_alloc.rs`:
       `SlotAlloc::build(function, block_map)` coalesces non-interfering VarIds
       onto shared physical slots via an interference graph (per-instruction

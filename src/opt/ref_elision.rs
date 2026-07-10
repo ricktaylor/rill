@@ -148,6 +148,17 @@ pub fn elide_refs(function: &mut Function) -> usize {
         }
     }
 
+    // An escaped ref's resolved base counts as written: the callee may
+    // mutate through the copied slot, so sibling aliases of that base must
+    // stay live to observe it. (This also survives the Ref(Accessor)
+    // flatten above — once the call arg points directly at the collection,
+    // the chain no longer connects it to the original binding.)
+    for ref_var in &escaped {
+        if let Some(info) = make_refs.get(ref_var) {
+            written_bases.insert(resolve_base(info.base, &make_refs));
+        }
+    }
+
     // ── Phase 3: Rewrite ─────────────────────────────────────────────────
 
     let mut rewrites = 0;
