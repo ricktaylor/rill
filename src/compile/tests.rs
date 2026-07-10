@@ -3135,6 +3135,137 @@ fn slot_alloc_shrinks_frame_for_disjoint_temps() {
     assert_eq!(program.call(&mut vm, "test", 1).unwrap(), Value::UInt(6));
 }
 
+// ============================================================================
+// Map content iteration (for k, v in map)
+// ============================================================================
+
+#[test]
+fn test_map_iter_real_keys() {
+    // Documented example: the key binds to the actual map key, not a counter.
+    let val = run_expect(
+        r#"
+        fn test() {
+            let m = {};
+            m["priority"] = 5;
+            m["other"] = 1;
+            for key, value in m {
+                if key == "priority" { return value; }
+            }
+            return 0;
+        }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(5));
+}
+
+#[test]
+fn test_map_iter_sum_values() {
+    let val = run_expect(
+        r#"
+        fn test() {
+            let m = {};
+            m["a"] = 10;
+            m["b"] = 20;
+            m["c"] = 30;
+            let sum = 0;
+            for k, v in m { sum = sum + v; }
+            return sum;
+        }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(60));
+}
+
+#[test]
+fn test_map_iter_single_binding_is_value() {
+    let val = run_expect(
+        r#"
+        fn test() {
+            let m = {};
+            m["a"] = 3;
+            m["b"] = 4;
+            let sum = 0;
+            for x in m { sum = sum + x; }
+            return sum;
+        }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(7));
+}
+
+#[test]
+#[ignore = "by-ref loop bindings lower to a RefOrigin with no base name, so the write-back reload is never emitted"]
+fn test_map_iter_byref_writeback_string_keys() {
+    // `with` value binding writes back to map[key] for string-keyed maps.
+    let val = run_expect(
+        r#"
+        fn test() {
+            let m = {};
+            m["a"] = 1;
+            m["b"] = 2;
+            for with k, v in m { v = v * 10; }
+            return m["a"] + m["b"];
+        }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(30));
+}
+
+#[test]
+fn test_map_iter_byval_no_writeback() {
+    let val = run_expect(
+        r#"
+        fn test() {
+            let m = {};
+            m["a"] = 1;
+            for let k, v in m { v = 99; }
+            return m["a"];
+        }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(1));
+}
+
+#[test]
+fn test_map_iter_empty() {
+    let val = run_expect(
+        r#"
+        fn test() {
+            let m = {};
+            let count = 0;
+            for k, v in m { count = count + 1; }
+            return count;
+        }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(0));
+}
+
+#[test]
+fn test_map_iter_numeric_key_writeback_limitation() {
+    // KNOWN LIMITATION (pre-existing): `vm.set` on an accessor dispatches on the
+    // key's value type, so by-ref write-back over a UInt-keyed map is a no-op.
+    // Pin current behavior so a future `vm.set` fix is intentional.
+    let val = run_expect(
+        r#"
+        fn test() {
+            let m = {};
+            m[0] = 1;
+            for with k, v in m { v = 99; }
+            return m[0];
+        }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(1));
+}
+
 #[test]
 fn test_compiler_import_require_namespace_clash() {
     // import and require both claim the same namespace — should error

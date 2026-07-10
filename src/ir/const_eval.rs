@@ -171,11 +171,13 @@ pub fn eval_intrinsic_const(op: crate::ir::IntrinsicOp, args: &[ConstValue]) -> 
             Some(ConstValue::Map(pairs))
         }
 
-        // Sequences are runtime-only (lazy), can't const-eval
+        // Sequences are runtime-only (lazy), can't const-eval.
+        // MapKeyAt only appears in loop bodies (not const-folded).
         IntrinsicOp::MakeSeq
         | IntrinsicOp::ArraySeq(_)
         | IntrinsicOp::SeqNext
-        | IntrinsicOp::Collect => None,
+        | IntrinsicOp::Collect
+        | IntrinsicOp::MapKeyAt => None,
 
         // Numeric conversion (checked = overflow-checked, unchecked = bit-reinterpret)
         IntrinsicOp::Convert(target, mode) => {

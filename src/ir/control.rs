@@ -615,14 +615,20 @@ impl<'a> Lowerer<'a> {
         let iter_var = self.lower_expression(iterable);
 
         let seq_bb = self.fresh_block();
+        let map_bb = self.fresh_block();
         let idx_bb = self.fresh_block();
         let join_bb = self.fresh_block();
 
         // Type dispatch is compiler-internal — use default span to suppress
         // unreachable arm warnings (the user didn't write this match).
+        // Maps iterate their entries (real keys + values) on a dedicated path;
+        // Array/Text/Bytes index positionally on the default path.
         self.finish_block(Terminator::Match {
             value: iter_var,
-            arms: vec![(MatchPattern::Type(types::BaseType::Sequence), seq_bb)],
+            arms: vec![
+                (MatchPattern::Type(types::BaseType::Sequence), seq_bb),
+                (MatchPattern::Type(types::BaseType::Map), map_bb),
+            ],
             default: idx_bb,
             span: ast::Span::default(),
         });
@@ -633,16 +639,29 @@ impl<'a> Lowerer<'a> {
         self.lower_for_seq(iter_var, binding_is_value, binding, body, body_expr);
         self.finish_block(Terminator::Jump { target: join_bb });
 
-        // === Index path ===
+        // === Map path ===
+        self.current_block = map_bb;
+        self.current_instructions = Vec::new();
+        // Narrow to Map so Len/MapKeyAt/Index see a known map base.
+        let map_type = self.var_type(iter_var);
+        let iter_map = self.emit_narrowing(iter_var, map_type.intersection(&TypeSet::map()));
+        self.lower_for_map(iter_map, binding_is_value, binding, body, body_expr);
+        self.finish_block(Terminator::Jump { target: join_bb });
+
+        // === Index path (Array, Text, Bytes) ===
         self.current_block = idx_bb;
         self.current_instructions = Vec::new();
-        // Narrow iter_var to exclude Sequence — the Match dispatch guarantees
-        // only non-Sequence values reach this path. Without this narrowing copy,
-        // the SSA type would still include Sequence, causing type guards on Len
-        // (which requires collection types) to reject valid values.
+        // Narrow iter_var to exclude Sequence and Map — the Match dispatch
+        // guarantees only positionally-indexable values reach this path. Without
+        // this narrowing copy, the SSA type would still include them, causing
+        // type guards on Len to reject valid values.
         let iter_type = self.var_type(iter_var);
-        let iter_narrowed =
-            self.emit_narrowing(iter_var, iter_type.difference(&TypeSet::sequence()));
+        let iter_narrowed = self.emit_narrowing(
+            iter_var,
+            iter_type
+                .difference(&TypeSet::sequence())
+                .difference(&TypeSet::map()),
+        );
         self.lower_for_idx(iter_narrowed, binding_is_value, binding, body, body_expr);
         self.finish_block(Terminator::Jump { target: join_bb });
 
@@ -653,7 +672,8 @@ impl<'a> Lowerer<'a> {
         self.emit_undefined()
     }
 
-    /// Lower the index-based iteration path (for Array, Map, Bytes, Text).
+    /// Lower the index-based iteration path (for Array, Text, Bytes).
+    /// Maps are handled by `lower_for_map` (entries, not positional index).
     ///
     /// ```text
     /// length = Len(iter)
@@ -823,6 +843,181 @@ impl<'a> Lowerer<'a> {
                 *sources = vec![(pre_header_bb, i_init), (latch_exit_bb, i_next)];
             }
             _ => panic!("for-loop instruction at phi index is not a Phi"),
+        }
+
+        // Exit — leave current_block set to exit_bb for the dispatcher
+        self.current_block = exit_bb;
+        self.current_instructions = Vec::new();
+    }
+
+    /// Lower map iteration (`for k, v in map` / `for x in map`).
+    ///
+    /// Mirrors `lower_for_idx`'s counter skeleton, but the loop body extracts the
+    /// real entry via `MapKeyAt(map, i)` (the i-th key, `IndexMap` order) rather
+    /// than using the counter as the key: `k` binds to the real key (always
+    /// by-value), `v`/`x` to `map[real_key]` (the value; by-ref enables
+    /// write-back to `map[real_key]`).
+    fn lower_for_map(
+        &mut self,
+        iter_var: VarId,
+        binding_is_value: bool,
+        binding: &ast::ForBinding,
+        body: &[ast::Stmt],
+        body_expr: &Option<Box<ast::Expr>>,
+    ) {
+        let user_span = self.current_span;
+        self.current_span = ast::Span::default();
+
+        // length = Len(map) — guarded so the optimizer sees the Map type.
+        let length = self.lower_guarded_expression(|s: &mut Self| {
+            s.emit_unary_intrinsic(IntrinsicOp::Len, iter_var)
+        });
+
+        let i_init = self.emit_const(Literal::UInt(0));
+
+        let header_bb = self.fresh_block();
+        let body_bb = self.fresh_block();
+        let latch_bb = self.fresh_block();
+        let exit_bb = self.fresh_block();
+
+        let pre_header_bb = self.current_block;
+        self.finish_block(Terminator::Jump { target: header_bb });
+
+        // Header: index phi, then check i < length
+        self.current_block = header_bb;
+        self.current_instructions = Vec::new();
+
+        let i_var = self.new_temp(TypeSet::uint());
+        let i_phi_idx = self.current_instructions.len();
+        self.emit(Instruction::Phi {
+            dest: i_var,
+            sources: vec![], // patched below
+        });
+
+        let has_more = self.emit_binary_intrinsic(IntrinsicOp::Lt, i_var, length);
+        self.finish_block(Terminator::If {
+            condition: has_more,
+            then_target: body_bb,
+            else_target: exit_bb,
+            span: ast::Span::default(),
+        });
+
+        // Body
+        self.current_span = user_span;
+        self.current_block = body_bb;
+        self.current_instructions = Vec::new();
+        self.push_scope();
+
+        let mode = if binding_is_value {
+            BindingMode::Value
+        } else {
+            BindingMode::Reference
+        };
+
+        // The real key at position i (i < len ⇒ the entry exists, so both the
+        // key and `map[key]` are defined).
+        let real_key = self.new_temp(TypeSet::defined());
+        self.emit(Instruction::Intrinsic {
+            dest: real_key,
+            op: IntrinsicOp::MapKeyAt,
+            args: vec![iter_var, i_var],
+        });
+
+        // Value = map[real_key]; by-ref binds an accessor for write-back.
+        let (elem, elem_origin) = if matches!(mode, BindingMode::Reference) {
+            let dest = self.new_temp(TypeSet::defined());
+            self.emit(Instruction::MakeAccessor {
+                dest,
+                base: iter_var,
+                key: real_key,
+            });
+            let origin = RefOrigin {
+                ref_var: dest,
+                base_var: iter_var,
+                key_var: Some(real_key),
+                base_name: None,
+            };
+            (dest, Some(origin))
+        } else {
+            let raw = self.emit_index(iter_var, real_key);
+            let dest = self.emit_copy(raw, TypeSet::defined());
+            (dest, None)
+        };
+
+        match binding {
+            // Single binding over a map yields the value.
+            ast::ForBinding::Single(name) => match mode {
+                BindingMode::Value => {
+                    self.bind(name, elem);
+                }
+                BindingMode::Reference => {
+                    self.bind(name, elem);
+                    if let Some(origin) = elem_origin.clone() {
+                        self.bind_ref(name, origin);
+                    }
+                }
+            },
+            // Pair binding: key (always by-value) + value.
+            ast::ForBinding::Pair(key_name, val_name) => {
+                self.bind(key_name, real_key);
+                match mode {
+                    BindingMode::Value => {
+                        self.bind(val_name, elem);
+                    }
+                    BindingMode::Reference => {
+                        self.bind(val_name, elem);
+                        if let Some(origin) = elem_origin.clone() {
+                            self.bind_ref(val_name, origin);
+                        }
+                    }
+                }
+            }
+        }
+
+        self.loop_stack.push(LoopContext {
+            break_target: exit_bb,
+            continue_target: latch_bb,
+            break_values: Vec::new(),
+        });
+
+        for stmt in body {
+            self.lower_stmt(stmt);
+        }
+        if let Some(expr) = body_expr {
+            self.lower_expression(expr);
+        }
+
+        self.loop_stack.pop();
+
+        self.pop_scope();
+        self.finish_block(Terminator::Jump { target: latch_bb });
+
+        // Latch: increment counter
+        self.current_block = latch_bb;
+        self.current_instructions = Vec::new();
+        self.current_span = ast::Span::default();
+
+        let one = self.emit_const(Literal::UInt(1));
+        let i_next = self.emit_binary_intrinsic(IntrinsicOp::Add, i_var, one);
+
+        let latch_exit_bb = self.current_block;
+        self.finish_block(Terminator::Jump { target: header_bb });
+
+        // Patch counter phi
+        let header_block = self
+            .blocks
+            .iter_mut()
+            .find(|b| b.id == header_bb)
+            .expect("for-map header block must exist");
+        let phi_inst = header_block
+            .instructions
+            .get_mut(i_phi_idx)
+            .expect("for-map phi instruction must exist at recorded index");
+        match &mut phi_inst.node {
+            Instruction::Phi { sources, .. } => {
+                *sources = vec![(pre_header_bb, i_init), (latch_exit_bb, i_next)];
+            }
+            _ => panic!("for-map instruction at phi index is not a Phi"),
         }
 
         // Exit — leave current_block set to exit_bb for the dispatcher

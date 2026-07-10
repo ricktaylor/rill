@@ -466,6 +466,7 @@ pub(super) fn compile_intrinsic_dispatch(op: IntrinsicOp, arg_slots: Vec<usize>,
             })
         }
         IntrinsicOp::Len => emit_unary!(exec_len),
+        IntrinsicOp::MapKeyAt => emit_binary!(exec_map_key_at),
         IntrinsicOp::MakeArray => emit_try!(|vm: &mut VM| { exec_make_array(&arg_slots, vm) }),
         IntrinsicOp::MakeMap => emit_try!(|vm: &mut VM| { exec_make_map(&arg_slots, vm) }),
         IntrinsicOp::MakeSeq => emit!(|vm: &mut VM| { exec_make_seq(&arg_slots, vm) }),

@@ -63,6 +63,9 @@ pub enum IntrinsicOp {
     Len,
     MakeArray,
     MakeMap,
+    /// `MapKeyAt(map, i)` → the i-th key of a Map in insertion order.
+    /// Used by `for k, v in map` lowering for positional key access.
+    MapKeyAt,
 
     // -- Sequence --
     /// Create a lazy numeric sequence with exclusive end.
@@ -127,6 +130,10 @@ impl IntrinsicOp {
             // Collection
             Self::Len => TypeSet::collection(),
             Self::MakeArray | Self::MakeMap => TypeSet::defined(),
+            Self::MapKeyAt => match index {
+                0 => TypeSet::map(), // the map
+                _ => TypeSet::uint(), // positional index
+            },
 
             // Sequence
             Self::MakeSeq => TypeSet::uint(), // start, end
@@ -163,6 +170,8 @@ impl IntrinsicOp {
             Self::BitSet => TypeSet::uint().union(&TypeSet::undefined()),
             // Len: wrong type → undefined
             Self::Len => TypeSet::uint().union(&TypeSet::undefined()),
+            // MapKeyAt: a key (any defined value), or Undefined if out of bounds
+            Self::MapKeyAt => TypeSet::defined().union(&TypeSet::undefined()),
             // Collection construction: infallible (lowerer guarantees valid args)
             Self::MakeArray => TypeSet::array(),
             Self::MakeMap => TypeSet::map(),
@@ -641,17 +650,31 @@ impl Function {
             return v.display_name();
         }
         // Temp — find the defining instruction and describe it
-        self.describe_var_origin(var)
+        self.describe_var_origin(var, 0)
     }
 
-    /// Trace a VarId back through SSA to describe its origin.
-    fn describe_var_origin(&self, var: VarId) -> String {
+    /// Trace a VarId back through SSA to describe its origin. `depth` guards
+    /// against Copy chains that cycle (the diagnostic must always terminate).
+    fn describe_var_origin(&self, var: VarId, depth: usize) -> String {
+        if depth > 32 {
+            return format!("_{}", var.0);
+        }
         for block in &self.blocks {
             for inst in &block.instructions {
                 let (dest, desc) = match &inst.node {
                     Instruction::Copy { dest, src } => {
                         // Follow copies to find the real origin
-                        (*dest, self.var_display_name(*src))
+                        let src = *src;
+                        let src_desc = if self
+                            .locals
+                            .get(src.0 as usize)
+                            .is_some_and(|v| v.is_user_var())
+                        {
+                            self.locals[src.0 as usize].display_name()
+                        } else {
+                            self.describe_var_origin(src, depth + 1)
+                        };
+                        (*dest, src_desc)
                     }
                     Instruction::Index { dest, .. } => (*dest, "index result".to_string()),
                     Instruction::Intrinsic { dest, op, .. } => {

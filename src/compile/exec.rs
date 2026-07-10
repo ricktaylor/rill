@@ -374,6 +374,18 @@ pub(super) fn exec_len(a: &Value) -> Value {
     }
 }
 
+/// The i-th key of a Map in insertion order (`IndexMap` is ordered). Used by
+/// `for k, v in map` lowering. Out-of-range → Undefined (the loop keeps `i < len`).
+pub(super) fn exec_map_key_at(map: &Value, index: &Value) -> Value {
+    match (map, index) {
+        (Value::Map(m), Value::UInt(i)) => m
+            .get_index(*i as usize)
+            .map(|(k, _)| k.clone())
+            .unwrap_or(Value::Undefined),
+        _ => Value::Undefined,
+    }
+}
+
 pub(super) fn exec_make_array(arg_slots: &[usize], vm: &mut VM) -> Result<Value, ExecError> {
     let elems: Vec<Value> = arg_slots
         .iter()
