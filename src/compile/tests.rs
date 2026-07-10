@@ -2485,6 +2485,73 @@ fn float_nonfinite_literal_undefined() {
 }
 
 #[test]
+fn short_circuit_and_false_edge() {
+    // The short-circuit (lhs false) edge must deliver Bool(false), not a
+    // stale slot value — the constant used to be emitted in the join block
+    let val = run_expect(
+        r#"
+        fn f(x) { return x == 1 && x == 2; }
+        fn test() { f(0) }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::Bool(false));
+}
+
+#[test]
+fn short_circuit_and_rhs_edge() {
+    let val = run_expect(
+        r#"
+        fn f(x) { return x == 1 && x < 2; }
+        fn test() { f(1) }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::Bool(true));
+}
+
+#[test]
+fn short_circuit_or_true_edge() {
+    // The short-circuit (lhs true) edge must deliver Bool(true)
+    let val = run_expect(
+        r#"
+        fn f(x) { return x == 1 || x == 2; }
+        fn test() { f(1) }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::Bool(true));
+}
+
+#[test]
+fn short_circuit_or_rhs_edge() {
+    let val = run_expect(
+        r#"
+        fn f(x) { return x == 1 || x == 2; }
+        fn test() { f(0) }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::Bool(false));
+}
+
+#[test]
+fn short_circuit_negated_branch() {
+    // !(a && b) on the short-circuit edge: the Not's operand must be a
+    // real Bool (this shape used to panic debug builds in exec_not)
+    let val = run_expect(
+        r#"
+        fn f(x) {
+            if !(x == 1 && x == 2) { return 111; } else { return 222; }
+        }
+        fn test() { f(0) }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(111));
+}
+
+#[test]
 fn algebra_div_pow2_not_miscompiled() {
     // x / 4 must divide, not copy (the old strength-reduction stub
     // rewrote x / 2^k to x for any proven-UInt operand)

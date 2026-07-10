@@ -322,6 +322,12 @@ impl<'a> Lowerer<'a> {
     fn lower_short_circuit_and(&mut self, left: &ast::Expr, right: &ast::Expr) -> VarId {
         let lhs = self.lower_expression(left);
 
+        // The short-circuit constant must be defined in the PREDECESSOR:
+        // a phi operand lives on its edge, and the edge's resolution copy
+        // runs at the end of the predecessor — before the join block's
+        // instructions ever execute.
+        let false_var = self.emit_const(Literal::Bool(false));
+
         let right_block = self.fresh_block();
         let join_block = self.fresh_block();
 
@@ -342,8 +348,6 @@ impl<'a> Lowerer<'a> {
         self.current_block = join_block;
         self.current_instructions = Vec::new();
 
-        let false_var = self.emit_const(Literal::Bool(false));
-
         let result = self.new_temp(TypeSet::bool());
         self.emit(Instruction::Phi {
             dest: result,
@@ -355,6 +359,10 @@ impl<'a> Lowerer<'a> {
 
     fn lower_short_circuit_or(&mut self, left: &ast::Expr, right: &ast::Expr) -> VarId {
         let lhs = self.lower_expression(left);
+
+        // As in lower_short_circuit_and: the short-circuit constant must
+        // be defined in the predecessor its phi edge leaves from.
+        let true_var = self.emit_const(Literal::Bool(true));
 
         let right_block = self.fresh_block();
         let join_block = self.fresh_block();
@@ -375,8 +383,6 @@ impl<'a> Lowerer<'a> {
 
         self.current_block = join_block;
         self.current_instructions = Vec::new();
-
-        let true_var = self.emit_const(Literal::Bool(true));
 
         let result = self.new_temp(TypeSet::bool());
         self.emit(Instruction::Phi {
