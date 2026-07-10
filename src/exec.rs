@@ -211,17 +211,26 @@ impl<T: HeapSize + Clone + Hash> Hash for HeapVal<T> {
 }
 
 // ============================================================================
-// Float wrapper (NaN-free, implements Eq + Hash)
+// Float wrapper (finite, normalized zero; implements Eq + Hash)
 // ============================================================================
 
 /// Float wrapper that implements Eq and Hash.
-/// Invariant: Never contains NaN. NaN values become Undefined at runtime.
+///
+/// Invariant: always finite, and zero is always +0.0. Non-representable
+/// results (NaN, ±inf — overflow, division by zero, inf - inf) become
+/// Undefined at runtime, matching integer overflow semantics. Normalizing
+/// -0.0 keeps the bitwise Eq/Hash (and therefore map keys) consistent with
+/// numeric equality.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Float(f64);
 
 impl Float {
     pub fn new(f: f64) -> Option<Self> {
-        if f.is_nan() { None } else { Some(Float(f)) }
+        if f.is_finite() {
+            Some(Float(if f == 0.0 { 0.0 } else { f }))
+        } else {
+            None
+        }
     }
 
     pub fn get(self) -> f64 {
@@ -229,7 +238,10 @@ impl Float {
     }
 
     pub fn new_unchecked(f: f64) -> Self {
-        debug_assert!(!f.is_nan(), "Float::new_unchecked called with NaN");
+        debug_assert!(
+            f.is_finite() && (f != 0.0 || f.is_sign_positive()),
+            "Float::new_unchecked requires a finite, +0.0-normalized value"
+        );
         Float(f)
     }
 }
@@ -984,7 +996,7 @@ impl VM {
     pub fn push_float(&mut self, f: f64) -> Result<Option<usize>, ExecError> {
         match Float::new(f) {
             Some(f) => self.push(Value::Float(f)).map(Some),
-            None => Ok(None), // NaN → Undefined
+            None => Ok(None), // non-finite → Undefined
         }
     }
 

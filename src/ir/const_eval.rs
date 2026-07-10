@@ -19,19 +19,31 @@ use crate::ir::{ConstValue, FunctionRef, Literal};
 // Literal <-> ConstValue Conversion
 // ============================================================================
 
-/// Convert an IR Literal to a ConstValue
 /// Convert an IR Literal to a ConstValue.
-/// Returns `None` for `Literal::Undefined` (not representable as a const).
+/// Returns `None` for `Literal::Undefined` (not representable as a const)
+/// and for float literals violating the runtime Float invariant.
 pub fn literal_to_const(lit: &Literal) -> Option<ConstValue> {
     Some(match lit {
         Literal::Bool(b) => ConstValue::Bool(*b),
         Literal::UInt(n) => ConstValue::UInt(*n),
         Literal::Int(n) => ConstValue::Int(*n),
-        Literal::Float(f) => ConstValue::Float(*f),
+        Literal::Float(f) => return const_float(*f),
         Literal::Text(s) => ConstValue::Text(s.clone()),
         Literal::Bytes(b) => ConstValue::Bytes(b.clone()),
         Literal::Undefined => return None,
     })
+}
+
+/// Build a Float ConstValue under the runtime `Float` invariant: finite
+/// with normalized +0.0. A non-finite result returns `None` — the fold is
+/// skipped and the runtime produces Undefined through the guard path, so
+/// constant evaluation never disagrees with execution.
+fn const_float(f: f64) -> Option<ConstValue> {
+    if f.is_finite() {
+        Some(ConstValue::Float(if f == 0.0 { 0.0 } else { f }))
+    } else {
+        None
+    }
 }
 
 /// Convert a ConstValue to an IR Literal
@@ -187,7 +199,7 @@ pub fn eval_intrinsic_const(op: crate::ir::IntrinsicOp, args: &[ConstValue]) -> 
                 // Identity
                 (ConstValue::UInt(n), NumericType::UInt, _) => Some(ConstValue::UInt(*n)),
                 (ConstValue::Int(n), NumericType::Int, _) => Some(ConstValue::Int(*n)),
-                (ConstValue::Float(f), NumericType::Float, _) => Some(ConstValue::Float(*f)),
+                (ConstValue::Float(f), NumericType::Float, _) => const_float(*f),
                 // UInt → Int: checked overflows, unchecked wraps
                 (ConstValue::UInt(n), NumericType::Int, ConvertMode::Checked) => {
                     if *n > i64::MAX as u64 {
@@ -204,8 +216,8 @@ pub fn eval_intrinsic_const(op: crate::ir::IntrinsicOp, args: &[ConstValue]) -> 
                     Some(ConstValue::UInt(*n as u64))
                 }
                 // → Float: same for both modes
-                (ConstValue::UInt(n), NumericType::Float, _) => Some(ConstValue::Float(*n as f64)),
-                (ConstValue::Int(n), NumericType::Float, _) => Some(ConstValue::Float(*n as f64)),
+                (ConstValue::UInt(n), NumericType::Float, _) => const_float(*n as f64),
+                (ConstValue::Int(n), NumericType::Float, _) => const_float(*n as f64),
                 _ => None,
             }
         }
@@ -218,7 +230,7 @@ fn const_add(args: &[ConstValue]) -> Option<ConstValue> {
     match (args.first()?, args.get(1)?) {
         (ConstValue::UInt(a), ConstValue::UInt(b)) => a.checked_add(*b).map(ConstValue::UInt),
         (ConstValue::Int(a), ConstValue::Int(b)) => a.checked_add(*b).map(ConstValue::Int),
-        (ConstValue::Float(a), ConstValue::Float(b)) => Some(ConstValue::Float(a + b)),
+        (ConstValue::Float(a), ConstValue::Float(b)) => const_float(a + b),
         (ConstValue::UInt(a), ConstValue::Int(b)) => i64::try_from(*a)
             .ok()
             .and_then(|a| a.checked_add(*b))
@@ -227,10 +239,10 @@ fn const_add(args: &[ConstValue]) -> Option<ConstValue> {
             .ok()
             .and_then(|b| a.checked_add(b))
             .map(ConstValue::Int),
-        (ConstValue::UInt(a), ConstValue::Float(b)) => Some(ConstValue::Float(*a as f64 + b)),
-        (ConstValue::Float(a), ConstValue::UInt(b)) => Some(ConstValue::Float(a + *b as f64)),
-        (ConstValue::Int(a), ConstValue::Float(b)) => Some(ConstValue::Float(*a as f64 + b)),
-        (ConstValue::Float(a), ConstValue::Int(b)) => Some(ConstValue::Float(a + *b as f64)),
+        (ConstValue::UInt(a), ConstValue::Float(b)) => const_float(*a as f64 + b),
+        (ConstValue::Float(a), ConstValue::UInt(b)) => const_float(a + *b as f64),
+        (ConstValue::Int(a), ConstValue::Float(b)) => const_float(*a as f64 + b),
+        (ConstValue::Float(a), ConstValue::Int(b)) => const_float(a + *b as f64),
         _ => None,
     }
 }
@@ -239,7 +251,7 @@ fn const_sub(args: &[ConstValue]) -> Option<ConstValue> {
     match (args.first()?, args.get(1)?) {
         (ConstValue::UInt(a), ConstValue::UInt(b)) => a.checked_sub(*b).map(ConstValue::UInt),
         (ConstValue::Int(a), ConstValue::Int(b)) => a.checked_sub(*b).map(ConstValue::Int),
-        (ConstValue::Float(a), ConstValue::Float(b)) => Some(ConstValue::Float(a - b)),
+        (ConstValue::Float(a), ConstValue::Float(b)) => const_float(a - b),
         (ConstValue::UInt(a), ConstValue::Int(b)) => i64::try_from(*a)
             .ok()
             .and_then(|a| a.checked_sub(*b))
@@ -248,10 +260,10 @@ fn const_sub(args: &[ConstValue]) -> Option<ConstValue> {
             .ok()
             .and_then(|b| a.checked_sub(b))
             .map(ConstValue::Int),
-        (ConstValue::UInt(a), ConstValue::Float(b)) => Some(ConstValue::Float(*a as f64 - b)),
-        (ConstValue::Float(a), ConstValue::UInt(b)) => Some(ConstValue::Float(a - *b as f64)),
-        (ConstValue::Int(a), ConstValue::Float(b)) => Some(ConstValue::Float(*a as f64 - b)),
-        (ConstValue::Float(a), ConstValue::Int(b)) => Some(ConstValue::Float(a - *b as f64)),
+        (ConstValue::UInt(a), ConstValue::Float(b)) => const_float(*a as f64 - b),
+        (ConstValue::Float(a), ConstValue::UInt(b)) => const_float(a - *b as f64),
+        (ConstValue::Int(a), ConstValue::Float(b)) => const_float(*a as f64 - b),
+        (ConstValue::Float(a), ConstValue::Int(b)) => const_float(a - *b as f64),
         _ => None,
     }
 }
@@ -260,7 +272,7 @@ fn const_mul(args: &[ConstValue]) -> Option<ConstValue> {
     match (args.first()?, args.get(1)?) {
         (ConstValue::UInt(a), ConstValue::UInt(b)) => a.checked_mul(*b).map(ConstValue::UInt),
         (ConstValue::Int(a), ConstValue::Int(b)) => a.checked_mul(*b).map(ConstValue::Int),
-        (ConstValue::Float(a), ConstValue::Float(b)) => Some(ConstValue::Float(a * b)),
+        (ConstValue::Float(a), ConstValue::Float(b)) => const_float(a * b),
         (ConstValue::UInt(a), ConstValue::Int(b)) => i64::try_from(*a)
             .ok()
             .and_then(|a| a.checked_mul(*b))
@@ -269,10 +281,10 @@ fn const_mul(args: &[ConstValue]) -> Option<ConstValue> {
             .ok()
             .and_then(|b| a.checked_mul(b))
             .map(ConstValue::Int),
-        (ConstValue::UInt(a), ConstValue::Float(b)) => Some(ConstValue::Float(*a as f64 * b)),
-        (ConstValue::Float(a), ConstValue::UInt(b)) => Some(ConstValue::Float(a * *b as f64)),
-        (ConstValue::Int(a), ConstValue::Float(b)) => Some(ConstValue::Float(*a as f64 * b)),
-        (ConstValue::Float(a), ConstValue::Int(b)) => Some(ConstValue::Float(a * *b as f64)),
+        (ConstValue::UInt(a), ConstValue::Float(b)) => const_float(*a as f64 * b),
+        (ConstValue::Float(a), ConstValue::UInt(b)) => const_float(a * *b as f64),
+        (ConstValue::Int(a), ConstValue::Float(b)) => const_float(*a as f64 * b),
+        (ConstValue::Float(a), ConstValue::Int(b)) => const_float(a * *b as f64),
         _ => None,
     }
 }
@@ -281,7 +293,7 @@ fn const_div(args: &[ConstValue]) -> Option<ConstValue> {
     match (args.first()?, args.get(1)?) {
         (ConstValue::UInt(a), ConstValue::UInt(b)) => a.checked_div(*b).map(ConstValue::UInt),
         (ConstValue::Int(a), ConstValue::Int(b)) => a.checked_div(*b).map(ConstValue::Int),
-        (ConstValue::Float(a), ConstValue::Float(b)) => Some(ConstValue::Float(a / b)),
+        (ConstValue::Float(a), ConstValue::Float(b)) => const_float(a / b),
         (ConstValue::UInt(a), ConstValue::Int(b)) => i64::try_from(*a)
             .ok()
             .and_then(|a| a.checked_div(*b))
@@ -290,10 +302,10 @@ fn const_div(args: &[ConstValue]) -> Option<ConstValue> {
             .ok()
             .and_then(|b| a.checked_div(b))
             .map(ConstValue::Int),
-        (ConstValue::UInt(a), ConstValue::Float(b)) => Some(ConstValue::Float(*a as f64 / b)),
-        (ConstValue::Float(a), ConstValue::UInt(b)) => Some(ConstValue::Float(a / *b as f64)),
-        (ConstValue::Int(a), ConstValue::Float(b)) => Some(ConstValue::Float(*a as f64 / b)),
-        (ConstValue::Float(a), ConstValue::Int(b)) => Some(ConstValue::Float(a / *b as f64)),
+        (ConstValue::UInt(a), ConstValue::Float(b)) => const_float(*a as f64 / b),
+        (ConstValue::Float(a), ConstValue::UInt(b)) => const_float(a / *b as f64),
+        (ConstValue::Int(a), ConstValue::Float(b)) => const_float(*a as f64 / b),
+        (ConstValue::Float(a), ConstValue::Int(b)) => const_float(a / *b as f64),
         _ => None,
     }
 }
@@ -302,7 +314,7 @@ fn const_mod(args: &[ConstValue]) -> Option<ConstValue> {
     match (args.first()?, args.get(1)?) {
         (ConstValue::UInt(a), ConstValue::UInt(b)) => a.checked_rem(*b).map(ConstValue::UInt),
         (ConstValue::Int(a), ConstValue::Int(b)) => a.checked_rem(*b).map(ConstValue::Int),
-        (ConstValue::Float(a), ConstValue::Float(b)) => Some(ConstValue::Float(a % b)),
+        (ConstValue::Float(a), ConstValue::Float(b)) => const_float(a % b),
         (ConstValue::UInt(a), ConstValue::Int(b)) => i64::try_from(*a)
             .ok()
             .and_then(|a| a.checked_rem(*b))
@@ -318,7 +330,7 @@ fn const_mod(args: &[ConstValue]) -> Option<ConstValue> {
 fn const_neg(args: &[ConstValue]) -> Option<ConstValue> {
     match args.first()? {
         ConstValue::Int(a) => a.checked_neg().map(ConstValue::Int),
-        ConstValue::Float(a) => Some(ConstValue::Float(-a)),
+        ConstValue::Float(a) => const_float(-a),
         ConstValue::UInt(a) => i64::try_from(*a)
             .ok()
             .and_then(|v| v.checked_neg())
@@ -395,7 +407,11 @@ fn const_bit_not(args: &[ConstValue]) -> Option<ConstValue> {
 
 fn const_shl(args: &[ConstValue]) -> Option<ConstValue> {
     if let (Some(ConstValue::UInt(a)), Some(ConstValue::UInt(b))) = (args.first(), args.get(1)) {
-        Some(ConstValue::UInt(a.wrapping_shl(*b as u32)))
+        // Checked, like the runtime: shift >= 64 is Undefined (no fold)
+        u32::try_from(*b)
+            .ok()
+            .and_then(|s| a.checked_shl(s))
+            .map(ConstValue::UInt)
     } else {
         None
     }
@@ -403,7 +419,11 @@ fn const_shl(args: &[ConstValue]) -> Option<ConstValue> {
 
 fn const_shr(args: &[ConstValue]) -> Option<ConstValue> {
     if let (Some(ConstValue::UInt(a)), Some(ConstValue::UInt(b))) = (args.first(), args.get(1)) {
-        Some(ConstValue::UInt(a.wrapping_shr(*b as u32)))
+        // Checked, like the runtime: shift >= 64 is Undefined (no fold)
+        u32::try_from(*b)
+            .ok()
+            .and_then(|s| a.checked_shr(s))
+            .map(ConstValue::UInt)
     } else {
         None
     }
@@ -555,7 +575,7 @@ mod tests {
                     IntrinsicOp::Convert(NumericType::Float, mode),
                     &[ConstValue::Float(3.1)]
                 ),
-                Some(ConstValue::Float(3.1))
+                const_float(3.1)
             );
         }
     }
@@ -614,14 +634,14 @@ mod tests {
                     IntrinsicOp::Convert(NumericType::Float, mode),
                     &[ConstValue::UInt(42)]
                 ),
-                Some(ConstValue::Float(42.0))
+                const_float(42.0)
             );
             assert_eq!(
                 eval_intrinsic_const(
                     IntrinsicOp::Convert(NumericType::Float, mode),
                     &[ConstValue::Int(-10)]
                 ),
-                Some(ConstValue::Float(-10.0))
+                const_float(-10.0)
             );
         }
     }

@@ -459,7 +459,7 @@ fn compile_instruction(
                             })
                         }
                         None => {
-                            // NaN → undefined
+                            // Non-finite literal → undefined
                             Box::new(move |vm: &mut VM, _prog| {
                                 vm.set_local(d, Value::Undefined);
                                 Ok(Action::Continue)

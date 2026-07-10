@@ -178,7 +178,7 @@ program contains resolved closures; only extern symbols require the host.
 | `Bool` | `bool` | Boolean |
 | `UInt` | `u64` | Unsigned 64-bit integer |
 | `Int` | `i64` | Signed 64-bit integer |
-| `Float` | `Float` wrapper | 64-bit IEEE 754 (NaN excluded) |
+| `Float` | `Float` wrapper | 64-bit IEEE 754 (finite only, single +0.0 zero) |
 | `Text` | `HeapVal<String>` | UTF-8 string |
 | `Bytes` | `HeapVal<Vec<u8>>` | Byte string |
 | `Array` | `HeapVal<Vec<Value>>` | Ordered collection |
@@ -202,18 +202,20 @@ Scripts probe for presence with `if let` rather than catching exceptions.
 - **Internal tracking**: `Value::Undefined` and `BaseType::Undefined` are explicit enum
   variants used internally by the VM and compiler. Users never name or pattern-match on
   `Undefined` directly — it is the implicit result of failed operations.
-- **NaN → Undefined**: Float operations producing NaN return Undefined
+- **Non-finite → Undefined**: Float operations producing NaN or ±inf (overflow,
+  division by zero, inf − inf) return Undefined, matching integer overflow semantics
 - **Failed operations → Undefined**: Type errors, out of bounds, overflow, division by zero
 - **Propagation**: Undefined propagates through operations; use `if let`/`if with` for handling
 
 ### Float Wrapper
 
 ```rust
-pub struct Float(f64);  // Invariant: never NaN
+pub struct Float(f64);  // Invariant: finite, zero is always +0.0
 ```
 
-- `Float::new(f64) -> Option<Self>`: Returns `None` for NaN
-- Implements `Eq` and `Hash` via bit representation
+- `Float::new(f64) -> Option<Self>`: Returns `None` for NaN and ±inf; normalizes -0.0 to +0.0
+- Implements `Eq` and `Hash` via bit representation — sound because the invariant
+  leaves exactly one bit pattern per representable value
 - Enables `Value` to be used as map key
 
 ---
@@ -828,7 +830,8 @@ without registry lookup. Each intrinsic carries metadata methods:
 | Comparison | `!=` `>` `<=` `>=` | Expanded to `Eq`/`Lt`/`Not` | — |
 | Logical | `!` | `Not` | No |
 | Logical | `&&` `\|\|` | Control flow (`If` + Phi), not intrinsics | — |
-| Bitwise | `&` `\|` `^` `~` `<<` `>>` | `BitAnd`, `BitOr`, `BitXor`, `BitNot`, `Shl`, `Shr` | No |
+| Bitwise | `&` `\|` `^` `~` | `BitAnd`, `BitOr`, `BitXor`, `BitNot` | No |
+| Shifts | `<<` `>>` | `Shl`, `Shr` | Yes (amount >= 64) |
 | Bit access | `@` | `BitTest` (read), `BitSet` (write) | Yes (OOB) |
 | Collection | `len(x)` `[a,b]` `{k:v}` | `Len`, `MakeArray`, `MakeMap` | Yes / No / Yes |
 | Collection | `collect(seq)` `append(arr,v)` | `Collect`, `Append` (via `Instruction::Append`) | No / No |
@@ -2698,7 +2701,7 @@ Preserves insertion order (important for serialization and deterministic output)
 
 ### Why Float wrapper?
 
-Enables `Value` to implement `Hash` and `Eq`. NaN would break both. By enforcing no-NaN at construction, we get clean derived traits.
+Enables `Value` to implement `Hash` and `Eq`. NaN would break both, and -0.0 would make two bit patterns compare unequal for one numeric value (two map keys for one zero). By enforcing finite + normalized zero at construction, we get clean derived traits and bitwise equality that coincides with numeric equality.
 
 ### Why return slot in Frame?
 

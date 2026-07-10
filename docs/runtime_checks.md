@@ -106,11 +106,18 @@ Type guard: Match(a, [Bool])                                              — em
 Infallible with Bool input                                                — result: Bool
 ```
 
-### Bitwise: exec_bitand, exec_bitor, exec_bitxor, exec_bitnot, exec_shl, exec_shr
+### Bitwise: exec_bitand, exec_bitor, exec_bitxor, exec_bitnot
 
 ```
 Type guard: Match(a, [UInt]) [+ Match(b, [UInt])]                        — emitted
 Infallible with UInt inputs                                               — result: UInt
+```
+
+### Shifts: exec_shl, exec_shr
+
+```
+Type guard: Match(a, [UInt]) + Match(b, [UInt])                          — emitted
+Checked: shift amount >= 64 → Undefined                                   — result: UInt | Undefined
 ```
 
 ### exec_bittest, exec_bitset

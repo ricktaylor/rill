@@ -2374,6 +2374,172 @@ fn byref_with_binding_writeback() {
 }
 
 #[test]
+fn float_div_by_zero_undefined() {
+    // Non-finite results are Undefined: 1.0 / 0.0 is not inf.
+    // Runtime path (param defeats const folding).
+    let val = run_expect(
+        r#"
+        fn f(a) {
+            let d = 1.0 / a;
+            match d {
+                Float => { 1 }
+                _ => { 2 }
+            }
+        }
+        fn test() { f(0.0) }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(2));
+}
+
+#[test]
+fn float_div_by_zero_undefined_const() {
+    // The fully-constant form agrees with the runtime: no fold to inf
+    let val = run_expect(
+        r#"
+        fn test() {
+            let d = 1.0 / 0.0;
+            match d {
+                Float => { 1 }
+                _ => { 2 }
+            }
+        }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(2));
+}
+
+#[test]
+fn float_overflow_undefined() {
+    // Float overflow is Undefined, matching integer overflow semantics
+    let val = run_expect(
+        r#"
+        fn f(a) {
+            let b = a * a;
+            let c = b * b;
+            let d = c * c;
+            match d {
+                Float => { 1 }
+                _ => { 2 }
+            }
+        }
+        fn test() { f(10000000000000000000000000000000000000000.0) }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(2));
+}
+
+#[test]
+fn float_neg_zero_normalized() {
+    // -x for x == 0.0 is +0.0: one zero, bitwise equality agrees with
+    // numeric equality
+    let val = run_expect(
+        r#"
+        fn f(x) {
+            let nz = -x;
+            if nz == 0.0 { 1 } else { 2 }
+        }
+        fn test() { f(0.0) }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(1));
+}
+
+#[test]
+fn float_neg_zero_single_map_key() {
+    // A computed -0.0 and literal 0.0 are the SAME map key
+    let val = run_expect(
+        r#"
+        fn f(x) {
+            let m = {};
+            m[-x] = 5;
+            m[0.0]
+        }
+        fn test() { f(0.0) }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(5));
+}
+
+#[test]
+fn float_nonfinite_literal_undefined() {
+    // A source literal beyond f64 range parses to inf → Undefined value
+    let val = run_expect(
+        r#"
+        fn test() {
+            let d = 1.0e999;
+            match d {
+                Float => { 1 }
+                _ => { 2 }
+            }
+        }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(2));
+}
+
+#[test]
+fn shift_amount_64_undefined() {
+    // Shifts are checked like arithmetic: amount >= 64 → Undefined
+    let val = run_expect(
+        r#"
+        fn f(s) {
+            let d = 1 << s;
+            match d {
+                UInt => { 1 }
+                _ => { 2 }
+            }
+        }
+        fn test() { f(63) * 10 + f(64) }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(12));
+}
+
+#[test]
+fn shift_amount_64_undefined_const() {
+    // The fully-constant form agrees with the runtime
+    let val = run_expect(
+        r#"
+        fn test() {
+            let d = 1 << 64;
+            match d {
+                UInt => { 1 }
+                _ => { 2 }
+            }
+        }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(2));
+}
+
+#[test]
+fn shift_right_64_undefined() {
+    let val = run_expect(
+        r#"
+        fn f(s) {
+            let d = 255 >> s;
+            match d {
+                UInt => { 1 }
+                _ => { 2 }
+            }
+        }
+        fn test() { f(4) * 10 + f(64) }
+        "#,
+        "test",
+    );
+    assert_eq!(val, Value::UInt(12));
+}
+
+#[test]
 fn with_pattern_array_writeback() {
     // Pattern-bound element refs write back to the named scrutinee
     let val = run_expect(

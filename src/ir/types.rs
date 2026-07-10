@@ -161,10 +161,10 @@ impl IntrinsicOp {
             Self::Eq | Self::Not => TypeSet::bool(),
             // Lt: type mismatch → undefined
             Self::Lt => TypeSet::bool().union(&TypeSet::undefined()),
-            // Bitwise: infallible on UInt inputs
-            Self::BitAnd | Self::BitOr | Self::BitXor | Self::BitNot | Self::Shl | Self::Shr => {
-                TypeSet::uint()
-            }
+            // Bitwise and/or/xor/not: infallible on UInt inputs
+            Self::BitAnd | Self::BitOr | Self::BitXor | Self::BitNot => TypeSet::uint(),
+            // Shifts: amount >= 64 → undefined (checked, like arithmetic)
+            Self::Shl | Self::Shr => TypeSet::uint().union(&TypeSet::undefined()),
             // BitTest/BitSet: out-of-bounds bit position → undefined
             Self::BitTest => TypeSet::bool().union(&TypeSet::undefined()),
             Self::BitSet => TypeSet::uint().union(&TypeSet::undefined()),

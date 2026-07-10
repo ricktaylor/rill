@@ -309,7 +309,11 @@ pub(super) fn exec_bitnot(a: &Value) -> Value {
 
 pub(super) fn exec_shl(a: &Value, b: &Value) -> Value {
     match (a, b) {
-        (Value::UInt(a), Value::UInt(b)) => Value::UInt(a.wrapping_shl(*b as u32)),
+        // Checked: a shift amount >= 64 is not representable → Undefined
+        (Value::UInt(a), Value::UInt(b)) => u32::try_from(*b)
+            .ok()
+            .and_then(|s| a.checked_shl(s))
+            .map_or(Value::Undefined, Value::UInt),
         _ => {
             debug_assert!(
                 false,
@@ -322,7 +326,11 @@ pub(super) fn exec_shl(a: &Value, b: &Value) -> Value {
 
 pub(super) fn exec_shr(a: &Value, b: &Value) -> Value {
     match (a, b) {
-        (Value::UInt(a), Value::UInt(b)) => Value::UInt(a.wrapping_shr(*b as u32)),
+        // Checked: a shift amount >= 64 is not representable → Undefined
+        (Value::UInt(a), Value::UInt(b)) => u32::try_from(*b)
+            .ok()
+            .and_then(|s| a.checked_shr(s))
+            .map_or(Value::Undefined, Value::UInt),
         _ => {
             debug_assert!(
                 false,
