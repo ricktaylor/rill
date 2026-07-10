@@ -45,8 +45,11 @@ pub fn simplify_cfg(function: &mut Function) -> usize {
 /// A block is "trivial" if it has no instructions (or only Phi instructions
 /// with no sources) and its terminator is an unconditional Jump.
 fn thread_jumps(function: &mut Function) {
-    // Build a map of trivial block redirections: block_id → final target
-    let mut redirects: HashMap<BlockId, BlockId> = HashMap::new();
+    // Each trivial block's ORIGINAL jump target — chains are walked one hop
+    // at a time through this map. (The chain-resolved `redirects` map skips
+    // intermediates, so walking it would never visit the middle blocks of a
+    // trivial chain, and their Phi sources would silently miss remapping.)
+    let mut direct: HashMap<BlockId, BlockId> = HashMap::new();
 
     for block in &function.blocks {
         if let Terminator::Jump { target } = &block.terminator {
@@ -54,22 +57,22 @@ fn thread_jumps(function: &mut Function) {
                 |inst| matches!(&inst.node, Instruction::Phi { sources, .. } if sources.is_empty()),
             );
             if is_trivial {
-                redirects.insert(block.id, *target);
+                direct.insert(block.id, *target);
             }
         }
     }
 
-    if redirects.is_empty() {
+    if direct.is_empty() {
         return;
     }
 
-    // Resolve chains: if A→B and B→C, then A→C
-    let keys: Vec<BlockId> = redirects.keys().copied().collect();
-    for key in keys {
-        let mut target = redirects[&key];
+    // Resolve chains for the terminator rewrite: if A→B and B→C, then A→C
+    let mut redirects: HashMap<BlockId, BlockId> = HashMap::new();
+    for (&key, &first) in &direct {
+        let mut target = first;
         let mut visited = HashSet::new();
         visited.insert(key);
-        while let Some(&next) = redirects.get(&target) {
+        while let Some(&next) = direct.get(&target) {
             if !visited.insert(target) {
                 break; // cycle
             }
@@ -78,61 +81,93 @@ fn thread_jumps(function: &mut Function) {
         redirects.insert(key, target);
     }
 
-    // Build reverse map: for each trivial block, which NON-TRIVIAL blocks
-    // reach it? We skip trivial blocks as predecessors and follow chains,
-    // so A→B→C→D (B, C trivial) records incoming[B]=[A], incoming[C]=[A].
-    // This ensures Phi sources are rewritten to the actual predecessors
-    // that will target the final destination after threading.
+    // Unthreading a conflicting block changes who reaches everything
+    // downstream of it, so the incoming map and the conflict check iterate
+    // until no new conflicts appear (redirects only shrinks — terminates).
     let mut incoming: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
-    for block in &function.blocks {
-        if redirects.contains_key(&block.id) {
-            continue;
-        }
-        for succ in block.terminator.successors() {
-            let mut t = succ;
-            while redirects.contains_key(&t) {
-                incoming.entry(t).or_default().push(block.id);
-                t = redirects[&t];
+    loop {
+        // Reverse map: for each still-threaded trivial block, the REAL
+        // predecessors that reach it. Walk chains hop by hop so that
+        // A→B→C→D (B, C trivial) records incoming[B]=[A] and
+        // incoming[C]=[A]. An unthreaded block stops the walk: it stays a
+        // real block, and acts as an origin for the chain behind it.
+        incoming.clear();
+        for block in &function.blocks {
+            if redirects.contains_key(&block.id) {
+                continue;
+            }
+            for succ in block.terminator.successors() {
+                let mut t = succ;
+                let mut seen = HashSet::new();
+                while redirects.contains_key(&t) {
+                    if !seen.insert(t) {
+                        break; // trivial cycle (unreachable garbage)
+                    }
+                    incoming.entry(t).or_default().push(block.id);
+                    t = direct[&t];
+                }
             }
         }
-    }
 
-    // Check for conflicts: threading would be unsafe if it creates a Phi
-    // with two sources from the same predecessor carrying different values.
-    // This happens when an If/Match has both branches go through different
-    // trivial blocks to the same join — the Phi uses block identity to
-    // distinguish which edge was taken.
-    let mut unsafe_redirects: HashSet<BlockId> = HashSet::new();
-    for block in &function.blocks {
-        for inst in &block.instructions {
-            if let Instruction::Phi { sources, .. } = &inst.node {
-                // Simulate the rewrite and check for conflicting predecessors
-                let mut pred_values: HashMap<BlockId, VarId> = HashMap::new();
-                for (src_block, var) in sources {
-                    if let Some(preds) = incoming.get(src_block) {
-                        for &pred in preds {
-                            if let Some(&existing) = pred_values.get(&pred) {
-                                if existing != *var {
-                                    // Conflict: same predecessor, different values.
-                                    // Don't thread this trivial block.
-                                    unsafe_redirects.insert(*src_block);
+        // Check for conflicts: threading is unsafe if it would create a Phi
+        // with two sources from the same predecessor carrying different
+        // values (an If/Match whose branches reach the same join through
+        // different trivial blocks — the Phi uses block identity to tell
+        // the edges apart). Each recorded value remembers which threaded
+        // block produced it, so a clash can be attributed no matter which
+        // side of it is processed first.
+        let mut unsafe_redirects: HashSet<BlockId> = HashSet::new();
+        for block in &function.blocks {
+            for inst in &block.instructions {
+                if let Instruction::Phi { sources, .. } = &inst.node {
+                    // pred → (value, threaded block it arrived through)
+                    let mut pred_values: HashMap<BlockId, (VarId, Option<BlockId>)> =
+                        HashMap::new();
+                    for (src_block, var) in sources {
+                        if let Some(preds) = incoming.get(src_block) {
+                            for &pred in preds {
+                                match pred_values.get(&pred) {
+                                    Some(&(existing, from)) if existing != *var => {
+                                        unsafe_redirects.insert(*src_block);
+                                        if let Some(t) = from {
+                                            unsafe_redirects.insert(t);
+                                        }
+                                    }
+                                    Some(_) => {}
+                                    None => {
+                                        pred_values.insert(pred, (*var, Some(*src_block)));
+                                    }
                                 }
-                            } else {
-                                pred_values.insert(pred, *var);
+                            }
+                        } else {
+                            match pred_values.get(src_block) {
+                                Some(&(existing, from)) if existing != *var => {
+                                    // A direct source clashing with a threaded
+                                    // expansion onto the same predecessor: unthread
+                                    // the expansion. (Two DIRECT sources from one
+                                    // predecessor with different values would be
+                                    // malformed input IR — nothing to unthread.)
+                                    if let Some(t) = from {
+                                        unsafe_redirects.insert(t);
+                                    }
+                                }
+                                Some(_) => {}
+                                None => {
+                                    pred_values.insert(*src_block, (*var, None));
+                                }
                             }
                         }
-                    } else {
-                        pred_values.insert(*src_block, *var);
                     }
                 }
             }
         }
-    }
 
-    // Remove unsafe redirects
-    for block_id in &unsafe_redirects {
-        redirects.remove(block_id);
-        incoming.remove(block_id);
+        if unsafe_redirects.is_empty() {
+            break;
+        }
+        for block_id in &unsafe_redirects {
+            redirects.remove(block_id);
+        }
     }
 
     if redirects.is_empty() {
@@ -607,5 +642,139 @@ mod tests {
         assert_eq!(removed, 2);
         assert_eq!(func.blocks.len(), 1);
         assert_eq!(func.blocks[0].instructions.len(), 3);
+    }
+
+    #[test]
+    fn test_thread_chain_middle_phi_source_remapped() {
+        // P(non-trivial) → T1 → T2 → J, T1/T2 trivial, and J's phi names
+        // T2 (the MIDDLE of the chain, not its head) as a source. Threading
+        // must remap (T2, v) to the real origin P — dropping it would let
+        // remove_unreachable_blocks silently delete the phi source.
+        let blocks = vec![
+            BasicBlock {
+                id: block(0),
+                instructions: vec![si(Instruction::Const {
+                    dest: var(0),
+                    value: Literal::UInt(1),
+                })],
+                terminator: Terminator::Jump { target: block(1) },
+            },
+            BasicBlock {
+                id: block(1),
+                instructions: vec![],
+                terminator: Terminator::Jump { target: block(2) },
+            },
+            BasicBlock {
+                id: block(2),
+                instructions: vec![],
+                terminator: Terminator::Jump { target: block(3) },
+            },
+            BasicBlock {
+                id: block(3),
+                instructions: vec![si(Instruction::Phi {
+                    dest: var(1),
+                    sources: vec![(block(2), var(0))],
+                })],
+                terminator: Terminator::Return {
+                    value: Some(var(1)),
+                },
+            },
+        ];
+
+        let mut func = make_function(blocks);
+        simplify_cfg(&mut func);
+
+        // The phi (or its simplified form) must still carry v0 from B0.
+        // After threading + single-source simplification the join block may
+        // reduce the phi to a copy — either way, v0 must remain the value.
+        let join = func.blocks.iter().find(|b| {
+            b.instructions.iter().any(|i| {
+                matches!(&i.node, Instruction::Phi { dest, .. } if *dest == var(1))
+                    || matches!(&i.node, Instruction::Copy { dest, .. } if *dest == var(1))
+            })
+        });
+        let join = join.expect("join block with v1 def must survive");
+        let keeps_v0 = join.instructions.iter().any(|i| match &i.node {
+            Instruction::Phi { dest, sources } if *dest == var(1) => {
+                sources.iter().any(|(b, v)| *v == var(0) && *b == block(0))
+            }
+            Instruction::Copy { dest, src } if *dest == var(1) => *src == var(0),
+            _ => false,
+        });
+        assert!(
+            keeps_v0,
+            "phi source through the chain middle must remap to the origin"
+        );
+    }
+
+    #[test]
+    fn test_thread_conflict_detected_regardless_of_source_order() {
+        // P: If → T (trivial → J) / J directly. The phi at J distinguishes
+        // the edges: [(T, a), (P, b)]. Threading T would give J two sources
+        // from P with different values. The direct source (P, b) appears
+        // AFTER the threaded one — the conflict must still be caught.
+        let blocks = vec![
+            BasicBlock {
+                id: block(0),
+                instructions: vec![
+                    si(Instruction::Const {
+                        dest: var(0),
+                        value: Literal::Bool(true),
+                    }),
+                    si(Instruction::Const {
+                        dest: var(1),
+                        value: Literal::UInt(1),
+                    }),
+                    si(Instruction::Const {
+                        dest: var(2),
+                        value: Literal::UInt(2),
+                    }),
+                ],
+                terminator: Terminator::If {
+                    condition: var(0),
+                    then_target: block(1),
+                    else_target: block(2),
+                    span: ast::Span::default(),
+                },
+            },
+            BasicBlock {
+                id: block(1),
+                instructions: vec![],
+                terminator: Terminator::Jump { target: block(2) },
+            },
+            BasicBlock {
+                id: block(2),
+                instructions: vec![si(Instruction::Phi {
+                    dest: var(3),
+                    sources: vec![(block(1), var(1)), (block(0), var(2))],
+                })],
+                terminator: Terminator::Return {
+                    value: Some(var(3)),
+                },
+            },
+        ];
+
+        let mut func = make_function(blocks);
+        simplify_cfg(&mut func);
+
+        // T (block 1) must NOT have been threaded away: the phi still has
+        // two distinct-predecessor sources with their original values.
+        let join = func
+            .blocks
+            .iter()
+            .find(|b| b.id == block(2))
+            .expect("join must survive");
+        let phi_ok = join.instructions.iter().any(|i| match &i.node {
+            Instruction::Phi { dest, sources } if *dest == var(3) => {
+                sources.len() == 2
+                    && sources.contains(&(block(1), var(1)))
+                    && sources.contains(&(block(0), var(2)))
+            }
+            _ => false,
+        });
+        assert!(
+            phi_ok,
+            "conflicting thread must be rejected; phi edges preserved"
+        );
     }
 }
