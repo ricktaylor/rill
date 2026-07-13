@@ -47,9 +47,81 @@ The full compilation and execution pipeline is working end-to-end with 270+ test
 - **Diagnostics** — source spans, line:column formatting, error codes (`src/diagnostics.rs`)
 - **Docs** — ABNF grammar, design document, stdlib spec, examples, benchmarks
 
+**2026-07-10 correctness series** (12 commits, `190aefb`..`3482137`, driven by the
+full-project review in `docs/code_review_2026-07-10.md` — kept locally, uncommitted):
+
+- **`for k, v in map`** — MapKeyAt intrinsic + counted-loop lowering
+- **By-ref write-back fixed end-to-end**: `bind_element` consolidates the ten
+  copy-pasted element-binding sites and threads the scrutinee name into element
+  RefOrigins (patterns, if-let); loop accessors alias the NAMED iterable (stable
+  ref var for by-ref params, per-iteration read otherwise); by-ref call args
+  reload the accessor's base after the call; `RefOrigin.base_slot` hardens
+  write-back against shadowing
+- **VM write dispatch**: accessor writes dispatch on the BASE type (UInt keys on
+  maps no longer dropped); array writes accept `Int >= 0` keys symmetric with reads
+- **Optimizer aliasing safety**: ref_elision demotes accessors only over
+  unwritten, non-escaping bases (escape tracked through call-arg ref chains, and
+  an escaped base counts as written); CSE clobbers heap-reading keys on any heap
+  write and never merges sequence ops (MakeSeq/ArraySeq carry cursor identity);
+  const_fold write invalidation resolves through Copy chains and ref wrappers
+- **thread_jumps**: incoming map walks trivial chains hop-by-hop (middle-of-chain
+  phi sources were silently dropped → loop back-edges lost); phi-conflict check
+  attributes values to their threaded origin (order-independent) with iterated
+  pruning
+- **Phi placement**: short-circuit `&&`/`||` constants and the while-expression's
+  normal-exit Undefined are emitted in the predecessor their edge leaves from
+- **Algebra**: wrong pow2 strength-reduction stubs deleted (`x*4` compiled to
+  `x+x`!); all rewrites gated on a proven single numeric type matching the
+  constant's type; `x == x` requires a provably-defined operand
+- **Checked semantics everywhere** (design ruling: roll to Undefined, never wrap):
+  `Float` invariant is finite with a single +0.0 zero (`1.0/0.0` → Undefined,
+  `-0.0` cannot exist; bitwise Eq/Hash now coincides with numeric equality);
+  shifts by >= 64 → Undefined; const evaluation applies the same rules
+  (`const_float`), so folded and executed results cannot disagree on float edges
+- **Honest arithmetic lattice**: refined Add/Sub/Mul/Div/Mod/Neg/BitTest result
+  types include Undefined, so definedness guards survive optimization
+  (`if x == x` on overflow now takes the else branch); `describe_var_origin`
+  made linear (was O(copies^depth), hung W201 rendering)
+
 All 28 code review issues (CR-1 through CR-27) resolved — see git history.
 
 ## Remaining Work
+
+### P1 — Correctness follow-ups (2026-07-10 review, still open)
+
+- [ ] **Heap limit enforcement**: `seq_collect` materializes the whole sequence
+      before `Heap::check` (a large range OOM-aborts the host past the limit);
+      `set_map_entry` never charges growth and `HeapVal::drop`'s saturating
+      dealloc then underflows the counter, disabling the limit for the VM's life
+- [ ] **Slot allocator interference for params/def-less vars** — never-assigned
+      pattern bindings can be coalesced onto a live param slot: `let Int(y) = x;
+      return y;` leaks the scrutinee instead of Undefined
+- [ ] **Parser recursion limit** — ~100K nested parens stack-overflow the host
+      at compile time (also cap IR lowering recursion)
+- [ ] **De-panic the embedding API** — `VM::local`'s expect fires on a missing
+      optional extern arg (size extern frames to declared params or yield
+      Undefined); `call_with_args` underflows on argc > pushed values
+- [ ] **Host-call vs interprocedural narrowing** — Phase B prunes match arms
+      still reachable via `Program::call` with arbitrary types; needs an
+      embedder entry-point contract (treat root functions' params as any()?)
+- [ ] **32-bit `as usize` truncation family** — script u64 indices/lengths are
+      cast before bounds checks (index_value, VM accessor read/write paths,
+      const_index, WriteAccessor arms, SeqState::remaining); on 32-bit,
+      `a[2^32] = x` overwrites `a[0]`. Compare in u64 first, then try_from
+- [ ] **Const/runtime op-table unification** — const_index vs index_value have
+      already drifted (`Text[Int]`, Map float-key lookup); `Lt` sits in
+      coercion's promotion list so proven-UInt comparisons above i64::MAX
+      become Undefined while const/runtime compare exactly in i128
+- [ ] **Module namespaces collide on filename stem** — importing `x/utils.rill`
+      and `y/utils.rill` under different aliases merges them (cross-file bleed,
+      spurious duplicate-function errors); namespace should follow file identity
+- [ ] **Lint/diagnostic fixes** — W001 fires on `_`-prefixed names despite its
+      own help text, and 3× per for-loop binding (one span at 0,0); W010 flags
+      transitively-load-bearing imports; diagnostic carets/columns are
+      byte-based (misaligned on multibyte UTF-8)
+- [ ] **TailCall arity/frame-reset** — tail_call.rs never checks call arity and
+      the frame reset uses call-site argc, so extra args write past the param
+      region; entry block hardcoded as BlockId(0)
 
 ### P1 — Core Functionality
 
@@ -407,7 +479,9 @@ All 28 code review issues (CR-1 through CR-27) resolved — see git history.
       - Read-only Accessor → Index: removes Slot::Accessor overhead
       - Read-only Ref → Copy: removes Slot::Ref overhead
       - `with` without write-back optimises to same IR as `let`
-      - WriteAccessor bases tracked in written_bases (prevents incorrect Ref demotion)
+      - WriteAccessor bases tracked in written_bases; accessor demotion gated on
+        written bases AND escape through call-arg ref chains, an escaped ref's
+        base counting as written (2026-07-10)
 
 ### P2 — Known Issues (resolved)
 
